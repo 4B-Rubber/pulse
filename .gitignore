@@ -22,6 +22,8 @@ compile_commands.json
 *.dll
 !third_party/pdfium/bin/pdfium.dll
 /third_party/pdfium/*.tgz
+!third_party/lumatext/bin/lumatext.dll
+!third_party/lumatext/lib/lumatext.lib
 *.exp
 *.idb
 *.iobj

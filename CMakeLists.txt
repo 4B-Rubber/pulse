@@ -25,6 +25,11 @@ set(LUMATEXT_SOURCE_DIR "" CACHE PATH
 set(PULSE_LUMATEXT_TARGET "")
 set(PULSE_LUMATEXT_RUNTIME_TARGET "")
 if(PULSE_WITH_LUMATEXT)
+    # The committed prebuilt package keeps everyday builds from rebuilding the
+    # LumaText source tree; an explicit CMAKE_PREFIX_PATH (release SDK) still wins.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lumatext/bin/lumatext.dll")
+        list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lumatext")
+    endif()
     if(LUMATEXT_SOURCE_DIR)
         if(NOT EXISTS "${LUMATEXT_SOURCE_DIR}/CMakeLists.txt")
             message(FATAL_ERROR "LUMATEXT_SOURCE_DIR does not contain CMakeLists.txt")
@@ -83,6 +88,13 @@ function(pulse_enable_lumatext target)
                         $<TARGET_FILE_DIR:${target}>/licenses/LumaText/LumaText.txt
                     COMMAND ${CMAKE_COMMAND} -E copy_directory
                         "${LUMATEXT_SOURCE_DIR}/LICENSES"
+                        $<TARGET_FILE_DIR:${target}>/licenses/LumaText)
+            elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lumatext/share/LumaText/licenses")
+                add_custom_command(TARGET ${target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                        $<TARGET_FILE_DIR:${target}>/licenses/LumaText
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lumatext/share/LumaText/licenses"
                         $<TARGET_FILE_DIR:${target}>/licenses/LumaText)
             endif()
         endif()
@@ -491,10 +503,14 @@ foreach(search_target IN LISTS search_targets)
     if("${search_sources}" MATCHES "index_query\\.cpp" AND NOT "${search_sources}" MATCHES "filename_pinyin\\.cpp")
         target_sources(${search_target} PRIVATE src/index/filename_pinyin.cpp)
     endif()
-    if("${search_sources}" MATCHES "index_engine\\.cpp" AND NOT "${search_sources}" MATCHES "index_engine_pinyin\\.cpp")
-        target_sources(${search_target} PRIVATE src/index/index_engine_pinyin.cpp)
-        target_sources(${search_target} PRIVATE src/index/filename_timing.cpp)
-        target_include_directories(${search_target} PRIVATE "${CMAKE_BINARY_DIR}/generated")
+    if("${search_sources}" MATCHES "index_engine\\.cpp")
+        if(NOT "${search_sources}" MATCHES "index_engine_pinyin\\.cpp")
+            target_sources(${search_target} PRIVATE src/index/index_engine_pinyin.cpp)
+            target_include_directories(${search_target} PRIVATE "${CMAKE_BINARY_DIR}/generated")
+        endif()
+        if(NOT "${search_sources}" MATCHES "filename_timing\\.cpp")
+            target_sources(${search_target} PRIVATE src/index/filename_timing.cpp)
+        endif()
     endif()
 endforeach()
 add_executable(pulse_content_index_test src/bench/content_index_test.cpp src/bench/content_instant_test.cpp
