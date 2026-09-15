@@ -1,4 +1,5 @@
 #include "../app/duplicate_scan.h"
+#include <algorithm>
 
 #include <cstdio>
 
@@ -75,6 +76,68 @@ int wmain() {
           L"all-extras matches the remaining copy");
     session.RemoveDeleted({L"D:\\new.bin"});
     Check(session.groups.empty(), L"groups drop when fewer than two files remain");
+
+    app::DuplicateScanSession batched;
+    batched.generation = 9;
+    index::ContentSearchProgress batch_progress;
+    batch_progress.generation = 9;
+    batch_progress.done = false;
+    index::ContentHit third = older;
+    third.path = L"E:\\third.bin";
+    third.name = L"third.bin";
+    third.modified = 30;
+    batched.ApplyUpdate(batch_progress, {older});
+    Check(batched.groups.empty(), L"a partial duplicate group stays hidden until its second file");
+    batched.ApplyUpdate(batch_progress, {newer});
+    Check(batched.groups.size() == 1 && batched.groups[0].files.size() == 2,
+          L"separate batches merge into one duplicate group");
+    batched.SetKeep(0, 1);
+    batched.ApplyUpdate(batch_progress, {third});
+    Check(batched.groups[0].files.size() == 3 &&
+              batched.groups[0].files[batched.groups[0].keep_index].path == L"C:\\old.bin",
+          L"later batches preserve the chosen file to keep");
+
+    app::DuplicateScanSession deletion;
+    deletion.generation = 10;
+    index::ContentSearchProgress deletion_progress;
+    deletion_progress.generation = 10;
+    index::ContentHit a = older;
+    a.path = L"A:\\first.bin";
+    a.name = L"first.bin";
+    a.modified = 40;
+    index::ContentHit b = older;
+    b.path = L"B:\\second.bin";
+    b.name = L"second.bin";
+    b.modified = 30;
+    index::ContentHit c = older;
+    c.path = L"C:\\keeper.bin";
+    c.name = L"keeper.bin";
+    c.modified = 20;
+    index::ContentHit d = older;
+    d.path = L"D:\\last.bin";
+    d.name = L"last.bin";
+    d.modified = 10;
+    deletion.ApplyUpdate(deletion_progress, {a, b, c, d});
+    for (size_t i = 0; i < deletion.groups[0].files.size(); ++i) {
+        if (deletion.groups[0].files[i].path == c.path) deletion.SetKeep(0, i);
+    }
+    deletion.RemoveDeleted({a.path});
+    const auto kept_after_delete = deletion.FilesToDelete(0);
+    Check(deletion.groups[0].files[deletion.groups[0].keep_index].path == c.path &&
+              std::find(kept_after_delete.begin(), kept_after_delete.end(), c.path) == kept_after_delete.end(),
+          L"deleting before the keeper preserves keeper identity");
+
+    app::DuplicateScanSession reforming;
+    reforming.generation = 11;
+    index::ContentSearchProgress reform_progress;
+    reform_progress.generation = 11;
+    reforming.ApplyUpdate(reform_progress, {older, newer});
+    reforming.RemoveDeleted({older.path});
+    reforming.ApplyUpdate(reform_progress, {third});
+    Check(reforming.groups.size() == 1 && reforming.groups[0].files.size() == 2 &&
+              std::any_of(reforming.groups[0].files.begin(), reforming.groups[0].files.end(),
+                          [&](const app::DuplicateFile& file) { return file.path == newer.path; }),
+          L"a surviving file reforms its group after a later scan hit");
 
     app::DuplicateScanSession epoch;
     epoch.generation = 1;

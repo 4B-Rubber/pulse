@@ -61,7 +61,8 @@ void DuplicateScanSession::ResetResults() {
     files_per_second = 0;
     megabytes_per_second = 0;
     groups.clear();
-    hits_.clear();
+    pending_groups_.clear();
+    group_indices_.clear();
     speed_tick_ = {};
     speed_files_ = 0;
     speed_bytes_ = 0;
@@ -93,52 +94,71 @@ void DuplicateScanSession::UpdateSpeed(const index::ContentSearchProgress& progr
     speed_bytes_ = progress.scanned_bytes;
 }
 
-void DuplicateScanSession::RebuildGroups() {
-    std::unordered_map<uint32_t, std::wstring> kept;
-    kept.reserve(groups.size());
-    for (const auto& group : groups) {
-        if (group.keep_index < group.files.size())
-            kept[group.id] = group.files[group.keep_index].path;
-    }
-    std::unordered_map<uint32_t, DuplicateGroup> by_id;
-    for (const auto& hit : hits_) {
+void DuplicateScanSession::RebuildGroupIndex() {
+    group_indices_.clear();
+    group_indices_.reserve(groups.size());
+    for (size_t index = 0; index < groups.size(); ++index)
+        group_indices_[groups[index].id] = index;
+}
+
+void DuplicateScanSession::SortGroups() {
+    std::sort(groups.begin(), groups.end(),
+              [](const DuplicateGroup& left, const DuplicateGroup& right) {
+                  if (left.size != right.size) return left.size > right.size;
+                  return left.files.size() > right.files.size();
+              });
+    RebuildGroupIndex();
+}
+
+void DuplicateScanSession::AppendHits(const std::vector<index::ContentHit>& hits) {
+    bool changed = false;
+    for (const auto& hit : hits) {
         if (hit.group == 0) continue;
-        DuplicateFile file;
-        file.path = hit.path;
-        file.name = hit.name.empty() ? hit.path : hit.name;
-        file.size = hit.size;
-        file.modified = hit.modified;
-        auto& group = by_id[hit.group];
-        group.id = hit.group;
-        group.size = hit.size;
+        DuplicateFile file{hit.path, hit.name.empty() ? hit.path : hit.name,
+                           hit.size, hit.modified};
+        const auto visible = group_indices_.find(hit.group);
+        if (visible == group_indices_.end()) {
+            const auto pending = pending_groups_.find(hit.group);
+            if (pending == pending_groups_.end()) {
+                pending_groups_.emplace(hit.group, std::move(file));
+                continue;
+            }
+            DuplicateGroup group;
+            group.id = hit.group;
+            group.size = hit.size;
+            group.files.push_back(std::move(pending->second));
+            group.files.push_back(std::move(file));
+            pending_groups_.erase(pending);
+            std::sort(group.files.begin(), group.files.end(),
+                      [](const DuplicateFile& left, const DuplicateFile& right) {
+                          if (left.modified != right.modified) return left.modified > right.modified;
+                          return left.path < right.path;
+                      });
+            group_indices_[group.id] = groups.size();
+            groups.push_back(std::move(group));
+            changed = true;
+            continue;
+        }
+
+        DuplicateGroup& group = groups[visible->second];
+        const std::wstring kept = group.keep_index < group.files.size()
+            ? group.files[group.keep_index].path : std::wstring{};
         group.files.push_back(std::move(file));
-    }
-    groups.clear();
-    groups.reserve(by_id.size());
-    for (auto& [id, group] : by_id) {
         std::sort(group.files.begin(), group.files.end(),
                   [](const DuplicateFile& left, const DuplicateFile& right) {
                       if (left.modified != right.modified) return left.modified > right.modified;
                       return left.path < right.path;
                   });
         group.keep_index = 0;
-        const auto found = kept.find(id);
-        if (found != kept.end()) {
-            for (size_t i = 0; i < group.files.size(); ++i) {
-                if (SamePath(group.files[i].path, found->second)) {
-                    group.keep_index = i;
-                    break;
-                }
+        for (size_t index = 0; index < group.files.size(); ++index) {
+            if (SamePath(group.files[index].path, kept)) {
+                group.keep_index = index;
+                break;
             }
         }
-        if (group.files.size() >= 2) groups.push_back(std::move(group));
+        changed = true;
     }
-    std::sort(groups.begin(), groups.end(),
-              [](const DuplicateGroup& left, const DuplicateGroup& right) {
-                  if (left.size != right.size) return left.size > right.size;
-                  return left.files.size() > right.files.size();
-              });
-    ++result_epoch;
+    if (changed) ++result_epoch;
 }
 
 void DuplicateScanSession::ApplyUpdate(const index::ContentSearchProgress& progress,
@@ -153,13 +173,13 @@ void DuplicateScanSession::ApplyUpdate(const index::ContentSearchProgress& progr
     truncated = progress.truncated;
     error = progress.error;
     if (!hits.empty()) {
-        hits_.insert(hits_.end(), hits.begin(), hits.end());
-        RebuildGroups();
+        AppendHits(hits);
     }
     if (progress.done) {
         scanning = false;
         completed = true;
-        if (!hits_.empty()) RebuildGroups();
+        SortGroups();
+        ++result_epoch;
     }
 }
 
@@ -192,9 +212,11 @@ std::vector<std::wstring> DuplicateScanSession::AllFilesToDelete() const {
 }
 
 void DuplicateScanSession::RemoveDeleted(const std::vector<std::wstring>& paths) {
-    if (paths.empty() || groups.empty()) return;
+    if (paths.empty()) return;
     ++result_epoch;
     for (auto& group : groups) {
+        const std::wstring kept = group.keep_index < group.files.size()
+            ? group.files[group.keep_index].path : std::wstring{};
         group.files.erase(std::remove_if(group.files.begin(), group.files.end(),
                                          [&](const DuplicateFile& file) {
                                              return std::any_of(paths.begin(), paths.end(),
@@ -203,19 +225,31 @@ void DuplicateScanSession::RemoveDeleted(const std::vector<std::wstring>& paths)
                                                                 });
                                          }),
                           group.files.end());
-        if (group.keep_index >= group.files.size()) group.keep_index = 0;
+        group.keep_index = 0;
+        for (size_t index = 0; index < group.files.size(); ++index) {
+            if (SamePath(group.files[index].path, kept)) {
+                group.keep_index = index;
+                break;
+            }
+        }
     }
-    groups.erase(std::remove_if(groups.begin(), groups.end(),
-                                [](const DuplicateGroup& group) { return group.files.size() < 2; }),
-                 groups.end());
-    hits_.erase(std::remove_if(hits_.begin(), hits_.end(),
-                               [&](const index::ContentHit& hit) {
-                                   return std::any_of(paths.begin(), paths.end(),
-                                                      [&](const std::wstring& path) {
-                                                          return SamePath(hit.path, path);
-                                                      });
-                               }),
-                hits_.end());
+    for (auto it = groups.begin(); it != groups.end();) {
+        if (it->files.size() >= 2) {
+            ++it;
+            continue;
+        }
+        if (it->files.size() == 1)
+            pending_groups_[it->id] = std::move(it->files.front());
+        it = groups.erase(it);
+    }
+    for (auto it = pending_groups_.begin(); it != pending_groups_.end();) {
+        const bool deleted = std::any_of(paths.begin(), paths.end(), [&](const std::wstring& path) {
+            return SamePath(it->second.path, path);
+        });
+        if (deleted) it = pending_groups_.erase(it);
+        else ++it;
+    }
+    SortGroups();
 }
 
 size_t DuplicateScanSession::ExtraCount() const {

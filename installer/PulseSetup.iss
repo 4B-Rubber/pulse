@@ -2,7 +2,7 @@
 ; Builds dist\PulseSetup-<version>.exe from the Release build in build\.
 ;
 ; Install-time behaviour:
-;   - Installs the 4 executables into Program Files\Pulse (admin required).
+;   - Installs the executables into Program Files\Pulse (admin required).
 ;   - "Index service" task (default on): runs `Pulse.Index.exe --install` and
 ;     starts the PulseIndex service, so full-disk MFT/USN indexing works out of
 ;     the box without a runtime UAC prompt.
@@ -51,9 +51,10 @@ OutputBaseFilename=PulseSetup-{#AppVersion}-win81
 #else
 OutputBaseFilename=PulseSetup-{#AppVersion}
 #endif
-Compression=lzma2
+Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=src\app\pulse.ico
 ; PrepareToInstall stops the service and leftover Pulse hosts before
 ; Restart Manager scans. Keep CloseApplications as a fallback prompt if
 ; something else still holds a file.
@@ -76,8 +77,12 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "å
 [Files]
 Source: "{#BuildDir}\pulse.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\lumatext.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\licenses\PDFium\*"; DestDir: "{app}\licenses\PDFium"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "third_party\ib-pinyin-cpp\LICENSE.txt"; DestDir: "{app}\licenses\ib-pinyin"; Flags: ignoreversion
 Source: "{#BuildDir}\licenses\LumaText\*"; DestDir: "{app}\licenses\LumaText"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#BuildDir}\Pulse.Index.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\Pulse.Document.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\Pulse.Preview.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\pulse_shell.exe"; DestDir: "{app}"; Flags: ignoreversion
 

@@ -1,4 +1,5 @@
 #include "content_search.h"
+#include "document_reader.h"
 #include "../common/text_decode.h"
 
 #include <windows.h>
@@ -39,19 +40,31 @@ std::wstring FileName(const std::wstring& path) {
 }
 
 size_t FindText(std::wstring_view text_value, std::wstring_view needle,
-                bool case_sensitive, bool whole_word) {
+                bool case_sensitive, bool whole_word, const std::atomic<bool>* cancelled = nullptr) {
     if (needle.empty()) return std::wstring_view::npos;
-    auto equal = [case_sensitive](wchar_t left, wchar_t right) {
-        return case_sensitive ? left == right : towlower(left) == towlower(right);
+    std::array<wchar_t, 128> folded{};
+    if (!case_sensitive) for (size_t i = 0; i < folded.size(); ++i) folded[i] = static_cast<wchar_t>(towlower(static_cast<wchar_t>(i)));
+    auto equal = [case_sensitive, &folded](wchar_t left, wchar_t right) {
+        if (left == right) return true;
+        if (case_sensitive) return false;
+        return (static_cast<unsigned>(left) < folded.size() ? folded[left] : towlower(left)) ==
+            (static_cast<unsigned>(right) < folded.size() ? folded[right] : towlower(right));
     };
     auto word_char = [](wchar_t c) {
         return iswalnum(c) || static_cast<unsigned>(c) > 127;
     };
     auto from = text_value.begin();
     while (from <= text_value.end()) {
-        const auto found = std::search(from, text_value.end(),
+        if (cancelled && cancelled->load()) return std::wstring_view::npos;
+        auto until = text_value.end();
+        constexpr size_t slice = 16384;
+        if (cancelled && static_cast<size_t>(until - from) > slice + needle.size()) until = from + slice + needle.size() - 1;
+        const auto found = std::search(from, until,
                                        needle.begin(), needle.end(), equal);
-        if (found == text_value.end()) return std::wstring_view::npos;
+        if (found == until) {
+            if (until == text_value.end()) return std::wstring_view::npos;
+            from += slice; continue;
+        }
         const size_t pos = static_cast<size_t>(found - text_value.begin());
         if (!whole_word) return pos;
         const bool left_ok = pos == 0 || !word_char(text_value[pos - 1]);
@@ -77,9 +90,9 @@ std::vector<std::wstring> EffectiveNeedles(const ContentSearchRequest& request) 
     return words;
 }
 
-size_t MatchContent(std::wstring_view text, const ContentSearchRequest& request) {
+size_t MatchContent(std::wstring_view text, const ContentSearchRequest& request, const std::atomic<bool>* cancelled = nullptr) {
     for (const auto& excluded : request.excluded_needles) {
-        if (FindText(text, excluded, request.case_sensitive, request.whole_word) !=
+        if (FindText(text, excluded, request.case_sensitive, request.whole_word, cancelled) !=
             std::wstring_view::npos)
             return std::wstring_view::npos;
     }
@@ -91,14 +104,14 @@ size_t MatchContent(std::wstring_view text, const ContentSearchRequest& request)
                 phrase.append(word);
             }
         }
-        return FindText(text, phrase, request.case_sensitive, request.whole_word);
+        return FindText(text, phrase, request.case_sensitive, request.whole_word, cancelled);
     }
     const auto needles = EffectiveNeedles(request);
     if (needles.empty()) return 0;
     size_t first = std::wstring_view::npos;
     size_t any = std::wstring_view::npos;
     for (const auto& needle : needles) {
-        const size_t found = FindText(text, needle, request.case_sensitive, request.whole_word);
+        const size_t found = FindText(text, needle, request.case_sensitive, request.whole_word, cancelled);
         if (found == std::wstring_view::npos) {
             if (request.match_mode != ContentMatchMode::AnyWord) return std::wstring_view::npos;
             continue;
@@ -474,7 +487,7 @@ bool RunDuplicateSearch(const ContentSearchRequest& request,
                     hit.modified = match->modified;
                     hit.group = group_id;
                     batch.push_back(std::move(hit));
-                    if (++total_hits >= request.maximum_hits) progress.truncated = true;
+                    if (++total_hits >= request.maximum_hits && request.maximum_hits) progress.truncated = true;
                     if (batch.size() >= 64) {
                         if (!callback(progress, std::move(batch))) return false;
                         batch.clear();
@@ -494,6 +507,40 @@ bool RunDuplicateSearch(const ContentSearchRequest& request,
 
 } // namespace
 
+bool MatchContentFilename(const std::wstring& path, uint64_t size, uint64_t modified, const CompiledQuery& q) {
+    if (!q.path_prefix.empty()) {
+        std::wstring prefix = q.path_prefix;
+        std::replace(prefix.begin(), prefix.end(), L'/', L'\\');
+        while (prefix.size() > 3 && prefix.back() == L'\\') prefix.pop_back();
+        if (path.size() < prefix.size() || CompareStringOrdinal(path.data(), static_cast<int>(prefix.size()), prefix.data(), static_cast<int>(prefix.size()), TRUE) != CSTR_EQUAL ||
+            (path.size() > prefix.size() && prefix.back() != L'\\' && path[prefix.size()] != L'\\')) return false;
+    }
+    const auto name = path.substr(path.find_last_of(L"\\/") + 1);
+    if (q.groups.empty()) return true;
+    for (const auto& group : q.groups) {
+        bool match = true;
+        for (const auto& term : group) {
+            const auto& text = term.name_in_path ? path : name;
+            if (term.folder || !MatchName(text.data(), static_cast<uint32_t>(text.size()), term) ||
+                !MatchExt(name.data(), static_cast<uint32_t>(name.size()), term) ||
+                !MatchSize(size, term) || !MatchDate(modified, term)) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+size_t MatchCachedContent(std::wstring_view text, const ContentSearchRequest& request, const std::atomic<bool>* cancelled) {
+    return MatchContent(text, request, cancelled);
+}
+ContentHit MakeCachedContentHit(const std::wstring& path, uint64_t size, uint64_t modified,
+                               std::wstring_view content, size_t match) {
+    Candidate file;
+    file.path = path;
+    file.name = FileName(path);
+    file.size = size;
+    file.modified = modified;
+    return MakeContentHit(file, content, match);
+}
 bool RunContentSearch(const ContentSearchRequest& request, const std::atomic<bool>& cancelled,
                       ContentBatchCallback callback) {
     ContentSearchProgress progress;
@@ -528,25 +575,60 @@ bool RunContentSearch(const ContentSearchRequest& request, const std::atomic<boo
         return ok;
     }
 
+    DocumentReadSession document_session;
+    progress.total_files = files.size();
+    progress.scanned_files = 0;
+    if (!callback(progress, {})) return false;
+    if(request.sort!=ContentResultSort::Index) std::sort(files.begin(),files.end(),[&](const Candidate& a,const Candidate& b) {
+        int cmp=0;
+        if(request.sort==ContentResultSort::Size) cmp=a.size<b.size ? -1:a.size>b.size ? 1:0;
+        else if(request.sort==ContentResultSort::Mtime) cmp=a.modified<b.modified ? -1:a.modified>b.modified ? 1:0;
+        else {
+            auto key=[&](const Candidate& file) {
+                if(request.sort==ContentResultSort::Path) return file.path;
+                if(request.sort==ContentResultSort::Type) {const auto dot=file.name.find_last_of(L'.');return dot==std::wstring::npos ? std::wstring{}:file.name.substr(dot+1);}
+                return file.name;
+            };
+            const auto x=key(a),y=key(b);
+            cmp=CompareStringOrdinal(x.c_str(),-1,y.c_str(),-1,TRUE)-CSTR_EQUAL;
+        }
+        if(!cmp) cmp=CompareStringOrdinal(a.path.c_str(),-1,b.path.c_str(),-1,TRUE)-CSTR_EQUAL;
+        return request.sort_desc ? cmp>0:cmp<0;
+    });
     std::vector<ContentHit> batch;
     size_t total_hits = 0;
+    auto last_update=GetTickCount64();
+    const auto filename_query = ParseQuery(request.filename_query);
     for (const auto& file : files) {
         if (cancelled.load()) break;
-        if (file.size > request.maximum_file_bytes) continue;
+        if(GetTickCount64()-last_update>=100) {
+            if(!callback(progress,std::move(batch))) return false;
+            batch.clear();last_update=GetTickCount64();
+        }
+        ++progress.scanned_files;
+        const auto dot = file.name.find_last_of(L'.');
+        const auto extension = dot == std::wstring::npos ? std::wstring_view{} : std::wstring_view(file.name).substr(dot);
+        const auto maximum = IsExtractedDocumentExtension(extension) ? request.maximum_document_bytes : request.maximum_file_bytes;
+        if (file.size > maximum || !MatchContentFilename(file.path, file.size, file.modified, filename_query)) continue;
         std::wstring content;
         uint64_t bytes = 0;
-        if (!text::ReadFile(Win32Path(file.path), request.maximum_file_bytes, content, bytes) &&
-            !text::ReadFile(file.path, request.maximum_file_bytes, content, bytes)) continue;
-        ++progress.scanned_files;
+        DWORD read_error = ERROR_SUCCESS;
+        if (!ReadSearchableDocument(Win32Path(file.path), maximum, content, bytes,
+                &read_error, text::Encoding::Auto, [&] { return cancelled.load(); })) {
+            if (read_error == ERROR_CANCELLED) break;
+            if (IsIndexedContentExtension(extension))
+                progress.error = read_error;
+            continue;
+        }
         progress.scanned_bytes += bytes;
-        const size_t match = MatchContent(content, request);
+        const size_t match = MatchContent(content, request, &cancelled);
         if (match != std::wstring::npos) {
             batch.push_back(MakeContentHit(file, content, match));
-            if (++total_hits >= request.maximum_hits) progress.truncated = true;
+            if (++total_hits >= request.maximum_hits && request.maximum_hits) progress.truncated = true;
         }
-        if (batch.size() >= 64) {
+        if ((!batch.empty() && total_hits==1) || batch.size() >= 64) {
             if (!callback(progress, std::move(batch))) return false;
-            batch.clear();
+            batch.clear(); last_update=GetTickCount64();
         }
         if (progress.truncated) break;
     }

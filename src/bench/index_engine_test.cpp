@@ -11,6 +11,158 @@
 namespace pulse::index {
 
 struct EngineTestAccess {
+    static bool MaintenanceFixture() {
+        bool ok = true;
+        auto check = [&](bool valid, const char* label) {
+            std::cout << (valid ? "[PASS] " : "[FAIL] ") << label << '\n';
+            ok &= valid;
+        };
+        const auto dir = std::filesystem::absolute(std::filesystem::path(L"bench_data") /
+            (L"filename-maintenance-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64())));
+        std::filesystem::create_directories(dir);
+        SetActiveIndexDirectory(dir.wstring());
+        {
+            Engine engine;
+            check(Build(engine), "build isolated maintenance fixture");
+            engine.struct_changes_ = 1;
+            engine.last_struct_tick_ = 1;
+            engine.last_merge_tick_ = 1;
+            check(engine.MaintenanceMergeReason(600001, 0, false) != nullptr, "quiet pending changes request a merge");
+            engine.MergeBase(true, "fixture");
+            check(engine.struct_changes_ == 0 && engine.merge_retry_after_tick_ == 0,
+                "successful merge clears pending structural work");
+            check(engine.MaintenanceMergeReason(GetTickCount64() + 1200000, 0, false) == nullptr,
+                "a successful merge never repeats solely because the quiet timer expired");
+            engine.Stop();
+        }
+        {
+            Engine engine;
+            check(Build(engine), "build isolated failed-merge fixture");
+            const auto cache = CacheFilePath();
+            HANDLE blocker = CreateFileW(cache.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            check(blocker != INVALID_HANDLE_VALUE, "lock fixture snapshot against replacement");
+            engine.built_unix_ = 42;
+            engine.struct_changes_ = 100000;
+            if (blocker != INVALID_HANDLE_VALUE) {
+                engine.MergeBase(true, "fixture_failure");
+                const auto retry = engine.merge_retry_after_tick_;
+                check(retry > GetTickCount64() && engine.built_unix_ == 42 && engine.struct_changes_ == 100000,
+                    "failed merge retains generation and pending changes and schedules retry");
+                engine.MergeBase(true, "fixture_failure");
+                check(engine.merge_retry_after_tick_ == retry &&
+                    engine.MaintenanceMergeReason(retry - 1, 100000000, true) == nullptr,
+                    "forced compaction and delta triggers honor failure backoff");
+                CloseHandle(blocker);
+                engine.merge_retry_after_tick_ = 0;
+                engine.MergeBase(true, "fixture_retry");
+                check(engine.struct_changes_ == 0, "failed merge succeeds once replacement becomes possible");
+            }
+        }
+        {
+            Engine engine;
+            engine.running_ = true;
+            VolumeInfo failed; failed.id = L"failed-fixture-volume"; failed.mount_point = L"X:\\";
+            VolumeInfo healthy; healthy.id = L"healthy-fixture-volume"; healthy.mount_point = L"Y:\\";
+            unsigned attempts = 0;
+            const auto epoch = GetTickCount64() + 1000000;
+            engine.indexed_ = 123;
+            engine.built_unix_ = 456;
+            auto failure = [&](const VolumeInfo& volume) {
+                ++attempts;
+                if (volume.id != failed.id) return true;
+                engine.indexed_ = 12;
+                engine.built_unix_ = 45;
+                return false;
+            };
+            engine.RecoverFailedVolumes({failed, healthy}, epoch + 1000, failure);
+            for (ULONGLONG tick = 1001; tick < 61000; tick += 1000)
+                engine.RecoverFailedVolumes({failed}, epoch + tick, failure);
+            check(attempts == 2 && !engine.volume_retry_after_.contains(healthy.id),
+                "persistent single-volume failure is attempted once per retry window; healthy volume is not retried");
+            check(engine.Count() == 123 && engine.built_unix_ == 456,
+                "failed single-volume recovery preserves the last published count and generation");
+            engine.RecoverFailedVolumes({failed}, epoch + 61000, failure);
+            check(attempts == 3, "failed volume becomes eligible after sixty seconds");
+            engine.RecoverFailedVolumes({failed}, epoch + 121000, [](const VolumeInfo&) { return true; });
+            check(engine.volume_retry_after_.empty(), "successful recovery clears its retry state");
+        }
+        {
+            Engine engine;
+            check(Build(engine), "build self-log exclusion fixture");
+            const auto before = engine.LiveCount();
+            Usn(engine, 9990, 20, L"pulse-index-timing.jsonl", USN_REASON_FILE_CREATE);
+            check(engine.LiveCount() == before, "USN excludes the default filename timing log");
+            engine.index_directory_ = L"C:\\Users\\TestUser\\index-data";
+            for (const auto* name : {L"pulse-index-timing.jsonl", L"pulse-index-timing.jsonl.1", L"index-data", L"index-data\\internal.tmp"}) {
+                const size_t chars = wcslen(name);
+                std::vector<BYTE> packet(sizeof(FILE_NOTIFY_INFORMATION) + chars * sizeof(wchar_t));
+                auto* notification = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(packet.data());
+                notification->Action = FILE_ACTION_MODIFIED;
+                notification->FileNameLength = static_cast<DWORD>(chars * sizeof(wchar_t));
+                memcpy(notification->FileName, name, chars * sizeof(wchar_t));
+                check(engine.ApplyNotifyLocked(L"C:\\Users\\TestUser", packet.data(), static_cast<DWORD>(packet.size())) == 0 &&
+                    engine.struct_changes_ == 0 && engine.LiveCount() == before,
+                    "directory notifications exclude self logs, their directory and descendants without marking changes");
+            }
+        }
+        SetActiveIndexDirectory(L"");
+        std::filesystem::remove_all(dir);
+        return ok;
+    }
+
+    static bool IdleFixture(unsigned seconds) {
+        if (seconds < 5 || seconds > 3600) return false;
+        const auto dir = std::filesystem::absolute(std::filesystem::path(L"bench_data") /
+            (L"filename-idle-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64())));
+        const auto root = dir / L"files";
+        const auto data = root / L"index-data";
+        std::filesystem::create_directories(data);
+        { std::ofstream seed(root / L"stable-fixture.txt"); seed << "fixture"; }
+        SetMachineIndexScope(false);
+        SetActiveIndexDirectory(data.wstring());
+        Engine engine;
+        engine.StartFixture(nullptr, 0, root.wstring());
+        auto wait_until = [](const auto& predicate, unsigned timeout_ms) {
+            const auto deadline = GetTickCount64() + timeout_ms;
+            while (!predicate() && GetTickCount64() < deadline) Sleep(20);
+            return predicate();
+        };
+        const bool ready = wait_until([&] { return engine.Ready() && !engine.building_.load() && engine.Count() > 0; }, 30000);
+        Sleep(2000);
+        auto cpu = [] {
+            FILETIME created{}, exited{}, kernel{}, user{};
+            GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
+            return ((static_cast<uint64_t>(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
+                ((static_cast<uint64_t>(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+        };
+        const auto revision = engine.Revision();
+        const auto started = GetTickCount64();
+        const auto before = cpu();
+        std::cout << "[INFO] isolated filename idle observation started: " << seconds << " seconds\n" << std::flush;
+        while (GetTickCount64() - started < seconds * 1000ull) Sleep(250);
+        const double elapsed = static_cast<double>(GetTickCount64() - started);
+        const double percent = static_cast<double>(cpu() - before) / (elapsed * 100.0);
+        const bool stable = revision == engine.Revision();
+        auto has = [&](const wchar_t* name) { Query query; query.needle = name; return engine.Search(query).total > 0; };
+        { std::ofstream item(root / L"created-fixture.txt"); item << "created"; }
+        const bool created = wait_until([&] { return has(L"created-fixture.txt"); }, 3000);
+        std::filesystem::rename(root / L"created-fixture.txt", root / L"renamed-fixture.txt");
+        const bool renamed = wait_until([&] { return has(L"renamed-fixture.txt") && !has(L"created-fixture.txt"); }, 3000);
+        std::filesystem::remove(root / L"renamed-fixture.txt");
+        const bool deleted = wait_until([&] { return !has(L"renamed-fixture.txt"); }, 3000);
+        const auto stop_started = GetTickCount64();
+        engine.Stop();
+        const bool stopped = GetTickCount64() - stop_started < 2000;
+        SetActiveIndexDirectory(L"");
+        const bool ok = ready && stable && percent < 1.0 && created && renamed && deleted && stopped;
+        std::cout << "[INFO] elapsed_ms=" << elapsed << " single_core_cpu_percent=" << percent
+            << " ready=" << ready << " revision_stable=" << stable << " create=" << created
+            << " rename=" << renamed << " delete=" << deleted << " prompt_stop=" << stopped << '\n';
+        std::wcout << L"[INFO] retained isolated timing log: " << (data / L"pulse-index-timing.jsonl").wstring() << L'\n';
+        std::cout << (ok ? "[PASS] " : "[FAIL] ") << "filename idle CPU and post-idle live updates\n";
+        return ok;
+    }
+
     static bool CoverageBenchmark() {
         constexpr uint32_t siblings = 1000000;
         std::vector<Node> nodes(siblings + 2);
@@ -294,6 +446,8 @@ void CheckSearch(Engine& e) {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--maintenance-only") return EngineTestAccess::MaintenanceFixture() ? 0 : 1;
+    if (argc > 2 && std::wstring_view(argv[1]) == L"--idle-seconds") return EngineTestAccess::IdleFixture(static_cast<unsigned>(wcstoul(argv[2], nullptr, 10))) ? 0 : 1;
     if (argc > 1 && std::wstring_view(argv[1]) == L"--parent-cycle-only") return EngineTestAccess::ParentCycleFixture() ? 0 : 1;
     if (argc > 1 && std::wstring_view(argv[1]) == L"--recycle-only") return EngineTestAccess::RecycleFixture() ? 0 : 1;
     if (argc > 1 && std::wstring_view(argv[1]) == L"--coverage-only") return EngineTestAccess::CoverageBenchmark() ? 0 : 1;

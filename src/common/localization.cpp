@@ -9,7 +9,7 @@ namespace pulse::l10n {
 namespace {
 
 constexpr UINT kFirstString = IDS_SETTINGS;
-constexpr UINT kLastString = IDS_SETTINGS_SERVICE_WAITING;
+constexpr UINT kLastString = IDS_SETTINGS_CONTENT_TYPES_DESC;
 static_assert(static_cast<UINT>(StringId::SettingsChangeTracking) >= kFirstString &&
               static_cast<UINT>(StringId::ChangeDisabled) <= kLastString);
 

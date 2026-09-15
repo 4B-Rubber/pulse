@@ -84,6 +84,31 @@ TransferChrome MakeTransferChrome(float scale, float width, float height,
     return chrome;
 }
 
+void DrawEllipsizedText(Compositor& compositor, IDWriteTextFormat* format,
+                        const D2D1_RECT_F& bounds, const std::wstring& text,
+                        const D2D1_COLOR_F& color) {
+    auto* factory = compositor.DwriteFactory();
+    auto* dc = compositor.Dc();
+    if (!factory || !dc || !format || text.empty()) return;
+    const float width = bounds.right - bounds.left;
+    const float height = bounds.bottom - bounds.top;
+    if (width <= 0.0f || height <= 0.0f) return;
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(factory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
+                                         format, width, height, &layout))) return;
+    layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    ComPtr<IDWriteInlineObject> ellipsis;
+    if (SUCCEEDED(factory->CreateEllipsisTrimmingSign(format, &ellipsis))) {
+        const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+        layout->SetTrimming(&trimming, ellipsis.get());
+    }
+    ComPtr<ID2D1SolidColorBrush> brush;
+    if (FAILED(dc->CreateSolidColorBrush(color, &brush))) return;
+    dc->DrawTextLayout(D2D1::Point2F(bounds.left, bounds.top), layout.get(), brush.get(),
+                       D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
 void DrawWrappedText(Compositor& compositor, IDWriteTextFormat* format,
                      const D2D1_RECT_F& bounds, const std::wstring& text,
                      const D2D1_COLOR_F& color) {
@@ -1032,8 +1057,8 @@ void FileOperationWindow::Render() {
     else if (restoring) subtitle = l10n::Get(l10n::StringId::OpRestoringPrefix).c_str() + src;
     else if (moving) subtitle = l10n::Get(l10n::StringId::OpFromPrefix).c_str() + src + l10n::Get(l10n::StringId::OpMoveTo).c_str() + dst;
     else subtitle = l10n::Get(l10n::StringId::OpFromPrefix).c_str() + src + l10n::Get(l10n::StringId::OpCopyTo).c_str() + dst;
-    painter_.DrawText(subtitle, Rect(scale_, kPadX, 48, dip_w - kPadX - 72.0f, 18),
-                      compositor_.SmallFormat(), theme.text);
+    DrawEllipsizedText(compositor_, compositor_.SmallFormat(),
+        Rect(scale_, kPadX, 48, dip_w - kPadX * 2.0f - 72.0f, 18), subtitle, theme.text);
     wchar_t percent[32];
     if (status_.percent < 0.0f) percent[0] = 0;
     else swprintf_s(percent, L"%.0f%%", std::clamp(status_.percent, 0.0f, 100.0f));
@@ -1049,34 +1074,35 @@ void FileOperationWindow::Render() {
         badge_text = l10n::Get(l10n::StringId::OpFailedBadge).c_str();
         badge_kind = fluent::BadgeKind::Danger;
     } else if (paused) {
-        file_line = l10n::Get(l10n::StringId::OpItemPrefix).c_str() + (status_.current_item.empty() ? status_.summary : status_.current_item);
+        file_line = l10n::Get(l10n::StringId::OpItemPrefix) + (status_.current_item.empty() ? src : status_.current_item);
         badge_text = l10n::Get(l10n::StringId::OpPaused).c_str();
         badge_kind = fluent::BadgeKind::Warning;
     } else if (waiting) {
-        file_line = l10n::Get(l10n::StringId::OpItemPrefix).c_str() + (status_.current_item.empty() ? status_.summary : status_.current_item);
+        file_line = l10n::Get(l10n::StringId::OpItemPrefix) + (status_.current_item.empty() ? src : status_.current_item);
         badge_text = l10n::Get(l10n::StringId::OpWaitingConflict).c_str();
         badge_kind = fluent::BadgeKind::Warning;
     } else if (completed) {
-        file_line = status_.summary.empty() ? l10n::Get(l10n::StringId::OpAllCompleted).c_str() : status_.summary;
+        file_line = title;
         badge_text = l10n::Get(l10n::StringId::OpCompleted).c_str();
         badge_kind = fluent::BadgeKind::Success;
     } else if (scanning) {
-        file_line = status_.summary.empty() ? l10n::Get(l10n::StringId::OpScanning).c_str() : status_.summary;
+        file_line = l10n::Get(l10n::StringId::OpScanning);
         badge_text = l10n::Get(l10n::StringId::OpPreparing).c_str();
         badge_kind = fluent::BadgeKind::Neutral;
     } else if (emptying) {
-        file_line = status_.current_item.empty() ? status_.summary : status_.current_item;
+        file_line = l10n::Get(l10n::StringId::OpEmptyingSub);
         badge_text = l10n::Get(l10n::StringId::OpEmptying);
         badge_kind = fluent::BadgeKind::Warning;
     } else {
-        const std::wstring item = status_.current_item.empty() ? status_.summary : status_.current_item;
+        const std::wstring item = status_.current_item.empty() ? src : status_.current_item;
         file_line = l10n::Get(l10n::StringId::OpItemPrefix).c_str() + item;
         badge_text = deleting ? l10n::Get(l10n::StringId::OpDeleting).c_str() : moving ? l10n::Get(l10n::StringId::OpMoving).c_str() : l10n::Get(l10n::StringId::OpCopying).c_str();
         badge_kind = fluent::BadgeKind::Success;
     }
     const float badge_w = std::max(48.0f, painter_.MeasureBadgeWidth(badge_text) / std::max(scale_, 0.001f));
-    painter_.DrawText(file_line, Rect(scale_, kPadX, 70, dip_w - kPadX - badge_w - 12.0f, 20),
-                      compositor_.SmallFormat(), theme.text);
+    DrawEllipsizedText(compositor_, compositor_.SmallFormat(),
+        Rect(scale_, kPadX, 70, dip_w - kPadX * 2.0f - badge_w - 12.0f, 20),
+        file_line, theme.text);
     painter_.DrawBadge({ Rect(scale_, dip_w - kPadX - badge_w, 70, badge_w, 18),
                          badge_text, badge_kind });
 

@@ -14,11 +14,16 @@ struct AppPrefs {
     bool verify_copies = false;
     bool show_status_performance = false;
     bool show_pinned_tab_names = true;
+    bool search_pinyin = true;
+    bool global_search_enabled = false;
+    uint32_t global_search_modifiers = 1; // MOD_ALT
+    uint32_t global_search_key = 32; // VK_SPACE
     bool show_hidden_files = false;
     bool blank_click_go_back = false;
     bool change_tracking_enabled = false;
     int change_tracking_days = 7;
     // system / zh-CN / en-US
+    int theme_mode = -1; // legacy session theme, or 0 system / 1 light / 2 dark
     std::wstring language = L"system";
     // none / acrylic-material / mica / mica-alt  (legacy dwm-blur → acrylic)
     std::wstring window_effect = L"mica-alt";

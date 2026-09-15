@@ -8,7 +8,7 @@ namespace pulse::fs {
 namespace {
 
 std::vector<DirNotifyEvent> ParseNotifyBuffer(const BYTE* data, DWORD bytes,
-                                              std::wstring& pending_old) {
+                                              std::wstring& pending_old, bool emit_old) {
     std::vector<DirNotifyEvent> out;
     if (!data || bytes < sizeof(FILE_NOTIFY_INFORMATION)) return out;
     const BYTE* p = data;
@@ -21,6 +21,7 @@ std::vector<DirNotifyEvent> ParseNotifyBuffer(const BYTE* data, DWORD bytes,
         std::wstring name(info->FileName, name_chars);
         if (info->Action == FILE_ACTION_RENAMED_OLD_NAME) {
             pending_old = std::move(name);
+            if (emit_old) out.push_back({FILE_ACTION_RENAMED_OLD_NAME, pending_old, {}});
         } else if (info->Action == FILE_ACTION_RENAMED_NEW_NAME) {
             DirNotifyEvent ev;
             ev.action = FILE_ACTION_RENAMED_NEW_NAME;
@@ -51,10 +52,11 @@ DirWatch::~DirWatch() {
     if (hStop_) CloseHandle(hStop_);
 }
 
-bool DirWatch::Start(const std::wstring& path, ChangeCallback cb) {
+bool DirWatch::Start(const std::wstring& path, ChangeCallback cb, bool subtree) {
     Stop();
     if (path.empty()) return false;
     path_ = NormalizePath(path);
+    subtree_ = subtree;
     callback_ = std::move(cb);
     ResetEvent(hStop_);
     running_ = true;
@@ -135,6 +137,7 @@ void DirWatch::Notify(bool overflow, std::vector<DirNotifyEvent> events) const {
 
 void DirWatch::WorkerThread() {
     if (!ReopenDirectory()) return;
+    bool newly_armed = true;
     while (running_) {
         ZeroMemory(&overlapped_, sizeof(overlapped_));
         overlapped_.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -150,7 +153,7 @@ void DirWatch::WorkerThread() {
             directory,
             buffer_,
             static_cast<DWORD>(sizeof(buffer_)),
-            FALSE,
+            subtree_ ? TRUE : FALSE,
             FILE_NOTIFY_CHANGE_FILE_NAME |
                 FILE_NOTIFY_CHANGE_DIR_NAME |
                 FILE_NOTIFY_CHANGE_ATTRIBUTES |
@@ -168,8 +171,14 @@ void DirWatch::WorkerThread() {
             pending_rename_old_.clear();
             Notify(true, {});
             if (!ReopenDirectory()) break;
+            newly_armed = true;
             continue;
         }
+
+        // An initial/reopened recursive watch may have missed changes while
+        // the handle was opening. Reconcile only after the read is armed.
+        if (subtree_ && newly_armed) Notify(true, {});
+        newly_armed = false;
 
         bool replaced = false;
         bool stopped = false;
@@ -206,6 +215,7 @@ void DirWatch::WorkerThread() {
             pending_rename_old_.clear();
             Notify(true, {});
             if (!ReopenDirectory()) break;
+            newly_armed = true;
             continue;
         }
 
@@ -215,6 +225,7 @@ void DirWatch::WorkerThread() {
             pending_rename_old_.clear();
             Notify(true, {});
             if (err != ERROR_NOTIFY_ENUM_DIR && !ReopenDirectory()) break;
+            newly_armed = true;
             continue;
         }
 
@@ -224,7 +235,7 @@ void DirWatch::WorkerThread() {
             continue;
         }
         Notify(false, ParseNotifyBuffer(reinterpret_cast<const BYTE*>(buffer_), transferred,
-                                        pending_rename_old_));
+                                        pending_rename_old_, subtree_));
     }
 }
 

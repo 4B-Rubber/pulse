@@ -132,6 +132,7 @@ namespace {
 
 struct ProbeJob {
     std::wstring unc;
+    UncProbeId probe_id = 0;
     HWND hwnd = nullptr;
     UINT msg = 0;
     HANDLE done = nullptr;
@@ -151,34 +152,52 @@ DWORD WINAPI ProbeInner(LPVOID param) {
 
 } // namespace
 
-void StartUncProbe(HWND hwnd, UINT msg, std::wstring unc) {
-    if (!hwnd || unc.empty()) return;
+bool StartUncProbe(HWND hwnd, UINT msg, std::wstring unc, UncProbeId probe_id) {
+    if (!hwnd || unc.empty() || probe_id == 0) return false;
     auto* job = new ProbeJob{};
     job->unc = std::move(unc);
+    job->probe_id = probe_id;
     job->hwnd = hwnd;
     job->msg = msg;
     job->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!job->done) {
+        delete job;
+        return false;
+    }
     HANDLE thread = CreateThread(nullptr, 0, ProbeInner, job, 0, nullptr);
     if (!thread) {
         CloseHandle(job->done);
         delete job;
-        return;
+        return false;
     }
     std::thread([job, thread]() {
         const DWORD wait = WaitForSingleObject(job->done, 1500);
         auto* result = new UncProbeResult{};
+        result->probe_id = job->probe_id;
         result->unc = job->unc;
         result->rtt_ms = job->rtt_ms;
         if (wait != WAIT_OBJECT_0) result->status = NetStatus::Offline;
         else if (!job->ok) result->status = NetStatus::Offline;
         else result->status = job->rtt_ms > 800 ? NetStatus::Slow : NetStatus::Online;
+        const bool timed_out = wait != WAIT_OBJECT_0;
         if (!PostMessageW(job->hwnd, job->msg, 0, reinterpret_cast<LPARAM>(result)))
             delete result;
         WaitForSingleObject(thread, INFINITE);
+        if (timed_out) {
+            auto* final_result = new UncProbeResult{};
+            final_result->probe_id = job->probe_id;
+            final_result->unc = job->unc;
+            final_result->rtt_ms = job->rtt_ms;
+            final_result->status = job->ok ?
+                (job->rtt_ms > 800 ? NetStatus::Slow : NetStatus::Online) : NetStatus::Offline;
+            if (!PostMessageW(job->hwnd, job->msg, 0, reinterpret_cast<LPARAM>(final_result)))
+                delete final_result;
+        }
         CloseHandle(thread);
         CloseHandle(job->done);
         delete job;
     }).detach();
+    return true;
 }
 
 } // namespace pulse::fs

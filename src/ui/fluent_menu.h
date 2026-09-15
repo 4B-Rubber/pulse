@@ -46,6 +46,8 @@ struct FluentMenuItem {
     bool has_swatch = false;
     bool checked = false;
     bool mixed = false;
+    bool toggle = false;
+    bool secondary = false;
     bool radio = false;            // selected single-choice item: filled dot, never a checkmark
     bool radio_group = false;      // reserve a leading selection-dot column (left of the icon)
     fluent::MenuPictogram pictogram = fluent::MenuPictogram::None;
@@ -112,6 +114,7 @@ public:
     using FilterFn = std::function<std::vector<FluentMenuItem>(const std::wstring& query)>;
     int TrackPopup(POINT screen_pt, std::vector<FluentMenuItem> items,
                    FilterFn filter = nullptr, bool top_center = false);
+    int TrackDropdown(RECT control_rect, std::vector<FluentMenuItem> items);
 
     // Renders the menu to a PNG without showing it (GUI verification helper).
     bool SaveDebugSnapshot(const wchar_t* png_path, std::vector<FluentMenuItem> items,
@@ -138,6 +141,8 @@ public:
     // Align the next TrackPopup to this screen rect (address bar). The filter
     // field covers the rect; results hang below. Cleared after the popup.
     void SetAnchorRect(RECT screen_rc) { anchor_rect_ = screen_rc; anchor_to_rect_ = true; }
+    // Align an ordinary selection menu below its control; cleared after use.
+    void SetDropdownRect(RECT screen_rc) { dropdown_rect_ = screen_rc; dropdown_ = true; }
     // Override the filter-mode minimum width (dips) for the next TrackPopup;
     // <= 0 restores the palette default. Reset after each popup.
     void SetFilterMinWidth(float dips) { filter_min_width_ = dips; }
@@ -220,6 +225,8 @@ private:
     bool forward_tab_key_ = false;
     RECT anchor_rect_{};
     bool anchor_to_rect_ = false;
+    RECT dropdown_rect_{};
+    bool dropdown_ = false;
     POINT popup_pt_{};
     bool top_center_ = false;
     HWND external_edit_ = nullptr; // borrowed; never moved, hidden or destroyed

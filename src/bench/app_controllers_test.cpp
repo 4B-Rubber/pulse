@@ -4,6 +4,7 @@
 #include "../app/single_instance_coordinator.h"
 #include "../app/tray_controller.h"
 #include "../app/blank_pane_click.h"
+#include "../app/unc_probe_scheduler.h"
 #include "../common/localization.h"
 #include "../common/path_utils.h"
 #include "../index/index_client.h"
@@ -40,8 +41,52 @@ bool Report(const char* name, bool passed) {
 
 } // namespace
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
     pulse::l10n::Initialize(GetModuleHandleW(nullptr), L"zh-CN");
+    if (argc == 2 && std::wstring(argv[1]) == L"--global-search") {
+        pulse::app::AppPrefs prefs;
+        prefs.persist = false;
+        bool ok = Report("global search defaults to off with Alt Space", !prefs.global_search_enabled && prefs.global_search_modifiers == MOD_ALT && prefs.global_search_key == VK_SPACE);
+        pulse::app::ContextMenuPrefs context;
+        context.persist = false;
+        pulse::index::IndexClient index;
+        pulse::index::NetworkAgentClient network;
+        pulse::app::SettingsController settings;
+        pulse::app::SettingsEffect effect = pulse::app::SettingsEffect::None;
+        pulse::app::SettingsController::UiCallbacks callbacks;
+        callbacks.apply_effects = [&](pulse::app::SettingsEffect value) { effect = value; };
+        settings.BindUi(prefs, context, index, network, std::move(callbacks));
+        settings.ToggleUi(15);
+        ok &= Report("global search toggle applies registration", prefs.global_search_enabled && pulse::app::HasEffect(effect, pulse::app::SettingsEffect::GlobalSearch));
+        settings.BeginGlobalSearchHotkeyCapture();
+        settings.CaptureGlobalSearchHotkey(VK_CONTROL, MOD_CONTROL);
+        settings.CaptureGlobalSearchHotkey('A', 0);
+        ok &= Report("invalid shortcut keeps capture and previous binding", settings.global_search_hotkey_capturing() && prefs.global_search_key == VK_SPACE);
+        settings.CaptureGlobalSearchHotkey(VK_ESCAPE, 0);
+        ok &= Report("Escape cancels shortcut capture", !settings.global_search_hotkey_capturing() && prefs.global_search_key == VK_SPACE);
+        settings.BeginGlobalSearchHotkeyCapture();
+        effect = pulse::app::SettingsEffect::None;
+        settings.CaptureGlobalSearchHotkey('K', MOD_CONTROL | MOD_SHIFT);
+        ok &= Report("shortcut capture saves and applies combination", !settings.global_search_hotkey_capturing() && prefs.global_search_key == 'K' && prefs.global_search_modifiers == (MOD_CONTROL | MOD_SHIFT) && pulse::app::HasEffect(effect, pulse::app::SettingsEffect::GlobalSearch));
+        pulse::app::AppPrefs loaded;
+        loaded.persist = false;
+        loaded.FromJson(prefs.ToJson());
+        ok &= Report("global search preferences round trip", loaded.global_search_enabled && loaded.global_search_key == 'K' && loaded.global_search_modifiers == (MOD_CONTROL | MOD_SHIFT));
+        loaded.FromJson(L"{}");
+        ok &= Report("older preferences retain safe defaults", !loaded.global_search_enabled && loaded.global_search_key == VK_SPACE && loaded.global_search_modifiers == MOD_ALT);
+        prefs.persist = true; // This executable's data-directory stub is empty, so Save fails without touching disk.
+        effect = pulse::app::SettingsEffect::None;
+        settings.BeginGlobalSearchHotkeyCapture();
+        settings.CaptureGlobalSearchHotkey('L', MOD_ALT);
+        ok &= Report("failed shortcut save rolls back and leaves registration unchanged", prefs.global_search_key == 'K' &&
+            prefs.global_search_modifiers == (MOD_CONTROL | MOD_SHIFT) && effect == pulse::app::SettingsEffect::None && settings.global_search_hotkey_capturing());
+        settings.ToggleUi(15);
+        ok &= Report("failed toggle save rolls back without registration", prefs.global_search_enabled && effect == pulse::app::SettingsEffect::None);
+        prefs.persist = false;
+        settings.ResetUi();
+        ok &= Report("settings reset cancels capture", !settings.global_search_hotkey_capturing());
+        return ok ? 0 : 1;
+    }
     using pulse::app::HasEffect;
     using pulse::app::SettingsController;
     using pulse::app::SettingsEffect;
@@ -50,6 +95,20 @@ int wmain() {
     using pulse::app::TrayController;
 
     bool passed = true;
+
+    {
+        pulse::app::UncProbeScheduler probes;
+        const uint64_t first = probes.Begin();
+        const bool first_completed = probes.Finish(first);
+        const uint64_t second = probes.Begin();
+        const bool stale_completed = probes.Finish(first);
+        const bool second_still_active = probes.IsActive(second);
+        const bool second_completed = probes.Finish(second);
+        passed &= Report("late UNC result cannot finish a newer same-path probe",
+                         first_completed && first != second && !stale_completed &&
+                         second_still_active && second_completed && probes.active_id == 0);
+    }
+
     passed &= Report("display paths strip extended UNC prefixes without losing the server",
         pulse::path::StripExtendedPathPrefix(L"\\\\?\\UNC\\192.168.0.254\\资料\\项目") ==
             L"\\\\192.168.0.254\\资料\\项目");

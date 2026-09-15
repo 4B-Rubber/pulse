@@ -20,6 +20,7 @@ void RequestSearchPage(AppState& s, app::Tab& tab, const std::wstring& rest,
                               bool reset);
 void ApplySearchHits(app::Tab& tab, const std::wstring& rest,
                             index::SearchResult&& result);
+void ConfigureContentSort(const app::Tab& tab,index::ContentSearchRequest& request);
 void RequestSavedSearch(AppState& s, app::Tab& tab, size_t saved_index);
 void ApplyContentSearchUpdate(AppState& s, index::ContentSearchUpdate update);
 void DeliverIndexSearchResult(AppState& s, uint32_t id,
@@ -28,15 +29,20 @@ void AcceptIndexProviderResult(AppState& s, uint32_t id,
                                       index::SearchResult&& result, bool network);
 void MaybePrefetchSearchPage(AppState& s);
 void CancelActiveContentSearch(AppState& s, app::Tab& tab);
-void LoadVirtualView(AppState& s, app::Tab& tab, const std::wstring& path);
-void StartLoadingPath(AppState& s, app::Tab& tab, const std::wstring& path);
+enum class PathLoadReason { Navigate, RestoreSession };
+void MarkContentSearchStopped(app::Tab& tab);
+void LoadVirtualView(AppState& s, app::Tab& tab, const std::wstring& path,
+                     PathLoadReason reason = PathLoadReason::Navigate);
+void StartLoadingPath(AppState& s, app::Tab& tab, const std::wstring& path,
+                      PathLoadReason reason = PathLoadReason::Navigate);
 void ApplyWorkerResult(AppState& s, app::WorkResult& res);
 void ProcessPendingResults(AppState& s);
 void CaptureListingSelection(app::Tab& tab);
 bool PathHasPendingRefresh(AppState& s, const std::wstring& path);
-void RefreshPath(AppState& s, const std::wstring& path);
+enum class RefreshReason { Explicit, Background, ShellNotification, OperationCompleted, FileChange };
+void RefreshPath(AppState& s, const std::wstring& path, RefreshReason reason = RefreshReason::Background);
 void RevalidateVisibleFolders(AppState& s);
-void RefreshActiveTab(AppState& s);
+void RefreshActiveTab(AppState& s, RefreshReason reason = RefreshReason::Explicit);
 void QueueSnapshotValidation(AppState& s, app::Tab& tab);
 bool ApplyNotifyToVisible(AppState& s, const std::wstring& path,
                                  const fs::DirNotifyEvent& event);

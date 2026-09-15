@@ -1,4 +1,5 @@
 #include "name_highlight.h"
+#include "../index/filename_pinyin.h"
 #include <algorithm>
 #include <cwctype>
 
@@ -51,6 +52,12 @@ std::vector<NameMatchRange> NameMatchRanges(std::wstring_view name, const std::v
     const auto folded = index::Fold(name);
     for (const auto& term : terms) {
         if (!index::MatchName(name.data(), static_cast<uint32_t>(name.size()), term)) continue;
+        if (term.pinyin && term.name_how == index::NameHow::Substring &&
+            folded.find(term.name) == std::wstring::npos) {
+            const auto match = index::FindPinyinMatch(name, term.name);
+            if (match && match.start + match.length <= mask.size())
+                std::fill(mask.begin() + match.start, mask.begin() + match.start + match.length, true);
+        }
         for (size_t i = 0; i < term.name.size();) {
             const size_t start = i;
             if (term.name_how == index::NameHow::Wildcard) {
@@ -86,15 +93,38 @@ std::vector<NameMatchRange> VisibleNameMatchRanges(std::wstring_view original, s
     return RangesFromMask(mask);
 }
 
+void ApplyNameHighlightPadding(IDWriteTextLayout* layout,
+                               const std::vector<NameMatchRange>& ranges, float scale) {
+    if (!layout || ranges.empty()) return;
+    ComPtr<IDWriteTextLayout1> spaced;
+    if (FAILED(layout->QueryInterface(__uuidof(IDWriteTextLayout1), reinterpret_cast<void**>(&spaced.p)))) return;
+    const float padding = kNameHighlightPaddingDip * scale;
+    for (const auto& range : ranges) {
+        if (!range.length) continue;
+        if (range.length == 1) {
+            spaced->SetCharacterSpacing(padding, padding, 0, {range.start, 1});
+        } else {
+            spaced->SetCharacterSpacing(padding, 0, 0, {range.start, 1});
+            spaced->SetCharacterSpacing(0, padding, 0, {range.start + range.length - 1, 1});
+        }
+    }
+}
+
 void DrawNameHighlightBackground(Compositor* compositor, IDWriteTextLayout* layout,
                                  D2D1_POINT_2F origin, const D2D1_RECT_F& clip,
-                                 const std::vector<NameMatchRange>& ranges, const Theme& theme) {
+                                 const std::vector<NameMatchRange>& ranges, const Theme& theme, float scale) {
     if (!compositor || !layout || ranges.empty()) return;
+    ApplyNameHighlightPadding(layout, ranges, scale);
     const bool dark = theme.bg.r < 0.5f;
-    ComPtr<ID2D1SolidColorBrush> background, foreground;
+    ComPtr<ID2D1SolidColorBrush> background, foreground, outline;
     auto* dc = compositor->Dc();
-    if (FAILED(dc->CreateSolidColorBrush(HexColor(dark ? 0xD8A441 : 0xFFE08A), &background)) ||
-        FAILED(dc->CreateSolidColorBrush(HexColor(0x30250E), &foreground))) return;
+    auto fill = HexColor(dark ? 0x674A16 : 0xFFE6A2);
+    fill.a = dark ? 0.78f : 0.88f;
+    if (FAILED(dc->CreateSolidColorBrush(fill, &background)) ||
+        FAILED(dc->CreateSolidColorBrush(HexColor(dark ? 0xFFD574 : 0x684400), &foreground)) ||
+        FAILED(dc->CreateSolidColorBrush(HexColor(dark ? 0xD8A441 : 0xBD8B25), &outline))) return;
+    const auto previous_aa = dc->GetAntialiasMode();
+    dc->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     dc->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     for (const auto& range : ranges) {
         UINT32 count = 0;
@@ -104,11 +134,25 @@ void DrawNameHighlightBackground(Compositor* compositor, IDWriteTextLayout* layo
         if (FAILED(layout->HitTestTextRange(range.start, range.length, origin.x, origin.y,
             metrics.data(), count, &count))) continue;
         for (const auto& hit : metrics) {
-            if (!hit.isText || hit.width <= 0 || hit.height <= 0) continue;
-            dc->FillRectangle(D2D1::RectF(hit.left, hit.top, hit.left + hit.width, hit.top + hit.height), background.get());
+            if (!hit.isText || hit.isTrimmed || hit.width <= 0 || hit.height <= 0) continue;
+            const float inset = std::min(0.5f * scale, hit.width * 0.1f);
+            const auto rect = D2D1::RectF(hit.left + inset, hit.top + 0.5f * scale,
+                hit.left + hit.width - inset, hit.top + hit.height - 0.5f * scale);
+            const float radius = std::min(3.5f * scale, (rect.right - rect.left) * 0.5f);
+            const auto rounded = D2D1::RoundedRect(rect, radius, radius);
+            if (dark) {
+                outline->SetOpacity(0.045f);
+                dc->DrawRoundedRectangle(rounded, outline.get(), 3.0f * scale);
+                outline->SetOpacity(0.08f);
+                dc->DrawRoundedRectangle(rounded, outline.get(), 1.8f * scale);
+            }
+            dc->FillRoundedRectangle(rounded, background.get());
+            outline->SetOpacity(dark ? 0.55f : 0.38f);
+            dc->DrawRoundedRectangle(rounded, outline.get(), 0.75f * scale);
         }
         layout->SetDrawingEffect(foreground.get(), {range.start, range.length});
     }
     dc->PopAxisAlignedClip();
+    dc->SetAntialiasMode(previous_aa);
 }
 }

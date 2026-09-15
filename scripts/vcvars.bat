@@ -1,4 +1,7 @@
 @echo off
+rem Keep MSVC include diagnostics consistent with Ninja dependency parsing.
+chcp 65001 >nul
+set "VSLANG=1033"
 rem Reuse an x64 developer prompt, or discover the installed C++ toolchain.
 if /i "%VSCMD_ARG_TGT_ARCH%"=="x64" exit /b 0
 set "PULSE_VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"

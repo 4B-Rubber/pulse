@@ -164,15 +164,15 @@ DWORD ResolveDropTarget(AppState& s, const std::vector<std::wstring>& sources,
 
     std::wstring destName;
     if (hit.region == ui::HitTestResult::Row && hit.index >= 0 &&
-        tab->snapshot && hit.index < (int)tab->snapshot->size() &&
-        (*tab->snapshot)[hit.index].is_dir) {
-        if ((*tab->snapshot)[hit.index].change_record_only) return DROPEFFECT_NONE;
+        tab->snapshot && hit.index < (int)tab->EntryCount() &&
+        tab->EntryAt(hit.index).is_dir) {
+        if (tab->EntryAt(hit.index).change_record_only) return DROPEFFECT_NONE;
         std::wstring full = EntryFullPath(*tab, hit.index);
         if (full.empty()) return DROPEFFECT_NONE;
         s.dropDestDir = full;
         s.dropRow = hit.index;
         s.dropPaneIndex = hit.pane_index;
-        destName = (*tab->snapshot)[hit.index].name;
+        destName = tab->EntryAt(hit.index).name;
 
         // Spring-loaded: hover 800ms on a folder row enters it (ui.md §7.8).
         if (s.springRow != hit.index) {
@@ -345,6 +345,7 @@ DWORD DropExecute(AppState& s, const std::vector<std::wstring>& sources,
 
 // Starts the modal OLE drag-out for the selected entries.
 void StartDragOut(AppState& s) {
+    if(DeferContentSelection(s,[](AppState& v){if(GetKeyState(VK_LBUTTON)&0x8000) StartDragOut(v);})) return;
     app::Tab* tab = ActiveTab(s);
     if (!tab || !tab->snapshot) return;
     std::vector<std::wstring> paths = SelectedFullPaths(*tab);
@@ -360,7 +361,7 @@ void StartDragOut(AppState& s) {
     if (effect == DROPEFFECT_MOVE) {
         // The target took the file; refresh the listing.
         s.store.MarkDirty(tab->current_path);
-        RefreshActiveTab(s);
+        RefreshActiveTab(s, RefreshReason::OperationCompleted);
     }
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
@@ -388,10 +389,10 @@ void ClampScroll(AppState& s) {
 
 void EnsureRowVisible(AppState& s, app::Tab& tab, int index) {
     if (index < 0) return;
-    const D2D1_RECT_F list = ListRect(s);
     int viewRow = index;
     ui::PaneViewModel pane;
     MaxScrollForActivePane(s, &pane);
+    const D2D1_RECT_F list = s.renderer.PaneListRect(pane, FocusedPaneRect(s));
     if (pane.filter_map || !pane.filter_text.empty()) {
         viewRow = pane.ViewIndex(index);
         if (viewRow < 0) return;
@@ -422,7 +423,7 @@ void ResetMarquee(AppState& s) {
 void ApplyMarqueeSelection(AppState& s) {
     app::Tab* tab = ActiveTab(s);
     if (!tab || !tab->snapshot) return;
-    const int n = static_cast<int>(tab->snapshot->size());
+    const int n = static_cast<int>(tab->EntryCount());
     const D2D1_RECT_F list = ListRect(s);
     const float left = static_cast<float>(std::min(s.marqueeStart.x, s.marqueeCur.x));
     const float top = static_cast<float>(std::min(s.marqueeStart.y, s.marqueeCur.y));
@@ -772,8 +773,8 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     const float travel = std::max(1.0f,
                         (track.bottom - track.top) - (thumb.bottom - thumb.top));
                     tab->scroll_y = std::clamp(
-                        s->scrollbarDragStartScroll
-                            + (my - s->scrollbarDragStartY) * maxScroll / travel,
+                        (my - track.top - std::min(s->scrollbarGrabOffset, thumb.bottom - thumb.top))
+                            * maxScroll / travel,
                         0.0f, maxScroll);
                     s->scrollTargetY = tab->scroll_y;
                     MaybePrefetchSearchPage(*s);
@@ -1630,6 +1631,10 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
         ui::HitTestResult hit = s->renderer.HitTest(vm, rect, (float)mx, (float)my);
         if (s->addressSearching && hit.region != ui::HitTestResult::AddressBar &&
             hit.region != ui::HitTestResult::AddressSearchScope &&
+            hit.region != ui::HitTestResult::AddressSearchMode &&
+            hit.region != ui::HitTestResult::AddressSearchContent &&
+            hit.region != ui::HitTestResult::AddressSearchOptions &&
+            hit.region != ui::HitTestResult::ContentIndexManage &&
             hit.region != ui::HitTestResult::AddressSearchClear &&
             hit.region != ui::HitTestResult::AddressSearchClose) {
             HideAddressEditor(*s, false);
@@ -1693,12 +1698,14 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             app::Tab* tab = ActiveTab(*s);
             s->scrollbarHorizontal = hit.sub_index == 1;
             s->scrollbarSidebar = hit.sub_index == 2;
+            const auto& scrollPane = hit.pane_index >= 0 && hit.pane_index < static_cast<int>(vm.pane_slots.size())
+                ? vm.pane_slots[static_cast<size_t>(hit.pane_index)].pane : vm.pane;
             const bool hasGeometry = s->scrollbarSidebar
                 ? s->renderer.SidebarScrollbarGeometry(vm, rect.right, rect.bottom,
                                                        track, thumb, maxScroll)
                 : s->scrollbarHorizontal
-                ? HorizontalScrollbarGeometry(*s, vm.pane, track, thumb, maxScroll)
-                : ScrollbarGeometry(*s, vm.pane, track, thumb, maxScroll);
+                ? HorizontalScrollbarGeometry(*s, scrollPane, track, thumb, maxScroll)
+                : ScrollbarGeometry(*s, scrollPane, track, thumb, maxScroll);
             if (tab && hasGeometry) {
                 const bool outside = s->scrollbarHorizontal
                     ? (mx < thumb.left || mx >= thumb.right)
@@ -1717,6 +1724,7 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     else if (s->scrollbarHorizontal) tab->scroll_x=value;
                     else { tab->scroll_y=value; s->scrollTargetY=value; MaybePrefetchSearchPage(*s); }
                 }
+                s->scrollbarGrabOffset = outside ? (thumb.bottom - thumb.top) * 0.5f : my - thumb.top;
                 s->scrollbarDragging = true;
                 s->scrollbarDragStartX = mx;
                 s->scrollbarDragStartY = my;
@@ -1788,6 +1796,7 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             OpenSettingsTab(*s, 0);
         } else if (hit.region == ui::HitTestResult::SettingsNav) {
             OpenSettingsTab(*s, hit.index);
+        } else if (HandleSettingsControl(*s, hit)) {
         } else if (hit.region == ui::HitTestResult::SettingsToggle) {
             s->settings.ToggleUi(hit.index);
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -1933,8 +1942,8 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             if (app::Tab* tab = ActiveTab(*s)) {
                 const std::wstring p = EntryFullPath(*tab, hit.index);
                 if (!p.empty() && tab->snapshot &&
-                    hit.index < static_cast<int>(tab->snapshot->size())) {
-                    const auto& entry = (*tab->snapshot)[static_cast<size_t>(hit.index)];
+                    hit.index < static_cast<int>(tab->EntryCount())) {
+                    const auto& entry = tab->EntryAt(static_cast<size_t>(hit.index));
                     ToggleStarred(*s, p, entry.is_dir
                         ? app::PlaceItemKind::Folder : app::PlaceItemKind::File);
                 }
@@ -2038,7 +2047,7 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 if (attrs != INVALID_FILE_ATTRIBUTES) {
                     attrs = (attrs & flag) ? (attrs & ~flag) : (attrs | flag);
                     if (SetFileAttributesW(vm.details.path.c_str(), attrs))
-                        RefreshActiveTab(*s);
+                        RefreshActiveTab(*s, RefreshReason::FileChange);
                 }
             }
         } else if (hit.region == ui::HitTestResult::DetailsSecurityChange) {
@@ -2078,6 +2087,16 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
         } else if (hit.region == ui::HitTestResult::AddressSearchScope) {
             if (!s->addressSearching) ShowAddressSearch(*s);
             ShowAddressSearchScope(*s);
+        } else if (hit.region == ui::HitTestResult::AddressSearchMode ||
+                   hit.region == ui::HitTestResult::AddressSearchContent) {
+            SwitchAddressSearchMode(*s, hit.region == ui::HitTestResult::AddressSearchContent);
+        } else if (hit.region == ui::HitTestResult::AddressSearchOptions) {
+            if (!s->addressSearching) ShowAddressSearch(*s);
+            ShowSearchOptions(*s);
+        } else if (hit.region == ui::HitTestResult::ContentIndexManage) {
+            ShowSearchOptions(*s, true);
+        } else if (hit.region == ui::HitTestResult::SettingsContentIndex) {
+            ShowSearchOptions(*s);
         } else if (hit.region == ui::HitTestResult::AddressSearchClear) {
             if (!s->addressSearching) ShowAddressSearch(*s);
             SetWindowTextW(s->hwndAddressEdit, L"");
@@ -2093,9 +2112,14 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             } else if (IsAddressSearchResults(ActiveTab(*s))) ShowAddressSearch(*s);
             else ShowOmnibar(*s, OmnibarMode::Path);
         } else if (hit.region == ui::HitTestResult::SearchFilter) {
-            POINT point{ mx, my };
-            ClientToScreen(hwnd, &point);
-            ShowSearchFilterMenu(*s, hit.index, point);
+            POINT corners[] = {
+                {static_cast<LONG>(std::lround(hit.control_bounds.left)),
+                 static_cast<LONG>(std::lround(hit.control_bounds.top))},
+                {static_cast<LONG>(std::lround(hit.control_bounds.right)),
+                 static_cast<LONG>(std::lround(hit.control_bounds.bottom))}};
+            MapWindowPoints(hwnd, nullptr, corners, 2);
+            ShowSearchFilterMenu(*s, hit.index,
+                {corners[0].x, corners[0].y, corners[1].x, corners[1].y});
         } else if (hit.region == ui::HitTestResult::RecentFilter) {
             if (app::Tab* tab = ActiveTab(*s)) {
                 const int filter = std::clamp(hit.index, 0, 2);
@@ -2167,6 +2191,9 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             } else if (!hit.path.empty()) {
                 NavigateTo(*s, hit.path);
             }
+        } else if (hit.region == ui::HitTestResult::StatusBarCancelSearch) {
+            if (auto* tab = ActiveTab(*s)) CancelActiveContentSearch(*s, *tab);
+            InvalidateRect(hwnd, nullptr, FALSE);
         } else if (hit.region == ui::HitTestResult::StatusBarTask) {
             PinAndShowOperationWindow(*s);
         } else if (hit.region == ui::HitTestResult::StatusBar) {
@@ -2640,7 +2667,7 @@ LRESULT HandleRButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // Selection changes on WM_RBUTTONUP; predict what it will be.
             std::vector<std::wstring> paths;
             std::wstring ext;
-            if (tab->IsSelected(hit.index)) {
+            if (tab->IsSelected(hit.index) && !tab->content_results) {
                 paths = SelectedFullPaths(*tab);
                 ext = StaticVerbKey(*tab, tab->SelectedIndices());
             } else {
@@ -2902,9 +2929,11 @@ LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         } else if (ctrl && shift && wParam >= L'1' && wParam <= L'7') {
             app::Tab* t = ActiveTab(*s);
             const int tag_index = static_cast<int>(wParam - L'1');
-            if (t && tag_index < static_cast<int>(s->places.tags.size()))
-                ToggleTagForSelection(*s, s->places.tags[static_cast<size_t>(tag_index)].id,
-                                      SelectedFullPaths(*t));
+            if (t && tag_index < static_cast<int>(s->places.tags.size())) {
+                const auto tag_id=s->places.tags[static_cast<size_t>(tag_index)].id;
+                auto apply=[tag_id](AppState& v){if(auto* current=ActiveTab(v)) ToggleTagForSelection(v,tag_id,SelectedFullPaths(*current));};
+                if(!DeferContentSelection(*s,apply)) apply(*s);
+            }
         } else if (ctrl && shift && wParam == L'F') {
             ShowAdvancedSearch(*s);
         } else if (ctrl && wParam == L'F') {
@@ -2977,7 +3006,8 @@ LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         } else if (ctrl && wParam == L'I') {
             DispatchMenuCommand(*s, app::CmdInvertSelection);
         } else if (wParam == VK_ESCAPE) {
-            if (tab->search_content_active || tab->search_awaiting_content) {
+            s->contentSelectionAction.reset();
+            if (tab->search_content_active || tab->search_awaiting_content || tab->search_live_generation) {
                 CancelActiveContentSearch(*s, *tab);
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else {

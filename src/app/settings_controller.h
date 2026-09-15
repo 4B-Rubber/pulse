@@ -27,6 +27,7 @@ enum class SettingsEffect : uint32_t {
     StatusBarPerformance = 1u << 6,
     FileVisibility = 1u << 7,
     ChangeTracking = 1u << 8,
+    GlobalSearch = 1u << 9,
 };
 
 constexpr SettingsEffect operator|(SettingsEffect left, SettingsEffect right) noexcept {
@@ -134,6 +135,13 @@ public:
     void Language(std::wstring_view language_id);
     void Wallpaper(int action);
     void ToggleUi(int index);
+    void BeginGlobalSearchHotkeyCapture() noexcept { global_search_capturing_ = true; }
+    void CancelGlobalSearchHotkeyCapture() noexcept { global_search_capturing_ = false; }
+    bool CaptureGlobalSearchHotkey(uint32_t key, uint32_t modifiers);
+    bool global_search_hotkey_capturing() const noexcept { return global_search_capturing_; }
+    std::wstring GlobalSearchHotkeyText() const;
+    void SetGlobalSearchError(std::wstring error) { global_search_error_ = std::move(error); }
+    const std::wstring& global_search_error() const noexcept { return global_search_error_; }
     void ChangeTrackingDays(int days);
     void ToggleVolume(int index);
     void AddExclude();
@@ -155,6 +163,8 @@ private:
         bool migration_pending = false;
     };
 
+    bool global_search_capturing_ = false;
+    std::wstring global_search_error_;
     int page_ = 0;
     float scroll_ = 0.0f;
     std::shared_ptr<TaskState> task_state_ = std::make_shared<TaskState>();

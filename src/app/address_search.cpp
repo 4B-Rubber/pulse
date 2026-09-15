@@ -1,4 +1,6 @@
 #include "app_internal.h"
+#include "../index/content_scope.h"
+#include "../index/content_search_protocol.h"
 #include "search_query.h"
 #include "../common/localization.h"
 #include "../ui/address_search_layout.h"
@@ -18,7 +20,8 @@ static std::wstring SearchOrigin(const app::Tab& tab) {
     while (!history.empty()) {
         const auto path = history.top();
         history.pop();
-        if (!fs::IsVirtualPath(path)) return path;
+        std::wstring kind;
+        if (!app::ParsePulsePath(path, &kind, nullptr) || kind != L"search") return path;
     }
     return {};
 }
@@ -29,7 +32,8 @@ static void RestoreSearchDraft(app::Tab& tab) {
     app::ParsePulsePath(tab.current_path, nullptr, &rest);
     const auto spec = app::ParseSearchQuery(rest);
     tab.search_input_path = tab.current_path;
-    tab.search_input_text = spec.name;
+    tab.search_input_content = !spec.content.empty();
+    tab.search_input_text = tab.search_input_content ? spec.content : spec.name;
     tab.search_input_current = spec.location != app::LocationScope::Indexed;
     tab.search_input_root = spec.location == app::LocationScope::CustomFolder
         ? spec.custom_folder : spec.current_folder;
@@ -49,23 +53,36 @@ void SaveAddressSearchDraft(AppState& s) {
     tab->search_input_text = std::move(text);
     tab->search_input_root = s.addressSearchRoot;
     tab->search_input_current = s.addressSearchCurrent;
+    tab->search_input_content = s.addressSearchContent;
 }
 
 void FillAddressSearchView(AppState& s, ui::WindowViewModel& vm) {
+    vm.address_search_content = s.addressSearchContent;
     auto* tab = ActiveTab(s);
     if (!s.addressEditing && IsAddressSearchResults(tab)) {
         RestoreSearchDraft(*tab);
         vm.address_searching = true;
         vm.address_search_current = tab->search_input_current;
+        vm.address_search_content = tab->search_input_content;
         vm.address_search_text = tab->search_input_text;
         vm.address_search_has_text = !vm.address_search_text.empty();
     }
 }
 
 void ExitAddressSearch(AppState& s) {
-    const auto* tab = ActiveTab(s);
+    auto* tab = ActiveTab(s);
     const bool results = IsAddressSearchResults(tab);
     const auto origin = results ? SearchOrigin(*tab) : std::wstring{};
+    // Explicit cancellation must not flush a debounced query while hiding the edit.
+    s.addressLiveDue = s.addressHistoryDue = 0;
+    s.addressLiveContext.clear();
+    s.addressHistoryPath.clear();
+    s.addressSearchComposing = false;
+    if (results) {
+        s.pendingIndexSearches.erase(static_cast<uint32_t>(tab->pending_generation));
+        CancelActiveContentSearch(s, *tab);
+        tab->search_loading_more = false;
+    }
     HideAddressEditor(s, false);
     if (results) NavigateTo(s, origin);
 }
@@ -85,9 +102,11 @@ void ShowAddressSearch(AppState& s) {
         query = tab->search_input_text;
         s.addressSearchRoot = tab->search_input_root;
         s.addressSearchCurrent = tab->search_input_current;
+        s.addressSearchContent = tab->search_input_content;
     } else {
         s.addressSearchRoot = fs::IsVirtualPath(tab->current_path) ? L"" : tab->current_path;
         s.addressSearchCurrent = false;
+        s.addressSearchContent = false;
     }
     ShowAddressEditor(s);
     if (!s.addressEditing || !s.hwndAddressEdit) return;
@@ -95,7 +114,7 @@ void ShowAddressSearch(AppState& s) {
     s.addressAnimationTick = GetTickCount64();
     SetWindowTextW(s.hwndAddressEdit, query.c_str());
     SendMessageW(s.hwndAddressEdit, EM_SETSEL, 0, -1);
-    const auto cue = l10n::Get(l10n::StringId::Search);
+    const auto cue = l10n::Get(s.addressSearchContent ? l10n::StringId::SearchContentHint : l10n::StringId::SearchNameHint);
     SendMessageW(s.hwndAddressEdit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(cue.c_str()));
     LayoutAddressEditor(s);
     InvalidateRect(s.hwnd, nullptr, FALSE);
@@ -103,11 +122,23 @@ void ShowAddressSearch(AppState& s) {
         PostMessageW(s.hwnd, WM_SEARCH_HISTORY, 0, 0);
 }
 
+void SwitchAddressSearchMode(AppState& s, bool content) {
+    if (!s.addressSearching) ShowAddressSearch(s);
+    if (s.addressSearchContent == content) return;
+    if (s.searchHistoryOpen && s.menu) s.menu->Dismiss();
+    s.addressSearchContent = content;
+    const auto& cue = l10n::Get(content ? l10n::StringId::SearchContentHint : l10n::StringId::SearchNameHint);
+    SendMessageW(s.hwndAddressEdit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(cue.c_str()));
+    QueueAddressSearch(s);
+    InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
 void QueueAddressSearch(AppState& s) {
     auto* tab = ActiveTab(s);
     if (!s.addressSearching || !tab) return;
     s.addressLiveContext = tab->current_path;
-    s.addressLiveDue = GetTickCount64() + 100;
+    s.addressLiveDue = GetTickCount64() + (s.addressSearchContent ? 150 : 100);
+    tab->search_allow_scan = false;
     s.addressHistoryDue = 0;
 }
 
@@ -131,24 +162,58 @@ void SubmitAddressSearch(AppState& s, bool live) {
     s.addressLiveDue = 0;
     if (s.addressSearchComposing) return;
     if (first == std::wstring::npos) {
-        if (!live || !IsAddressSearchResults(tab)) return;
+        if ((!live || !IsAddressSearchResults(tab)) && !s.addressSearchContent) return;
         query.clear();
     } else query = query.substr(first, query.find_last_not_of(L" \t\r\n") - first + 1);
     const bool continuing = IsAddressSearchResults(tab);
+    if (s.addressSearchContent && query.empty()) {
+        if (tab->search_session_id) s.contentSearch.Cancel(tab->search_session_id);
+        tab->search_live_generation = 0;
+        if (continuing) {
+            tab->pending_generation = 0;
+            tab->loading = tab->search_content_active = tab->search_awaiting_content = false;
+            tab->search_input_content = true;
+            tab->search_content_empty = true;
+            tab->search_input_text.clear();
+            CancelContentSelection(s,*tab);
+            tab->content_results.reset();
+            tab->content_count_final=false;
+            tab->content_selection_restore.reset();
+            tab->search_entries = std::make_shared<std::vector<fs::DirEntry>>();
+            tab->search_snippets = std::make_shared<std::vector<std::wstring>>();
+            tab->search_total = 0;
+            tab->SetSnapshot(tab->search_entries);
+            tab->banner_title = l10n::Get(l10n::StringId::ContentIndexNoQuery);
+            tab->banner_message.clear();
+            InvalidateRect(s.hwnd, nullptr, FALSE);
+        }
+        return;
+    }
+    const bool restore_empty_content = tab->search_content_empty;
+    tab->search_content_empty = false;
     std::wstring previous_query;
     if (continuing) app::ParsePulsePath(tab->current_path, nullptr, &previous_query);
     auto spec = continuing ? app::ParseSearchQuery(previous_query) : app::AdvancedSearchSpec{};
-    spec.name = query;
+    if (s.addressSearchContent) {
+        const bool was_content_query = !spec.content.empty();
+        spec.content = query;
+        if (!was_content_query) spec.name.clear();
+    } else {
+        spec.name = query;
+        spec.content.clear();
+        spec.content_exclude.clear();
+    }
     spec.current_folder = s.addressSearchRoot;
     spec.custom_folder.clear();
     spec.location = s.addressSearchCurrent && !spec.current_folder.empty()
         ? app::LocationScope::CurrentFolder : app::LocationScope::Indexed;
-    const auto path = app::MakeSearchPath(app::CompileSearchQuery(spec));
-    if (!continuing) {
-        tab->search_origin_path = tab->current_path;
-        tab->search_origin_valid = true;
-    }
+    auto compiled_text = app::CompileSearchQuery(spec);
+    const auto path = app::MakeSearchPath(compiled_text);
     if (tab->current_path == path) {
+        if (restore_empty_content || (!live && tab->search_content_stopped)) {
+            tab->search_input_text = query;
+            RequestSearchPage(s, *tab, compiled_text, true);
+        }
         if (!query.empty()) {
             if (live) {
                 s.addressHistoryPath = path;
@@ -183,6 +248,7 @@ void SubmitAddressSearch(AppState& s, bool live) {
     tab->search_input_text = query;
     tab->search_input_root = s.addressSearchRoot;
     tab->search_input_current = s.addressSearchCurrent;
+    tab->search_input_content = s.addressSearchContent;
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -193,7 +259,7 @@ void ShowAddressSearchScope(AppState& s) {
         return;
     }
     if (!s.addressSearching || !EnsureMenu(s)) return;
-    std::vector<ui::FluentMenuItem> items(2);
+    std::vector<ui::FluentMenuItem> items(3);
     items[0].command = 1;
     items[0].text = l10n::Get(l10n::StringId::LocationCurrent);
     items[0].enabled = !s.addressSearchRoot.empty();
@@ -205,6 +271,8 @@ void ShowAddressSearchScope(AppState& s) {
     items[1].checked = !s.addressSearchCurrent;
     items[1].radio = !s.addressSearchCurrent;
     items[1].radio_group = true;
+    items[2].command = 3;
+    items[2].text = l10n::Get(l10n::StringId::SearchChooseScope);
     const auto layout = ui::LayoutAddressSearch(
         s.renderer.AddressBarRect(static_cast<float>(s.compositor.Width())), s.scale);
     POINT anchor{static_cast<LONG>(layout.scope.left), static_cast<LONG>(layout.scope.bottom)};
@@ -213,6 +281,14 @@ void ShowAddressSearchScope(AppState& s) {
     anchor.y += static_cast<LONG>(4 * s.scale) - ui::FluentMenu::kShadowMargin;
     s.addressIgnoreKillFocus = true;
     const int command = s.menu->TrackPopup(anchor, std::move(items));
+    if (command == 3) {
+        std::wstring chosen;
+        if (PickFolder(s.hwnd, chosen, l10n::Get(l10n::StringId::SearchChooseScope).c_str())) {
+            s.addressSearchRoot = chosen;
+            s.addressSearchCurrent = true;
+            QueueAddressSearch(s);
+        }
+    }
     if (command == 1 || command == 2) {
         s.addressSearchCurrent = command == 1;
         s.addressScopeAnimation = 1.0f;
@@ -227,6 +303,71 @@ void ShowAddressSearchScope(AppState& s) {
 
 bool TickAddressSearch(AppState& s, ULONGLONG now) {
     bool searched = false;
+    if (s.searchOptionsPending && !s.searchHistoryOpen && (!s.menu || !s.menu->IsOpen())) {
+        s.searchOptionsPending = false;
+        ShowSearchOptions(s);
+        return true;
+    }
+    if (now - s.contentStatusTick >= 750) {
+        s.contentStatusTick = now;
+        std::vector<index::VolumeInfo> volumes;
+        std::vector<std::wstring> excluded;
+        if (!s.isolatedTest && s.contentSearch.ConfigurationReady() && s.index.GetScope(volumes, excluded)) {
+            const auto current = s.contentSearch.GetConfig();
+            const auto shared = index::SharedContentScope(current, volumes, excluded);
+            ipc::PayloadWriter old_scope, new_scope;
+            index::content::PutConfig(old_scope, current);
+            index::content::PutConfig(new_scope, shared);
+            if (old_scope.data() != new_scope.data()) s.contentSearch.Configure(shared);
+        }
+        const auto status = ContentIndexStatusText(s);
+        if (status != s.contentStatusText) {
+            s.contentStatusText = status;
+            searched = true;
+        }
+        const auto progress = s.contentSearch.GetStatus();
+        // The client runs one query at a time. Leave revisions unconsumed while
+        // busy so another tick can refresh without cancelling an active query.
+        bool content_busy = false;
+        ForEachPane(s, [&](app::Pane& pane) {
+            if (auto* tab = pane.ActiveTab())
+                content_busy |= tab->search_content_active && tab->pending_generation != 0 &&
+                    tab->pending_generation == s.contentSearch.CurrentGeneration();
+        });
+        ForEachPane(s, [&](app::Pane& pane) {
+            auto* tab = pane.ActiveTab();
+            std::wstring kind, rest;
+            if (!tab || !app::ParsePulsePath(tab->current_path, &kind, &rest) ||
+                kind != L"search" || !app::SplitSearchQueryText(rest).content.present()) return;
+            if (tab->banner_title == l10n::Get(l10n::StringId::ContentIndexPartial) ||
+                tab->banner_title == l10n::Get(l10n::StringId::ContentCoverageHint) ||
+                tab->banner_title == l10n::Get(l10n::StringId::ContentIndexBuilding) ||
+                tab->banner_title == l10n::Get(l10n::StringId::ContentIndexPaused)) {
+                if (tab->search_content_active && !tab->search_allow_scan) {
+                    // The query title and status bar already show live scan progress.
+                    tab->banner_title.clear();
+                    tab->banner_message.clear();
+                    searched = true;
+                } else {
+                    const auto title = l10n::Get(progress.paused ? l10n::StringId::ContentIndexPaused :
+                        progress.indexing ? l10n::StringId::ContentIndexBuilding :
+                        progress.error || progress.skipped_files ? l10n::StringId::ContentIndexPartial : l10n::StringId::ContentCoverageHint);
+                    searched |= tab->banner_title != title || tab->banner_message != status;
+                    tab->banner_title = title;
+                    tab->banner_message = status;
+                }
+            }
+            if (tab->search_content_stopped || tab->content_subscription_error || s.contentSearch.InstantMode() || !progress.revision || tab->search_index_revision == progress.revision ||
+                content_busy || tab->search_live_generation || tab->search_content_active || tab->search_content_empty || tab->search_allow_scan ||
+                s.addressLiveDue || s.renameIndex >= 0) return;
+            if (tab->selected_index >= 0 &&
+                static_cast<size_t>(tab->selected_index) < tab->EntryCount())
+                tab->search_preserve_selection = tab->EntryAt(static_cast<size_t>(tab->selected_index)).full_path;
+            RequestSearchPage(s, *tab, rest, true);
+            content_busy = tab->search_content_active;
+            searched = true;
+        });
+    }
     if (s.addressLiveDue && now >= s.addressLiveDue && !s.addressSearchComposing) {
         s.addressLiveDue = 0;
         if (s.addressSearching && ActiveTab(s) && ActiveTab(s)->current_path == s.addressLiveContext) {

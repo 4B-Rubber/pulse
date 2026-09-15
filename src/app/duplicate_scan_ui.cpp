@@ -66,6 +66,7 @@ void StartDuplicateScan(AppState& s) {
     index::ContentSearchRequest request;
     request.generation = session.generation;
     request.mode = index::ContentSearchMode::Duplicates;
+    request.maximum_hits = 10000;
     request.roots = roots;
     request.root = roots.front();
     request.recursive = true;

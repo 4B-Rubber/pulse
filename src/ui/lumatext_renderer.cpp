@@ -446,7 +446,7 @@ struct LumaTextRenderer::Impl {
         return true;
     }
 
-    bool PresentEditBits(HWND hwnd, HDC paint_dc, const void* bits, int w, int h) {
+    bool PresentEditBits(HWND hwnd, HDC paint_dc, const void* bits, int w, int h, bool preserve_alpha) {
         if (!hwnd || !bits || w <= 0 || h <= 0) return false;
         const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
         const bool layered =
@@ -457,7 +457,8 @@ struct LumaTextRenderer::Impl {
             if (!EnsurePresent(w, h)) return false;
             auto* dst = static_cast<std::uint8_t*>(present_bits);
             std::memcpy(dst, bits, bytes);
-            for (int i = 0; i < w * h; ++i) dst[static_cast<size_t>(i) * 4u + 3u] = 255;
+            if (!preserve_alpha)
+                for (int i = 0; i < w * h; ++i) dst[static_cast<size_t>(i) * 4u + 3u] = 255;
             RECT wr{};
             GetWindowRect(hwnd, &wr);
             POINT dst_pt{wr.left, wr.top};
@@ -1025,7 +1026,7 @@ struct LumaTextRenderer::Impl {
             }
             dib_bits = tight_pixels.data();
         }
-        const bool presented = PresentEditBits(hwnd, hdc, dib_bits, w, h);
+        const bool presented = PresentEditBits(hwnd, hdc, dib_bits, w, h, background.a < 1.0f);
         blit_staging->Unmap();
 
         HIMC imc = ImmGetContext(hwnd);

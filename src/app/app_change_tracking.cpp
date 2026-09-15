@@ -123,7 +123,7 @@ bool TickChangeTracking(AppState& s) {
             else {
                 tab->banner_message = Text(I::ChangeScope);
                 tab->change_empty_text = Text(I::ChangeDisabled);
-                tab->change_status_text = tab->snapshot && !tab->snapshot->empty() ? Text(I::ChangeDisabled) : L"";
+                tab->change_status_text = tab->snapshot && tab->EntryCount() != 0 ? Text(I::ChangeDisabled) : L"";
             }
         });
         changed = true;
@@ -206,7 +206,7 @@ void ApplyChangeDetails(AppState& s, uint32_t request, const index::ChangeRespon
         tab->banner_title = Text(I::ChangeTitle);
         tab->banner_message = Text(I::ChangeScope);
         if (!HasResponse(result.state)) {
-            const bool has_entries = tab->snapshot && !tab->snapshot->empty();
+            const bool has_entries = tab->snapshot && tab->EntryCount() != 0;
             const auto message = result.state == S::NotCovered ? I::ChangeNotCovered :
                 has_entries ? I::ChangeRefreshFailed : I::ChangeReadFailed;
             tab->change_empty_text = Text(message);
@@ -279,7 +279,7 @@ void FillChangePane(AppState& s, app::Tab& tab, ui::PaneViewModel& pane, const D
     pane.is_changes = !root.empty();
     if (pane.is_changes) {
         pane.is_search = true;
-        pane.search_retaining_results = tab.snapshot && !tab.snapshot->empty();
+        pane.search_retaining_results = tab.snapshot && tab.EntryCount() != 0;
         pane.curated_order = true;
         pane.change_time_label = DaysText(tab.change_days);
         pane.change_type_label = KindText(tab.change_kind);
@@ -307,8 +307,8 @@ void FillChangePane(AppState& s, app::Tab& tab, ui::PaneViewModel& pane, const D
     const auto [first, last] = s.renderer.VisibleRangeInPane(pane, bounds);
     for (int view = first; view < last && view < static_cast<int>(pane.EntryCount()); ++view) {
         const int source = pane.SourceIndex(view);
-        if (source < 0 || source >= static_cast<int>(tab.snapshot->size())) continue;
-        const auto& entry = (*tab.snapshot)[static_cast<size_t>(source)];
+        if (source < 0 || source >= static_cast<int>(tab.EntryCount())) continue;
+        const auto& entry = tab.EntryAt(static_cast<size_t>(source));
         if (entry.is_dir && !entry.change_record_only) add(EntryFullPath(tab, source), source);
     }
 }

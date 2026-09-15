@@ -93,7 +93,11 @@ void PlaceHostedEdit(HWND hwnd, HWND owner, const D2D1_RECT_F& cell, float scale
     const int y = pt.y + std::max(0, (cellH - lineH) / 2);
     const int left = std::max(0, static_cast<int>(std::lround(static_cast<float>(left_margin_dip) * scale)));
     const int right = std::max(0, static_cast<int>(std::lround(static_cast<float>(right_margin_dip) * scale)));
-    SendMessageW(hwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(left, right));
+    const LPARAM margins=MAKELPARAM(left,right);
+    // Layout runs after every parent frame. Reapplying identical margins enters
+    // the LumaText redraw guard, briefly hiding the redirected edit surface.
+    if (SendMessageW(hwnd,EM_GETMARGINS,0,0)!=margins)
+        SendMessageW(hwnd,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,margins);
     SetWindowPos(hwnd, HWND_TOP, pt.x, y, w, lineH, SWP_NOACTIVATE);
 }
 
@@ -309,6 +313,10 @@ void HideFilterEditor(AppState& s, bool commit) {
     s.filterIgnoreKillFocus = false;
     if (app::Tab* tab = ActiveTab(s)) {
         if (select_mode) {
+            if(commit && tab->content_results) {
+                SelectContentPattern(s,buf);
+                InvalidateRect(s.hwnd,nullptr,FALSE); return;
+            }
             if (commit) {
                 tab->filter_text = buf;
                 std::vector<int> matches;
@@ -330,18 +338,14 @@ void HideFilterEditor(AppState& s, bool commit) {
 
 void LayoutRenameOverlay(AppState& s) {
     if (!s.hwndRenameEdit || s.renameIndex < 0 || !s.hwnd) return;
-    app::Tab* tab = ActiveTab(s);
-    if (!tab) return;
     ui::WindowViewModel vm = BuildVm(s, false);
-    const D2D1_RECT_F pane = FocusedPaneRect(s);
-    float extra = tab->banner_message.empty() ? 0.0f : 36.0f * s.scale;
-    std::wstring virtual_kind;
-    if (app::ParsePulsePath(tab->current_path, &virtual_kind, nullptr) &&
-        virtual_kind == L"recent") {
-        extra += 40.0f * s.scale;
+    D2D1_RECT_F field{};
+    for (const auto& slot : vm.pane_slots) {
+        if (!slot.focused) continue;
+        const auto list = s.renderer.PaneListRect(slot.pane, slot.rect);
+        field = s.renderer.RenameFieldRect(slot.pane, list, s.renameIndex);
+        break;
     }
-    const D2D1_RECT_F list = s.renderer.PaneListRect(pane, extra, tab->view_mode);
-    D2D1_RECT_F field = s.renderer.RenameFieldRect(vm.pane, list, s.renameIndex);
     if (field.right <= field.left) return;
     // Seat the EDIT inside the Fluent frame: frame stroke + text padding.
     const float insetX = 3.0f * s.scale;
@@ -353,16 +357,17 @@ void LayoutRenameOverlay(AppState& s) {
     PlaceHostedEdit(s.hwndRenameEdit, s.hwnd, field, s.scale, 4, 4);
 }
 void ShowRenameOverlay(AppState& s) {
+    if(DeferContentSelection(s,[](AppState& v){ShowRenameOverlay(v);})) return;
     app::Tab* tab = ActiveTab(s);
     if (!tab || !tab->snapshot || tab->selected_index < 0) return;
-    if (tab->selected_index < static_cast<int>(tab->snapshot->size()) &&
-        (*tab->snapshot)[static_cast<size_t>(tab->selected_index)].change_record_only) return;
+    if (tab->selected_index < static_cast<int>(tab->EntryCount()) &&
+        tab->EntryAt(static_cast<size_t>(tab->selected_index)).change_record_only) return;
     if (tab->net_readonly || IsRecycleTab(tab)) return;
     if (tab->SelectedCount() >= 2) {
         ShowBatchRename(s);
         return;
     }
-    if (tab->selected_index >= (int)tab->snapshot->size()) return;
+    if (tab->selected_index >= (int)tab->EntryCount()) return;
     if (!s.tagRenameId.empty()) HideTagRenameOverlay(s, true);
     if (s.addressEditing) HideAddressEditor(s, false);
     if (s.filterEditing) HideFilterEditor(s, true);
@@ -384,14 +389,14 @@ void ShowRenameOverlay(AppState& s) {
         }
     }
 
-    const std::wstring& name = (*tab->snapshot)[s.renameIndex].name;
+    const std::wstring& name = tab->EntryAt(s.renameIndex).name;
     SetWindowTextW(s.hwndRenameEdit, name.c_str());
     LayoutRenameOverlay(s);
     ShowWindow(s.hwndRenameEdit, SW_SHOW);
     SetForegroundWindow(GetAncestor(s.hwndRenameEdit, GA_ROOT));
     SetFocus(s.hwndRenameEdit);
     int stem = (int)name.find_last_of(L'.');
-    bool isDir = (*tab->snapshot)[s.renameIndex].is_dir;
+    bool isDir = tab->EntryAt(s.renameIndex).is_dir;
     SendMessageW(s.hwndRenameEdit, EM_SETSEL, 0, (stem > 0 && !isDir) ? stem : -1);
     s.renameIgnoreKillFocus = false;
     InvalidateRect(s.hwnd, nullptr, FALSE);
@@ -410,9 +415,9 @@ void HideRenameOverlay(AppState& s, bool commit) {
         app::Tab* tab = ActiveTab(s);
         wchar_t buf[512];
         GetWindowTextW(s.hwndRenameEdit, buf, ARRAYSIZE(buf));
-        if (tab && buf[0] && index < (int)(tab->snapshot ? tab->snapshot->size() : 0)) {
+        if (tab && buf[0] && index < (int)(tab->snapshot ? tab->EntryCount() : 0)) {
             std::wstring full = EntryFullPath(*tab, index);
-            if (!full.empty() && buf != (*tab->snapshot)[index].name) {
+            if (!full.empty() && buf != tab->EntryAt(index).name) {
                 ops::OpRequest req;
                 req.type = ops::OpType::Rename;
                 req.sources.push_back(full);
@@ -504,7 +509,7 @@ void HideTagRenameOverlay(AppState& s, bool commit) {
     s.tagRenameIgnoreKillFocus = false;
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
-constexpr UINT_PTR kEditCaretTimer = 71;
+
 
 D2D1_COLOR_F HostedEditForeground(const AppState& s) {
     return s.darkMode ? D2D1::ColorF(1.0f, 1.0f, 1.0f)
@@ -532,94 +537,17 @@ bool HandleHostedEditMessage(AppState& s, HWND hwnd, UINT msg, WPARAM wParam,
         result = 0;
         return true;
     }
-    if (s.compositor.LumaTextEnabled() &&
-        (msg == WM_PRINT || msg == WM_PRINTCLIENT || msg == WM_NCPAINT)) {
-        result = 0;
-        return true;
-    }
-    if (s.compositor.LumaTextEnabled() && msg == WM_ERASEBKGND) {
-        result = 1;
-        return true;
-    }
-    switch (msg) {
-    case WM_LBUTTONDOWN: {
-    case WM_LBUTTONDBLCLK:
-    case WM_LBUTTONUP:
-    case WM_MOUSEMOVE:
-    case WM_CAPTURECHANGED:
-        if (!s.compositor.LumaTextEnabled()) return false;
-        result = s.compositor.CallLumaEditMouse(
-            hwnd, msg, wParam, lParam, HostedEditFormat(s, hwnd));
-        if (msg != WM_MOUSEMOVE || GetCapture() == hwnd) {
-            s.compositor.PresentLumaEdit(hwnd, HostedEditFormat(s, hwnd),
-                                         HostedEditForeground(s), HostedEditBackground(s));
-        }
-        return true;
-    }
-    case WM_PAINT: {
-        if (!s.compositor.LumaTextEnabled()) return false;
-        HideCaret(hwnd);
-        if (!s.compositor.PresentLumaEdit(hwnd, HostedEditFormat(s, hwnd),
-                                          HostedEditForeground(s), HostedEditBackground(s))) {
-            PAINTSTRUCT ps{};
-            HDC hdc = BeginPaint(hwnd, &ps);
-            EnsureEditVisuals(s);
-            FillRect(hdc, &ps.rcPaint, s.editBrush);
-            EndPaint(hwnd, &ps);
-        }
-        result = 0;
-        return true;
-    }
-    case WM_SETFOCUS: {
-        result = DefSubclassProc(hwnd, msg, wParam, lParam);
-        if (s.compositor.LumaTextEnabled()) {
-            HideCaret(hwnd);
-            SetTimer(hwnd, kEditCaretTimer, GetCaretBlinkTime(), nullptr);
-            s.compositor.PresentLumaEdit(hwnd, HostedEditFormat(s, hwnd),
-                                         HostedEditForeground(s), HostedEditBackground(s));
-        } else {
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        return true;
-    }
-    case WM_KILLFOCUS:
-        KillTimer(hwnd, kEditCaretTimer);
-        return false;
-    case WM_TIMER:
-        if (wParam == kEditCaretTimer) {
-            if (GetCapture() != hwnd && s.compositor.LumaTextEnabled()) {
-                s.compositor.PresentLumaEdit(hwnd, HostedEditFormat(s, hwnd),
-                                             HostedEditForeground(s), HostedEditBackground(s));
-            } else if (GetCapture() != hwnd) {
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-            result = 0;
-            return true;
-        }
-        return false;
-    default:
-        return false;
-    }
+    EnsureEditVisuals(s);
+    return ui::HandleChildEditMessage(s.compositor, HostedEditFormat(s, hwnd),
+        HostedEditForeground(s), HostedEditBackground(s), s.editBrush,
+        hwnd, msg, wParam, lParam, result);
 }
 
 static LRESULT DefPresentedHostedEditProc(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    const bool changes_visual = msg == WM_SETTEXT || msg == EM_SETSEL || msg == EM_REPLACESEL ||
-        msg == WM_KEYDOWN || msg == WM_CHAR || msg == WM_CUT || msg == WM_PASTE ||
-        msg == WM_CLEAR || msg == WM_UNDO || msg == EM_UNDO || msg == WM_IME_COMPOSITION ||
-        msg == WM_IME_ENDCOMPOSITION || msg == WM_SETFONT || msg == WM_SIZE || msg == EM_SETMARGINS ||
-        msg == EM_SETCUEBANNER;
-    const bool custom_paint = changes_visual && s && s->compositor.LumaTextEnabled() && IsWindowVisible(hwnd);
-    if (custom_paint) SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
-    const LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
-    if (custom_paint) {
-        SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
-        HideCaret(hwnd);
-        s->compositor.PresentLumaEdit(hwnd, HostedEditFormat(*s, hwnd),
-            HostedEditForeground(*s), HostedEditBackground(*s));
-    }
-    return result;
+    if (!s) return DefSubclassProc(hwnd, msg, wParam, lParam);
+    return ui::DefPresentedChildEditProc(s->compositor, HostedEditFormat(*s, hwnd),
+        HostedEditForeground(*s), HostedEditBackground(*s), hwnd, msg, wParam, lParam);
 }
-
 LRESULT CALLBACK AddressEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                         UINT_PTR /*uIdSubclass*/, DWORD_PTR dwRefData) {
     AppState* s = reinterpret_cast<AppState*>(dwRefData);
@@ -657,7 +585,9 @@ LRESULT CALLBACK AddressEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (wParam == VK_ESCAPE) {
-            HideAddressEditor(*s, false);
+            if (s->menu && s->menu->IsOpen()) s->menu->Dismiss();
+            else if (s->addressSearching) ExitAddressSearch(*s);
+            else HideAddressEditor(*s, false);
             return 0;
         }
         break;

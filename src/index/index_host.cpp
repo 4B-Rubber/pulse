@@ -9,6 +9,7 @@
 //   Pulse.Index.exe --uninstall  removes the service
 #include "index_protocol.h"
 #include "index_engine.h"
+#include "search_trace.h"
 #include "index_service_start.h"
 #include "index_config.h"
 #include "../common/crash_reporter.h"
@@ -17,6 +18,7 @@
 #include "index_path_service.h"
 #include "network_agent_host.h"
 #include "content_agent.h"
+#include "../common/current_user_security.h"
 #include <windows.h>
 #include <sddl.h>
 #include <shellapi.h>
@@ -58,6 +60,9 @@ struct Client {
     std::mutex write_mu;
     std::atomic<bool> alive{true};
     std::atomic<uint32_t> latest_search{0};
+    struct Subscription { uint32_t id = 0; Query query; std::shared_ptr<std::atomic<uint32_t>> latest = std::make_shared<std::atomic<uint32_t>>(0); };
+    std::mutex subscriptions_mu;
+    std::map<uint64_t, Subscription> subscriptions;
     std::atomic<bool> thread_done{false};
     std::wstring tracking_owner;
     bool tracking_lease = false;
@@ -67,6 +72,7 @@ struct SearchTask {
     std::shared_ptr<Client> client;
     uint32_t id = 0;
     Query query;
+    std::shared_ptr<std::atomic<uint32_t>> latest;
 };
 
 struct ClientWorker {
@@ -145,6 +151,10 @@ void SetSvc(DWORD state, DWORD win32 = NO_ERROR) {
 }
 
 SECURITY_ATTRIBUTES* PipeSa() {
+    if(!g.as_service) {
+        static pulse::CurrentUserSecurityAttributes owner;
+        return owner.get();
+    }
     static SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES) };
     static PSECURITY_DESCRIPTOR sd = nullptr;
     if (!sd) {
@@ -169,7 +179,9 @@ bool ClientIo(Client& client, HANDLE pipe, uint8_t* bytes, DWORD size, bool writ
                         : ReadFile(pipe, bytes, size, &transferred, &operation);
         if (!ok && GetLastError() == ERROR_IO_PENDING) {
             HANDLE waits[] = {operation.hEvent, g.stop};
-            const DWORD wait = WaitForMultipleObjects(g.stop ? 2u : 1u, waits, FALSE, INFINITE);
+            DWORD wait = WAIT_TIMEOUT;
+            while (wait == WAIT_TIMEOUT && g.running && client.alive)
+                wait = WaitForMultipleObjects(g.stop ? 2u : 1u, waits, FALSE, 1000);
             if (wait != WAIT_OBJECT_0) {
                 CancelIoEx(pipe, &operation);
                 GetOverlappedResult(pipe, &operation, &transferred, TRUE);
@@ -203,9 +215,12 @@ std::vector<uint8_t> StatusPayload() {
     w.PutU32(g.engine.Ready() ? 1u : 0u);
     w.PutU32(static_cast<uint32_t>((std::min)(g.engine.Count(), static_cast<size_t>(0xffffffffu))));
     w.PutString(g.engine.Status());
+    w.PutU32(g.engine.PinyinReady() ? 1u : 0u);
+    w.PutU64(g.engine.Revision()); w.PutU32(1);
     return w.data();
 }
 
+void QueueSearch(std::shared_ptr<Client> c, uint32_t id, Query query, bool refresh = false);
 void BroadcastStatus() {
     auto payload = StatusPayload();
     std::vector<std::shared_ptr<Client>> clients;
@@ -214,7 +229,12 @@ void BroadcastStatus() {
         clients = g.clients;
     }
     for (auto& c : clients) {
-        if (c && c->alive) WriteFrame(*c, RSP_IDX_STATUS, 0, payload);
+        if (c && c->alive) {
+            WriteFrame(*c, RSP_IDX_STATUS, 0, payload);
+            std::vector<Client::Subscription> subscriptions;
+            { std::lock_guard lock(c->subscriptions_mu); for (const auto& [id, sub] : c->subscriptions) if (sub.query.subscribe) subscriptions.push_back(sub); }
+            for (const auto& sub : subscriptions) QueueSearch(c, sub.id, sub.query, true);
+        }
     }
 }
 
@@ -231,6 +251,7 @@ std::vector<uint8_t> SearchPayload(const SearchResult& sr) {
         w.PutU32(static_cast<uint32_t>(h.mtime));
         w.PutU32(static_cast<uint32_t>(h.mtime >> 32));
     }
+    w.PutU64(sr.revision);
     return w.data();
 }
 
@@ -280,6 +301,8 @@ bool ParseQuery(const uint8_t* p, size_t n, Query& q) {
     q.rank = (flags & 1) != 0;
     q.folders_only = (flags & 2) != 0;
     q.sort_desc = (flags & 4) != 0;
+    q.subscribe = (flags & 8) != 0;
+    if (r.remaining() && !r.GetU64(q.session_id)) return false;
     q.sort = static_cast<ResultSort>(sort);
     q.limit = limit;
     q.offset = offset;
@@ -287,13 +310,21 @@ bool ParseQuery(const uint8_t* p, size_t n, Query& q) {
     return true;
 }
 
-void QueueSearch(std::shared_ptr<Client> c, uint32_t id, Query query) {
+void QueueSearch(std::shared_ptr<Client> c, uint32_t id, Query query, bool refresh) {
+    std::shared_ptr<std::atomic<uint32_t>> latest;
+    {
+        std::lock_guard lock(c->subscriptions_mu);
+        auto& subscription = c->subscriptions[query.session_id];
+        if (refresh && subscription.id != id) return;
+        subscription.id = id; subscription.query = query; latest = subscription.latest; *latest = id;
+    }
     std::lock_guard<std::mutex> lock(g.search_mu);
     g.search_queue.erase(
         std::remove_if(g.search_queue.begin(), g.search_queue.end(),
-            [&](const SearchTask& task) { return task.client == c; }),
+            [&](const SearchTask& task) { return task.client == c && task.query.session_id == query.session_id; }),
         g.search_queue.end());
-    g.search_queue.push_back(SearchTask{std::move(c), id, std::move(query)});
+    g.search_queue.push_back(SearchTask{std::move(c), id, std::move(query), std::move(latest)});
+    TraceSearch("filename_query_queued", g.engine.Revision());
     g.search_cv.notify_one();
 }
 
@@ -311,9 +342,12 @@ void SearchThread() {
             g.search_queue.pop_front();
         }
         auto& c = task.client;
-        if (!c || !c->alive || c->latest_search.load() != task.id) continue;
-        SearchResult sr = g.engine.Search(task.query, &c->latest_search, task.id);
-        if (!c->alive || c->latest_search.load() != task.id) continue;
+        if (!c || !c->alive || task.latest->load() != task.id) continue;
+        TraceSearch("filename_query_begin", g.engine.Revision());
+        SearchResult sr = g.engine.Search(task.query, task.latest.get(), task.id);
+        sr.revision = g.engine.Revision();
+        TraceSearch("filename_query_done", sr.revision);
+        if (!c->alive || task.latest->load() != task.id) continue;
         auto out = SearchPayload(sr);
         if (out.size() > kIndexMaxPayload) {
             sr.hits.clear();
@@ -337,6 +371,10 @@ void DropClient(const std::shared_ptr<Client>& c) {
     if (!c->tracking_owner.empty()) SetTrackingLease(*c, c->tracking_owner, false);
     c->alive = false;
     ++c->latest_search;
+    // A writer holds write_mu while awaiting overlapped IO. Cancel it before
+    // acquiring that mutex so a disconnected reader cannot strand the host.
+    const HANDLE active_pipe = c->pipe.load();
+    if (active_pipe != INVALID_HANDLE_VALUE) CancelIoEx(active_pipe, nullptr);
     {
         std::lock_guard<std::mutex> lock(c->write_mu);
         const HANDLE pipe = c->pipe.exchange(INVALID_HANDLE_VALUE);
@@ -435,7 +473,26 @@ void ClientThread(std::shared_ptr<Client> c) {
         if (hdr.payload_size &&
             !ClientIo(*c, pipe, payload.data(), hdr.payload_size, false))
             break;
-        if (hdr.type >= REQ_IDX_CHANGE_LEASE && hdr.type <= REQ_IDX_CHANGE_DETAILS) {
+        if(hdr.type==8) {
+            PayloadReader reader(payload.data(),payload.size());uint64_t session=0;
+            if(!reader.GetU64(session)) break;
+            std::lock_guard lock(c->subscriptions_mu);
+            if(auto found=c->subscriptions.find(session);found!=c->subscriptions.end()) {++*found->second.latest;c->subscriptions.erase(found);}
+        } else if (hdr.type == kFeedRequest) {
+            PayloadReader reader(payload.data(),payload.size()); uint32_t version=0,changes=0;
+            std::wstring root; uint64_t epoch=0,cursor=0;
+            if(!reader.GetU32(version)||version!=1||!reader.GetU32(changes)||changes>1||!reader.GetString(root)||root.size()>32768||!reader.GetU64(epoch)||!reader.GetU64(cursor)) break;
+            auto page=g.engine.ReadFeed(changes!=0,root,epoch,cursor);
+            if(changes && page.ready && !page.gap && page.records.empty() && epoch) {
+                for(unsigned i=0;i<10 && g.running && c->alive;++i) {
+                    if(WaitForSingleObject(g.stop,10)==WAIT_OBJECT_0) break;
+                    page=g.engine.ReadFeed(true,root,epoch,cursor);
+                    if(page.gap || !page.records.empty()) break;
+                }
+            }
+            PayloadWriter writer;PutFeedPage(writer,page);
+            if(!WriteFrame(*c,kFeedResponse,hdr.request_id,writer.data())) break;
+        } else if (hdr.type >= REQ_IDX_CHANGE_LEASE && hdr.type <= REQ_IDX_CHANGE_DETAILS) {
             if (!HandleChanges(*c, hdr, payload)) break;
         } else if (hdr.type == REQ_IDX_STATUS) {
             WriteFrame(*c, RSP_IDX_STATUS, hdr.request_id, StatusPayload());
@@ -448,6 +505,9 @@ void ClientThread(std::shared_ptr<Client> c) {
             if (!ParseQuery(payload.data(), payload.size(), query)) break;
             QueueSearch(c, id, std::move(query));
         } else if (hdr.type == REQ_IDX_TEST_SHUTDOWN && g.test_mode) {
+            TraceSearch("filename_shutdown_requested");
+            g.running = false;
+            if (g.stop) SetEvent(g.stop);
             PostMessageW(g.hwnd, WM_QUIT_HOST, 0, 0);
             break;
         }
@@ -580,7 +640,7 @@ HWND CreateMsgWindow() {
 
 int RunHost(bool as_service, bool test_mode = false,
             std::wstring pipe_name = kPipeName,
-            std::wstring mutex_name = kMutexName) {
+            std::wstring mutex_name = kMutexName, std::wstring fixture_root = {}) {
     g.as_service = as_service;
     g.test_mode = test_mode;
     g.pipe_name = std::move(pipe_name);
@@ -636,7 +696,9 @@ int RunHost(bool as_service, bool test_mode = false,
     g.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (as_service) SetSvc(SERVICE_RUNNING);
     ServiceTrace(L"service running reported");
-    if (g.test_mode) {
+    if (!fixture_root.empty()) {
+        g.engine.StartFixture(g.hwnd, WM_ENGINE_NOTIFY, std::move(fixture_root));
+    } else if (g.test_mode) {
         g.engine.AddForTest(L"C:\\PulseIndexStress\\.codex", L".codex", true);
         for (uint32_t i = 0; i < 50000; ++i) {
             const std::wstring name = L"stress-item-" + std::to_wstring(i) + L".txt";
@@ -658,6 +720,7 @@ int RunHost(bool as_service, bool test_mode = false,
         DispatchMessageW(&msg);
     }
     ServiceTrace(L"message loop exited");
+    TraceSearch("filename_shutdown_message_loop_done");
 
     g.running = false;
     g.engine.RequestStop();
@@ -679,8 +742,10 @@ int RunHost(bool as_service, bool test_mode = false,
         if (worker.thread.joinable()) worker.thread.join();
     g.client_workers.clear();
     if (g.search_thread.joinable()) g.search_thread.join();
+    TraceSearch("filename_shutdown_clients_done");
     ServiceTrace(L"pipe and search workers stopped; stopping engine");
-    if (!g.test_mode) g.engine.Stop();
+    g.engine.Stop();
+    TraceSearch("filename_shutdown_engine_done");
     ServiceTrace(L"engine stopped");
     if (g.mutex) {
         ReleaseMutex(g.mutex);
@@ -927,6 +992,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 0;
     }
     if (a1 == L"--network-agent") return RunNetworkAgent();
+    if (a1 == L"--content-instant-agent" && args.size() == 4) return RunPersistentContentAgent(args[2], wcstoul(args[3].c_str(), nullptr, 10), ContentAgentMode::Instant);
+    if (a1 == L"--content-index-agent" && args.size() == 4) return RunPersistentContentAgent(args[2], wcstoul(args[3].c_str(), nullptr, 10));
+    if (a1 == L"--content-index-observer" && args.size() == 4) return RunPersistentContentAgent(args[2], wcstoul(args[3].c_str(), nullptr, 10), true);
     if (a1 == L"--content-agent" && args.size() == 3) return RunContentAgent(args[2]);
     if (a1 == L"--test-host" && args.size() >= 3) {
         const std::wstring& token = args[2];
@@ -936,9 +1004,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                        (c >= L'A' && c <= L'Z') || c == L'-' || c == L'_';
             });
         if (!valid) return ERROR_INVALID_PARAMETER;
+        if (args.size() >= 5) SetActiveIndexDirectory(args[4]);
         return RunHost(false, true,
             L"\\\\.\\pipe\\PulseIndex.Test." + token,
-            L"Local\\Pulse.Index.Test." + token);
+            L"Local\\Pulse.Index.Test." + token, args.size() >= 5 ? args[3] : std::wstring{});
     }
     return RunHost(false);
 }

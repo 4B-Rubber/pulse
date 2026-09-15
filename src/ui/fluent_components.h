@@ -106,6 +106,8 @@ struct MenuItemSpec {
     bool has_swatch = false;
     bool checked = false;
     bool mixed = false;
+    bool toggle = false;
+    bool secondary = false;
     bool radio = false;
     bool radio_group = false;      // reserve a leading selection-dot column
     MenuPictogram pictogram = MenuPictogram::None;
@@ -323,6 +325,7 @@ struct InfoBarSpec {
     ControlState state{};
     bool show_close = true;
     bool show_icon_background = true;
+    float trailing_width = 0.0f; // DIP reserved for an adjacent action.
     float close_inset = 2.0f;
 };
 

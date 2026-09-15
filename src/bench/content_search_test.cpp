@@ -92,7 +92,8 @@ void PumpClient(index::ContentSearchClient& client, int polls,
 
 } // namespace
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
+    const bool fixture_only = argc > 1 && std::wstring_view(argv[1]) == L"--fixture-only";
     namespace fs = std::filesystem;
     const std::wstring root = FixtureRoot();
     std::error_code ignored;
@@ -114,6 +115,7 @@ int wmain() {
     Check(WriteBytes(root + L"\\nested\\nested.txt", utf8), L"write recursive fixture");
 
     index::ContentSearchRequest request;
+    request.indexed = false; // These fixtures exercise the explicit transient scanner.
     request.generation = 42;
     request.root = root;
     request.needle = L"needle";
@@ -354,7 +356,7 @@ int wmain() {
     }
     Check(wrote_many, L"write many-file listing fixture");
 
-    {
+    if (!fixture_only) {
         index::ContentSearchRequest drive;
         drive.mode = index::ContentSearchMode::Duplicates;
         drive.generation = 8;
@@ -387,8 +389,13 @@ int wmain() {
         Check(listed > 0, L"C:\\ listing reports files within 2.5s");
     }
 
+    wchar_t saved_local_appdata[32768]{};
+    const DWORD saved_length = GetEnvironmentVariableW(L"LOCALAPPDATA", saved_local_appdata, ARRAYSIZE(saved_local_appdata));
+    const auto isolated_profile = std::filesystem::path(root) / L"test-profile";
+    std::filesystem::create_directories(isolated_profile);
+    SetEnvironmentVariableW(L"LOCALAPPDATA", isolated_profile.c_str());
     index::ContentSearchClient client;
-    client.Start(nullptr, 0);
+    client.Start(nullptr, 0, false);
     request.mode = index::ContentSearchMode::Content;
     request.generation = 99;
     request.root = root;
@@ -434,7 +441,7 @@ int wmain() {
           L"duplicate agent IPC completes");
     Check(many_listed >= 40, L"duplicate agent listing counts files before hashing");
 
-    {
+    if (!fixture_only) {
         index::ContentSearchRequest drive;
         drive.mode = index::ContentSearchMode::Duplicates;
         drive.generation = 102;
@@ -464,6 +471,8 @@ int wmain() {
         Check(listed > 0, L"content agent duplicate listing on C:\\ reports files");
     }
     client.Stop();
+    Check(!std::filesystem::exists(isolated_profile / L"Pulse" / L"ContentIndex"), L"transient-only client never starts persistent index" );
+    SetEnvironmentVariableW(L"LOCALAPPDATA", saved_length ? saved_local_appdata : nullptr);
 
     fs::remove_all(root, ignored);
     wprintf(L"%d passed, %d failed\n", passed, failed);

@@ -56,7 +56,7 @@ void SetViewMode(AppState& s, ui::ViewMode mode);
 void ShowViewDropdown(AppState& s, int pane_index);
 void ShowOmnibar(AppState& s, OmnibarMode mode);
 void ShowAdvancedSearch(AppState& s, bool require_scope = false);
-void ShowSearchFilterMenu(AppState& s, int chip, POINT screen_pt);
+void ShowSearchFilterMenu(AppState& s, int chip, RECT control_rect);
 void ShowRecyclePlaceMenu(AppState& s, POINT screen_pt);
 void ApplyAppWindowChrome(AppState& s);
 bool PickImageFile(HWND owner, std::wstring& path);
@@ -68,5 +68,7 @@ void ToggleQuickPreview(AppState& s);
 void NavigateQuickPreview(AppState& s, int direction);
 void ApplySettingsEffects(AppState& s, app::SettingsEffect effects);
 app::SettingsTaskCompletion SettingsCompletion(HWND hwnd);
+void SetThemeMode(AppState& s, int mode);
+bool HandleSettingsControl(AppState& s, const ui::HitTestResult& hit);
 void ToggleTheme(AppState& s);
 } // namespace pulse

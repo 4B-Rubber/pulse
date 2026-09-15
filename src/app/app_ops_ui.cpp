@@ -90,14 +90,15 @@ void PasteIntoCurrent(AppState& s) {
 }
 
 void DeleteSelected(AppState& s, bool permanent) {
+    if(DeferContentSelection(s,[=](AppState& v){DeleteSelected(v,permanent);})) return;
     app::Tab* tab = ActiveTab(s);
     if (!tab) return;
     if (IsRecycleTab(tab)) {
         std::vector<std::wstring> paths;
         if (tab->snapshot) {
             for (int index : tab->SelectedIndices()) {
-                if (index < 0 || index >= static_cast<int>(tab->snapshot->size())) continue;
-                const fs::DirEntry& entry = (*tab->snapshot)[static_cast<size_t>(index)];
+                if (index < 0 || index >= static_cast<int>(tab->EntryCount())) continue;
+                const fs::DirEntry& entry = tab->EntryAt(static_cast<size_t>(index));
                 if (entry.recycle_path.empty()) continue;
                 paths.push_back(entry.recycle_path);
                 const std::wstring index_path = fs::RecycleIndexPath(entry.recycle_path);
@@ -165,6 +166,7 @@ void EmptyRecycleBin(AppState& s) {
     s.ops.Submit(std::move(req));
 }
 void CollectToTray(AppState& s, bool move_intent) {
+    if(DeferContentSelection(s,[=](AppState& v){CollectToTray(v,move_intent);})) return;
     app::Tab* tab = ActiveTab(s);
     if (!tab || !tab->snapshot || IsRecycleTab(tab)) return;
     std::vector<std::wstring> paths = SelectedFullPaths(*tab);
@@ -192,6 +194,7 @@ void PinAndShowOperationWindow(AppState& s) {
 }
 
 void ShowBatchRename(AppState& s) {
+    if(DeferContentSelection(s,[=](AppState& v){ShowBatchRename(v);})) return;
     app::Tab* tab = ActiveTab(s);
     if (!tab || IsRecycleTab(tab) || tab->net_readonly) return;
     std::vector<std::wstring> paths = SelectedFullPaths(*tab);

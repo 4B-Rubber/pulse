@@ -23,7 +23,7 @@ std::wstring ScopeLabel(const app::SearchHistoryEntry& entry) {
     const auto spec = app::ParseSearchQuery(raw);
     if (spec.location == app::LocationScope::CustomFolder) return spec.custom_folder;
     if (spec.location == app::LocationScope::CurrentFolder) return spec.current_folder;
-    return l10n::Get(l10n::StringId::LocationIndexed);
+    return l10n::Get(l10n::StringId::SearchScopeAll);
 }
 }
 
@@ -67,7 +67,12 @@ void ShowAddressSearchHistory(AppState& s) {
                 if (const auto slash = scope.find_last_of(L"\\/"); slash != std::wstring::npos && slash + 1 < scope.size())
                     item.shortcut = scope.substr(slash + 1);
                 if (item.shortcut.size() > 14) item.shortcut = item.shortcut.substr(0, 13) + L"\u2026";
-                item.tooltip = entries[i].query + L"\n" + scope;
+                std::wstring raw;
+                app::ParsePulsePath(entries[i].path, nullptr, &raw);
+                const auto& mode = l10n::Get(app::SplitSearchQueryText(raw).content.present()
+                    ? l10n::StringId::SearchModeContent : l10n::StringId::SearchModeName);
+                item.shortcut += L" · " + mode;
+                item.tooltip = entries[i].query + L"\n" + scope + L" · " + mode;
                 items.push_back(std::move(item));
             }
             if (items.empty()) {
@@ -80,10 +85,15 @@ void ShowAddressSearchHistory(AppState& s) {
                 items.back().separator_after = true;
                 ui::FluentMenuItem clear;
                 clear.command = 2;
+                clear.secondary = true;
                 clear.text = l10n::Get(l10n::StringId::SearchHistoryClear);
                 clear.glyph = L"\xE74D";
                 items.push_back(std::move(clear));
             }
+            ui::FluentMenuItem header;
+            header.text = l10n::Get(l10n::StringId::SearchHistory);
+            header.enabled = false;
+            items.insert(items.begin(), std::move(header));
             return items;
         };
         const auto field = ui::LayoutAddressSearch(s.renderer.AddressBarRect(
@@ -99,6 +109,12 @@ void ShowAddressSearchHistory(AppState& s) {
         s.menu->SetFilterPlaceholder(l10n::Get(l10n::StringId::SearchHistory));
         s.menu->SetHoverFirstOnOpen(false);
         s.menu->SetSelectAllOnOpen(false);
+        wchar_t debug_path[32768]{};
+        if (s.shot.active && s.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_HISTORY_SHOT", debug_path, ARRAYSIZE(debug_path))) {
+            s.menu->SetTheme(s.darkMode, s.accentColor);
+            s.menu->SaveDebugSnapshot(debug_path, items_for(L""));
+            break;
+        }
         const int command = s.menu->TrackPopup({anchor.left, anchor.top},
             items_for(show_all ? L"" : draft), items_for);
         draft = s.menu->LastFilterQuery();

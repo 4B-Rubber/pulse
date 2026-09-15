@@ -34,13 +34,47 @@ struct ChangeTrackerTestAccess {
     static bool Empty(const ChangeTracker& tracker, const std::wstring& owner) {
         return tracker.journals_.at(owner).records.empty();
     }
+    static void MakeFlushDue(ChangeTracker& tracker) { tracker.last_flush_tick_ = 0; }
 };
 }
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
     const auto root = std::filesystem::temp_directory_path() / (L"pulse-changes-test-" + std::to_wstring(GetCurrentProcessId()));
     std::filesystem::create_directories(root);
     int failures = 0;
     auto check = [&](bool ok, const char* name) { std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", name); failures += !ok; };
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--flush-only") {
+        ChangeTracker batched; batched.Open(root.wstring()); batched.Lease(L"batch", true);
+        ChangeRecord event; event.path = L"C:\\batch\\first.txt";
+        batched.Record(event); batched.Flush();
+        auto persisted = [&] {
+            ChangeTracker reader; reader.Open(root.wstring());
+            return reader.Details(L"batch", L"C:\\batch", 0, 0, 200).records.size();
+        };
+        check(persisted() == 1, "initial flush persists history");
+        event.path = L"C:\\batch\\second.txt"; batched.Record(event);
+        for (int i = 0; i < 100; ++i) batched.Flush(false);
+        check(persisted() == 1 && batched.Details(L"batch", L"C:\\batch", 0, 0, 200).records.size() == 2,
+            "notification burst keeps history live without rewriting disk");
+        ChangeTrackerTestAccess::MakeFlushDue(batched); batched.Flush(false);
+        check(persisted() == 2, "due batch persists pending history");
+        const auto file = *std::filesystem::directory_iterator(root);
+        const auto sentinel = std::filesystem::file_time_type::clock::now() - std::chrono::hours(1);
+        std::filesystem::last_write_time(file.path(), sentinel);
+        batched.Lease(L"batch", true); batched.Flush();
+        check(std::filesystem::last_write_time(file.path()) == sentinel, "lease renewal does not rewrite history");
+        event.path = L"C:\\batch\\third.txt"; batched.Record(event); batched.Flush();
+        check(persisted() == 3, "shutdown flush bypasses batching delay");
+        const auto blocked = root / L"missing";
+        ChangeTracker retry; retry.Open(blocked.wstring()); retry.Lease(L"retry", true); retry.Record(event);
+        retry.Flush(false);
+        std::filesystem::create_directory(blocked);
+        ChangeTrackerTestAccess::MakeFlushDue(retry); retry.Flush(false);
+        ChangeTracker reader; reader.Open(blocked.wstring());
+        check(reader.Details(L"retry", L"C:\\batch", 0, 0, 200).records.size() == 1,
+            "failed persistence retains pending history for retry");
+        std::filesystem::remove_all(root);
+        return failures ? 1 : 0;
+    }
     ChangeTracker tracker; tracker.Open(root.wstring()); tracker.Lease(L"test", true);
     check(tracker.Summaries(L"test", {L"C:\\root"}).state == ChangeState::Available, "first enable starts complete observed history without pre-install gap");
     const auto first_origin = ChangeTrackerTestAccess::Origin(tracker, L"test");

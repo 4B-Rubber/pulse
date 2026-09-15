@@ -8,7 +8,10 @@
 
 namespace pulse::fs {
 
+using UncProbeId = uint64_t;
+
 struct UncProbeResult {
+    UncProbeId probe_id = 0;
     std::wstring unc;
     NetStatus status = NetStatus::Unknown;
     DWORD rtt_ms = 0;
@@ -19,6 +22,8 @@ SnapshotPtr LoadNetSnapshot(const std::wstring& path, uint64_t* unix_sec = nullp
 std::wstring FormatCacheAge(uint64_t unix_sec);
 
 // Background probe: posts `msg` to `hwnd` with lParam = heap UncProbeResult*.
-void StartUncProbe(HWND hwnd, UINT msg, std::wstring unc);
+// If the initial timeout result is followed by a final completion, both carry
+// the same probe ID.
+bool StartUncProbe(HWND hwnd, UINT msg, std::wstring unc, UncProbeId probe_id);
 
 } // namespace pulse::fs

@@ -14,8 +14,8 @@ std::vector<std::wstring> QuickAccessTargets(const app::Tab* tab, bool backgroun
     if (!tab->snapshot) return {};
     std::vector<std::wstring> paths;
     for (int index : tab->SelectedIndices()) {
-        if (index < 0 || static_cast<size_t>(index) >= tab->snapshot->size() ||
-            !(*tab->snapshot)[static_cast<size_t>(index)].is_dir) return {};
+        if (index < 0 || static_cast<size_t>(index) >= tab->EntryCount() ||
+            !tab->EntryAt(static_cast<size_t>(index)).is_dir) return {};
         auto path = EntryFullPath(*tab, index);
         if (path.empty() || fs::IsVirtualPath(path)) return {};
         paths.push_back(std::move(path));

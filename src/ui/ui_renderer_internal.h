@@ -1,9 +1,11 @@
 // ui_renderer_internal.h — Draw + HitTest shared geometry (not a public API).
 #pragma once
 #include "ui_renderer.h"
+#include "empty_state_layout.h"
 #include "bloom_accent_picker.h"
 #include "../common/localization.h"
 #include "typography.h"
+#include "name_highlight.h"
 #include "../app/places.h"
 #include "../app/search_query.h"
 #include "../common/text_format.h"
@@ -167,7 +169,11 @@ void ClearTextWidthCache() {
         if (const auto found = cache.rows.find(index); found != cache.rows.end())
             return found->second;
 
-        const fs::DirEntry& source = (*vm.snapshot)[index];
+        index::ContentResultStore::Row stored;
+        if(vm.content_results && !vm.content_results->Get(index,stored)) {
+            static const ListEntryView pending{}; return pending;
+        }
+        const fs::DirEntry& source = vm.content_results ? stored.entry : (*vm.snapshot)[index];
         const bool penetrated = !source.link_target.empty();
         ListEntryView entry;
         // Keep the on-disk name, including .lnk. Stripping hid the suffix and
@@ -203,7 +209,8 @@ void ClearTextWidthCache() {
         if (!source.change_type_text.empty()) entry.type_text = source.change_type_text;
         entry.starred = vm.tag_catalog && !entry.path.empty() &&
             vm.tag_catalog->IsStarred(entry.path);
-        if (vm.search_snippets && index < vm.search_snippets->size())
+        if(vm.content_results) entry.snippet = std::move(stored.snippet);
+        else if (vm.search_snippets && index < vm.search_snippets->size())
             entry.snippet = (*vm.search_snippets)[index];
         if (entry.starred) {
             if (const app::StarredItem* starred = vm.tag_catalog->FindStarred(entry.path)) {
@@ -947,55 +954,6 @@ void ClearTextWidthCache() {
         out.content_height_dip = (y + d.scroll_y * s - panel.top) / s;
     }
 
-struct PaneEmptyLayout {
-    D2D1_RECT_F art{};
-    D2D1_RECT_F title{};
-    D2D1_RECT_F message{};
-    D2D1_RECT_F action{};
-    bool show_message = false;
-    bool show_action = false;
-};
-
-PaneEmptyLayout MakePaneEmptyLayout(const D2D1_RECT_F& bounds, float scale,
-                                    bool can_create, float art_aspect = 512.0f / 360.0f) {
-    PaneEmptyLayout out;
-    const float width = std::max(0.0f, bounds.right - bounds.left);
-    const float height = std::max(0.0f, bounds.bottom - bounds.top);
-    out.show_message = height >= 220.0f * scale;
-    out.show_action = can_create && height >= 280.0f * scale && width >= 180.0f * scale;
-
-    const float titleH = 24.0f * scale;
-    const float messageH = out.show_message ? 20.0f * scale : 0.0f;
-    const float actionH = out.show_action ? 34.0f * scale : 0.0f;
-    const float textGap = out.show_message ? 2.0f * scale : 0.0f;
-    const float actionGap = out.show_action ? 14.0f * scale : 0.0f;
-    const float fixedH = titleH + textGap + messageH + actionGap + actionH;
-    const float aspect = art_aspect > 0.05f ? art_aspect : (512.0f / 360.0f);
-    const float maxArtW = std::max(72.0f * scale,
-        std::min(200.0f * scale, width - 32.0f * scale));
-    const float maxArtH = std::max(60.0f * scale, height - fixedH - 44.0f * scale);
-    const float artW = std::min(maxArtW, maxArtH * aspect);
-    const float artH = artW / aspect;
-    // The SVG viewBox already has bottom breathing room; keep only a small
-    // layout gap so the illustration and copy read as one centered group.
-    const float artGap = 2.0f * scale;
-    const float totalH = artH + artGap + fixedH;
-    float y = bounds.top + std::max(8.0f * scale, (height - totalH) * 0.5f);
-    const float cx = (bounds.left + bounds.right) * 0.5f;
-    out.art = D2D1::RectF(cx - artW * 0.5f, y, cx + artW * 0.5f, y + artH);
-    y = out.art.bottom + artGap;
-    out.title = D2D1::RectF(bounds.left + 12.0f * scale, y,
-                            bounds.right - 12.0f * scale, y + titleH);
-    y = out.title.bottom + textGap;
-    out.message = D2D1::RectF(bounds.left + 12.0f * scale, y,
-                              bounds.right - 12.0f * scale, y + messageH);
-    y = out.message.bottom + actionGap;
-    const float actionW = std::min(142.0f * scale, width - 32.0f * scale);
-    out.action = D2D1::RectF(cx - actionW * 0.5f, y,
-                             cx + actionW * 0.5f, y + actionH);
-    return out;
-}
-
 D2D1_RECT_F StepLeftHeaderButton(const D2D1_RECT_F& rc, float scale) {
     const float step = kCommandIconStepDip * scale;
     const float btn = kCommandIconButtonDip * scale;
@@ -1038,6 +996,7 @@ constexpr float kStatusBarPadDip = 12.0f;
 struct StatusBarMetrics {
     D2D1_RECT_F bar{};
     D2D1_RECT_F task{};
+    D2D1_RECT_F cancel_search{};
     float pad = 0.0f;
     float right_reserved = 0.0f;
 };
@@ -1050,10 +1009,10 @@ StatusBarMetrics MakeStatusBarMetrics(const WindowViewModel& vm, const D2D1_RECT
     m.pad = kStatusBarPadDip * scale;
     m.right_reserved = m.pad;
     const std::wstring* trailing = nullptr;
-    if (!vm.status.performance_text.empty()) {
+    if (!vm.status.query_active && !vm.status.performance_text.empty()) {
         trailing = rect.right < 1100.0f * scale
             ? &vm.status.performance_compact_text : &vm.status.performance_text;
-    } else if (!vm.status.hint_text.empty()) {
+    } else if (!vm.status.query_active && !vm.status.hint_text.empty()) {
         trailing = &vm.status.hint_text;
     }
     if (trailing && factory && small_format) {
@@ -1061,10 +1020,26 @@ StatusBarMetrics MakeStatusBarMetrics(const WindowViewModel& vm, const D2D1_RECT
             MeasureTextWidth(factory, small_format, *trailing) + 16.0f * scale);
         m.right_reserved = perfWidth + m.pad;
     }
-    const bool has_task = !vm.status.task_text.empty() || vm.status.task_progress >= 0.0f;
+    if (vm.status.query_cancellable) {
+        const float width = 22.0f * scale;
+        m.cancel_search = D2D1::RectF(std::max(rect.left, rect.right - m.pad - width),
+            m.bar.top + 2.0f * scale, rect.right - m.pad, m.bar.bottom - 2.0f * scale);
+        m.right_reserved += width + 8.0f * scale;
+    }
+    const bool has_task = vm.status.query_active || !vm.status.task_text.empty() || vm.status.task_progress >= 0.0f;
     if (has_task) {
-        m.task = D2D1::RectF(rect.right * 0.48f, m.bar.top,
+        m.task = D2D1::RectF(rect.right * (vm.status.query_cancellable ? 0.40f : 0.48f), m.bar.top,
                              rect.right - m.right_reserved, m.bar.bottom);
+    }
+    if (vm.status.query_active) {
+        const float cancel_width = vm.status.query_cancellable ? 30.0f * scale : 0.0f;
+        const float width = std::min(std::max(0.0f, rect.right - rect.left - 2.0f * m.pad),
+            MeasureTextWidth(factory, small_format, vm.status.query_text) + 112.0f * scale + cancel_width);
+        const float left = (rect.left + rect.right - width) * 0.5f;
+        m.task = D2D1::RectF(left, m.bar.top, left + width - cancel_width, m.bar.bottom);
+        if (vm.status.query_cancellable)
+            m.cancel_search = D2D1::RectF(m.task.right + 8.0f * scale, m.bar.top + 2.0f * scale,
+                left + width, m.bar.bottom - 2.0f * scale);
     }
     return m;
 }
@@ -1212,6 +1187,13 @@ constexpr float kSettingsNavW = 200.0f;
 constexpr int kSettingsNavCount = 5;
 
 struct SettingsLayout {
+    D2D1_RECT_F context_cards[5]{}, context_header[5]{}, context_toggle[5]{}, context_empty[5]{}, context_restore{};
+    std::vector<D2D1_RECT_F> context_rows;
+    D2D1_RECT_F duplicate_options{};
+    D2D1_RECT_F section[4]{}, group[3]{}, footer{};
+    D2D1_RECT_F theme_row{}, theme_tile[3]{}, effect_choice{}, language_choice{};
+    D2D1_RECT_F performance_row{}, disclosure[2]{}, filename_status{};
+    D2D1_RECT_F content_header{}, content_types{}, content_pause{}, content_options{}, content_rebuild{}, content_empty{};
     D2D1_RECT_F body{};
     D2D1_RECT_F nav{};
     D2D1_RECT_F content{};
@@ -1235,6 +1217,9 @@ struct SettingsLayout {
     D2D1_RECT_F pinned_names_row{};
     D2D1_RECT_F blank_click_row{};
     D2D1_RECT_F change_tracking_row{}, change_days_row{}, change_days[3]{};
+    D2D1_RECT_F search_pinyin_row{};
+    D2D1_RECT_F global_search_row{}, global_search_hotkey_row{}, global_search_hotkey_button{};
+    D2D1_RECT_F content_index_row{};
     D2D1_RECT_F index_info{};
     D2D1_RECT_F index_status{};
     D2D1_RECT_F index_path{};
@@ -1282,19 +1267,21 @@ bool VisibleInContent(const D2D1_RECT_F& rc, const D2D1_RECT_F& content, float p
     return rc.bottom > content.top - pad && rc.top < content.bottom + pad;
 }
 
+#include "settings_layout_sections.h"
+
 SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& rect,
                                   float scale, float title_h, float status_h,
                                   const fluent::Painter* painter) {
     SettingsLayout l;
     l.body = D2D1::RectF(rect.left, title_h, rect.right, rect.bottom - status_h);
-    l.nav = D2D1::RectF(l.body.left, l.body.top, l.body.left + kSettingsNavW * scale, l.body.bottom);
+    const float nav_width = (rect.right - rect.left < 760 * scale ? 64.0f :
+        rect.right - rect.left < 1000 * scale ? 200.0f : 220.0f) * scale;
+    l.nav = D2D1::RectF(l.body.left, l.body.top, l.body.left + nav_width, l.body.bottom);
     l.content = D2D1::RectF(l.nav.right, l.body.top, l.body.right, l.body.bottom);
-    const float row_h = 40.0f * scale;
-    const float nav_pad = 12.0f * scale;
     for (int i = 0; i < kSettingsNavCount; ++i) {
-        const float y = l.nav.top + nav_pad + 8.0f * scale + i * (row_h + 4.0f * scale);
-        l.nav_row[i] = D2D1::RectF(l.nav.left + 8.0f * scale, y,
-                                   l.nav.right - 8.0f * scale, y + row_h);
+        const int position = i == 4 ? 3 : i;
+        const float top = i == 3 ? l.nav.bottom - 92*scale : l.nav.top + (20 + position*46)*scale;
+        l.nav_row[i] = D2D1::RectF(l.nav.left + 8*scale, top, l.nav.right - 8*scale, top + 40*scale);
     }
     const float pad = 20.0f * scale;
     auto label_btn_w = [&](std::wstring_view label) {
@@ -1306,101 +1293,27 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
     y += 36.0f * scale;
     y += 8.0f * scale;
     if (vm.settings_page == 0) {
-        y += 22.0f * scale;
-        y += 8.0f * scale;
-        const float radio_h = 36.0f * scale;
-        const float effect_header = 56.0f * scale;
-        const float card_left = l.content.left + pad;
-        const float card_right = l.content.right - pad;
-
-        const float picker = kBloomPickerDip * scale;
-        const float accent_h = 96.0f * scale;
-        l.accent_card = D2D1::RectF(card_left, y, card_right, y + accent_h);
-        l.accent_picker = D2D1::RectF(card_right - 16.0f * scale - picker,
-                                      y + (accent_h - picker) * 0.5f,
-                                      card_right - 16.0f * scale,
-                                      y + (accent_h + picker) * 0.5f);
-        y += accent_h + 12.0f * scale;
-
-        const float effect_h = effect_header + kWindowEffectCount * radio_h + 8.0f * scale;
-        l.effect_card = D2D1::RectF(card_left, y, card_right, y + effect_h);
-        for (int i = 0; i < kWindowEffectCount; ++i) {
-            const float ry = y + effect_header + static_cast<float>(i) * radio_h;
-            l.effect_row[i] = D2D1::RectF(card_left, ry, card_right, ry + radio_h);
-        }
-        y += effect_h + 12.0f * scale;
-
-        const float density_h = effect_header + 3 * radio_h + 8.0f * scale;
-        l.density_card = D2D1::RectF(card_left, y, card_right, y + density_h);
-        for (int i = 0; i < 3; ++i) {
-            const float ry = y + effect_header + static_cast<float>(i) * radio_h;
-            l.density_row[i] = D2D1::RectF(card_left, ry, card_right, ry + radio_h);
-        }
-        y += density_h + 12.0f * scale;
-
-        l.tray_icon_card = D2D1::RectF(card_left, y, card_right, y + density_h);
-        for (int i = 0; i < 3; ++i) {
-            const float ry = y + effect_header + static_cast<float>(i) * radio_h;
-            l.tray_icon_row[i] = D2D1::RectF(card_left, ry, card_right, ry + radio_h);
-        }
-        y += density_h + 12.0f * scale;
-
-        const float language_h = 112.0f * scale;
-        l.language_card = D2D1::RectF(card_left, y, card_right, y + language_h);
-        const float segment_left = card_left + 16.0f * scale;
-        const float segment_right = card_right - 16.0f * scale;
-        const float segment_w = (segment_right - segment_left) / 3.0f;
-        for (int i = 0; i < 3; ++i) {
-            l.language_segment[i] = D2D1::RectF(
-                segment_left + static_cast<float>(i) * segment_w, y + 66.0f * scale,
-                segment_left + static_cast<float>(i + 1) * segment_w, y + 98.0f * scale);
-        }
-        y += language_h + 12.0f * scale;
-
-        const bool compact_wallpaper = card_right - card_left < 620.0f * scale;
-        const float wall_h = (compact_wallpaper ? 132.0f : 88.0f) * scale;
-        l.wallpaper_card = D2D1::RectF(card_left, y, card_right, y + wall_h);
-        const float preview_w = 96.0f * scale;
-        const float preview_h = 56.0f * scale;
-        const float preview_top = compact_wallpaper ? y + 12.0f * scale
-                                                     : y + (wall_h - preview_h) * 0.5f;
-        l.wallpaper_preview = D2D1::RectF(card_left + 16.0f * scale, preview_top,
-                                          card_left + 16.0f * scale + preview_w,
-                                          preview_top + preview_h);
-        const float btn_h = 32.0f * scale;
-        const float btn_y = compact_wallpaper ? y + 88.0f * scale
-                                               : y + (wall_h - btn_h) * 0.5f;
-        const float clear_w = label_btn_w(pulse::l10n::Get(pulse::l10n::StringId::Clear));
-        const float choose_w = label_btn_w(pulse::l10n::Get(pulse::l10n::StringId::ChooseImage));
-        l.wallpaper_clear = D2D1::RectF(card_right - 16.0f * scale - clear_w, btn_y,
-                                        card_right - 16.0f * scale, btn_y + btn_h);
-        l.wallpaper_choose = D2D1::RectF(l.wallpaper_clear.left - 8.0f * scale - choose_w, btn_y,
-                                         l.wallpaper_clear.left - 8.0f * scale, btn_y + btn_h);
-        y += wall_h + 12.0f * scale;
-        l.hidden_files_row = D2D1::RectF(card_left, y, card_right, y + 56.0f * scale);
-        y += 68.0f * scale;
-        l.pinned_names_row = D2D1::RectF(card_left, y, card_right, y + 56.0f * scale);
-        y += 68.0f * scale;
-        l.blank_click_row = D2D1::RectF(card_left, y, card_right, y + 56.0f * scale);
-        y += 68.0f * scale;
-        l.change_tracking_row = D2D1::RectF(card_left, y, card_right, y + 56 * scale);
-        y += 68 * scale;
-        l.change_days_row = D2D1::RectF(card_left, y, card_right, y + 88 * scale);
-        const float segment = (card_right - card_left - 32 * scale) / 3;
-        for (int i = 0; i < 3; ++i) l.change_days[i] = D2D1::RectF(card_left + 16 * scale + i * segment, y + 42 * scale, card_left + 16 * scale + (i + 1) * segment, y + 78 * scale);
-        y += 108 * scale;
-
-        y += 22.0f * scale;
-        y += 8.0f * scale;
-        const float startup_h = 56.0f * scale;
-        for (int i = 0; i < 3; ++i) {
-            l.startup_row[i] = D2D1::RectF(card_left, y + static_cast<float>(i) * startup_h,
-                                           card_right, y + static_cast<float>(i + 1) * startup_h);
-        }
-        y += startup_h * 3 + 24.0f * scale;
+        y = LayoutSettingsGeneral(l, vm, scale, y, painter);
     } else if (vm.settings_page == 1) {
         const float card_left = l.content.left + pad;
         const float card_right = l.content.right - pad;
+        y += 30*scale;
+        l.section[0] = D2D1::RectF(card_left, y, card_right, y + 28*scale);
+        y += 30*scale;
+        l.global_search_row = D2D1::RectF(card_left, y, card_right, y + 88*scale);
+        y += 88*scale;
+        l.global_search_hotkey_row = D2D1::RectF(card_left, y, card_right, y + 108*scale);
+        l.global_search_hotkey_button = D2D1::RectF(card_left + 54*scale, y + 62*scale, card_right - 16*scale, y + 98*scale);
+        y += 108*scale;
+        l.search_pinyin_row = D2D1::RectF(card_left, y, card_right, y + 68*scale);
+        y += 68*scale;
+        l.filename_status = D2D1::RectF(card_left, y, card_right, y + 72*scale);
+        y += 72*scale;
+        l.disclosure[1] = D2D1::RectF(card_left, y, card_right, y + 64*scale);
+        y += 64*scale;
+        l.group[0] = D2D1::RectF(card_left, l.global_search_row.top, card_right, y);
+        y += 10*scale;
+        if (vm.settings_expanded & 2u) {
         l.index_info = D2D1::RectF(card_left, y, card_right, y + 58.0f * scale);
         y += 70.0f * scale;
         l.index_status = D2D1::RectF(card_left, y, card_right, y + 82.0f * scale);
@@ -1481,16 +1394,32 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         }
         if (vm.settings_network_roots.empty()) y += 44.0f * scale;
         y += 24.0f * scale;
+        }
+        y = LayoutSettingsContent(l, vm, scale, y, painter);
     } else if (vm.settings_page == 2) {
-        int counts[5] = {};
-        for (const auto& row : vm.settings_items) {
-            if (row.group >= 0 && row.group < 5) ++counts[row.group];
+        y += 30*scale;
+        l.context_rows.resize(vm.settings_items.size());
+        for(int g=0;g<5;++g) {
+            const float top=y;
+            l.context_header[g]=D2D1::RectF(l.content.left+pad,y,l.content.right-pad,y+76*scale);
+            l.context_toggle[g]=D2D1::RectF(l.content.right-pad-100*scale,y+20*scale,l.content.right-pad-56*scale,y+52*scale);
+            y+=76*scale;
+            if(vm.settings_expanded & (1u<<(g+8))) {
+                for(size_t i=0;i<vm.settings_items.size();++i) if(vm.settings_items[i].group==g) {
+                    l.context_rows[i]=D2D1::RectF(l.content.left+pad+12*scale,y,l.content.right-pad-12*scale,y+40*scale);
+                    y+=40*scale;
+                }
+                if(y==l.context_header[g].bottom) {
+                    l.context_empty[g]=D2D1::RectF(l.content.left+pad+16*scale,y,l.content.right-pad-16*scale,y+44*scale);
+                    y+=44*scale;
+                }
+                y+=8*scale;
+            }
+            l.context_cards[g]=D2D1::RectF(l.content.left+pad,top,l.content.right-pad,y);
+            y+=12*scale;
         }
-        for (int g = 0; g < 5; ++g) {
-            y += 56.0f * scale + 36.0f * scale + counts[g] * 36.0f * scale
-               + 8.0f * scale + 12.0f * scale;
-        }
-        y += 48.0f * scale;
+        l.context_restore=D2D1::RectF(l.content.left+pad,y,l.content.left+pad+label_btn_w(l10n::Get(l10n::StringId::RestoreDefaults)),y+32*scale);
+        y+=56*scale;
     } else if (vm.settings_page == 3) {
         const float card_left = l.content.left + pad;
         const float card_right = l.content.right - pad;
@@ -1559,7 +1488,8 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         const float gap = 8.0f * scale;
         const float inner = 16.0f * scale;
         const float btn_h = 32.0f * scale;
-        y += 28.0f * scale;
+        y += 40.0f * scale;
+        const float options_top=y-12*scale;
         const float scope_w = (card_right - card_left - inner * 2 - gap * 2) / 3.0f;
         for (int i = 0; i < 3; ++i) {
             const float left = card_left + inner + i * (scope_w + gap);
@@ -1600,6 +1530,7 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         l.dup_cancel = D2D1::RectF(l.dup_scan.right + gap, y,
                                    l.dup_scan.right + gap + cancel_w, y + btn_h);
         y += 48.0f * scale;
+        l.duplicate_options=D2D1::RectF(card_left,options_top,card_right,y);
         y += 36.0f * scale;
         if (vm.dup_show_progress) {
             l.dup_progress = D2D1::RectF(card_left, y, card_right, y + 72.0f * scale);
@@ -1665,7 +1596,8 @@ HitTestResult::Region StatusBarHitRegion(const WindowViewModel& vm, const D2D1_R
     IDWriteTextFormat* fmt = compositor ? compositor->SmallFormat() : nullptr;
     const StatusBarMetrics sb = MakeStatusBarMetrics(
         vm, rect, scale, status_height, factory, fmt);
-    return ContainsPt(sb.task, x, y) ? HitTestResult::StatusBarTask
+    if (vm.status.query_cancellable && ContainsPt(sb.cancel_search, x, y)) return HitTestResult::StatusBarCancelSearch;
+    return !vm.status.query_active && ContainsPt(sb.task, x, y) ? HitTestResult::StatusBarTask
                                     : HitTestResult::StatusBar;
 }
 
@@ -1757,6 +1689,7 @@ float TagStepForLeftover(int n, float diameter, float spread_gap, float leftover
 constexpr float kDetailsSnippetMinRowDip = 36.0f;
 
 bool DetailsShowsSnippet(const PaneViewModel& vm) {
+    if(vm.content_results && vm.view_mode == ViewMode::Details) return true;
     if (vm.view_mode != ViewMode::Details || !vm.search_snippets) return false;
     for (const auto& snippet : *vm.search_snippets) {
         if (!snippet.empty()) return true;
@@ -1816,13 +1749,34 @@ struct NameTrail {
     bool show_more = false;
 };
 
+float HighlightPaddingWidth(const std::wstring& name, const std::wstring& shown,
+                            const std::vector<NameMatchRange>& matches, float scale) {
+    return static_cast<float>(VisibleNameMatchRanges(name, shown, matches).size()) *
+        2.0f * kNameHighlightPaddingDip * scale;
+}
+
+std::wstring FitHighlightedFileName(Compositor* compositor, IDWriteFactory2* factory,
+                                   IDWriteTextFormat* fmt, const std::wstring& name, float budget,
+                                   const std::vector<NameMatchRange>& matches, float scale) {
+    float reserved = 0;
+    for (;;) {
+        const auto shown = FitFileName(compositor, factory, fmt, name, std::max(0.0f, budget - reserved));
+        const float required = HighlightPaddingWidth(name, shown, matches, scale);
+        if (required <= reserved) return shown;
+        // Reserve only visible matches. A newly split match across ellipsis may
+        // require one more iteration; the reservation grows monotonically.
+        reserved = required;
+    }
+}
+
 NameTrail LayoutNameTrail(float name_x, float text_y, float text_h,
                                  float col_right, float cell_top, float cell_bottom,
                                  float scale, const std::wstring& name, int tag_n,
                                  float badge_w,
                                  bool show_star, bool show_new_tab, bool show_more,
                                  Compositor* compositor, IDWriteFactory2* factory,
-                                 IDWriteTextFormat* fmt, bool change_badge = false, int action_slots = 0) {
+                                 IDWriteTextFormat* fmt, bool change_badge = false, int action_slots = 0,
+                                 const std::vector<NameMatchRange>& matches = {}) {
     NameTrail t;
     t.name_x = name_x;
     t.show_star = show_star;
@@ -1844,7 +1798,8 @@ NameTrail LayoutNameTrail(float name_x, float text_y, float text_h,
     bool reserve_actions = action_slots > 0 || (change_badge && badge_w > 0.0f);
     // Choose the action density from content, never hover state. Keep star and
     // more available; opening in a new tab is also in the more menu.
-    const float full_name_width = MeasureLayoutText(compositor, factory, fmt, name);
+    const float full_name_width = MeasureLayoutText(compositor, factory, fmt, name) +
+        HighlightPaddingWidth(name, name, matches, scale);
     const float content_width = full_name_width +
         badge_w + gap + (t.tag_n ? gap + OverlapTagsWidth(t.tag_n, diameter) : 0.0f);
     const bool compact_actions = action_slots == 2 || (reserve_actions &&
@@ -1886,8 +1841,9 @@ NameTrail LayoutNameTrail(float name_x, float text_y, float text_h,
     const float tags_gap = t.tag_n > 0 ? gap : 0.0f;
     const float budget = std::max(0.0f,
         dock - name_x - badge_gap - badge_w - tags_gap - tags_w);
-    const std::wstring fitted = FitFileName(compositor, factory, fmt, name, budget);
-    t.name_w = std::min(budget, MeasureLayoutText(compositor, factory, fmt, fitted));
+    const std::wstring fitted = FitHighlightedFileName(compositor, factory, fmt, name, budget, matches, scale);
+    t.name_w = std::min(budget, MeasureLayoutText(compositor, factory, fmt, fitted) +
+        HighlightPaddingWidth(name, fitted, matches, scale));
     float trail_x = name_x + t.name_w;
     if (badge_w > 0.0f && !change_badge) {
         trail_x += badge_gap;
@@ -1975,8 +1931,8 @@ ScrollbarMetrics ComputeScrollbar(float viewH, float totalH, float scrollY, floa
     ScrollbarMetrics m{};
     if (totalH <= viewH || viewH <= 0) return m;
     m.valid = true;
-    m.thumbH = std::max(rowH, viewH * (viewH / totalH));
-    m.thumbY = (scrollY / (totalH - viewH)) * (viewH - m.thumbH);
+    m.thumbH = std::min(viewH, std::max(rowH, viewH * (viewH / totalH)));
+    m.thumbY = std::clamp(scrollY / (totalH - viewH), 0.0f, 1.0f) * (viewH - m.thumbH);
     return m;
 }
 } // namespace

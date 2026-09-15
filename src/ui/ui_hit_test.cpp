@@ -167,6 +167,19 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             }
         }
         if (ContainsPt(lay.content, x, y)) {
+            for(int i=0;i<2;++i) if(ContainsPt(lay.disclosure[i],x,y)) {
+                r.region=HitTestResult::SettingsDisclosure;r.index=i;return r;
+            }
+            for(int i=0;i<3;++i) if(ContainsPt(lay.theme_tile[i],x,y)) {
+                const int values[]={1,2,0};r.region=HitTestResult::SettingsTheme;r.index=values[i];return r;
+            }
+            if(ContainsPt(lay.effect_choice,x,y) || ContainsPt(lay.language_choice,x,y)) {
+                r.region=HitTestResult::SettingsDropdown;r.index=ContainsPt(lay.effect_choice,x,y) ? 0 : 1;return r;
+            }
+            if(ContainsPt(lay.performance_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=4;return r;}
+            const D2D1_RECT_F actions[]={lay.content_pause,lay.content_options,lay.content_rebuild};
+            for(int i=0;i<3;++i) if(ContainsPt(actions[i],x,y)) {r.region=HitTestResult::SettingsContentAction;r.index=i+1;return r;}
+
             if (vm.settings_page == 0) {
                 if (vm.settings_bloom) {
                     vm.settings_bloom->SetDisk(lay.accent_picker);
@@ -244,6 +257,18 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     }
                 }
             } else if (vm.settings_page == 1) {
+                if (ContainsPt(lay.global_search_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 15; return r;
+                }
+                if (ContainsPt(lay.global_search_hotkey_button, x, y)) {
+                    r.region = HitTestResult::SettingsGlobalSearchHotkey; return r;
+                }
+                if (ContainsPt(lay.search_pinyin_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 9; return r;
+                }
+                if (ContainsPt(lay.content_index_row, x, y)) {
+                    r.region = HitTestResult::SettingsContentIndex; return r;
+                }
                 for (int i = 0; i < 3; ++i) {
                     if (ContainsPt(lay.index_action[i], x, y)) {
                         r.region = HitTestResult::SettingsIndexAction;
@@ -285,42 +310,14 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     }
                 }
             } else if (vm.settings_page == 2) {
-                const float pad = 20.0f * scale_;
-                float cy = lay.content_origin + pad + 44.0f * scale_;
-                cy += 30.0f * scale_;
-                for (int g = 0; g < 5; ++g) {
-                    size_t n = 0;
-                    for (const auto& row : vm.settings_items)
-                        if (row.group == g) ++n;
-                    const float header = 56.0f * scale_;
-                    const float desc = 36.0f * scale_;
-                    const float row_h = 36.0f * scale_;
-                    const float card_h = header + desc + n * row_h + 8.0f * scale_;
-                    const float card_left = lay.content.left + pad;
-                    const float card_right = lay.content.right - pad;
-                    if (x >= card_left && x < card_right && y >= cy && y < cy + header) {
-                        r.region = HitTestResult::SettingsToggle;
-                        r.index = 10 + g;
-                        return r;
-                    }
-                    float iy = cy + header + desc;
-                    for (size_t i = 0; i < vm.settings_items.size(); ++i) {
-                        if (vm.settings_items[i].group != g) continue;
-                        if (x >= card_left && x < card_right && y >= iy && y < iy + row_h) {
-                            r.region = HitTestResult::SettingsToggle;
-                            r.index = 100 + static_cast<int>(i);
-                            return r;
-                        }
-                        iy += row_h;
-                    }
-                    cy += card_h + 12.0f * scale_;
+                for(int g=0;g<5;++g) {
+                    if(ContainsPt(lay.context_toggle[g],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=10+g;return r;}
+                    if(ContainsPt(lay.context_header[g],x,y)) {r.region=HitTestResult::SettingsDisclosure;r.index=8+g;return r;}
                 }
-                const D2D1_RECT_F restore = D2D1::RectF(lay.content.left + pad, cy,
-                    lay.content.left + pad + 120.0f * scale_, cy + 32.0f * scale_);
-                if (ContainsPt(restore, x, y)) {
-                    r.region = HitTestResult::SettingsRestore;
-                    return r;
+                for(size_t i=0;i<lay.context_rows.size();++i) if(ContainsPt(lay.context_rows[i],x,y)) {
+                    r.region=HitTestResult::SettingsToggle;r.index=100+static_cast<int>(i);return r;
                 }
+                if(ContainsPt(lay.context_restore,x,y)) {r.region=HitTestResult::SettingsRestore;return r;}
             } else if (vm.settings_page == 3) {
                 if (ContainsPt(lay.diagnostics_perf, x, y)) {
                     r.region = HitTestResult::SettingsToggle;
@@ -432,7 +429,10 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             if (vm.address_searching) {
                 const auto layout = LayoutAddressSearch(addrRc, scale_);
                 if (x < layout.scope.right) r.region = HitTestResult::AddressSearchScope;
-                else if (x >= layout.close.left) r.region = HitTestResult::AddressSearchClose;
+                else if (x < layout.name.right) r.region = HitTestResult::AddressSearchMode;
+                else if (x < layout.content.right) r.region = HitTestResult::AddressSearchContent;
+                else if (layout.close.right > layout.close.left && x >= layout.close.left) r.region = HitTestResult::AddressSearchClose;
+                else if (x >= layout.options.left) r.region = HitTestResult::AddressSearchOptions;
                 else if (vm.address_search_has_text && layout.clear.right > layout.clear.left && x >= layout.clear.left)
                     r.region = HitTestResult::AddressSearchClear;
                 else r.region = HitTestResult::AddressBar;
@@ -692,6 +692,14 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             return out;
         }
         const float banner = PaneBannerHeight(paneVm, paneRc.right - paneRc.left, scale_, compositor_);
+        if (paneVm.is_content_search && banner > 0) {
+            const float action_width = std::min(144.0f * scale_, (paneRc.right - paneRc.left - 16 * scale_) * 0.4f);
+            if (x >= paneRc.right - 8 * scale_ - action_width && x < paneRc.right - 8 * scale_ &&
+                y >= paneRc.top + pane_header_height_ && y < paneRc.top + pane_header_height_ + banner - 4 * scale_) {
+                out.region = HitTestResult::ContentIndexManage;
+                return out;
+            }
+        }
         const float extra = PaneExtraTop(paneVm, scale_, paneRc.right - paneRc.left, compositor_);
         const float recentTop = paneRc.top + pane_header_height_ + banner;
         const float filterExtra = (paneVm.is_recent ? kRecentControlsDip * scale_ : 0.0f) +
@@ -740,6 +748,8 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                         paneRc, pane_header_height_ + banner, scale_, i, widths), x, y)) {
                     out.region = HitTestResult::SearchFilter;
                     out.index = i;
+                    out.control_bounds = SearchFilterRect(
+                        paneRc, pane_header_height_ + banner, scale_, i, widths);
                     return out;
                 }
             }
@@ -762,8 +772,8 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             out.region = HitTestResult::ColumnHeader;
             if (x < columns.DividerX(0)) out.column = SortColumn::Name;
             else if (paneVm.is_search && x < columns.DividerX(1)) {
-                // Path column header: not sortable.
-                out.region = HitTestResult::Pane;
+                if(paneVm.content_results) out.column=SortColumn::Path;
+                else out.region=HitTestResult::Pane;
                 return out;
             }
             else if (x < columns.DividerX(paneVm.is_search ? 2 : 1)) out.column = SortColumn::Mtime;
@@ -799,6 +809,10 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 return out;
             }
             int idx = ItemFromPointInPane(paneVm, paneRc, x, y);
+            if(idx>=0 && paneVm.content_results && !paneVm.content_results->Ready(static_cast<size_t>(idx))) {
+                paneVm.content_results->Prefetch(static_cast<size_t>(idx));
+                out.region=HitTestResult::Pane; return out;
+            }
             if (idx >= 0) {
                 if (idx != paneVm.rename_index) {
                     int viewRow = paneVm.ViewIndex(idx);
@@ -845,7 +859,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                             showActions, showActions && paneVm.hover_index == idx && entry.is_dir,
                             showActions && rowHot,
                             compositor_, compositor_->DwriteFactory(), compositor_->TextFormat(), change != nullptr,
-                            paneVm.view_mode == ViewMode::Details ? (entry.is_dir ? 3 : 2) : 0);
+                            paneVm.view_mode == ViewMode::Details ? (entry.is_dir ? 3 : 2) : 0,
+                            NameMatchRanges(entry.name, NameHighlightTerms(paneVm.filter_text,
+                                paneVm.is_search ? paneVm.search_query : L"")));
                         if (change && !grid && ContainsPt(trail.badge, x, y)) {
                             out.region = HitTestResult::ChangeBadge; out.index = idx; return out;
                         }

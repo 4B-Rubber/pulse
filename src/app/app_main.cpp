@@ -34,9 +34,11 @@
 #include "context_menu_prefs.h"
 #include "app_prefs.h"
 #include "saved_search.h"
+#include "search_query.h"
 #include "settings_controller.h"
 #include "single_instance_coordinator.h"
 #include "tray_controller.h"
+#include "global_search_controller.h"
 #include "tab_controller.h"
 #include "update_checker.h"
 #include "app_updates.h"
@@ -270,6 +272,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         ProbePinnedNetworks(*s);
         s->ctxMenuPrefs.Load();
         s->appPrefs.Load();
+        if (!s->shot.active && s->appPrefs.theme_mode >= 0) {
+            s->themeOverride = s->appPrefs.theme_mode == 1 ? ui::ThemeMode::Light :
+                s->appPrefs.theme_mode == 2 ? ui::ThemeMode::Dark : ui::ThemeMode::Auto;
+            s->darkMode = ui::ShouldUseDarkMode(s->themeOverride);
+        }
         s->searchHistory.persist = !s->shot.active && !s->menushot && !s->isolatedTest;
         if (s->searchHistory.persist) s->searchHistory.Load();
         s->showFps = s->forceStatusPerformance || s->appPrefs.show_status_performance;
@@ -307,12 +314,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->renderer.SetTrayIconDip(static_cast<float>(s->appPrefs.tray_icon_size));
         ApplyAccentFromPrefs(*s, true);
         ApplyAppWindowChrome(*s);
-        if (s->appPrefs.keep_running_on_close) s->tray_controller.SetVisible(true);
         s->index.Start(hwnd, WM_INDEX_NOTIFY, WM_INDEX_SEARCH);
         StartChangeTracking(*s);
         s->networkIndex.Start(hwnd, WM_NETWORK_INDEX_NOTIFY, WM_NETWORK_INDEX_SEARCH);
-        s->contentSearch.Start(hwnd, WM_CONTENT_SEARCH);
-        s->duplicateSearch.Start(hwnd, WM_DUPLICATE_SCAN);
+        s->contentSearch.Start(hwnd, WM_CONTENT_SEARCH, s->contentIndexObserver ? index::ContentAgentMode::Observer : index::ContentAgentMode::Instant);
+        s->duplicateSearch.Start(hwnd, WM_DUPLICATE_SCAN, false);
         s->settings.SetServiceInstalled(s->index.ServiceInstalled());
         app::SettingsController::UiCallbacks settings_callbacks;
         settings_callbacks.pick_image = [hwnd](std::wstring& path) {
@@ -399,6 +405,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         };
         s->settings.BindUi(s->appPrefs, s->ctxMenuPrefs, s->index,
                            s->networkIndex, std::move(settings_callbacks));
+        ApplyGlobalSearchSettings(*s);
 
         s->worker.Start([s](app::WorkResult res) { PostWorkerResult(*s, std::move(res)); });
         RequestRecycleOccupancy(*s);
@@ -506,7 +513,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->session_active_layout_tab,
                 [s](app::Tab& tab, const std::wstring& path) {
                     WarmupUnc(*s, path);
-                    StartLoadingPath(*s, tab, path);
+                    StartLoadingPath(*s, tab, path, PathLoadReason::RestoreSession);
                 });
             for (size_t i = 0; i < s->window_tabs.items.size(); ++i) {
                 app::RebuildLayoutRoot(*s->window_tabs.items[i]);
@@ -529,7 +536,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             startPath = ResolveOpenFolderPath(s->open_path);
         s->pane->NewTab(startPath);
         if (s->shot.active) s->pane->ActiveTab()->view_mode = s->shot.view_mode;
-        StartLoadingPath(*s, *s->pane->ActiveTab(), startPath);
+        StartLoadingPath(*s, *s->pane->ActiveTab(), startPath,
+            !s->shot.active && !s->session_path.empty()
+                ? PathLoadReason::RestoreSession : PathLoadReason::Navigate);
         RememberPath(*s, startPath);
         }
 
@@ -656,7 +665,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         if (wParam == HTCLOSE) {
-            if (s->appPrefs.keep_running_on_close) s->tray_controller.HideWindow();
+            SuspendContentSearches(*s);
+            s->globalSearchWindow.Hide();
+            if (s->appPrefs.keep_running_on_close || s->appPrefs.global_search_enabled) s->tray_controller.HideWindow();
             else DestroyWindow(hwnd);
             return 0;
         }
@@ -664,7 +675,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_CLOSE: {
-        if (s && s->appPrefs.keep_running_on_close) {
+        if (s) { SuspendContentSearches(*s); s->globalSearchWindow.Hide(); }
+        if (s && (s->appPrefs.keep_running_on_close || s->appPrefs.global_search_enabled)) {
             s->tray_controller.HideWindow();
             return 0;
         }
@@ -796,9 +808,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 dirty = true;
             }
             if (TickAddressSearch(*s, now)) dirty = true;
+            if (RefreshContentResults(*s)) dirty = true;
             const int shell_refreshes = s->context_menu.ConsumeDueRefreshes(now);
             for (int i = 0; i < shell_refreshes; ++i) {
-                RefreshActiveTab(*s);
+                RefreshActiveTab(*s, RefreshReason::ShellNotification);
                 dirty = true;
             }
             if (PumpRecycleRefresh(*s, now)) dirty = true;
@@ -935,11 +948,17 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
-        if (hit.region == ui::HitTestResult::AddressBar || s->addressEditing) {
+        if (hit.region == ui::HitTestResult::AddressSearchMode ||
+            hit.region == ui::HitTestResult::AddressSearchContent ||
+            hit.region == ui::HitTestResult::AddressSearchOptions) {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+        if (hit.region == ui::HitTestResult::AddressBar) {
             SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
             return TRUE;
         }
-        if (hit.region == ui::HitTestResult::StatusBarTask) {
+        if (hit.region == ui::HitTestResult::StatusBarTask || hit.region == ui::HitTestResult::StatusBarCancelSearch) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
@@ -990,7 +1009,18 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s && HandleBrowserNavigation(*s, lParam)) return TRUE;
         break;
 
+    case WM_HOTKEY:
+        if (s && wParam == GlobalSearchHotkey::kId) {
+            if (s->settings.global_search_hotkey_capturing() && IsSettingsTab(ActiveTab(*s))) {
+                s->settings.CaptureGlobalSearchHotkey(HIWORD(lParam), LOWORD(lParam));
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else ToggleGlobalSearch(*s);
+            return 0;
+        }
+        break;
+
     case WM_SYSKEYDOWN:
+        if (s && HandleGlobalSearchHotkeyCapture(*s, static_cast<UINT>(wParam))) return 0;
         if (s && wParam == L'D' && (GetKeyState(VK_MENU) & 0x8000)) {
             ShowOmnibar(*s, OmnibarMode::Path);
             return 0;
@@ -998,6 +1028,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         break;
 
     case WM_KEYDOWN:
+        if (s && HandleGlobalSearchHotkeyCapture(*s, static_cast<UINT>(wParam))) return 0;
         if (s && wParam == VK_ESCAPE && s->detailsPreviewPanning) {
             s->detailsPreviewPanning = false;
             s->renderer.EndDetailsPreviewPan();
@@ -1049,7 +1080,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             UpdateOperationWindow(*s, true);
             if (s->ops.TakeCtxInvokeDone()) {
                 if (app::Tab* tab = ActiveTab(*s)) s->store.MarkDirty(tab->current_path);
-                RefreshActiveTab(*s);
+                RefreshActiveTab(*s, RefreshReason::ShellNotification);
                 ScheduleRecycleRefresh(*s);
                 RefreshRecycleViews(*s, false);
             }
@@ -1147,7 +1178,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 app::Tab* tab = ActiveTab(*s);
                 if (tab) {
                     s->store.MarkDirty(tab->current_path);
-                    RefreshActiveTab(*s);
+                    RefreshActiveTab(*s, RefreshReason::OperationCompleted);
                 }
             }
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -1231,7 +1262,23 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_INDEX_NOTIFY: {
-        if (s) InvalidateRect(hwnd, nullptr, FALSE);
+        if (s) {
+            const bool ready = s->index.PinyinReady();
+            if (ready && !s->pinyinReadyLast && s->appPrefs.search_pinyin) {
+                ForEachPane(*s, [&](app::Pane& pane) {
+                    auto* tab = pane.ActiveTab();
+                    std::wstring kind, rest;
+                    if (!tab || !app::ParsePulsePath(tab->current_path, &kind, &rest) ||
+                        kind != L"search" || app::SplitSearchQueryText(rest).content.present()) return;
+                    if (tab->snapshot && tab->selected_index >= 0 &&
+                        static_cast<size_t>(tab->selected_index) < tab->EntryCount())
+                        tab->search_preserve_selection = tab->EntryAt(static_cast<size_t>(tab->selected_index)).full_path;
+                    RequestSearchPage(*s, *tab, rest, true);
+                });
+            }
+            s->pinyinReadyLast = ready;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
     }
 
@@ -1298,11 +1345,15 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s) InstallUpdate(*s);
         return 0;
 
+    case WM_CONTENT_SELECTION:
+        if(s) CompleteContentSelection(*s);
+        return 0;
     case WM_CONTENT_SEARCH: {
         if (!s) return 0;
         index::ContentSearchUpdate update;
         while (s->contentSearch.TakeUpdate(update))
             ApplyContentSearchUpdate(*s, std::move(update));
+        RefreshContentResults(*s);
         return 0;
     }
 
@@ -1333,7 +1384,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_NET_PROBE: {
         auto* result = reinterpret_cast<fs::UncProbeResult*>(lParam);
         if (s && result) {
-            s->probeBusy = false;
+            const bool completed_current_probe = s->probe_scheduler.Finish(result->probe_id);
+            if (completed_current_probe) s->probeUnc.clear();
             s->places.SetNetworkStatus(result->unc, result->status, result->rtt_ms);
             if (result->status == fs::NetStatus::Offline) {
                 ForEachPane(*s, [&](app::Pane& pane) {
@@ -1345,8 +1397,18 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         tab->banner_message = l10n::Get(l10n::StringId::OfflineSnapshot);
                     }
                 });
+            } else {
+                ForEachPane(*s, [&](app::Pane& pane) {
+                    app::Tab* tab = pane.ActiveTab();
+                    if (!tab || tab->current_path != result->unc) return;
+                    tab->net_readonly = false;
+                    if (tab->banner_title == l10n::Get(l10n::StringId::Offline)) {
+                        tab->banner_title.clear();
+                        tab->banner_message.clear();
+                    }
+                });
             }
-            PumpUncProbe(*s);
+            if (completed_current_probe) PumpUncProbe(*s);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         delete result;
@@ -1393,6 +1455,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_DESTROY: {
         if (s) {
+            ShutdownGlobalSearch(*s);
             StopShellRegistryWatch();
             s->watches.Stop();
             s->settings.ResetUi();
@@ -1661,6 +1724,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     state.safeMode = pulse::crash::SafeModeRequested();
     for (int i = 1; i < __argc; ++i)
         if (wcscmp(__wargv[i], L"--test-instance") == 0) state.isolatedTest = true;
+    for (int i = 1; i < __argc; ++i)
+        if (state.isolatedTest && wcscmp(__wargv[i], L"--content-index-observer") == 0) state.contentIndexObserver = true;
 
 #ifdef PULSE_WITH_SELFTEST
     // Optional headless suite: excluded from production builds together with
@@ -1749,7 +1814,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         } else if (wcscmp(__wargv[i], L"--light") == 0) {
             state.shot.force_dark = false;
             state.themeOverride = ui::ThemeMode::Light;
-        } else if (wcscmp(__wargv[i], L"--test-instance") == 0) {
+        } else if (wcscmp(__wargv[i], L"--test-instance") == 0 || wcscmp(__wargv[i], L"--content-index-observer") == 0) {
             continue;
         } else if (wcscmp(__wargv[i], L"--fps") == 0) {
             state.forceStatusPerformance = true;
@@ -1902,6 +1967,47 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
 
     if (state.shot.active) {
+        wchar_t settings_fixture[32]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SETTINGS_EXPANDED",settings_fixture,ARRAYSIZE(settings_fixture)))
+            state.settingsExpanded=static_cast<unsigned>(wcstoul(settings_fixture,nullptr,10)) & 0x1f03u;
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SETTINGS_SCROLL",settings_fixture,ARRAYSIZE(settings_fixture))) {
+            auto vm=BuildVm(state,false);
+            state.settings.SetScroll(static_cast<float>(_wtof(settings_fixture))*state.scale,
+                state.renderer.SettingsMaxScroll(vm,static_cast<float>(state.compositor.Width()),static_cast<float>(state.compositor.Height())));
+        }
+        wchar_t panel_shot[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_OPTIONS_SHOT", panel_shot, ARRAYSIZE(panel_shot))) {
+            ShowAddressSearch(state);
+            ShowSearchOptions(state);
+        }
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_HISTORY_SHOT", panel_shot, ARRAYSIZE(panel_shot))) {
+            state.searchHistory.Record(L"setup-dia", app::MakeSearchPath(L"setup-dia"));
+            state.searchHistory.Record(L"项目预算", app::MakeSearchPath(L"content:项目预算"));
+            ShowAddressSearch(state);
+            ShowAddressSearchHistory(state);
+        }
+#ifdef PULSE_WITH_SELFTEST
+        wchar_t settings_interactions[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SETTINGS_INTERACTIONS",settings_interactions,ARRAYSIZE(settings_interactions))) {
+            extern int RunSettingsInteractionTest(AppState&,const wchar_t*);
+            const int result=RunSettingsInteractionTest(state,settings_interactions);
+            DestroyWindow(hwnd);OleUninitialize();return result;
+        }
+        wchar_t settings_flow[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SETTINGS_FLOW",settings_flow,ARRAYSIZE(settings_flow))) {
+            extern int RunSettingsFlowTest(AppState&,const wchar_t*);
+            const int result=RunSettingsFlowTest(state,settings_flow);
+            DestroyWindow(hwnd);OleUninitialize();return result;
+        }
+        wchar_t flow_output[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SEARCH_FLOW", flow_output, ARRAYSIZE(flow_output))) {
+            extern int RunSearchFlowTest(AppState&, const wchar_t*);
+            const int result = RunSearchFlowTest(state, flow_output);
+            DestroyWindow(hwnd);
+            OleUninitialize();
+            return result;
+        }
+#endif
         if (state.shot_tray) {
             // Stage a few real files from the shot folder so the deck is
             // visible in the verification screenshot. Drop any restored

@@ -79,6 +79,7 @@ namespace {
 
 bool DisplayEqualItem(const FluentMenuItem& a, const FluentMenuItem& b) {
     if (a.text != b.text || a.enabled != b.enabled ||
+        a.toggle != b.toggle || a.secondary != b.secondary || a.checked != b.checked ||
         a.shortcut_inline != b.shortcut_inline || a.shortcut != b.shortcut ||
         a.separator_after != b.separator_after || a.tooltip != b.tooltip ||
         (a.trailing_command != 0) != (b.trailing_command != 0) ||
@@ -140,6 +141,7 @@ void FluentMenuModel::Layout(IDWriteFactory2* dwrite, float scale, float min_wid
             inline_label_width_ = std::max(inline_label_width_, text_w);
         float w = radio_col + left_chrome + text_w + right_chrome;
         if (it.trailing_command) w += 32.0f * scale_;
+        if (it.toggle) w += 52.0f * scale_;
         if (!it.children.empty()) {
             w += 26.0f * scale_; // 22px chevron column + 4px gap
         } else if (!it.badge_text.empty()) {
@@ -368,7 +370,15 @@ void FluentMenu::LayoutWindow(POINT screen_pt) {
     }
     int x = screen_pt.x;
     int y = screen_pt.y;
-    if (anchor_to_rect_) {
+    if (dropdown_) {
+        const int gap = static_cast<int>(std::lround(4 * scale_));
+        x = dropdown_rect_.left - kShadowMargin;
+        y = dropdown_rect_.bottom + gap - kShadowMargin;
+        if (y + h > mi.rcWork.bottom)
+            y = dropdown_rect_.top - gap + kShadowMargin - h;
+        x = std::max<int>(mi.rcWork.left, std::min<int>(x, mi.rcWork.right - w));
+        y = std::max<int>(mi.rcWork.top, std::min<int>(y, mi.rcWork.bottom - h));
+    } else if (anchor_to_rect_) {
         x = anchor_rect_.left - kShadowMargin;
         y = (external_edit_ ? anchor_rect_.bottom + static_cast<int>(4 * scale_) : anchor_rect_.top) - kShadowMargin;
         if (x + w > mi.rcWork.right) x = (std::max)(mi.rcWork.left, mi.rcWork.right - w);
@@ -519,6 +529,8 @@ bool FluentMenu::RenderSurface(const FluentMenuModel& model, int hover_row, int 
             spec.separator_after = it->separator_after;
             spec.has_swatch = it->has_swatch;
             spec.checked = it->checked;
+            spec.toggle = it->toggle;
+            spec.secondary = it->secondary;
             spec.mixed = it->mixed;
             spec.radio = it->radio;
             spec.radio_group = it->radio_group;
@@ -1361,9 +1373,18 @@ int FluentMenu::RunModalLoop() {
     return result_;
 }
 
+int FluentMenu::TrackDropdown(RECT control_rect, std::vector<FluentMenuItem> items) {
+    SetDropdownRect(control_rect);
+    for (auto& item : items) {
+        if (item.checked) item.glyph = L"\xE73E";
+    }
+    return TrackPopup({control_rect.left, control_rect.bottom}, std::move(items));
+}
+
 int FluentMenu::TrackPopup(POINT screen_pt, std::vector<FluentMenuItem> items,
                            FilterFn filter, bool top_center) {
     if (!EnsureWindow()) {
+        dropdown_ = false;
         external_edit_ = nullptr;
         max_visible_rows_ = 0;
         return 0;
@@ -1379,12 +1400,14 @@ int FluentMenu::TrackPopup(POINT screen_pt, std::vector<FluentMenuItem> items,
     scroll_y_ = 0.0f;
     body_limit_px_ = 0.0f;
     if (items.empty() && !filter_fn_) {
+        dropdown_ = false;
         external_edit_ = nullptr;
         max_visible_rows_ = 0;
         return 0;
     }
     const float minW = filter_fn_
-        ? (filter_min_width_ > 0.0f ? filter_min_width_ : 440.0f) * scale_ : 0.0f;
+        ? (filter_min_width_ > 0.0f ? filter_min_width_ : 440.0f) * scale_
+        : dropdown_ ? static_cast<float>(dropdown_rect_.right - dropdown_rect_.left) : 0.0f;
     model_.SetItems(std::move(items));
     model_.Layout(compositor_->DwriteFactory(), scale_, minW);
     hover_row_ = hover_first_on_open_ ? model_.FirstEnabled() : -1;
@@ -1397,6 +1420,7 @@ int FluentMenu::TrackPopup(POINT screen_pt, std::vector<FluentMenuItem> items,
         max_visible_rows_ = 0;
         ShowWindow(hwnd_, SW_HIDE);
         anchor_to_rect_ = false;
+        dropdown_ = false;
         hover_first_on_open_ = true;
         select_all_on_open_ = true;
         return 0;
@@ -1432,6 +1456,7 @@ int FluentMenu::TrackPopup(POINT screen_pt, std::vector<FluentMenuItem> items,
     max_visible_rows_ = 0;
     scroll_y_ = 0.0f;
     anchor_to_rect_ = false;
+    dropdown_ = false;
     hover_first_on_open_ = true;
     select_all_on_open_ = true;
     // Queue only after the modal loop has unwound, avoiding nested tab changes.
@@ -1484,7 +1509,8 @@ bool FluentMenu::SaveDebugSnapshot(const wchar_t* png_path,
                                    std::vector<FluentMenuItem> items, int hover_row) {
     if (!compositor_ || items.empty()) return false;
     model_.SetItems(std::move(items));
-    model_.Layout(compositor_->DwriteFactory(), scale_, filter_min_width_ * scale_);
+    model_.Layout(compositor_->DwriteFactory(), scale_, dropdown_
+        ? static_cast<float>(dropdown_rect_.right - dropdown_rect_.left) : filter_min_width_ * scale_);
     hover_row_ = hover_row;
     hover_swatch_ = -1;
     if (!Render()) return false;

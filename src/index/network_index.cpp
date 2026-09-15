@@ -1,6 +1,7 @@
 #include "network_index.h"
 #include "index_config.h"
 #include "index_query.h"
+#include "../common/utf8_file.h"
 #include "../common/json_utils.h"
 #include <algorithm>
 #include <chrono>
@@ -58,40 +59,6 @@ std::wstring Win32Message(DWORD code) {
         LocalFree(message);
     }
     return out;
-}
-
-bool DecodeUtf8(const std::vector<uint8_t>& bytes, std::wstring& text) {
-    size_t offset = 0;
-    if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
-        offset = 3;
-    if (offset == bytes.size()) {
-        text.clear();
-        return true;
-    }
-    const int byte_count = static_cast<int>(bytes.size() - offset);
-    const int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                           reinterpret_cast<const char*>(bytes.data() + offset),
-                                           byte_count, nullptr, 0);
-    if (chars <= 0) return false;
-    text.resize(static_cast<size_t>(chars));
-    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                               reinterpret_cast<const char*>(bytes.data() + offset), byte_count,
-                               text.data(), chars) == chars;
-}
-
-bool EncodeUtf8(const std::wstring& text, std::vector<uint8_t>& bytes) {
-    if (text.empty()) {
-        bytes.clear();
-        return true;
-    }
-    const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
-                                         static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-    if (size <= 0) return false;
-    bytes.resize(static_cast<size_t>(size));
-    return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
-                               static_cast<int>(text.size()),
-                               reinterpret_cast<char*>(bytes.data()), size,
-                               nullptr, nullptr) == size;
 }
 
 bool ReadBytes(const std::wstring& path, std::vector<uint8_t>& bytes, std::wstring* error) {
@@ -554,7 +521,7 @@ bool LoadNetworkRootsFile(const std::wstring& path, std::vector<std::wstring>& r
     std::vector<uint8_t> bytes;
     if (!ReadBytes(path, bytes, error)) return false;
     std::wstring json;
-    if (!DecodeUtf8(bytes, json)) {
+    if (!pulse::DecodeUtf8Bytes(bytes, json)) {
         SetError(error, L"网络索引配置不是有效的 UTF-8 文件");
         return false;
     }
@@ -593,7 +560,7 @@ bool SaveNetworkRootsFile(const std::wstring& path, const std::vector<std::wstri
     if (!roots.empty()) json += L"\n  ";
     json += L"]\n}\n";
     std::vector<uint8_t> bytes;
-    if (!EncodeUtf8(json, bytes)) {
+    if (!pulse::EncodeUtf8Bytes(json, bytes)) {
         SetError(error, L"无法将网络索引配置编码为 UTF-8");
         return false;
     }
@@ -960,7 +927,7 @@ void NetworkIndex::CrawlLoop() {
     auto next_reconcile = std::chrono::steady_clock::now() + kReconcileInterval;
     while (running_) {
         SeedPendingChanges();
-        changes_.Flush();
+        changes_.Flush(false);
         std::vector<std::wstring> work;
         uint64_t generation = 0;
         {

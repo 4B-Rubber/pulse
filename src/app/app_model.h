@@ -5,6 +5,8 @@
 #include "../fs/fs_snapshot.h"
 #include "../ui/ui_renderer.h"
 #include "places.h"
+#include "../index/content_result_store.h"
+#include <map>
 #include <memory>
 #include <array>
 #include <string>
@@ -12,9 +14,11 @@
 #include <utility>
 #include <vector>
 #include <stack>
+#include <optional>
 #include <cstdint>
 #include <unordered_set>
 
+namespace pulse { struct ContentSizeSummary; struct ContentSelectionRestore; }
 namespace pulse::app {
 
 // When navigating from a descendant to one of its ancestors, returns the
@@ -27,6 +31,9 @@ struct Tab {
     std::wstring current_path;
     std::stack<std::wstring> back_stack;
     std::stack<std::wstring> forward_stack;
+    // Search origins belong to history entries, not to query strings.
+    std::stack<std::optional<std::wstring>> back_search_origins;
+    std::stack<std::optional<std::wstring>> forward_search_origins;
 
     int selected_index = -1;
     int selection_anchor = -1;
@@ -67,17 +74,47 @@ struct Tab {
     bool pending_ensure_selection_visible = false;
     std::wstring git_root;
     std::shared_ptr<std::vector<fs::DirEntry>> search_entries;
+    std::shared_ptr<index::ContentResultStore> content_results;
+    uint64_t content_revision = 0;
+    bool content_count_final = false;
+    DWORD content_scan_error = ERROR_SUCCESS;
+    DWORD content_subscription_error = ERROR_SUCCESS;
+    index::ContentSubscriptionFailure content_subscription_failure = index::ContentSubscriptionFailure::None;
+    bool content_sort_override = false;
+    uint64_t content_scanned_files = 0;
+    uint64_t content_total_files = 0;
+    std::shared_ptr<ContentSelectionRestore> content_selection_restore;
+    uint64_t selection_revision = 0;
+    std::shared_ptr<ContentSizeSummary> content_size_summary;
+    std::wstring content_filter;
+    // Explicit bulk actions resolve off-page selections asynchronously. These
+    // rows are pinned only for the duration of the action, not for browsing.
+    std::map<size_t,index::ContentResultStore::Row> content_action_rows;
+    bool content_action_ready = false;
+    size_t content_action_count = 0;
+    size_t EntryCount() const { if(content_action_ready && all_selected) return content_action_count; return content_results ? content_results->Count() : snapshot ? snapshot->size() : 0; }
+    fs::DirEntry EntryAt(size_t index) const;
     size_t search_total = 0;
     size_t search_next_offset = 0;
     size_t pending_search_offset = 0;
     bool search_loading_more = false;
     bool search_awaiting_content = false;
     bool search_content_active = false;
+    bool search_content_stopped = false;
+    uint64_t search_index_revision = 0;
+    uint64_t search_session_id = 0;
+    uint64_t search_live_generation = 0;
+    uint64_t filename_live_generation = 0;
     std::shared_ptr<std::vector<std::wstring>> search_snippets;
     std::wstring search_input_path;
     std::wstring search_input_text;
     std::wstring search_input_root;
     bool search_input_current = false;
+    bool search_input_content = false;
+    bool search_content_empty = false;
+    bool search_relevance = true;
+    bool search_allow_scan = false;
+    std::wstring search_preserve_selection;
     std::wstring search_origin_path;
     bool search_origin_valid = false;
     bool search_retaining_results = false;
@@ -122,6 +159,7 @@ struct Tab {
 
 bool NameMatchesPattern(std::wstring_view name, std::wstring_view needle);
 void CollectFilterMatches(const Tab& tab, const PlacesCatalog* places, std::vector<int>& out);
+index::ContentResultStore::Filter ContentFilter(const std::wstring& text, const PlacesCatalog& places);
 
 // A browser-style tab group: named, colored; window tabs join via LayoutTab::tab_group.
 struct TabGroup {

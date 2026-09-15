@@ -236,6 +236,7 @@ std::wstring CompileSearchQuery(const AdvancedSearchSpec& spec) {
     }
     if (spec.whole_word) append(L"ww:");
     if (spec.case_sensitive) append(L"case:");
+    if (!spec.pinyin_enabled) append(L"nopinyin:");
     return q;
 }
 
@@ -243,6 +244,7 @@ AdvancedSearchSpec ParseSearchQuery(std::wstring_view raw, std::wstring_view cur
     AdvancedSearchSpec spec;
     spec.current_folder = path::StripExtendedPathPrefix(current_folder);
     const auto compiled = index::ParseQuery(raw);
+    spec.pinyin_enabled = compiled.pinyin_enabled;
     spec.content_mode = compiled.content.mode;
     spec.whole_word = compiled.content.whole_word;
     spec.case_sensitive = compiled.content.case_sensitive;

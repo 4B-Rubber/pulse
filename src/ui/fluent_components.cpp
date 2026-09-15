@@ -1032,11 +1032,13 @@ void Painter::DrawSwitch(const D2D1_RECT_F& bounds, std::wstring_view text,
     if (!theme_ || !compositor_) {
         return;
     }
-    const float switch_width = Px(42.0f);
-    const float switch_height = Px(22.0f);
-    const float top = bounds.top + (Height(bounds) - switch_height) * 0.5f;
-    const auto track = D2D1::RectF(bounds.left, top, bounds.left + switch_width,
-                                  top + switch_height);
+    // This renderer uses device-pixel coordinates. Align the outer silhouette
+    // before insetting the stroke so fractional DPI/scroll offsets do not blur it.
+    const float switch_width = std::round(Px(42.0f));
+    const float switch_height = std::round(Px(22.0f));
+    const float top = std::round(bounds.top + (Height(bounds) - switch_height) * 0.5f);
+    const float left = std::round(bounds.left);
+    const auto track = D2D1::RectF(left, top, left + switch_width, top + switch_height);
     D2D1_COLOR_F fill;
     D2D1_COLOR_F border;
     D2D1_COLOR_F knob;
@@ -1068,14 +1070,17 @@ void Painter::DrawSwitch(const D2D1_RECT_F& bounds, std::wstring_view text,
         border = state.enabled ? Rgba(0x000000, 133) : Rgba(0x000000, 56);
         knob = state.enabled ? Rgba(0x000000, 156) : Rgba(0x000000, 91);
     }
-    const auto painted_track = Inset(track, Px(1.0f));
-    FillRoundedRect(painted_track, switch_height * 0.5f, fill);
-    StrokeRoundedRect(painted_track, switch_height * 0.5f, border);
+    const float stroke = std::max(1.0f, std::round(Px(1.0f)));
+    const auto painted_track = Inset(track, stroke);
+    const float radius = Height(painted_track) * 0.5f;
+    FillRoundedRect(painted_track, radius, fill);
+    StrokeRoundedRect(painted_track, radius - stroke * 0.5f, border, stroke);
     const float position = state.check_progress < 0.0f
                                ? (state.checked ? 1.0f : 0.0f)
                                : Clamp01(state.check_progress);
     const float knob_radius = Px(6.0f);
-    const float knob_x = track.left + Px(11.0f) + Px(20.0f) * position;
+    const float knob_x = painted_track.left + radius +
+        (Width(painted_track) - 2.0f * radius) * position;
     dc_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob_x, top + switch_height * 0.5f),
                                    knob_radius, knob_radius),
                      ScratchBrush(knob));
@@ -1226,11 +1231,19 @@ void Painter::DrawMenuItem(const MenuItemSpec& spec) {
     if (spec.state.enabled && spec.state.pressed) {
         foreground = MultiplyAlpha(foreground, 0.70f);
     }
+    if (spec.secondary && spec.state.enabled) foreground = theme_->text_secondary;
     // Menu padding is horizontal. Applying it vertically as well leaves only
     // 8-12 px for a 13 px body font at common DPI scales and clips CJK glyphs.
     auto content = item;
     content.left += spec.radio_group ? Px(4.0f) : Px(10.0f);
     content.right -= Px(10.0f);
+    if (spec.toggle) {
+        auto state = spec.state;
+        state.checked = spec.checked;
+        const float middle = (content.top + content.bottom) * 0.5f;
+        DrawSwitch(D2D1::RectF(content.right - Px(40.0f), middle - Px(10.0f), content.right, middle + Px(10.0f)), L"", state);
+        content.right -= Px(52.0f);
+    }
     if (spec.radio_group) {
         const float radio_col = Px(12.0f);
         if (spec.radio) {
@@ -1750,6 +1763,7 @@ void Painter::DrawSplitter(const SplitterSpec& spec) {
     if (!theme_ || !dc_ || Width(spec.bounds) <= 0.0f || Height(spec.bounds) <= 0.0f) {
         return;
     }
+    if (!spec.state.hovered && !spec.state.pressed) return;
 
     const float cx = (spec.bounds.left + spec.bounds.right) * 0.5f;
     const float cy = (spec.bounds.top + spec.bounds.bottom) * 0.5f;
@@ -2536,7 +2550,7 @@ void Painter::DrawInfoBar(const InfoBarSpec& spec) {
         FillRoundedRect(glyph_bounds, Px(14.0f), icon_fill);
     }
     DrawGlyph(spec.glyph.empty() ? fallback_glyph : spec.glyph, glyph_bounds, accent);
-    const float close_space = spec.show_close ? Px(30.0f + spec.close_inset) : Px(8.0f);
+    const float close_space = (spec.show_close ? Px(30.0f + spec.close_inset) : Px(8.0f)) + Px(spec.trailing_width);
     const auto text_bounds = D2D1::RectF(glyph_bounds.right + Px(10.0f), spec.bounds.top,
                                          spec.bounds.right - close_space, spec.bounds.bottom);
     if (stacked) {
@@ -2552,15 +2566,20 @@ void Painter::DrawInfoBar(const InfoBarSpec& spec) {
                                 layout.get(), ScratchBrush(theme_->text_secondary), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     } else {
-    const float title_width = std::min(Px(150.0f), Width(text_bounds) * 0.36f);
-    DrawText(spec.title,
-             D2D1::RectF(text_bounds.left, text_bounds.top,
-                        text_bounds.left + title_width, text_bounds.bottom),
-             BodyFormat(), theme_->text);
-    DrawText(spec.message,
-             D2D1::RectF(text_bounds.left + title_width, text_bounds.top,
-                        text_bounds.right, text_bounds.bottom),
-             CaptionFormat(), theme_->text_secondary);
+        const float measured_title = MeasureTextWidth(compositor_, BodyFormat(), spec.title);
+        const bool show_message = !spec.message.empty() &&
+            measured_title + Px(12.0f + 120.0f) <= Width(text_bounds);
+        const float title_width = show_message ? measured_title : Width(text_bounds);
+        DrawText(spec.title,
+                 D2D1::RectF(text_bounds.left, text_bounds.top,
+                            text_bounds.left + title_width, text_bounds.bottom),
+                 BodyFormat(), theme_->text);
+        if (show_message) {
+            DrawText(spec.message,
+                     D2D1::RectF(text_bounds.left + title_width + Px(12.0f), text_bounds.top,
+                                text_bounds.right, text_bounds.bottom),
+                     CaptionFormat(), theme_->text_secondary);
+        }
     }
     if (spec.show_close) {
         const float close_right = spec.bounds.right - Px(spec.close_inset);

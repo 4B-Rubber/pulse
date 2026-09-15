@@ -40,6 +40,10 @@ int main() {
             complete &= !Get(static_cast<StringId>(id)).empty();
         }
         passed &= Report("audited menus dialogs and status strings are present", complete);
+        bool search_complete = true;
+        for (UINT id = IDS_SEARCH_ENH_0; id <= IDS_SEARCH_UI_1839; ++id)
+            search_complete &= !Get(static_cast<StringId>(id)).empty();
+        passed &= Report("search enhancement strings are present", search_complete);
         const bool chinese = std::wstring(language) == L"zh-CN";
         passed &= Report("tag and badge menus follow display language",
             Get(StringId::TagSearchHint) == (chinese ? L"搜索或新建标签…" : L"Search or create a tag…") &&

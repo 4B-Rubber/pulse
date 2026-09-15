@@ -1,5 +1,6 @@
 // ui_renderer.h — Full-window Fluent renderer (title bar, toolbar, sidebar, pane, tray).
 #pragma once
+#include "../index/content_result_store.h"
 #include "ui_compositor.h"
 #include "window_material.h"
 #include "fluent_components.h"
@@ -23,6 +24,9 @@
 namespace pulse::app { class PlacesCatalog; }
 
 namespace pulse::ui {
+
+inline constexpr unsigned kSettingsContextExpandedMask = 0x1f00u;
+inline constexpr unsigned kSettingsDefaultExpandedMask = kSettingsContextExpandedMask | 0x3u;
 
 class BloomAccentPicker;
 
@@ -120,6 +124,7 @@ struct PaneViewModel {
     // Real directory views retain the immutable filesystem snapshot and only
     // materialize visible rows. entries remains available to gallery/tests.
     fs::SnapshotPtr snapshot;
+    std::shared_ptr<index::ContentResultStore> content_results;
     mutable std::shared_ptr<RowPresentationCache> row_cache;
     const app::PlacesCatalog* tag_catalog = nullptr;
     std::unordered_set<std::wstring> cut_names;
@@ -137,6 +142,7 @@ struct PaneViewModel {
     bool is_recycle = false;
     bool is_search = false;   // search results add a display-only 路径 column
     bool is_query_search = false;
+    bool is_content_search = false;
     std::wstring search_query;
     std::shared_ptr<const std::vector<std::wstring>> search_snippets;
     int recent_filter = 0;
@@ -172,6 +178,7 @@ struct PaneViewModel {
     }
 
     size_t EntryCount() const {
+        if(content_results) return content_results->Count();
         if (filter_map) return filter_map->size();
         if (!filter_text.empty()) return filter_map ? filter_map->size() : 0;
         return snapshot ? snapshot->size() : entries.size();
@@ -179,6 +186,7 @@ struct PaneViewModel {
 
     int SourceIndex(int view_row) const {
         if (view_row < 0) return -1;
+        if(content_results) return view_row;
         if (filter_map || !filter_text.empty()) {
             if (!filter_map || view_row >= static_cast<int>(filter_map->size())) return -1;
             return (*filter_map)[static_cast<size_t>(view_row)];
@@ -188,7 +196,7 @@ struct PaneViewModel {
 
     int ViewIndex(int source_index) const {
         if (source_index < 0) return -1;
-        if (!filter_map && filter_text.empty()) return source_index;
+        if (content_results || (!filter_map && filter_text.empty())) return source_index;
         if (!filter_map) return -1;
         const auto it = std::lower_bound(filter_map->begin(), filter_map->end(), source_index);
         return it != filter_map->end() && *it == source_index
@@ -320,6 +328,10 @@ struct DetailsHitRects {
 };
 
 struct StatusBarView {
+    bool query_active = false;
+    bool query_cancellable = false;
+    float query_progress = -1.0f; // 0..1 of this query's candidates; negative means unknown.
+    std::wstring query_text;
     std::wstring status_text;
     std::wstring selection_text;
     std::wstring hint_text;        // contextual shortcut / hover prompt
@@ -441,6 +453,13 @@ struct WindowViewModel {
     bool address_editing = false;
     bool address_searching = false;
     bool address_search_current = false;
+    bool address_search_content = false;
+    bool settings_search_pinyin = true;
+    bool settings_global_search_enabled = false;
+    bool settings_global_search_capturing = false;
+    std::wstring settings_global_search_hotkey;
+    std::wstring settings_global_search_error;
+    std::wstring settings_content_status, settings_content_summary;
     bool address_search_has_text = false;
     std::wstring address_search_text;
     float address_search_animation = 0.0f;
@@ -451,6 +470,12 @@ struct WindowViewModel {
     bool column_resize_pressed = false;
     int hover_pane_index = -1;
 
+    struct ContentFolderView { std::wstring path, status; bool error = false; };
+    std::vector<ContentFolderView> settings_content_folders;
+    bool settings_content_paused = false;
+    bool settings_content_instant = false;
+    unsigned settings_expanded = kSettingsDefaultExpandedMask;
+    int settings_theme = 0; // system, light, dark
     bool settings_open = false;
     int settings_page = 0; // 0 general, 1 search/index, 2 context menu, 3 about, 4 duplicates
     float settings_scroll = 0.0f;
@@ -536,6 +561,13 @@ struct HitTestResult {
         AddressBar,
         AddressSearch,
         AddressSearchScope,
+        AddressSearchMode,
+        AddressSearchContent,
+        AddressSearchOptions,
+        ContentIndexManage,
+        SettingsContentIndex,
+        SettingsFind, SettingsDisclosure, SettingsTheme, SettingsDropdown,
+        SettingsContentAction,
         AddressSearchClear,
         AddressSearchClose,
         BreadcrumbSegment,
@@ -585,8 +617,10 @@ struct HitTestResult {
         DetailsResize,
         StatusBar,
         StatusBarTask,
+        StatusBarCancelSearch,
         SettingsNav,
         SettingsToggle,
+        SettingsGlobalSearchHotkey,
         SettingsChangeDays,
         SettingsRestore,
         SettingsAccent,
@@ -621,6 +655,7 @@ struct HitTestResult {
     int pane_index = -1;     // leaf in pane_slots, or -1 outside the content area.
     SortColumn column = SortColumn::Name;
     std::wstring path;
+    D2D1_RECT_F control_bounds{};
 };
 
 class MainRenderer {
@@ -675,6 +710,7 @@ public:
     D2D1_RECT_F ContentRect(float w, float h) const;
     D2D1_RECT_F PaneListRect(const D2D1_RECT_F& pane_bounds, float extra_top = 0.0f,
                              ViewMode mode = ViewMode::Details) const;
+    D2D1_RECT_F PaneListRect(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds) const;
     D2D1_RECT_F FilterBoxRect(const D2D1_RECT_F& pane_bounds,
                               float expand = 1.0f) const;
     D2D1_RECT_F PaneMediumIconsRect(const D2D1_RECT_F& pane_bounds,
@@ -775,6 +811,8 @@ public:
     HitTestResult HitTest(const WindowViewModel& vm, const D2D1_RECT_F& rect,
                           float x, float y) const;
 
+    bool PaneScrollbarGeometry(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds,
+                               D2D1_RECT_F& track, D2D1_RECT_F& thumb, float& max_scroll) const;
     float MaxScrollForPane(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds) const;
     float MaxScrollXForPane(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds) const;
     D2D1_RECT_F ItemRectInPane(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds,
@@ -798,6 +836,8 @@ public:
     // Uniform tab pitch (excludes group-chip offsets); used by drag math.
     float TabPitchPx(const WindowViewModel& vm, float window_w) const;
     float SettingsMaxScroll(const WindowViewModel& vm, float window_w, float window_h) const;
+    D2D1_RECT_F SettingsDropdownBounds(const WindowViewModel& vm, int index, float window_w, float window_h) const;
+    float SettingsDestinationOffset(const WindowViewModel& vm, int setting_id, float window_w, float window_h) const;
     float SidebarMaxScroll(const WindowViewModel& vm, float window_w, float window_h) const;
     bool SidebarScrollbarGeometry(const WindowViewModel& vm, float window_w, float window_h,
                                   D2D1_RECT_F& track, D2D1_RECT_F& thumb, float& max_scroll) const;
@@ -834,6 +874,8 @@ private:
                             const D2D1_RECT_F& bounds, int pane_index, const Theme& theme);
     void DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
+    void DrawSettingsContext(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
+    void DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
 
     void DrawList(const PaneViewModel& vm, float x, float y, float w, float h, const Theme& theme,
                   int hover_region = 0, int hover_control_index = -1);

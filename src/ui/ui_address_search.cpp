@@ -41,7 +41,7 @@ void MainRenderer::DrawAddressSearchChrome(const WindowViewModel& vm, float w, c
         const auto layout = LayoutAddressSearch(field, scale_);
         if (!vm.address_editing) {
             const auto text = vm.address_search_text.empty()
-                ? l10n::Get(l10n::StringId::Search) : vm.address_search_text;
+                ? l10n::Get(vm.address_search_content ? l10n::StringId::SearchContentHint : l10n::StringId::SearchNameHint) : vm.address_search_text;
             ComPtr<ID2D1SolidColorBrush> brush;
             compositor_->Dc()->CreateSolidColorBrush(vm.address_search_text.empty()
                 ? theme.text_secondary : theme.text, &brush);
@@ -58,12 +58,29 @@ void MainRenderer::DrawAddressSearchChrome(const WindowViewModel& vm, float w, c
                 D2D1::RoundedRect(layout.scope, 4.0f * scale_, 4.0f * scale_), brush.get());
         }
         const auto label = l10n::Get(vm.address_search_current
-            ? l10n::StringId::LocationCurrent : l10n::StringId::LocationIndexed);
-        button(layout.scope, layout.scope_label ? label : L"", L"\xE721",
-               HitTestResult::AddressSearchScope, layout.scope_label);
+            ? l10n::StringId::SearchScopeHere : l10n::StringId::SearchScopeAll);
+        if (layout.scope.right > layout.scope.left)
+            button(layout.scope, layout.scope_label ? label : L"", L"\xE721",
+                   HitTestResult::AddressSearchScope, layout.scope_label);
+        painter_.DrawSegmentedTrack(layout.mode);
+        auto segment = [&](D2D1_RECT_F bounds, bool content) {
+            fluent::ButtonSpec spec;
+            spec.bounds = D2D1::RectF(bounds.left + scale_, bounds.top + scale_, bounds.right - scale_, bounds.bottom - scale_);
+            spec.text = layout.mode_label ? l10n::Get(content ? l10n::StringId::SearchModeContent : l10n::StringId::SearchModeName) : L"";
+            spec.glyph = layout.mode_label ? L"" : content ? L"\xE8A5" : L"\xE8B7";
+            spec.icon_only = !layout.mode_label;
+            spec.kind = fluent::ButtonKind::TransparentToggle;
+            spec.state.checked = vm.address_search_content == content;
+            spec.state.hovered = IsHovered(vm, content ? HitTestResult::AddressSearchContent : HitTestResult::AddressSearchMode);
+            painter_.DrawButton(spec);
+        };
+        segment(layout.name, false);
+        segment(layout.content, true);
+        button(layout.options, L"", L"\xE9E9", HitTestResult::AddressSearchOptions);
         if (vm.address_search_has_text && layout.clear.right > layout.clear.left)
             button(layout.clear, L"", L"\xE711", HitTestResult::AddressSearchClear);
-        button(layout.close, L"", L"\xE72B", HitTestResult::AddressSearchClose);
+        if (layout.close.right > layout.close.left)
+            button(layout.close, L"", L"\xE72B", HitTestResult::AddressSearchClose);
     } else if (!vm.address_editing) {
         const auto bounds = AddressSearchButtonRect(w);
         button(bounds, bounds.right - bounds.left > 40.0f * scale_

@@ -1,5 +1,6 @@
 // app_model.cpp
 #include "app_model.h"
+#include "search_query.h"
 #include "../common/json_utils.h"
 #include "../common/localization.h"
 #include "../common/path_utils.h"
@@ -40,10 +41,47 @@ std::wstring NavigationReturnChildName(const std::wstring& from_path,
 // ---------------------------------------------------------------------------
 // Tab / Pane / SplitContainer
 // ---------------------------------------------------------------------------
+namespace {
+bool IsSearchPath(const std::wstring& path) {
+    std::wstring kind;
+    return ParsePulsePath(path, &kind, nullptr) && kind == L"search";
+}
+
+std::optional<std::wstring> CurrentSearchOrigin(const Tab& tab) {
+    return IsSearchPath(tab.current_path) && tab.search_origin_valid
+        ? std::optional<std::wstring>(tab.search_origin_path) : std::nullopt;
+}
+
+void AlignHistoryOrigins(const std::stack<std::wstring>& paths,
+                         std::stack<std::optional<std::wstring>>& origins) {
+    if (origins.size() == paths.size()) return;
+    // Restored/older history can have paths without source metadata.
+    origins = {};
+    for (size_t i = 0; i < paths.size(); ++i) origins.push(std::nullopt);
+}
+
+void RestoreHistoryOrigin(Tab& tab, const std::optional<std::wstring>& origin) {
+    tab.search_origin_valid = IsSearchPath(tab.current_path) && origin.has_value();
+    tab.search_origin_path = tab.search_origin_valid ? *origin : std::wstring{};
+}
+}
+
 void Tab::NavigateTo(const std::wstring& path) {
     ++view_generation;
-    if (!current_path.empty()) back_stack.push(current_path);
-    while (!forward_stack.empty()) forward_stack.pop();
+    if (!current_path.empty()) {
+        AlignHistoryOrigins(back_stack, back_search_origins);
+        back_stack.push(current_path);
+        back_search_origins.push(CurrentSearchOrigin(*this));
+    }
+    forward_stack = {};
+    forward_search_origins = {};
+    if (IsSearchPath(path) && !IsSearchPath(current_path)) {
+        search_origin_path = current_path;
+        search_origin_valid = true;
+    } else if (!IsSearchPath(path)) {
+        search_origin_path.clear();
+        search_origin_valid = false;
+    }
     current_path = path;
     ClearSelection();
     scroll_y = 0.0f;
@@ -58,6 +96,16 @@ void Tab::NavigateTo(const std::wstring& path) {
     loading = true;
 }
 
+fs::DirEntry Tab::EntryAt(size_t index) const {
+    if(content_results) {
+        if(const auto it=content_action_rows.find(index); it!=content_action_rows.end()) return it->second.entry;
+        index::ContentResultStore::Row row;
+        if(content_results->Get(index,row)) return row.entry;
+        fs::DirEntry pending; pending.change_record_only=true; return pending;
+    }
+    return snapshot && index<snapshot->size() ? (*snapshot)[index] : fs::DirEntry{};
+}
+
 void Tab::SetSnapshot(fs::SnapshotPtr value) {
     snapshot = std::move(value);
     view_cache_snapshot.reset();
@@ -67,6 +115,7 @@ void Tab::SetSnapshot(fs::SnapshotPtr value) {
     view_filter_map.reset();
     view_tag_dots.reset();
     snapshot_path = snapshot ? current_path : L"";
+    if(content_results) { directory_count=0; file_count=content_results->Count(); return; }
     if (all_selected && !show_hidden_files) MaterializeSelection();
     std::erase_if(selected, [&](int i) { return !EntryVisible(i); });
     if (selected_index >= 0 && !EntryVisible(selected_index)) {
@@ -86,7 +135,8 @@ void Tab::SetSnapshot(fs::SnapshotPtr value) {
 }
 
 bool Tab::EntryVisible(int index) const {
-    if (!snapshot || index < 0 || index >= static_cast<int>(snapshot->size())) return false;
+    if(index < 0 || static_cast<size_t>(index) >= EntryCount()) return false;
+    if(content_results) return true;
     // Recycle Bin lists payloads whose hidden attributes belong to Windows.
     return show_hidden_files || current_path.starts_with(L"pulse:recycle") ||
         (((*snapshot)[static_cast<size_t>(index)].attrs & FILE_ATTRIBUTE_HIDDEN) == 0);
@@ -102,6 +152,7 @@ void Tab::SetShowHiddenFiles(bool show) {
 }
 
 void Tab::ClearSelection() {
+    ++selection_revision;
     selected_index = -1;
     selection_anchor = -1;
     all_selected = false;
@@ -110,7 +161,7 @@ void Tab::ClearSelection() {
 
 int Tab::CountBound() const {
     if (search_retaining_results) return 0;
-    return snapshot ? static_cast<int>(snapshot->size()) : 0;
+    return static_cast<int>(std::min(EntryCount(),static_cast<size_t>(INT_MAX)));
 }
 
 void Tab::MaterializeSelection() {
@@ -123,6 +174,7 @@ void Tab::MaterializeSelection() {
 }
 
 void Tab::SelectOnly(int index) {
+    ++selection_revision;
     selected.clear();
     all_selected = false;
     const int n = CountBound();
@@ -137,6 +189,7 @@ void Tab::SelectOnly(int index) {
 }
 
 void Tab::ToggleSelect(int index) {
+    ++selection_revision;
     const int n = CountBound();
     if (index < 0 || index >= n || !EntryVisible(index)) return;
     MaterializeSelection();
@@ -152,6 +205,7 @@ void Tab::ToggleSelect(int index) {
 }
 
 void Tab::SelectRange(int from, int to) {
+    ++selection_revision;
     const int n = CountBound();
     if (n <= 0) {
         ClearSelection();
@@ -170,7 +224,8 @@ void Tab::SelectRange(int from, int to) {
 }
 
 void Tab::SelectAll() {
-    if (!show_hidden_files) {
+    ++selection_revision;
+    if (!content_results && !show_hidden_files) {
         std::vector<int> visible;
         for (int i = 0; i < CountBound(); ++i) if (EntryVisible(i)) visible.push_back(i);
         SelectIndices(visible);
@@ -188,6 +243,7 @@ void Tab::SelectAll() {
 }
 
 void Tab::SelectIndices(const std::vector<int>& indices) {
+    ++selection_revision;
     const int n = CountBound();
     if (n <= 0 || indices.empty()) {
         ClearSelection();
@@ -215,6 +271,7 @@ void Tab::SelectIndices(const std::vector<int>& indices) {
 }
 
 void Tab::InvertIndices(const std::vector<int>& universe) {
+    ++selection_revision;
     const int n = CountBound();
     if (n <= 0) {
         ClearSelection();
@@ -304,9 +361,9 @@ void Tab::RemapSelection(const std::vector<std::wstring>& names, const std::wstr
     }
     std::unordered_set<std::wstring> want(names.begin(), names.end());
     for (int i = 0; i < n; ++i) {
-        if (!EntryVisible(i) || !want.contains((*snapshot)[static_cast<size_t>(i)].name)) continue;
+        if (!EntryVisible(i) || !want.contains(EntryAt(static_cast<size_t>(i)).name)) continue;
         selected.insert(i);
-        if ((*snapshot)[static_cast<size_t>(i)].name == focus_name) selected_index = i;
+        if (EntryAt(static_cast<size_t>(i)).name == focus_name) selected_index = i;
     }
     if (selected.empty()) {
         SelectOnly(0);
@@ -322,10 +379,15 @@ void Tab::RemapSelection(const std::vector<std::wstring>& names, const std::wstr
 
 std::wstring Tab::GoBack() {
     if (back_stack.empty()) return current_path;
+    AlignHistoryOrigins(back_stack, back_search_origins);
+    AlignHistoryOrigins(forward_stack, forward_search_origins);
     forward_stack.push(current_path);
+    forward_search_origins.push(CurrentSearchOrigin(*this));
     ++view_generation;
     current_path = back_stack.top();
+    RestoreHistoryOrigin(*this, back_search_origins.top());
     back_stack.pop();
+    back_search_origins.pop();
     ClearSelection();
     scroll_y = 0.0f;
     scroll_x = 0.0f;
@@ -337,10 +399,15 @@ std::wstring Tab::GoBack() {
 
 std::wstring Tab::GoForward() {
     if (forward_stack.empty()) return current_path;
+    AlignHistoryOrigins(forward_stack, forward_search_origins);
+    AlignHistoryOrigins(back_stack, back_search_origins);
     back_stack.push(current_path);
+    back_search_origins.push(CurrentSearchOrigin(*this));
     ++view_generation;
     current_path = forward_stack.top();
+    RestoreHistoryOrigin(*this, forward_search_origins.top());
     forward_stack.pop();
+    forward_search_origins.pop();
     ClearSelection();
     scroll_y = 0.0f;
     scroll_x = 0.0f;
@@ -944,6 +1011,11 @@ static std::wstring PaneHeaderText(const Tab& tab) {
 }
 
 static std::wstring StatusText(const Tab& tab) {
+    if (tab.search_content_active || tab.content_results) {
+        wchar_t count[128]{};
+        swprintf_s(count,l10n::Get(l10n::StringId::ContentStatusMatches).c_str(),tab.search_total);
+        return count;
+    }
     if (tab.loading || !tab.snapshot) return L"";
     wchar_t buf[128];
     swprintf_s(buf, l10n::Get(l10n::StringId::StatusItemsFormat).c_str(),
@@ -955,8 +1027,8 @@ static std::wstring SelectionText(const Tab& tab) {
     const int count = tab.SelectedCount();
     if (count <= 0) return l10n::Get(l10n::StringId::NotSelected);
     if (count == 1 && tab.snapshot && tab.selected_index >= 0 &&
-        tab.selected_index < static_cast<int>(tab.snapshot->size())) {
-        const auto& e = (*tab.snapshot)[tab.selected_index];
+        tab.selected_index < static_cast<int>(tab.EntryCount())) {
+        const auto& e = tab.EntryAt(tab.selected_index);
         wchar_t buf[256];
         swprintf_s(buf, l10n::Get(l10n::StringId::SelectedOneFormat).c_str(), e.name.c_str(),
                    pulse::format::ByteSize(e.size, true).c_str());
@@ -1072,10 +1144,26 @@ static bool TagMatchesNeedle(const ColorTag& tag, int index, const std::wstring&
     return false;
 }
 
+index::ContentResultStore::Filter ContentFilter(const std::wstring& text, const PlacesCatalog& places) {
+    if(text.empty()) return {};
+    std::wstring name; std::vector<std::wstring> tags;
+    ParseFilterText(text,name,tags);
+    if(name.empty() && tags.empty()) name=ToLowerCopy(text);
+    std::unordered_set<std::wstring> paths;
+    for(size_t id=0;id<places.tags.size();++id) for(const auto& needle:tags) {
+        if(TagMatchesNeedle(places.tags[id],static_cast<int>(id),needle))
+            for(const auto& path:places.tags[id].paths) paths.insert(ToLowerCopy(path));
+    }
+    return [name=std::move(name),has_tags=!tags.empty(),paths=std::move(paths)](const fs::DirEntry& entry) {
+        return NameMatchesPattern(entry.name,name) && (!has_tags || paths.contains(ToLowerCopy(entry.full_path)));
+    };
+}
+
 void CollectFilterMatches(const Tab& tab, const PlacesCatalog* places, std::vector<int>& out) {
     out.clear();
     if (!tab.snapshot) return;
-    const int n = static_cast<int>(tab.snapshot->size());
+    const int n = static_cast<int>(tab.EntryCount());
+    if(tab.content_results) { out.reserve(n); for(int i=0;i<n;++i) out.push_back(i); return; }
     if (tab.filter_text.empty() && tab.show_hidden_files) {
         out.reserve(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) if (tab.EntryVisible(i)) out.push_back(i);
@@ -1088,7 +1176,7 @@ void CollectFilterMatches(const Tab& tab, const PlacesCatalog* places, std::vect
         name_needle = ToLowerCopy(tab.filter_text);
     out.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
-        const auto& e = (*tab.snapshot)[static_cast<size_t>(i)];
+        const auto& e = tab.EntryAt(static_cast<size_t>(i));
         if (!tab.EntryVisible(i)) continue;
         const bool name_ok = NameMatchesPattern(e.name, name_needle);
         bool tag_ok = tag_needles.empty();
@@ -1144,9 +1232,11 @@ void FillPaneViewModel(ui::PaneViewModel& out, const Pane& pane, const PlacesCat
         std::wstring rest;
         ParsePulsePath(tab->current_path, nullptr, &rest);
         out.search_query = rest;
+        out.is_content_search = SplitSearchQueryText(rest).content.present();
         // Keep pulse:search:... so the address bar is one segment, not C:\ splits.
         out.path = tab->current_path;
     }
+    out.content_results = tab->content_results;
     out.search_snippets = tab->search_snippets;
     out.recent_filter = tab->recent_filter;
     out.recent_total = out.is_recent && places ? places->recent_items.size() : 0;
@@ -1192,7 +1282,7 @@ void FillPaneViewModel(ui::PaneViewModel& out, const Pane& pane, const PlacesCat
     }
     out.row_cache = tab->view_row_cache;
     out.tag_dots = tab->view_tag_dots;
-    if (tab->snapshot && (!tab->show_hidden_files || !tab->filter_text.empty())) {
+    if (!tab->content_results && tab->snapshot && (!tab->show_hidden_files || !tab->filter_text.empty())) {
         if (!tab->view_filter_map || tab->view_cache_filter_text != tab->filter_text) {
             auto filtered = std::make_shared<ui::PaneViewModel::FilterMap>();
             CollectFilterMatches(*tab, places, *filtered);
@@ -1271,6 +1361,24 @@ ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
 
     vm.status.status_text = StatusText(*tab);
     vm.status.selection_text = SelectionText(*tab);
+    vm.status.query_active=tab->search_content_active;
+    vm.status.query_cancellable = !tab->search_content_stopped &&
+        (tab->search_input_content || tab->content_results || tab->search_content_active) &&
+        (tab->search_content_active || tab->search_awaiting_content || tab->search_live_generation);
+    if (vm.status.query_active) {
+        vm.status.query_text=l10n::Get(l10n::StringId::Searching);
+        if (tab->content_total_files) {
+            const auto scanned=std::min(tab->content_scanned_files,tab->content_total_files);
+            vm.status.query_progress=static_cast<float>(static_cast<double>(scanned)/static_cast<double>(tab->content_total_files));
+            wchar_t progress[128]{};
+            swprintf_s(progress,l10n::Get(l10n::StringId::ContentQueryProgress).c_str(),
+                static_cast<unsigned long long>(scanned),static_cast<unsigned long long>(tab->content_total_files));
+            const unsigned percent = scanned == tab->content_total_files ? 100u :
+                std::min(99u, static_cast<unsigned>(static_cast<double>(scanned) * 100.0 /
+                    static_cast<double>(tab->content_total_files)));
+            vm.status.query_text=std::to_wstring(percent)+L"% · "+progress;
+        }
+    }
 
     ui::SidebarGroup workspaces;
     workspaces.header = l10n::Get(l10n::StringId::SidebarWorkspaces);

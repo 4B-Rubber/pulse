@@ -1,6 +1,7 @@
 // app_commands.cpp — extracted from app_main.cpp.
 #include "quick_access.h"
 #include "app_internal.h"
+#include "global_search_controller.h"
 #include "../ui/lumatext_renderer.h"
 #include "../ui/fluent_menu.h"
 #include "../ui/drag_drop.h"
@@ -70,6 +71,7 @@ bool EnsureMenu(AppState& s) {
 }
 
 void CopySelectedPath(AppState& s) {
+    if(DeferContentSelection(s,[=](AppState& v){CopySelectedPath(v);})) return;
     app::Tab* tab = ActiveTab(s);
     if (!tab) return;
     std::vector<std::wstring> paths = SelectedFullPaths(*tab);
@@ -199,6 +201,7 @@ void AppendCustomTagColor(AppState& s, uint32_t rgb) {
 }
 
 void ShowTagPicker(AppState& s, POINT screen_pt) {
+    if(DeferContentSelection(s,[=](AppState& v){ShowTagPicker(v,screen_pt);})) return;
     if (!EnsureMenu(s)) return;
     const std::vector<std::wstring> paths = ActiveTab(s)
         ? SelectedFullPaths(*ActiveTab(s)) : std::vector<std::wstring>{};
@@ -428,6 +431,8 @@ void ShowTagSidebarMenu(AppState& s, const app::TagId& tag_id, POINT screen_pt) 
 }
 
 void DispatchMenuCommand(AppState& s, int cmd) {
+    const bool needs_files=cmd==app::CmdProperties || cmd==app::CmdOpenPath || cmd==app::CmdOpenInNewTab || cmd==app::CmdRename;
+    if(needs_files && DeferContentSelection(s,[cmd](AppState& v){DispatchMenuCommand(v,cmd);})) return;
     if (cmd >= app::CmdViewBase && cmd < app::CmdViewBase + 8) {
         SetViewMode(s, ui::ViewModeFromIndex(cmd - app::CmdViewBase));
         return;
@@ -472,8 +477,8 @@ void DispatchMenuCommand(AppState& s, int cmd) {
         app::Tab* tab = ActiveTab(s);
         if (!tab || !tab->snapshot) break;
         for (int index : tab->SelectedIndices()) {
-            if (index < 0 || index >= static_cast<int>(tab->snapshot->size())) continue;
-            const fs::DirEntry& entry = (*tab->snapshot)[static_cast<size_t>(index)];
+            if (index < 0 || index >= static_cast<int>(tab->EntryCount())) continue;
+            const fs::DirEntry& entry = tab->EntryAt(static_cast<size_t>(index));
             if (!entry.is_dir) continue;
             const std::wstring path = EntryFullPath(*tab, index);
             if (!path.empty()) NewTab(s, path);
@@ -535,7 +540,7 @@ void DispatchMenuCommand(AppState& s, int cmd) {
         if (const app::Tab* tab = ActiveTab(s); IsRecycleTab(tab) && tab->snapshot) {
             const auto indices = tab->SelectedIndices();
             if (!indices.empty()) {
-                const fs::DirEntry& entry = (*tab->snapshot)[static_cast<size_t>(indices[0])];
+                const fs::DirEntry& entry = tab->EntryAt(static_cast<size_t>(indices[0]));
                 full = entry.recycle_path.empty() ? entry.full_path : entry.recycle_path;
             }
         } else {
@@ -609,11 +614,7 @@ void DispatchMenuCommand(AppState& s, int cmd) {
     case app::CmdSearchAll: {
         const auto q = app::ParseOmnibarQuery(s.paletteQuery, false);
         if (q.needle.empty()) break;
-        const auto split = app::SplitSearchQueryText(q.needle);
-        if (split.content.present() && app::ContentSearchNeedsScope(split))
-            ShowAdvancedSearch(s, true);
-        else
-            NavigateTo(s, app::MakeSearchPath(q.needle));
+        NavigateTo(s, app::MakeSearchPath(q.needle));
         break;
     }
     case app::CmdInstallFullIndex:
@@ -670,8 +671,8 @@ std::vector<ui::FluentMenuItem> BuildFinderItemMenu(
     bool folder = false;
     if (const app::Tab* tab = ActiveTab(s); tab && tab->snapshot) {
         for (int index : tab->SelectedIndices()) {
-            if (index >= 0 && index < static_cast<int>(tab->snapshot->size()) &&
-                (*tab->snapshot)[static_cast<size_t>(index)].is_dir) {
+            if (index >= 0 && index < static_cast<int>(tab->EntryCount()) &&
+                tab->EntryAt(static_cast<size_t>(index)).is_dir) {
                 folder = true;
                 break;
             }
@@ -731,8 +732,8 @@ std::wstring CommonExtension(const app::Tab& tab,
     if (!tab.snapshot) return L"";
     std::wstring ext;
     for (int index : indices) {
-        if (index < 0 || index >= static_cast<int>(tab.snapshot->size())) return L"";
-        const fs::DirEntry& e = (*tab.snapshot)[static_cast<size_t>(index)];
+        if (index < 0 || index >= static_cast<int>(tab.EntryCount())) return L"";
+        const fs::DirEntry& e = tab.EntryAt(static_cast<size_t>(index));
         if (e.is_dir) return L"";
         const auto pos = e.name.find_last_of(L'.');
         if (pos == std::wstring::npos || pos == 0 || pos + 1 >= e.name.size()) return L"";
@@ -760,8 +761,8 @@ std::wstring StaticVerbKey(const app::Tab& tab, const std::vector<int>& indices)
     bool all_dirs = true;
     bool all_drives = true;
     for (int index : indices) {
-        if (index < 0 || index >= static_cast<int>(tab.snapshot->size())) return L"";
-        const fs::DirEntry& e = (*tab.snapshot)[static_cast<size_t>(index)];
+        if (index < 0 || index >= static_cast<int>(tab.EntryCount())) return L"";
+        const fs::DirEntry& e = tab.EntryAt(static_cast<size_t>(index));
         if (!e.is_dir) {
             all_dirs = false;
             all_drives = false;
@@ -953,6 +954,7 @@ bool HandleShellMenuCommand(AppState& s, int cmd) {
 }
 
 void ShowItemContextMenu(AppState& s, POINT screen_pt) {
+    if(DeferContentSelection(s,[=](AppState& v){ShowItemContextMenu(v,screen_pt);})) return;
     if (!EnsureMenu(s)) return;
     app::Tab* tab = ActiveTab(s);
     const std::vector<std::wstring> paths =
@@ -991,11 +993,11 @@ void ShowBackgroundContextMenu(AppState& s, POINT screen_pt) {
     view_options.sort_direction = tab->sort_direction;
     view_options.details_panel = s.showDetailsPanel;
     view_options.can_sort = kind != L"starred" && kind != L"recent";
-    view_options.indexed_search = kind == L"search" || kind == L"saved-search";
+    view_options.indexed_search = (kind == L"search" || kind == L"saved-search") && !tab->content_results;
     view_options.show_path = kind == L"search" || kind == L"saved-search" || kind == L"recycle";
     view_options.filesystem = !tab->current_path.empty() && !fs::IsVirtualPath(tab->current_path);
     if (IsRecycleTab(tab)) {
-        const bool can_empty = tab->snapshot && !tab->snapshot->empty();
+        const bool can_empty = tab->snapshot && tab->EntryCount() != 0;
         const std::wstring undoLabel = s.ops.UndoLabel();
         auto items = app::BuildRecycleBackgroundMenu(s.ops.CanUndo(), undoLabel, can_empty);
         app::AppendBackgroundViewCommands(items, view_options);
@@ -1300,7 +1302,7 @@ void ShowAdvancedSearch(AppState& s, bool require_scope) {
         NavigateTo(s, app::MakeSearchPath(result.query));
 }
 
-void ShowSearchFilterMenu(AppState& s, int chip, POINT screen_pt) {
+void ShowSearchFilterMenu(AppState& s, int chip, RECT control_rect) {
     if (chip >= 3) {
         ShowAdvancedSearch(s, false);
         return;
@@ -1313,17 +1315,15 @@ void ShowSearchFilterMenu(AppState& s, int chip, POINT screen_pt) {
     if (kind != L"search") return;
     app::AdvancedSearchSpec spec = app::ParseSearchQuery(rest, {});
     constexpr int kTypeCustomCmd = 9;
-    constexpr int kTypeTypedExtCmd = 100;
-    auto make_type_items = [&](const std::wstring& query) {
-        std::vector<ui::FluentMenuItem> out;
-        auto add = [&](int cmd, const std::wstring& text, bool checked) {
-            ui::FluentMenuItem item;
-            item.command = cmd;
-            item.text = text;
-            item.radio_group = true;
-            item.radio = checked;
-            out.push_back(std::move(item));
-        };
+    std::vector<ui::FluentMenuItem> items;
+    auto add = [&](int cmd, const std::wstring& text, bool checked) {
+        ui::FluentMenuItem item;
+        item.command = cmd;
+        item.text = text;
+        item.checked = checked;
+        items.push_back(std::move(item));
+    };
+    if (chip == 0) {
         struct Row { int cmd; l10n::StringId id; index::SearchKind kind; };
         const Row rows[] = {
             {1, l10n::StringId::KindAny, index::SearchKind::Any},
@@ -1335,48 +1335,13 @@ void ShowSearchFilterMenu(AppState& s, int chip, POINT screen_pt) {
             {7, l10n::StringId::KindArchive, index::SearchKind::Archive},
             {8, l10n::StringId::KindCode, index::SearchKind::Code},
         };
-        const std::wstring needle = index::Fold(query);
         for (const auto& row : rows) {
-            const std::wstring label = l10n::Get(row.id);
-            if (!needle.empty() && index::Fold(label).find(needle) == std::wstring::npos)
-                continue;
-            add(row.cmd, label, spec.kind == row.kind);
+            add(row.cmd, l10n::Get(row.id), spec.kind == row.kind);
         }
-        const std::wstring typed = app::NormalizeExtensionList(query);
-        if (!typed.empty()) {
-            add(kTypeTypedExtCmd, typed,
-                spec.kind == index::SearchKind::Custom &&
-                    index::Fold(spec.custom_exts) == index::Fold(typed));
-        }
-        const std::wstring custom_label = spec.custom_exts.empty()
-            ? l10n::Get(l10n::StringId::KindCustom) : spec.custom_exts;
-        const bool show_saved = typed.empty() ||
-            (!spec.custom_exts.empty() &&
-             index::Fold(spec.custom_exts) != index::Fold(typed) &&
-             (needle.empty() ||
-              index::Fold(custom_label).find(needle) != std::wstring::npos));
-        if (show_saved) {
-            add(kTypeCustomCmd, custom_label, spec.kind == index::SearchKind::Custom && typed.empty());
-        }
-        return out;
-    };
-
-    std::vector<ui::FluentMenuItem> items;
-    ui::FluentMenu::FilterFn filter;
-    if (chip == 0) {
-        items = make_type_items({});
-        s.menu->SetFilterPlaceholder(l10n::Get(l10n::StringId::AdvSearchExtHint));
-        s.menu->SetFilterMinWidth(220.0f);
-        filter = make_type_items;
+        add(kTypeCustomCmd, spec.custom_exts.empty()
+            ? l10n::Get(l10n::StringId::KindCustom) : spec.custom_exts,
+            spec.kind == index::SearchKind::Custom);
     } else {
-        auto add = [&](int cmd, const std::wstring& text, bool checked) {
-            ui::FluentMenuItem item;
-            item.command = cmd;
-            item.text = text;
-            item.radio_group = true;
-            item.radio = checked;
-            items.push_back(std::move(item));
-        };
         if (chip == 1) {
             add(1, l10n::Get(l10n::StringId::DateAny), spec.date == app::DatePreset::Any);
             add(2, l10n::Get(l10n::StringId::DateToday), spec.date == app::DatePreset::Today);
@@ -1392,15 +1357,10 @@ void ShowSearchFilterMenu(AppState& s, int chip, POINT screen_pt) {
             add(5, l10n::Get(l10n::StringId::SizeGt10MB), spec.size == app::SizePreset::Gt10MB);
         }
     }
-    const int cmd = s.menu->TrackPopup(screen_pt, std::move(items), std::move(filter));
+    s.menu->SetTheme(s.darkMode, s.accentColor);
+    const int cmd = s.menu->TrackDropdown(control_rect, std::move(items));
     if (chip == 0) {
-        if (cmd == kTypeTypedExtCmd ||
-            (cmd <= 0 && s.menu->LastFilterCommitted())) {
-            const std::wstring typed = app::NormalizeExtensionList(s.menu->LastFilterQuery());
-            if (typed.empty()) return;
-            spec.kind = index::SearchKind::Custom;
-            spec.custom_exts = typed;
-        } else if (cmd == kTypeCustomCmd) {
+        if (cmd == kTypeCustomCmd) {
             if (spec.custom_exts.empty()) {
                 ShowAdvancedSearch(s, false);
                 return;
@@ -1549,11 +1509,7 @@ void ShowOmnibar(AppState& s, OmnibarMode mode) {
     const auto q = app::ParseOmnibarQuery(s.menu->LastFilterQuery(), project_only);
     if (q.kind == app::OmnibarQuery::Kind::Search) {
         if (!q.needle.empty()) {
-            const auto split = app::SplitSearchQueryText(q.needle);
-            if (split.content.present() && app::ContentSearchNeedsScope(split))
-                ShowAdvancedSearch(s, true);
-            else
-                NavigateTo(s, app::MakeSearchPath(q.needle));
+            NavigateTo(s, app::MakeSearchPath(q.needle));
         }
         return;
     }
@@ -1573,6 +1529,7 @@ void ShowRecyclePlaceMenu(AppState& s, POINT screen_pt) {
 void ApplyAppWindowChrome(AppState& s) {
     if (!s.hwnd) return;
     const auto effect = ui::WindowEffectFromId(s.appPrefs.window_effect);
+    s.globalSearchWindow.SetAppearance(s.darkMode, effect, s.appPrefs.background_image, s.accentColor);
     // Any selected image takes over the window base: sampled as material for
     // Mica/Acrylic, drawn as-is when the effect is None.
     const bool sample_image = !s.appPrefs.background_image.empty();
@@ -1638,6 +1595,8 @@ void ApplyAccentFromPrefs(AppState& s, bool snap_picker) {
     uint32_t rgb = 0;
     const bool follow = !app::ParseAccentRgb(s.appPrefs.accent_rgb, rgb);
     s.accentColor = ResolveAccentColor(s.appPrefs);
+    s.globalSearchWindow.SetAppearance(s.darkMode, ui::WindowEffectFromId(s.appPrefs.window_effect),
+        s.appPrefs.background_image, s.accentColor);
     s.bloom_accent.SetSelection(follow, rgb, snap_picker);
     if (s.menu) s.menu->SetTheme(s.darkMode, s.accentColor);
     if (s.operationWindow) s.operationWindow->SetTheme(s.darkMode, s.accentColor);
@@ -1646,8 +1605,8 @@ void ApplyAccentFromPrefs(AppState& s, bool snap_picker) {
 bool SelectedQuickPreviewItem(AppState& s, ui::QuickPreviewItem& item) {
     app::Tab* tab = ActiveTab(s);
     if (!tab || !tab->snapshot || tab->selected_index < 0 ||
-        tab->selected_index >= static_cast<int>(tab->snapshot->size())) return false;
-    const fs::DirEntry& entry = (*tab->snapshot)[static_cast<size_t>(tab->selected_index)];
+        tab->selected_index >= static_cast<int>(tab->EntryCount())) return false;
+    const fs::DirEntry& entry = tab->EntryAt(static_cast<size_t>(tab->selected_index));
     if (entry.is_dir) return false;
     item.path = EntryFullPath(*tab, tab->selected_index);
     item.name = entry.name;
@@ -1663,6 +1622,7 @@ void ToggleQuickPreview(AppState& s) {
         s.quickPreview.Close();
         return;
     }
+    if(DeferContentSelection(s,[](AppState& v){ToggleQuickPreview(v);},true)) return;
     ui::QuickPreviewItem item;
     if (SelectedQuickPreviewItem(s, item)) {
         const auto effect = s.appPrefs.background_image.empty()
@@ -1683,8 +1643,11 @@ void NavigateQuickPreview(AppState& s, int direction) {
     view = std::clamp(view + (direction < 0 ? -1 : 1), 0, count - 1);
     tab->MoveFocus(vm.pane.SourceIndex(view), false);
     EnsureRowVisible(s, *tab, tab->selected_index);
-    ui::QuickPreviewItem item;
-    if (SelectedQuickPreviewItem(s, item)) s.quickPreview.Update(item);
+    auto update=[](AppState& v) {
+        ui::QuickPreviewItem item;
+        if(v.quickPreview.visible() && SelectedQuickPreviewItem(v,item)) v.quickPreview.Update(item);
+    };
+    if(!DeferContentSelection(s,update,true)) update(s);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -1709,7 +1672,9 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
     if (app::HasEffect(effects, app::SettingsEffect::TrayDeckIcon))
         s.renderer.SetTrayIconDip(static_cast<float>(s.appPrefs.tray_icon_size));
     if (app::HasEffect(effects, app::SettingsEffect::TrayVisibility))
-        s.tray_controller.SetVisible(s.appPrefs.keep_running_on_close);
+        s.tray_controller.SetVisible(s.appPrefs.keep_running_on_close || s.appPrefs.global_search_enabled);
+    if (app::HasEffect(effects, app::SettingsEffect::GlobalSearch))
+        ApplyGlobalSearchSettings(s);
     if (app::HasEffect(effects, app::SettingsEffect::StatusBarPerformance))
         s.showFps = s.forceStatusPerformance || s.appPrefs.show_status_performance;
     if (app::HasEffect(effects, app::SettingsEffect::Language)) {
@@ -1748,10 +1713,12 @@ app::SettingsTaskCompletion SettingsCompletion(HWND hwnd) {
     };
 }
 void ToggleTheme(AppState& s) {
-    // A title-bar toggle must always produce visible feedback. Cycling through
-    // Auto first can resolve to the theme already on screen and appears to
-    // require a second click.
-    s.themeOverride = s.darkMode ? ui::ThemeMode::Light : ui::ThemeMode::Dark;
+    SetThemeMode(s, s.darkMode ? 1 : 2);
+}
+void SetThemeMode(AppState& s, int mode) {
+    s.appPrefs.theme_mode = std::clamp(mode, 0, 2);
+    s.appPrefs.Save();
+    s.themeOverride = mode == 1 ? ui::ThemeMode::Light : mode == 2 ? ui::ThemeMode::Dark : ui::ThemeMode::Auto;
     s.darkMode = ui::ShouldUseDarkMode(s.themeOverride);
     ApplyAppWindowChrome(s);
     if (s.editBrush) {

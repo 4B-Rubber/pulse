@@ -27,6 +27,7 @@ struct Term {
     NameHow name_how = NameHow::Any;
     bool name_in_path = false;
     bool name_not = false;
+    bool pinyin = false;
 
     std::vector<std::wstring> exts; // folded, no leading dot
     bool ext_not = false;
@@ -58,6 +59,7 @@ struct ContentClause {
 struct CompiledQuery {
     std::vector<std::vector<Term>> groups; // OR of AND-groups
     ContentClause content;
+    bool pinyin_enabled = true;
     std::wstring path_prefix; // original casing; empty = whole index
 };
 
@@ -67,6 +69,7 @@ bool QueryCanNarrow(std::wstring_view prev, std::wstring_view next);
 bool QueryUsesAttrs(const CompiledQuery& q);
 size_t QueryPrimaryNameLen(const CompiledQuery& q);
 bool QueryIsSimpleName(const CompiledQuery& q);
+bool QueryHasPinyin(const CompiledQuery& q);
 bool QueryHasContent(const CompiledQuery& q);
 bool QueryHasExtFilter(const CompiledQuery& q);
 bool QueryHasNameFilter(const CompiledQuery& q);

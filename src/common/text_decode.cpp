@@ -45,11 +45,12 @@ bool LooksBinary(const std::vector<uint8_t>& bytes) noexcept {
     return sample > 0 && controls * 20 > sample;
 }
 
-bool Decode(const std::vector<uint8_t>& bytes, std::wstring& output) {
+bool Decode(const std::vector<uint8_t>& bytes, std::wstring& output, Encoding encoding) {
     output.clear();
     if (bytes.empty()) return true;
     size_t offset = 0;
     if (bytes.size() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
+        if (bytes.size() % 2) return false;
         offset = 2;
         output.reserve((bytes.size() - offset) / 2);
         for (size_t i = offset; i + 1 < bytes.size(); i += 2)
@@ -57,6 +58,7 @@ bool Decode(const std::vector<uint8_t>& bytes, std::wstring& output) {
         return true;
     }
     if (bytes.size() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
+        if (bytes.size() % 2) return false;
         offset = 2;
         output.reserve((bytes.size() - offset) / 2);
         for (size_t i = offset; i + 1 < bytes.size(); i += 2)
@@ -65,12 +67,13 @@ bool Decode(const std::vector<uint8_t>& bytes, std::wstring& output) {
     }
     if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
         offset = 3;
+    if (offset == bytes.size()) return true;
     const char* raw = reinterpret_cast<const char*>(bytes.data() + offset);
     const int raw_size = static_cast<int>(bytes.size() - offset);
-    UINT code_page = CP_UTF8;
+    UINT code_page = offset == 3 ? CP_UTF8 : encoding == Encoding::System ? CP_ACP : encoding == Encoding::Gb18030 ? 54936 : CP_UTF8;
     DWORD flags = MB_ERR_INVALID_CHARS;
     int chars = MultiByteToWideChar(code_page, flags, raw, raw_size, nullptr, 0);
-    if (chars <= 0) {
+    if (chars <= 0 && encoding == Encoding::Auto && offset == 0) {
         code_page = CP_ACP;
         flags = 0;
         chars = MultiByteToWideChar(code_page, flags, raw, raw_size, nullptr, 0);
@@ -81,7 +84,7 @@ bool Decode(const std::vector<uint8_t>& bytes, std::wstring& output) {
 }
 
 bool ReadFile(const std::wstring& path, uint64_t maximum_bytes, std::wstring& output,
-              uint64_t& bytes_read, DWORD* error) {
+              uint64_t& bytes_read, DWORD* error, Encoding encoding) {
     output.clear();
     bytes_read = 0;
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
@@ -90,6 +93,11 @@ bool ReadFile(const std::wstring& path, uint64_t maximum_bytes, std::wstring& ou
     if (file == INVALID_HANDLE_VALUE) {
         if (error) *error = GetLastError();
         return false;
+    }
+    BY_HANDLE_FILE_INFORMATION before{};
+    if (!GetFileInformationByHandle(file, &before)) {
+        if (error) *error = GetLastError();
+        CloseHandle(file); return false;
     }
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 ||
@@ -111,13 +119,27 @@ bool ReadFile(const std::wstring& path, uint64_t maximum_bytes, std::wstring& ou
         }
         done += read;
     }
+    BY_HANDLE_FILE_INFORMATION after{}, current{};
+    bool stable = GetFileInformationByHandle(file, &after) &&
+        before.nFileSizeHigh == after.nFileSizeHigh && before.nFileSizeLow == after.nFileSizeLow &&
+        CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0;
+    HANDLE path_file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    stable = stable && path_file != INVALID_HANDLE_VALUE && GetFileInformationByHandle(path_file, &current) &&
+        current.nFileIndexHigh == before.nFileIndexHigh && current.nFileIndexLow == before.nFileIndexLow &&
+        current.dwVolumeSerialNumber == before.dwVolumeSerialNumber;
+    if (path_file != INVALID_HANDLE_VALUE) CloseHandle(path_file);
     CloseHandle(file);
+    if (!stable) { if (error) *error = ERROR_RETRY; return false; }
     bytes_read = done;
     if (LooksBinary(bytes)) {
         if (error) *error = ERROR_BAD_FORMAT;
         return false;
     }
-    return Decode(bytes, output);
+    const bool decoded = Decode(bytes, output, encoding);
+    if (!decoded && error) *error = ERROR_BAD_FORMAT;
+    return decoded;
 }
 
 } // namespace pulse::text

@@ -43,6 +43,10 @@ bool MatchTests() {
     terms = NameHighlightTerms(L"\x62a5\x544a", L"");
     ok &= Check(NameMatchRanges(L"\x62a5\x544a-\x62a5\x544a.docx", terms).size() == 2,
         "repeated Unicode terms preserve UTF-16 positions");
+    terms = NameHighlightTerms(L"", L"zhongguo");
+    ranges = NameMatchRanges(L"2026中国报告.txt", terms);
+    ok &= Check(ranges.size() == 1 && ranges[0].start == 4 && ranges[0].length == 2,
+        "pinyin highlight keeps the original Chinese character span");
     return ok;
 }
 
@@ -105,14 +109,62 @@ bool RunNameHighlightUiTest() {
         if (!hwnd || !compositor.Init(hwnd)) return false;
         MainRenderer renderer;
         renderer.SetCompositor(&compositor);
+        compositor.Resize(1100, 740);
+        auto* wallpaper_dc = compositor.Dc();
+        ComPtr<ID2D1SolidColorBrush> wallpaper_brush;
+        wallpaper_dc->CreateSolidColorBrush(HexColor(0xC79552), &wallpaper_brush);
+        wallpaper_dc->BeginDraw();
+        wallpaper_dc->Clear(HexColor(0x163543));
+        wallpaper_dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(600, 240), 420, 260), wallpaper_brush.get());
+        wallpaper_brush->SetColor(HexColor(0xF0E5CE));
+        wallpaper_dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(900, 450), 220, 370), wallpaper_brush.get());
+        wallpaper_dc->EndDraw();
+        const std::wstring wallpaper = L"bench_data/name-highlight/contrast-background.png";
+        ok &= Check(compositor.SaveSnapshot(wallpaper.c_str()), "contrast wallpaper fixture captured");
         for (const float scale : {1.0f, 1.5f, 2.0f}) {
             compositor.Resize(static_cast<int>(1100 * scale), static_cast<int>(740 * scale));
             compositor.RecreateTextFormats(scale);
             renderer.SetScale(scale);
+            ComPtr<IDWriteTextLayout> padded;
+            const std::wstring sample = L"20report20.jpg";
+            const auto padding_matches = NameMatchRanges(sample, NameHighlightTerms(L"", L"20"));
+            compositor.DwriteFactory()->CreateTextLayout(sample.c_str(), static_cast<UINT32>(sample.size()),
+                compositor.TextFormat(), 1000 * scale, 40 * scale, &padded);
+            DWRITE_TEXT_METRICS before{}, after{};
+            padded->GetMetrics(&before);
+            ApplyNameHighlightPadding(padded.get(), padding_matches, scale);
+            padded->GetMetrics(&after);
+            ok &= Check(std::abs(after.width - before.width - 8 * scale) < 0.1f,
+                "two matches reserve exactly two DIP per side without changing internal letter spacing");
+            for (float budget : {40.0f * scale, 85.0f * scale, 180.0f * scale}) {
+                const auto shown = FitHighlightedFileName(&compositor, compositor.DwriteFactory(),
+                    compositor.TextFormat(), sample, budget, padding_matches, scale);
+                const float measured = MeasureLayoutText(&compositor, compositor.DwriteFactory(),
+                    compositor.TextFormat(), shown) + HighlightPaddingWidth(sample, shown, padding_matches, scale);
+                ok &= Check(measured <= budget + 0.1f, "ellipsis fitting reserves highlight gutters inside the name column");
+                ok &= Check(shown == FitHighlightedFileName(&compositor, compositor.DwriteFactory(),
+                    compositor.TextFormat(), sample, measured, padding_matches, scale),
+                    "highlight name fitting stays stable when layout supplies its measured width");
+            }
             const auto bounds = D2D1::RectF(0, 0, 1100 * scale, 740 * scale);
-            for (const bool dark : {false, true}) for (int variant = 0; variant < 4; ++variant) {
+            for (const bool dark : {false, true}) for (int variant = 0; variant < 7; ++variant) {
                 auto vm = Fixture(scale, variant == 1);
                 vm.dark = dark;
+                if (variant >= 4) {
+                    vm.background_image = wallpaper;
+                    vm.backdrop_enabled = true;
+                    auto& pane = vm.pane_slots.front().pane;
+                    pane.filter_text.clear();
+                    pane.is_search = true;
+                    pane.search_query = variant == 6 ? L"zhongguo" : L"20";
+                    const wchar_t* numeric[] = {L"20e066dac2b122caf93a721-long-folder", L"20fa2d4c858a873ca262d",
+                        L"20.jpg", L"2020-report-20.pdf", L"20.mp4"};
+                    for (size_t i = 0; i < pane.entries.size(); ++i) {
+                        pane.entries[i].name = variant == 6 ? L"2026中国报告-中国.txt" : numeric[i];
+                        pane.entries[i].is_dir = i < 2;
+                    }
+                    if (variant == 5) pane.view_mode = ViewMode::MediumIcons;
+                }
                 if (variant == 2) vm.pane_slots.front().pane.view_mode = ViewMode::MediumIcons;
                 if (variant == 3) vm.pane_slots.front().rect.right = 620 * scale;
                 if (variant == 3) {

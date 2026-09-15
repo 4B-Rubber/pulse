@@ -1,0 +1,80 @@
+#include "app_internal.h"
+#include "../ui/ui_renderer_internal.h"
+#include <filesystem>
+#include <fstream>
+
+#ifdef PULSE_WITH_SELFTEST
+using namespace pulse;
+void Render(pulse::AppState&);
+int RunSettingsInteractionTest(AppState& s,const wchar_t* output) {
+    using H=ui::HitTestResult;using I=l10n::StringId;
+    std::ofstream log{std::filesystem::path(output)};int failures=0;
+    auto check=[&](bool ok,const char* label) {log<<(ok ? "[PASS] " : "[FAIL] ")<<label<<std::endl;if(!ok)++failures;};
+    auto wait=[&](auto predicate) {
+        const auto deadline=GetTickCount64()+8000;
+        while(GetTickCount64()<deadline) {
+            if(predicate()) return true;
+            MSG msg{};while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&msg);DispatchMessageW(&msg);}
+            Sleep(20);
+        }
+        return predicate();
+    };
+    s.appPrefs.persist=false;
+    const auto base=std::filesystem::path(output).parent_path();
+    const auto docs=base/L"Content fixture with a longer folder name";
+    std::filesystem::create_directories(docs);
+    std::ofstream(docs/L"notes.txt")<<"Pulse settings interaction fixture.";
+    index::ContentIndexConfig config;
+    config.roots={{docs.wstring(),text::Encoding::Auto},{(base/L"missing-folder").wstring(),text::Encoding::Auto}};
+    s.contentSearch.Configure(config);
+    check(wait([&]{return s.contentSearch.GetConfig().roots.size()==2;}),"inline content view receives configured roots");
+    check(wait([&]{return s.contentSearch.GetStatus().indexed_files>=1;}),"isolated content folder finishes indexing");
+    OpenSettingsTab(s,1);s.settingsExpanded=0;s.settings.SetScroll(0,0);
+    auto vm=BuildVm(s,false);
+    check(vm.settings_content_folders.size()==2 && !vm.settings_content_summary.empty(),"inline summary and folder rows use live index data");
+    bool error_visible=false;for(const auto& f:vm.settings_content_folders) error_visible|=f.error;
+    check(error_visible,"unavailable content folder has an explicit error state");
+    auto snapshot=[&](const wchar_t* name) { Render(s);check(s.compositor.SaveSnapshot((base/name).c_str()),"live content settings snapshot captured"); };
+    snapshot(L"content-populated.png");
+    H action;action.region=H::SettingsContentAction;action.index=1;
+    HandleSettingsControl(s,action);check(wait([&]{return s.contentSearch.GetStatus().paused;}),"inline pause reaches content index agent");
+    snapshot(L"content-paused.png");
+    HandleSettingsControl(s,action);check(wait([&]{return !s.contentSearch.GetStatus().paused;}),"inline resume reaches content index agent");
+    auto select=[&](H control,int down) {
+        EnsureMenu(s);s.menu->SetHoverFirstOnOpen(true);
+        for(int i=0;i<down;++i) PostThreadMessageW(GetCurrentThreadId(),WM_KEYDOWN,VK_DOWN,0);
+        PostThreadMessageW(GetCurrentThreadId(),WM_KEYDOWN,VK_RETURN,0);
+        HandleSettingsControl(s,control);
+    };
+    H dropdown;dropdown.region=H::SettingsDropdown;dropdown.index=1;
+    select(dropdown,2);check(s.appPrefs.language==L"en-US","language dropdown keyboard selection applies immediately");
+    dropdown.index=0;select(dropdown,0);check(s.appPrefs.window_effect==ui::WindowEffectId(ui::WindowEffect::None),"window effect dropdown applies selected material");
+    action.index=2;select(action,1);
+    check(wait([&]{auto c=s.contentSearch.GetConfig();return c.roots.size()==2 &&
+        std::all_of(c.roots.begin(),c.roots.end(),[](const auto& root){return root.encoding==text::Encoding::Utf8;});}),
+        "text encoding applies to every shared root without changing scope");
+    action.index=0;HandleSettingsControl(s,action);
+    check((s.settingsExpanded&2u)!=0 && s.contentSearch.GetConfig().roots.size()==2,
+        "scope action opens common index maintenance without adding or removing folders");
+    s.settingsExpanded=0;s.settings.SetScroll(0,0);
+    static std::wstring search_query=l10n::Get(I::SettingsWallpaper);
+    s.menu->SetInitialFilterText(L"");
+    SetTimer(s.hwnd,0x5346,10,[](HWND hwnd,UINT,UINT_PTR id,DWORD) {
+        KillTimer(hwnd,id);
+        SetWindowTextW(GetFocus(),search_query.c_str());
+        PostThreadMessageW(GetCurrentThreadId(),WM_KEYDOWN,VK_RETURN,0);
+    });
+    H find;find.region=H::SettingsFind;HandleSettingsControl(s,find);
+    vm=BuildVm(s,false);
+    log<<"search page="<<vm.settings_page<<" expanded="<<s.settingsExpanded<<" scroll="<<s.settings.scroll()<<std::endl;
+    check(vm.settings_page==0 && (s.settingsExpanded&1u) && s.settings.scroll()>0,"settings search opens and scrolls to a hidden option");
+    OpenSettingsTab(s,2);s.settings.SetScroll(0,0);
+    H expand;expand.region=H::SettingsDisclosure;expand.index=8;
+    const bool group_on=s.ctxMenuPrefs.GroupEnabled(ipc::CtxMenuGroup::Software);
+    HandleSettingsControl(s,expand);
+    check((s.settingsExpanded&(1u<<8)) && s.ctxMenuPrefs.GroupEnabled(ipc::CtxMenuGroup::Software)==group_on,"expanding context group does not toggle its preference");
+    s.contentSearch.Configure(index::ContentIndexConfig{});
+    check(wait([&]{return s.contentSearch.GetConfig().roots.empty();}),"isolated content fixture configuration cleared");
+    log<<"failures="<<failures<<'\n';return failures ? 1 : 0;
+}
+#endif

@@ -110,6 +110,7 @@ Remove-Item Env:PULSE_LUMATEXT
     Set-Content -LiteralPath $batch -Encoding ascii
 & $batch
 if ($LASTEXITCODE -ne 0) { throw 'Production compilation failed' }
+& (Join-Path $repo 'scripts/check_release_payload.ps1') -BuildDir $build
 if ($Channel -eq 'win81') {
     python tools/audit_win81_imports.py $build
     if ($LASTEXITCODE -ne 0) { throw 'Windows 8.1 startup import guard failed' }

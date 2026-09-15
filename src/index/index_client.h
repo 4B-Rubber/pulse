@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <map>
 #include <windows.h>
 
 namespace pulse::index {
@@ -19,15 +20,18 @@ public:
     IndexClient(const IndexClient&) = delete;
     IndexClient& operator=(const IndexClient&) = delete;
 
-    void Start(HWND notify, UINT status_msg, UINT search_msg);
+    void Start(HWND notify, UINT status_msg, UINT search_msg, std::wstring pipe_name = kPipeName);
     void Stop();
 
     std::wstring Status() const;
     std::wstring IndexPath() const;
     bool ServiceMode() const;
     bool Connected() const { return connected_.load(); }
+    bool PinyinReady() const { return connected_.load() && pinyin_ready_.load(); }
+    uint64_t Revision() const { return revision_.load(); }
     std::vector<VolumeInfo> Volumes() const;
     std::vector<std::wstring> ExcludedPaths() const;
+    bool GetScope(std::vector<VolumeInfo>& volumes, std::vector<std::wstring>& excluded) const;
     void RefreshVolumesAsync();
     bool RequestConfigureVolume(const std::wstring& volume_id, bool enabled);
     bool RequestRebuild();
@@ -40,6 +44,7 @@ public:
 
     // Fire-and-forget. Reply arrives as search_msg (wParam = request id).
     void SearchAsync(const Query& q, uint32_t id);
+    void CancelSession(uint64_t session_id);
     bool TakeResult(uint32_t id, SearchResult& out);
 
     bool ServiceInstalled() const;
@@ -63,6 +68,7 @@ private:
     UINT status_msg_ = 0;
     UINT search_msg_ = 0;
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
+    std::wstring pipe_name_ = kPipeName;
     HANDLE child_proc_ = nullptr;
     HANDLE child_thread_ = nullptr;
     std::thread worker_;
@@ -70,13 +76,16 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> ready_{false};
+    std::atomic<bool> pinyin_ready_{false};
     std::atomic<size_t> count_{0};
+    std::atomic<uint64_t> revision_{0};
     std::atomic<uint32_t> latest_search_id_{0};
     mutable std::mutex mu_;
     std::wstring status_ = L"索引未连接";
     std::wstring index_path_;
     bool service_mode_ = false;
     std::vector<VolumeInfo> volumes_;
+    bool scope_ready_ = false;
     std::vector<std::wstring> excluded_paths_;
     uint32_t result_id_ = 0;
     SearchResult result_;
@@ -85,6 +94,11 @@ private:
     Query pending_q_;
     uint32_t pending_id_ = 0;
     bool have_pending_ = false;
+    std::map<uint64_t, std::pair<uint32_t, Query>> pending_searches_;
+    std::map<uint64_t, std::pair<uint32_t, Query>> subscribed_searches_;
+    std::vector<uint64_t> cancelled_sessions_;
+    std::map<uint64_t, uint32_t> session_requests_;
+    std::map<uint32_t, SearchResult> results_;
     bool volume_refresh_requested_ = true;
     std::condition_variable pending_cv_;
 };

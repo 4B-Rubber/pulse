@@ -14,6 +14,7 @@ enum class DatePreset : uint8_t { Any, Today, Yesterday, ThisWeek, ThisMonth, Th
 
 struct AdvancedSearchSpec {
     std::wstring name;
+    bool pinyin_enabled = true;
     NameMatchHow name_how = NameMatchHow::Contains;
     index::SearchKind kind = index::SearchKind::Any;
     std::wstring custom_exts;

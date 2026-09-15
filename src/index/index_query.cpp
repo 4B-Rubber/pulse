@@ -1,3 +1,4 @@
+#include "filename_pinyin.h"
 // index_query.cpp — Compile Everything-subset queries into predicate groups.
 #include "index_query.h"
 #include "search_kinds.h"
@@ -309,6 +310,7 @@ struct RawToken {
 bool ConsumeContentOrFlag(const RawToken& tok, CompiledQuery& q) {
     if (tok.quoted) return false;
     std::wstring_view val;
+    if (!tok.negated && Fold(tok.text) == L"nopinyin:") { q.pinyin_enabled = false; return true; }
     if (IsFlagToken(tok.text, q.content)) return true;
     if (IsContentKey(tok.text, val)) {
         std::wstring needle(val);
@@ -535,7 +537,8 @@ bool MatchName(const wchar_t* s, uint32_t n, const Term& t) {
     switch (t.name_how) {
     case NameHow::Exact:     return EqualsFolded(s, n, t.name);
     case NameHow::Wildcard:  return WildcardFolded(s, n, t.name);
-    case NameHow::Substring: return ContainsFolded(s, n, t.name);
+    case NameHow::Substring: return ContainsFolded(s, n, t.name) ||
+        (t.pinyin && static_cast<bool>(FindPinyinMatch({s, n}, t.name)));
     default: return true;
     }
 }
@@ -602,6 +605,13 @@ bool QueryIsSimpleName(const CompiledQuery& q) {
     return t.name_how == NameHow::Substring || t.name_how == NameHow::Exact;
 }
 
+bool QueryHasPinyin(const CompiledQuery& q) {
+    for (const auto& group : q.groups)
+        for (const auto& term : group)
+            if (term.pinyin) return true;
+    return false;
+}
+
 bool QueryHasContent(const CompiledQuery& q) {
     return q.content.present();
 }
@@ -636,13 +646,17 @@ int RankName(const wchar_t* s, uint32_t n, bool is_dir, const CompiledQuery& q) 
             if (t.name_how == NameHow::Wildcard) {
                 if (WildcardFolded(s, n, t.name)) sc = 150;
             } else if (EqualsFolded(s, n, t.name)) {
-                sc = 400;
+                sc = 600;
             } else if (StartsWithFolded(s, n, t.name)) {
-                sc = 300;
+                sc = 500;
             } else if (WordStartFolded(s, n, t.name)) {
-                sc = 200;
+                sc = 400;
             } else if (ContainsFolded(s, n, t.name)) {
-                sc = 100;
+                sc = 300;
+            }
+            if (!sc && t.pinyin) {
+                const auto match = FindPinyinMatch({s, n}, t.name);
+                if (match) sc = match.kind == PinyinMatchKind::Full ? 200 : 100;
             }
             if (sc > best) best = sc;
         }
@@ -655,6 +669,12 @@ int RankName(const wchar_t* s, uint32_t n, bool is_dir, const CompiledQuery& q) 
 
 bool QueryCanNarrow(std::wstring_view prev, std::wstring_view next) {
     if (prev.empty() || next.size() < prev.size()) return false;
+    const auto previous = ParseQuery(prev);
+    const auto following = ParseQuery(next);
+    if (!QueryHasPinyin(previous) && QueryHasPinyin(following)) return false;
+    for (const auto& group : previous.groups)
+        for (const auto& term : group)
+            if (term.pinyin && term.name_not) return false; // extending an exclusion broadens results
     if (next.substr(0, prev.size()) != prev) return false;
     if (CountChar(next, L'|') != CountChar(prev, L'|')) return false;
     if (CountChar(next, L'!') < CountChar(prev, L'!')) return false;
@@ -676,6 +696,10 @@ CompiledQuery ParseQuery(std::wstring_view raw) {
         q.groups.back().push_back(ParseTerm(tokens[i].text, tokens[i].quoted, tokens[i].negated));
     }
     while (!q.groups.empty() && q.groups.back().empty()) q.groups.pop_back();
+    for (auto& group : q.groups)
+        for (auto& term : group)
+            term.pinyin = q.pinyin_enabled && !term.name_in_path &&
+                term.name_how == NameHow::Substring && PinyinEligible(term.name);
     if (q.content.needles.size() == 1 && q.content.mode == ContentMatchMode::AllWords &&
         q.content.needles[0].find(L' ') != std::wstring::npos)
         q.content.mode = ContentMatchMode::Phrase;

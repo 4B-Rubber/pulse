@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace pulse {
@@ -70,10 +71,13 @@ struct DuplicateScanSession {
     size_t ExtraCount() const;
 
 private:
-    void RebuildGroups();
+    void AppendHits(const std::vector<index::ContentHit>& hits);
+    void SortGroups();
+    void RebuildGroupIndex();
     void UpdateSpeed(const index::ContentSearchProgress& progress);
 
-    std::vector<index::ContentHit> hits_;
+    std::unordered_map<uint32_t, DuplicateFile> pending_groups_;
+    std::unordered_map<uint32_t, size_t> group_indices_;
     std::chrono::steady_clock::time_point speed_tick_{};
     uint64_t speed_files_ = 0;
     uint64_t speed_bytes_ = 0;

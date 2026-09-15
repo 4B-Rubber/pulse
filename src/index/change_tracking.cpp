@@ -212,6 +212,10 @@ bool ChangeTracker::Lease(const std::wstring& owner, bool enabled) {
     std::lock_guard lock(mutex_); auto& j = journals_[owner]; Load(owner, j);
     const auto now = Now();
     if (enabled) {
+        if (j.active && j.expiry >= now && !j.paused_at) {
+            j.expiry = now + 90;
+            return false;
+        }
         if (!j.tracking_since) { j.tracking_since = now; ++j.revision; }
         else if (j.expiry < now && (j.active || j.paused_at)) {
             j.gap = true; j.gap_end = now; j.gap_until = now + kRetention;
@@ -248,10 +252,15 @@ void ChangeTracker::Record(ChangeRecord e) {
         j.dirty = true;
     }
 }
-void ChangeTracker::Flush() {
+void ChangeTracker::Flush(bool force) {
     std::vector<std::pair<std::wstring, Journal>> pending;
     {
         std::lock_guard lock(mutex_);
+        const auto tick = GetTickCount64();
+        // Queries read live records. Batch persistence and pruning instead of
+        // copying the entire retained history on every journal notification.
+        if (!force && last_flush_tick_ && tick - last_flush_tick_ < 60000) return;
+        last_flush_tick_ = tick;
         for (auto& [owner, journal] : journals_) {
             Prune(journal);
             if (!journal.dirty) continue;

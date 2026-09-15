@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <map>
 
 namespace pulse::index {
 
@@ -36,6 +37,7 @@ private:
     bool Request(uint32_t type, uint32_t id, const std::vector<uint8_t>& payload,
                  uint32_t& response_type, std::vector<uint8_t>& response);
     void SearchRequest(Query query, uint32_t id);
+    void SearchLoop();
     void RefreshRoots();
     static std::wstring ExePath();
 
@@ -48,10 +50,21 @@ private:
     std::vector<NetworkRootInfo> roots_;
     uint32_t result_id_ = 0;
     SearchResult result_;
+    std::map<uint32_t,SearchResult> results_;
     std::mutex request_mu_;
+    std::mutex pipe_mu_;
+    HANDLE active_pipe_ = INVALID_HANDLE_VALUE;
     std::mutex status_mu_;
     std::condition_variable status_cv_;
     std::thread status_thread_;
+    std::mutex search_mu_;
+    std::condition_variable search_cv_;
+    Query pending_query_;
+    uint32_t pending_search_id_ = 0;
+    bool have_pending_search_ = false;
+    std::map<uint64_t,std::pair<uint32_t,Query>> pending_searches_;
+    std::map<uint64_t,uint32_t> session_requests_;
+    std::thread search_thread_;
     HANDLE agent_process_ = nullptr;
 };
 

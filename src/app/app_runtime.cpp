@@ -35,11 +35,75 @@
 #include <cmath>
 #include <cwctype>
 #include <thread>
+#include <condition_variable>
+#include <mutex>
+#include <optional>
 #include <unordered_set>
 
 using namespace pulse;
 
 namespace {
+
+struct DetailsMetaRequest {
+    HWND hwnd = nullptr;
+    std::wstring path;
+};
+
+class DetailsMetaWorker {
+public:
+    void Submit(HWND hwnd, std::wstring path) {
+        if (!hwnd || path.empty()) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_ = DetailsMetaRequest{hwnd, std::move(path)};
+            if (!thread_.joinable()) thread_ = std::thread([this] { Run(); });
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void Run() {
+        for (;;) {
+            DetailsMetaRequest request;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return pending_.has_value(); });
+                request = std::move(*pending_);
+                pending_.reset();
+            }
+            auto* result = new DetailsMetaResult{};
+            result->path = request.path;
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            if (GetFileAttributesExW(request.path.c_str(), GetFileExInfoStandard, &fad)) {
+                result->attrs_valid = true;
+                result->created = fad.ftCreationTime;
+                result->modified = fad.ftLastWriteTime;
+                result->accessed = fad.ftLastAccessTime;
+            }
+            SHFILEINFOW sfi{};
+            const std::wstring shell_path = path::StripExtendedPathPrefix(request.path);
+            if (SHGetFileInfoW(shell_path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_TYPENAME) &&
+                sfi.szTypeName[0]) {
+                result->type_name = sfi.szTypeName;
+            }
+            result->meta = app::FetchDetailsMeta(request.path);
+            if (!PostMessageW(request.hwnd, WM_DETAILS_META, 0, reinterpret_cast<LPARAM>(result)))
+                delete result;
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::optional<DetailsMetaRequest> pending_;
+    std::thread thread_;
+};
+
+DetailsMetaWorker& GetDetailsMetaWorker() {
+    // The worker is intentionally process-lifetime: Windows may leave a Shell
+    // metadata call blocked on an offline provider during window teardown.
+    static auto* worker = new DetailsMetaWorker();
+    return *worker;
+}
 
 void RefreshDuplicateGroupViews(AppState& s) {
     constexpr size_t kMaxGroups = 80;
@@ -78,26 +142,7 @@ void RefreshDuplicateGroupViews(AppState& s) {
 
 namespace pulse {
 void PrefetchDetailsMeta(HWND hwnd, const std::wstring& path) {
-    std::thread([hwnd, path] {
-        auto* result = new DetailsMetaResult{};
-        result->path = path;
-        WIN32_FILE_ATTRIBUTE_DATA fad{};
-        if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
-            result->attrs_valid = true;
-            result->created = fad.ftCreationTime;
-            result->modified = fad.ftLastWriteTime;
-            result->accessed = fad.ftLastAccessTime;
-        }
-        SHFILEINFOW sfi{};
-        const std::wstring shell_path = pulse::path::StripExtendedPathPrefix(path);
-        if (SHGetFileInfoW(shell_path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_TYPENAME) &&
-            sfi.szTypeName[0]) {
-            result->type_name = sfi.szTypeName;
-        }
-        result->meta = app::FetchDetailsMeta(path);
-        if (!PostMessageW(hwnd, WM_DETAILS_META, 0, reinterpret_cast<LPARAM>(result)))
-            delete result;
-    }).detach();
+    GetDetailsMetaWorker().Submit(hwnd, path);
 }
 void RememberLayoutFocus(AppState& s) {
     for (auto& owned : s.window_tabs.items) {
@@ -248,17 +293,7 @@ D2D1_RECT_F ListRect(const AppState& s) {
 }
 bool ScrollbarGeometry(const AppState& s, const ui::PaneViewModel& pane,
                               D2D1_RECT_F& track, D2D1_RECT_F& thumb, float& maxScroll) {
-    track = ListRect(s);
-    const float viewH = std::max(0.0f, track.bottom - track.top);
-    maxScroll = s.renderer.MaxScrollForPane(pane, FocusedPaneRect(s));
-    if (maxScroll <= 0.0f || viewH <= 0.0f) return false;
-    const float totalH = viewH + maxScroll;
-    const float thumbH = std::max(24.0f * s.scale, viewH * (viewH / totalH));
-    const float travel = std::max(1.0f, viewH - thumbH);
-    const float thumbY = track.top + std::clamp(pane.scroll_y / maxScroll, 0.0f, 1.0f) * travel;
-    track.left = track.right - 14.0f * s.scale;
-    thumb = D2D1::RectF(track.left, thumbY, track.right, thumbY + thumbH);
-    return true;
+    return s.renderer.PaneScrollbarGeometry(pane, FocusedPaneRect(s), track, thumb, maxScroll);
 }
 
 bool HorizontalScrollbarGeometry(const AppState& s, const ui::PaneViewModel& pane,
@@ -308,6 +343,40 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             vm.settings_launch_on_startup = s.appPrefs.launch_on_startup;
             vm.settings_keep_running = s.appPrefs.keep_running_on_close;
             vm.settings_show_hidden_files = s.appPrefs.show_hidden_files;
+            vm.settings_search_pinyin = s.appPrefs.search_pinyin;
+            vm.settings_global_search_enabled = s.appPrefs.global_search_enabled;
+            vm.settings_global_search_capturing = s.settings.global_search_hotkey_capturing();
+            vm.settings_global_search_hotkey = s.settings.GlobalSearchHotkeyText();
+            vm.settings_global_search_error = s.settings.global_search_error();
+            vm.settings_content_status = ContentIndexStatusText(s);
+            vm.settings_expanded = s.settingsExpanded;
+            vm.settings_theme = s.themeOverride == ui::ThemeMode::Light ? 1 : s.themeOverride == ui::ThemeMode::Dark ? 2 : 0;
+            const auto content_config = s.contentSearch.GetConfig();
+            const auto content_status = s.contentSearch.GetStatus();
+            vm.settings_content_paused = content_status.paused;
+            vm.settings_content_instant = s.contentSearch.InstantMode();
+            wchar_t content_summary[160]{};
+            swprintf_s(content_summary,l10n::Get(l10n::StringId::SettingsContentSummaryFormat).c_str(),
+                static_cast<unsigned long long>(content_config.roots.size()),static_cast<unsigned long long>(content_status.indexed_files));
+            vm.settings_content_summary=content_summary;
+            if (vm.settings_content_instant) vm.settings_content_summary = l10n::Get(l10n::StringId::ContentInstantReady);
+            for (const auto& root : content_config.roots) {
+                ui::WindowViewModel::ContentFolderView folder;
+                folder.path = root.path;
+                folder.error=content_status.error!=0;
+                folder.status = l10n::Get(folder.error ? l10n::StringId::SettingsUnavailable :
+                    content_status.paused ? l10n::StringId::ContentIndexPaused : l10n::StringId::ContentIndexBuilding);
+                for (const auto& status : content_status.root_status) if (status.path == root.path) {
+                    folder.error = status.error != 0 || !status.available;
+                    folder.status = l10n::Get(folder.error ? l10n::StringId::SettingsUnavailable :
+                        content_status.paused ? l10n::StringId::ContentIndexPaused :
+                        status.indexing ? l10n::StringId::ContentIndexBuilding : l10n::StringId::ContentIndexReady);
+                    if (status.error) folder.status += L" (" + std::to_wstring(status.error) + L")";
+                    break;
+                }
+                if (vm.settings_content_instant) { folder.error = false; folder.status = l10n::Get(l10n::StringId::ContentInstantReady); }
+                vm.settings_content_folders.push_back(std::move(folder));
+            }
             vm.settings_open_folders = s.appPrefs.open_folders_in_pulse;
             vm.settings_blank_click_go_back = s.appPrefs.blank_click_go_back;
             vm.settings_change_tracking = s.appPrefs.change_tracking_enabled;
@@ -1063,6 +1132,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         vm.status.task_text = st.last_error.empty() ? st.summary
             : st.summary + L" — " + st.last_error;
         vm.status.task_progress = st.active ? st.percent : -1.0f;
+        if(s.contentSelectionAction) vm.status.selection_text=l10n::Get(l10n::StringId::OpPreparingList);
     }
     {
         std::wstring idx = s.index.Status();
@@ -1072,7 +1142,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         const bool search_visible = active &&
             app::ParsePulsePath(active->current_path, &virtual_kind, &virtual_rest) &&
             virtual_kind == L"search";
-        if (!idx.empty() && (s.paletteSearching || search_visible)) {
+        if (!idx.empty() && !vm.status.query_active && (s.paletteSearching || search_visible)) {
             if (!vm.status.status_text.empty()) vm.status.status_text += L"  ·  ";
             vm.status.status_text += idx;
         }
@@ -1292,8 +1362,8 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         }
         if (dv.has_selection && selCount == 1 && tab->snapshot &&
             tab->selected_index >= 0 &&
-            tab->selected_index < static_cast<int>(tab->snapshot->size())) {
-            const fs::DirEntry& e = (*tab->snapshot)[static_cast<size_t>(tab->selected_index)];
+            tab->selected_index < static_cast<int>(tab->EntryCount())) {
+            const fs::DirEntry& e = tab->EntryAt(static_cast<size_t>(tab->selected_index));
             const bool penetrated = !e.link_target.empty();
             dv.name = e.name;
             dv.is_dir = penetrated ? e.link_target_is_dir : e.is_dir;
@@ -1319,9 +1389,12 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         if (dv.has_selection && selCount > 1 && tab->snapshot) {
             uint64_t knownSize = 0;
             int files = 0, folders = 0;
-            for (int index : tab->SelectedIndices()) {
-                if (index < 0 || index >= static_cast<int>(tab->snapshot->size())) continue;
-                const fs::DirEntry& entry = (*tab->snapshot)[static_cast<size_t>(index)];
+            std::optional<uint64_t> contentSize;
+            if(tab->content_results) {
+                files=selCount;contentSize=ContentSelectionSize(*tab);knownSize=contentSize.value_or(0);
+            } else for (int index : tab->SelectedIndices()) {
+                if (index < 0 || index >= static_cast<int>(tab->EntryCount())) continue;
+                const fs::DirEntry& entry = tab->EntryAt(static_cast<size_t>(index));
                 if (entry.is_dir) ++folders;
                 else { ++files; knownSize += entry.size; }
             }
@@ -1336,7 +1409,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
                 swprintf_s(composition,
                     l10n::Get(l10n::StringId::FoldersOnlyFormat).c_str(), folders);
             dv.type_text = composition;
-            dv.size_text = pulse::format::ByteSize(knownSize, true);
+            dv.size_text = tab->content_results && !contentSize ? l10n::Get(l10n::StringId::LoadingEllipsis) : pulse::format::ByteSize(knownSize, true);
             dv.location_text = fs::IsVirtualPath(tab->current_path)
                 ? l10n::Get(l10n::StringId::MultipleLocations)
                 : TrayDisplayPath(tab->current_path);
@@ -1450,6 +1523,11 @@ std::wstring TooltipForHover(AppState& s) {
             ? tab->search_input_current : s.addressSearchCurrent;
         return text(current ? I::LocationCurrent : I::LocationIndexed);
     }
+    case R::AddressSearchMode: return text(I::SearchModeName);
+    case R::AddressSearchContent: return text(I::SearchModeContent);
+    case R::AddressSearchOptions: return text(I::SearchOptions);
+    case R::ContentIndexManage:
+    case R::SettingsContentIndex: return text(I::ContentIndexManage);
     case R::AddressSearchClear: return text(I::Clear);
     case R::AddressSearchClose: return text(I::Back);
     case R::TabClose: return text(I::TooltipCloseTab);
@@ -1471,6 +1549,11 @@ std::wstring TooltipForHover(AppState& s) {
     case R::TabNew: return text(I::TooltipNewTab);
     case R::ThemeToggle: return text(I::TooltipToggleTheme);
     case R::SettingsButton: return text(I::Settings);
+    case R::SettingsFind: return text(I::SettingsFind);
+    case R::SettingsNav: {
+        const I names[]={I::SettingsGeneral,I::SettingsSearchIndex,I::SettingsContextMenu,I::SettingsAboutDiagnostics,I::SettingsDuplicates};
+        return s.hoverControlIndex>=0 && s.hoverControlIndex<5 ? text(names[s.hoverControlIndex]) : L"";
+    }
     case R::SettingsEffect: {
         if (s.hoverControlIndex >= 0 && s.hoverControlIndex < ui::kWindowEffectCount) {
             static constexpr I effects[] = {
@@ -1534,6 +1617,7 @@ std::wstring TooltipForHover(AppState& s) {
     case R::DetailsPreviewToggle: return text(s.detailsPreviewOnly ? I::PreviewExpandDetails : I::PreviewCollapseDetails);
     case R::DetailsPreview: return L"";
     case R::StatusBarTask: return text(I::OpDetails);
+    case R::StatusBarCancelSearch: return text(I::ContentCancelSearch);
     case R::DetailsNewTab: return text(I::OpenNewTab);
     case R::DetailsCopyPath: return text(I::CopyPath);
     case R::DetailsSection: return text(I::ExpandCollapse);
@@ -1560,8 +1644,8 @@ std::wstring TooltipForHover(AppState& s) {
         app::Pane* pane = PaneAtSlot(s, s.hoverPaneIndex);
         app::Tab* tab = pane ? pane->ActiveTab() : ActiveTab(s);
         if (tab && tab->snapshot && s.hoverControlIndex >= 0 &&
-            s.hoverControlIndex < static_cast<int>(tab->snapshot->size())) {
-            const auto& entry = (*tab->snapshot)[s.hoverControlIndex];
+            s.hoverControlIndex < static_cast<int>(tab->EntryCount())) {
+            const auto& entry = tab->EntryAt(s.hoverControlIndex);
             std::wstring tooltip = entry.name;
             if (!entry.change_type_text.empty()) {
                 tooltip += L" · " + entry.change_type_text + L" · " + entry.full_path;
@@ -1607,8 +1691,8 @@ std::wstring TooltipForHover(AppState& s) {
 
 // Full path of a directory entry (normalized, empty when out of range).
 std::wstring EntryFullPath(const app::Tab& tab, int index) {
-    if (!tab.snapshot || index < 0 || index >= static_cast<int>(tab.snapshot->size())) return L"";
-    const fs::DirEntry& e = (*tab.snapshot)[static_cast<size_t>(index)];
+    if (!tab.snapshot || index < 0 || index >= static_cast<int>(tab.EntryCount())) return L"";
+    const fs::DirEntry& e = tab.EntryAt(static_cast<size_t>(index));
     if (e.change_record_only) return L"";
     if (!e.full_path.empty()) return e.full_path;
     if (fs::IsVirtualPath(tab.current_path)) return L"";
@@ -1638,7 +1722,7 @@ std::wstring TagDiscoveryKey(std::wstring path) {
 
 void QueueVisibleTagDiscovery(AppState& s) {
     app::Tab* tab = ActiveTab(s);
-    if (!tab || tab->loading || !tab->snapshot || tab->snapshot->empty()) return;
+    if (!tab || tab->loading || !tab->snapshot || tab->EntryCount() == 0) return;
 
     const D2D1_RECT_F list = ListRect(s);
     const float row_height = s.renderer.RowHeight();

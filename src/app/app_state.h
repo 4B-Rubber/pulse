@@ -14,6 +14,7 @@
 #include "../fs/fs_snapshot.h"
 #include "../fs/fs_watch.h"
 #include "app_model.h"
+#include "content_results_ui.h"
 #include "app_worker.h"
 #include "places.h"
 #include "details_meta.h"
@@ -26,6 +27,8 @@
 #include "settings_controller.h"
 #include "single_instance_coordinator.h"
 #include "tray_controller.h"
+#include "global_search_hotkey.h"
+#include "global_search_window.h"
 #include "tab_controller.h"
 #include "update_checker.h"
 #include "update_installer.h"
@@ -33,6 +36,7 @@
 #include "duplicate_scan.h"
 #include "../index/index_client.h"
 #include "app_change_tracking.h"
+#include "unc_probe_scheduler.h"
 #include "../index/network_agent_client.h"
 #include "../index/content_search_client.h"
 #include "../ops/ops_manager.h"
@@ -67,6 +71,7 @@ constexpr UINT WM_SHELL_CACHE_INVALIDATE = WM_APP + 49;
 constexpr UINT WM_NETWORK_INDEX_NOTIFY = WM_APP + 51;
 constexpr UINT WM_NETWORK_INDEX_SEARCH = WM_APP + 52;
 constexpr UINT WM_CONTENT_SEARCH = WM_APP + 53;
+constexpr UINT WM_CONTENT_SELECTION = WM_APP + 64;
 constexpr UINT WM_DUPLICATE_SCAN = WM_APP + 58;
 constexpr UINT WM_QUICK_PREVIEW_NAVIGATE = WM_APP + 54;
 constexpr UINT WM_QUICK_PREVIEW_OPEN = WM_APP + 55;
@@ -178,6 +183,8 @@ struct AppState {
     std::wstring notified_update_version;
     app::TabController tabs;
     app::TrayController tray_controller;
+    GlobalSearchHotkey globalSearchHotkey;
+    GlobalSearchWindow globalSearchWindow;
     app::SingleInstanceCoordinator single_instance;
     ui::BloomAccentPicker bloom_accent;
     std::unordered_set<std::wstring> tagFallbackVolumes;
@@ -192,6 +199,7 @@ struct AppState {
     ChangeTrackingUi changes;
     index::NetworkAgentClient networkIndex;
     index::ContentSearchClient contentSearch;
+    std::shared_ptr<ContentSelectionAction> contentSelectionAction;
     index::ContentSearchClient duplicateSearch;
     app::DuplicateScanSession duplicateScan;
     uint64_t dup_view_epoch = 0;
@@ -218,14 +226,16 @@ struct AppState {
     uint32_t paletteSearchId = 0;
     uint32_t nextIndexReq = 1;
     bool paletteSearching = false;
-    bool probeBusy = false;
+    app::UncProbeScheduler probe_scheduler;
     std::wstring probeUnc;
     std::vector<std::wstring> probeQueue;
 
     bool darkMode = false;
+    unsigned settingsExpanded = ui::kSettingsDefaultExpandedMask;
     ui::ThemeMode themeOverride = ui::ThemeMode::Auto;
     bool safeMode = false;
     bool isolatedTest = false;
+    bool contentIndexObserver = false;
     D2D1_COLOR_F accentColor;
     float scale = 1.0f;
     bool maximized = false;
@@ -253,6 +263,7 @@ struct AppState {
     bool scrollbarSidebar = false;
     int scrollbarDragStartX = 0;
     int scrollbarDragStartY = 0;
+    float scrollbarGrabOffset = 0.0f;
     float scrollbarDragStartScroll = 0.0f;
     float scrollbarHoverWidth = 0.0f;
 
@@ -351,6 +362,11 @@ struct AppState {
     std::wstring addressLiveContext;
     std::wstring addressHistoryPath;
     bool addressSearchCurrent = false;
+    bool addressSearchContent = false;
+    bool searchOptionsPending = false;
+    ULONGLONG contentStatusTick = 0;
+    std::wstring contentStatusText;
+    bool pinyinReadyLast = false;
     std::wstring addressSearchRoot;
     float addressSearchAnimation = 0.0f;
     float addressScopeAnimation = 0.0f;

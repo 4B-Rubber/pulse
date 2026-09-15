@@ -101,8 +101,8 @@ std::wstring RecentChangesMenuPath(const Tab& tab, bool background) {
     if (!tab.snapshot) return {};
     const auto selected = tab.SelectedIndices();
     if (selected.size() != 1 || selected[0] < 0 ||
-        static_cast<size_t>(selected[0]) >= tab.snapshot->size()) return {};
-    const auto& entry = (*tab.snapshot)[static_cast<size_t>(selected[0])];
+        static_cast<size_t>(selected[0]) >= tab.EntryCount()) return {};
+    const auto& entry = tab.EntryAt(static_cast<size_t>(selected[0]));
     if (entry.change_record_only || !entry.recycle_path.empty()) return {};
     if (!entry.link_target.empty())
         return entry.link_target_is_dir && filesystem(entry.link_target) ? entry.link_target : std::wstring{};

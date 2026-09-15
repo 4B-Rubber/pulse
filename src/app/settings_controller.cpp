@@ -43,6 +43,7 @@ const wchar_t* SettingsController::PageName(int page) noexcept {
 }
 
 void SettingsController::SelectPage(int page) noexcept {
+    CancelGlobalSearchHotkeyCapture();
     page_ = std::clamp(page, 0, 4);
     scroll_ = 0.0f;
 }
@@ -232,6 +233,7 @@ void SettingsController::BindUi(AppPrefs& prefs, ContextMenuPrefs& context,
 }
 
 void SettingsController::ResetUi() noexcept {
+    CancelGlobalSearchHotkeyCapture();
     prefs_ = nullptr;
     context_ = nullptr;
     index_ = nullptr;
@@ -314,6 +316,51 @@ void SettingsController::ChangeTrackingDays(int days) {
     SaveAndApply(SettingsEffect::ChangeTracking);
 }
 
+bool SettingsController::CaptureGlobalSearchHotkey(uint32_t key, uint32_t modifiers) {
+    if (!global_search_capturing_) return false;
+    if (key == VK_ESCAPE) { CancelGlobalSearchHotkeyCapture(); return true; }
+    if (key == VK_CONTROL || key == VK_MENU || key == VK_SHIFT || key == VK_LWIN || key == VK_RWIN ||
+        (key >= VK_LSHIFT && key <= VK_RMENU)) return true;
+    if (!prefs_) return true;
+    if (modifiers == 0 || (modifiers & ~15u) || key == 0 || key > 254) {
+        global_search_error_ = l10n::Get(l10n::StringId::GlobalSearchInvalid);
+        return true;
+    }
+    const auto previous_modifiers = prefs_->global_search_modifiers;
+    const auto previous_key = prefs_->global_search_key;
+    prefs_->global_search_modifiers = modifiers;
+    prefs_->global_search_key = key;
+    if (!prefs_->Save()) {
+        prefs_->global_search_modifiers = previous_modifiers;
+        prefs_->global_search_key = previous_key;
+        global_search_error_ = l10n::Get(l10n::StringId::GlobalSearchSaveFailed);
+        return true;
+    }
+    global_search_capturing_ = false;
+    global_search_error_.clear();
+    Apply(SettingsEffect::GlobalSearch);
+    return true;
+}
+
+std::wstring SettingsController::GlobalSearchHotkeyText() const {
+    if (!prefs_) return L"Alt + Space";
+    std::wstring text;
+    const auto modifiers = prefs_->global_search_modifiers;
+    if (modifiers & MOD_CONTROL) text += L"Ctrl + ";
+    if (modifiers & MOD_ALT) text += L"Alt + ";
+    if (modifiers & MOD_SHIFT) text += L"Shift + ";
+    if (modifiers & MOD_WIN) text += L"Win + ";
+    const UINT key = prefs_->global_search_key;
+    LONG scan = static_cast<LONG>(MapVirtualKeyW(key, MAPVK_VK_TO_VSC) << 16);
+    if (key == VK_LEFT || key == VK_RIGHT || key == VK_UP || key == VK_DOWN ||
+        key == VK_PRIOR || key == VK_NEXT || key == VK_END || key == VK_HOME ||
+        key == VK_INSERT || key == VK_DELETE || key == VK_DIVIDE || key == VK_NUMLOCK) scan |= 1 << 24;
+    wchar_t name[128]{};
+    if (GetKeyNameTextW(scan, name, 128)) text += name;
+    else text += L"VK " + std::to_wstring(key);
+    return text;
+}
+
 void SettingsController::ToggleUi(int index) {
     if (!prefs_ || !context_) return;
     if (index == 1) {
@@ -340,6 +387,18 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 8) {
         prefs_->change_tracking_enabled = !prefs_->change_tracking_enabled;
         SaveAndApply(SettingsEffect::ChangeTracking);
+    } else if (index == 9) {
+        prefs_->search_pinyin = !prefs_->search_pinyin;
+        SaveAndApply(SettingsEffect::None);
+    } else if (index == 15) {
+        prefs_->global_search_enabled = !prefs_->global_search_enabled;
+        if (!prefs_->Save()) {
+            prefs_->global_search_enabled = !prefs_->global_search_enabled;
+            global_search_error_ = l10n::Get(l10n::StringId::GlobalSearchSaveFailed);
+            return;
+        }
+        global_search_error_.clear();
+        Apply(SettingsEffect::GlobalSearch);
     } else if (index >= 10 && index < 15) {
         static constexpr ipc::CtxMenuGroup groups[] = {
             ipc::CtxMenuGroup::Software, ipc::CtxMenuGroup::OpenWith,

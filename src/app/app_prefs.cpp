@@ -49,10 +49,15 @@ void AppPrefs::ResetToDefaults() {
     verify_copies = false;
     show_status_performance = false;
     show_pinned_tab_names = true;
+    search_pinyin = true;
+    global_search_enabled = false;
+    global_search_modifiers = 1;
+    global_search_key = 32;
     show_hidden_files = false;
     blank_click_go_back = false;
     change_tracking_enabled = false;
     change_tracking_days = 7;
+    theme_mode = -1;
     language = L"system";
     window_effect = L"mica-alt";
     background_image.clear();
@@ -86,12 +91,20 @@ std::wstring AppPrefs::ToJson() const {
     out += show_pinned_tab_names ? L"true" : L"false";
     out += L",\n  \"show_hidden_files\":";
     out += show_hidden_files ? L"true" : L"false";
+    out += L",\n  \"search_pinyin\":";
+    out += search_pinyin ? L"true" : L"false";
+    out += L",\n  \"global_search_enabled\":";
+    out += global_search_enabled ? L"true" : L"false";
+    out += L",\n  \"global_search_modifiers\":" + std::to_wstring(global_search_modifiers);
+    out += L",\n  \"global_search_key\":" + std::to_wstring(global_search_key);
     out += L",\n  \"blank_click_go_back\":";
     out += blank_click_go_back ? L"true" : L"false";
     out += L",\n  \"change_tracking_enabled\":";
     out += change_tracking_enabled ? L"true" : L"false";
     out += L",\n  \"change_tracking_days\":";
     out += std::to_wstring(change_tracking_days == 1 || change_tracking_days == 3 ? change_tracking_days : 7);
+    out += L",\n  \"theme_mode\":";
+    out += std::to_wstring(theme_mode);
     out += L",\n  \"language\":\"";
     out += escaped_language;
     out += L"\"";
@@ -144,12 +157,20 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     verify_copies = pulse::json::ExtractBool(json, L"verify_copies", false);
     show_status_performance = pulse::json::ExtractBool(json, L"show_status_performance", false);
     show_pinned_tab_names = pulse::json::ExtractBool(json, L"show_pinned_tab_names", true);
+    search_pinyin = pulse::json::ExtractBool(json, L"search_pinyin", true);
+    global_search_enabled = pulse::json::ExtractBool(json, L"global_search_enabled", false);
+    const int modifiers = pulse::json::ExtractInt(json, L"global_search_modifiers", 1);
+    const int key = pulse::json::ExtractInt(json, L"global_search_key", 32);
+    global_search_modifiers = modifiers > 0 && modifiers <= 15 ? static_cast<uint32_t>(modifiers) : 1;
+    global_search_key = key > 0 && key <= 254 ? static_cast<uint32_t>(key) : 32;
     show_hidden_files = pulse::json::ExtractBool(json, L"show_hidden_files", false);
     blank_click_go_back = pulse::json::ExtractBool(json, L"blank_click_go_back", false);
     change_tracking_enabled = pulse::json::ExtractBool(json, L"change_tracking_enabled", false);
     change_tracking_days = pulse::json::ExtractInt(json, L"change_tracking_days", 7);
     if (change_tracking_days != 1 && change_tracking_days != 3 && change_tracking_days != 7)
         change_tracking_days = 7;
+    theme_mode = pulse::json::ExtractInt(json, L"theme_mode", -1);
+    if (theme_mode < -1 || theme_mode > 2) theme_mode = -1;
     language = pulse::json::ExtractString(json, L"language", L"system");
     if (language != L"system" && language != L"zh-CN" && language != L"en-US")
         language = L"system";

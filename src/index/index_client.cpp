@@ -1,7 +1,9 @@
 // index_client.cpp — Connect to Pulse.Index (service or spawned helper).
 #include "../common/command_line.h"
 #include "index_client.h"
+#include "search_trace.h"
 #include <chrono>
+#include <algorithm>
 #include <shellapi.h>
 #include <winsvc.h>
 
@@ -15,8 +17,9 @@ std::wstring IndexClient::ExePath() {
     return std::wstring(exe, slash + 1) + L"Pulse.Index.exe";
 }
 
-void IndexClient::Start(HWND notify, UINT status_msg, UINT search_msg) {
+void IndexClient::Start(HWND notify, UINT status_msg, UINT search_msg, std::wstring pipe_name) {
     Stop();
+    pipe_name_ = std::move(pipe_name);
     notify_ = notify;
     status_msg_ = status_msg;
     search_msg_ = search_msg;
@@ -24,6 +27,7 @@ void IndexClient::Start(HWND notify, UINT status_msg, UINT search_msg) {
     {
         std::lock_guard<std::mutex> lock(mu_);
         status_ = L"索引未连接";
+        scope_ready_ = false;
     }
     worker_ = std::thread([this] { Worker(); });
     writer_ = std::thread([this] { Writer(); });
@@ -31,6 +35,7 @@ void IndexClient::Start(HWND notify, UINT status_msg, UINT search_msg) {
 
 void IndexClient::Stop() {
     running_ = false;
+    pinyin_ready_ = false;
     pending_cv_.notify_all();
     HANDLE pipe = INVALID_HANDLE_VALUE;
     {
@@ -57,6 +62,7 @@ void IndexClient::Stop() {
 }
 
 bool IndexClient::SpawnHelper() {
+    if (pipe_name_ != kPipeName) return false;
     if (ServiceInstalled()) {
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -91,7 +97,7 @@ bool IndexClient::EnsureConnected() {
         if (pipe_ != INVALID_HANDLE_VALUE) return true;
     }
     auto try_open = [&]() -> HANDLE {
-        HANDLE h = CreateFileW(kPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        HANDLE h = CreateFileW(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
         if (h == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
         DWORD mode = PIPE_READMODE_BYTE;
@@ -104,7 +110,7 @@ bool IndexClient::EnsureConnected() {
         const ULONGLONG deadline = GetTickCount64() + 8000;
         while (running_ && h == INVALID_HANDLE_VALUE && GetTickCount64() < deadline) {
             DWORD err = GetLastError();
-            if (err == ERROR_PIPE_BUSY) WaitNamedPipeW(kPipeName, 200);
+            if (err == ERROR_PIPE_BUSY) WaitNamedPipeW(pipe_name_.c_str(), 200);
             else Sleep(50);
             h = try_open();
         }
@@ -121,6 +127,7 @@ bool IndexClient::EnsureConnected() {
         }
         pipe_ = h;
     }
+    { std::lock_guard<std::mutex> lock(mu_); scope_ready_ = false; pending_searches_=subscribed_searches_; have_pending_=!pending_searches_.empty(); }
     connected_ = true;
     pending_cv_.notify_one();
     return true;
@@ -168,13 +175,20 @@ void IndexClient::HandleStatus(const uint8_t* p, size_t n) {
         std::lock_guard<std::mutex> lock(mu_);
         status_ = std::move(text);
     }
+    uint32_t pinyin_ready = 0;
+    // Optional trailing status field: older hosts remain usable and report unavailable.
+    if (!r.GetU32(pinyin_ready)) pinyin_ready = 0;
+    pinyin_ready_.store(pinyin_ready == 1);
     ready_.store(ready != 0);
     count_.store(count);
+    uint64_t revision = 0; uint32_t version = 0;
+    if (r.GetU64(revision) && r.GetU32(version) && version == 1) revision_ = revision;
+    else { std::lock_guard lock(mu_); status_ = L"索引进程版本过旧，请重启 Pulse 和索引服务以启用实时搜索"; }
     if (notify_ && status_msg_) PostMessageW(notify_, status_msg_, 0, 0);
 }
 
 void IndexClient::HandleSearch(uint32_t id, const uint8_t* p, size_t n) {
-    if (id != latest_search_id_.load()) return;
+    { std::lock_guard lock(mu_); if (std::none_of(session_requests_.begin(), session_requests_.end(), [id](const auto& value) { return value.second == id; })) return; }
     ipc::PayloadReader r(p, n);
     uint32_t total = 0, nh = 0;
     if (!r.GetU32(total) || !r.GetU32(nh)) return;
@@ -195,8 +209,9 @@ void IndexClient::HandleSearch(uint32_t id, const uint8_t* p, size_t n) {
     }
     {
         std::lock_guard<std::mutex> lock(mu_);
-        result_id_ = id;
-        result_ = std::move(sr);
+        r.GetU64(sr.revision);
+        TraceSearch("filename_received", sr.revision);
+        results_[id] = std::move(sr);
     }
     if (notify_ && search_msg_) PostMessageW(notify_, search_msg_, id, 0);
 }
@@ -240,6 +255,7 @@ void IndexClient::HandleVolumes(const uint8_t* p, size_t n) {
         index_path_ = std::move(path);
         volumes_ = std::move(volumes);
         excluded_paths_ = std::move(excluded_paths);
+        scope_ready_ = true;
     }
     if (notify_ && status_msg_) PostMessageW(notify_, status_msg_, 0, 0);
 }
@@ -249,24 +265,28 @@ void IndexClient::FlushPendingSearch() {
     uint32_t id = 0;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (!have_pending_) return;
-        q = pending_q_;
-        id = pending_id_;
+        if (pending_searches_.empty()) return;
+        id = pending_searches_.begin()->second.first;
+        q = pending_searches_.begin()->second.second;
     }
     ipc::PayloadWriter w;
     uint32_t flags = 0;
     if (q.rank) flags |= 1;
     if (q.folders_only) flags |= 2;
     if (q.sort_desc) flags |= 4;
+    if (q.subscribe) flags |= 8;
     w.PutU32(flags);
     w.PutU32(static_cast<uint32_t>(q.sort));
     w.PutU32(static_cast<uint32_t>(q.limit));
     w.PutU32(static_cast<uint32_t>(q.offset));
     w.PutString(q.needle);
     w.PutString(q.path_prefix);
+    w.PutU64(q.session_id);
     if (WriteMsg(REQ_IDX_SEARCH, id, w.data())) {
         std::lock_guard<std::mutex> lock(mu_);
-        if (pending_id_ == id) have_pending_ = false;
+        auto found = pending_searches_.find(q.session_id);
+        if (found != pending_searches_.end() && found->second.first == id) pending_searches_.erase(found);
+        have_pending_ = !pending_searches_.empty();
     }
 }
 
@@ -275,11 +295,14 @@ void IndexClient::Writer() {
         {
             std::unique_lock<std::mutex> lock(mu_);
             pending_cv_.wait_for(lock, std::chrono::milliseconds(100),
-                [this] { return !running_ || have_pending_ || volume_refresh_requested_; });
+                [this] { return !running_ || have_pending_ || !cancelled_sessions_.empty() || volume_refresh_requested_; });
             if (!running_) return;
-            if (!have_pending_ && !volume_refresh_requested_) continue;
+            if (!have_pending_ && cancelled_sessions_.empty() && !volume_refresh_requested_) continue;
         }
         if (connected_) {
+            std::vector<uint64_t> cancelled;
+            {std::lock_guard lock(mu_);cancelled.swap(cancelled_sessions_);}
+            for(auto session:cancelled) {ipc::PayloadWriter payload;payload.PutU64(session);WriteMsg(8,0,payload.data());}
             bool refresh = false;
             {
                 std::lock_guard<std::mutex> lock(mu_);
@@ -319,6 +342,7 @@ void IndexClient::Worker() {
                     pipe_ = INVALID_HANDLE_VALUE;
                 }
                 connected_ = false;
+                pinyin_ready_ = false;
                 {
                     std::lock_guard<std::mutex> lock(mu_);
                     status_ = L"索引连接已断开，正在重新连接…";
@@ -346,8 +370,11 @@ void IndexClient::SearchAsync(const Query& q, uint32_t id) {
     latest_search_id_.store(id);
     {
         std::lock_guard<std::mutex> lock(mu_);
-        pending_q_ = q;
-        pending_id_ = id;
+        auto previous = session_requests_.find(q.session_id);
+        if (previous != session_requests_.end()) results_.erase(previous->second);
+        session_requests_[q.session_id] = id;
+        pending_searches_[q.session_id] = {id, q};
+        subscribed_searches_[q.session_id] = {id,q};
         have_pending_ = true;
     }
     pending_cv_.notify_one();
@@ -372,6 +399,12 @@ std::vector<std::wstring> IndexClient::ExcludedPaths() const {
     std::lock_guard<std::mutex> lock(mu_);
     return excluded_paths_;
 }
+bool IndexClient::GetScope(std::vector<VolumeInfo>& volumes, std::vector<std::wstring>& excluded) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!connected_ || !scope_ready_) return false;
+    volumes = volumes_; excluded = excluded_paths_;
+    return true;
+}
 
 void IndexClient::RefreshVolumesAsync() {
     {
@@ -383,10 +416,19 @@ void IndexClient::RefreshVolumesAsync() {
 
 bool IndexClient::TakeResult(uint32_t id, SearchResult& out) {
     std::lock_guard<std::mutex> lock(mu_);
-    if (result_id_ != id) return false;
-    out = std::move(result_);
-    result_id_ = 0;
+    auto found = results_.find(id);
+    if (found == results_.end()) return false;
+    out = std::move(found->second);
+    results_.erase(found);
     return true;
+}
+void IndexClient::CancelSession(uint64_t session_id) {
+    if(!session_id) return;
+    {std::lock_guard lock(mu_);
+     if(auto it=session_requests_.find(session_id);it!=session_requests_.end()) {results_.erase(it->second);session_requests_.erase(it);}
+     pending_searches_.erase(session_id);subscribed_searches_.erase(session_id);cancelled_sessions_.push_back(session_id);
+     have_pending_=!pending_searches_.empty();}
+    pending_cv_.notify_all();
 }
 
 bool IndexClient::ServiceInstalled() const {

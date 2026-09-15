@@ -5,6 +5,9 @@
 // and never waits on Status()/Count(). V7-V10 snapshots remain readable and
 // trigger a background rebuild to repair visibility and disconnected parent links.
 #pragma once
+#include "usn_stream.h"
+#include "filename_timing.h"
+#include "index_feed.h"
 #include "index_config.h"
 #include "index_query.h"
 #include "index_delta.h"
@@ -12,7 +15,10 @@
 #include <atomic>
 #include <bit>
 #include <cstdint>
+#include <condition_variable>
+#include <functional>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -41,6 +47,8 @@ struct Hit {
 enum class ResultSort : uint8_t { Index, Name, Size, Mtime };
 
 struct Query {
+    uint64_t session_id = 0;
+    bool subscribe = false;
     std::wstring needle;
     std::wstring path_prefix;
     bool folders_only = false;
@@ -52,6 +60,7 @@ struct Query {
 };
 
 struct SearchResult {
+    uint64_t revision = 0;
     std::vector<Hit> hits;
     size_t total = 0;
 };
@@ -120,13 +129,17 @@ public:
     Engine& operator=(const Engine&) = delete;
 
     void Start(HWND notify, UINT msg);
-    void RequestStop() { running_ = false; }
+    void StartFixture(HWND notify, UINT msg, std::wstring root) { fixture_root_ = std::move(root); Start(notify,msg); }
+    void RequestStop() { running_ = false; if (change_signal_) SetEvent(change_signal_); }
     void Stop();
 
     SearchResult Search(const Query& q, const std::atomic<uint32_t>* latest = nullptr,
                         uint32_t expected = 0) const;
     size_t Count() const { return indexed_.load(); }
     bool Ready() const { return ready_.load(); }
+    bool PinyinReady() const { return pinyin_ready_.load(); }
+    uint64_t Revision() const { return revision_.load(); }
+    FileFeedPage ReadFeed(bool changes, const std::wstring& root, uint64_t epoch, uint64_t cursor) const;
     std::wstring Status() const;
     std::vector<VolumeInfo> Volumes() const;
     void RequestRebuild();
@@ -261,15 +274,31 @@ private:
     };
 
     void Worker();
+    std::wstring fixture_root_;
+    void StartJournalStreams();
+    std::map<std::wstring, std::unique_ptr<UsnStream>> journal_streams_;
+    HANDLE change_signal_ = nullptr;
+    std::atomic<uint64_t> revision_{1};
+    std::atomic<uint64_t> feed_epoch_{(GetTickCount64() << 20) ^ GetCurrentProcessId()};
+    uint64_t feed_sequence_ = 0;
+    std::deque<ChangeRecord> feed_changes_;
+    void RecordFeed(ChangeRecord record);
+    void GapFeed() { changes_.Gap(); ++feed_epoch_; }
+    void PinyinWorker();
+    void RequestPinyinBuildLocked();
+    void StopPinyinWorker();
     bool TryLoadCache();
     void SaveCache();
-    void MergeBase(bool force);
+    void MergeBase(bool force, const char* reason = "forced");
+    const char* MaintenanceMergeReason(ULONGLONG now, uint64_t delta_bytes, bool compact) const;
+    void RecoverFailedVolumes(const std::vector<VolumeInfo>& volumes, ULONGLONG now,
+                              const std::function<bool(const VolumeInfo&)>& rebuild);
     void FlushDeltas();
     void OpenDeltasLocked();
     void CloseDeltas();
     void ReplayDeltasLocked();
     DeltaLog* DeltaFor(wchar_t letter);
-    void FullRebuild();
+    void FullRebuild(const char* reason = "requested_or_watch_gap");
     void PreserveOfflineVolumesLocked(const std::vector<VolumeInfo>& active,
                                       const IndexConfig& config);
     bool IndexVolumeMft(const VolumeInfo& volume);
@@ -309,7 +338,7 @@ private:
     void StartWalkWatches(const std::vector<std::wstring>& roots);
     void StopWalkWatches();
     void PollWalkWatches();
-    void ApplyNotifyLocked(const std::wstring& root, const BYTE* buf, DWORD len);
+    uint64_t ApplyNotifyLocked(const std::wstring& root, const BYTE* buf, DWORD len);
 
     bool CatchUpVolume(VolState& v, bool* changed, bool* structural = nullptr);
     enum class UsnApply : uint8_t { None, Attr, Structure };
@@ -382,12 +411,16 @@ private:
     size_t pool_waste_ = 0;
     uint64_t built_unix_ = 0;
     uint64_t index_dir_frn_ = 0;
+    std::wstring index_directory_;
     wchar_t index_dir_letter_ = 0;
     std::atomic<bool> merging_{false};
     size_t struct_changes_ = 0;
     ULONGLONG last_merge_tick_ = 0;
+    ULONGLONG merge_retry_after_tick_ = 0;
     ULONGLONG last_struct_tick_ = 0;
     ULONGLONG last_delta_flush_tick_ = 0;
+    std::unordered_map<std::wstring, ULONGLONG> volume_retry_after_;
+    FilenameTiming filename_timing_;
 
     struct WalkWatch {
         std::wstring path;
@@ -400,6 +433,18 @@ private:
     std::vector<std::wstring> walk_roots_;
     std::vector<std::wstring> excluded_paths_;
 
+    // Auxiliary IDs are tied to one immutable filename snapshot, never persisted
+    // in the filename format. Mutable names always use the current overlay.
+    std::thread pinyin_thread_;
+    std::mutex pinyin_build_mutex_;
+    std::condition_variable pinyin_build_cv_;
+    std::atomic<uint64_t> pinyin_request_{0};
+    std::atomic<bool> pinyin_stopping_{false};
+    std::atomic<bool> pinyin_ready_{false};
+    mutable const MappedFile* pinyin_snapshot_ = nullptr;
+    mutable uint32_t pinyin_version_ = 0;
+    mutable std::vector<int32_t> pinyin_chinese_ids_;
+    mutable std::vector<std::vector<int32_t>> pinyin_pair_ids_;
     mutable uint64_t filter_epoch_ = 1;
     mutable uint64_t cache_epoch_ = 0;
     mutable std::wstring cache_raw_;

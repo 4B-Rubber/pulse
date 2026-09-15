@@ -20,6 +20,8 @@ compile_commands.json
 *.obj
 *.lib
 *.dll
+!third_party/pdfium/bin/pdfium.dll
+/third_party/pdfium/*.tgz
 *.exp
 *.idb
 *.iobj
@@ -68,4 +70,12 @@ CONERR$
 /docs/index-migration-review.md
 /docs/list-visibility-upgrade-r6.md
 /docs/windows-8.1-candidate.md
+/docs/research/
+/docs/plans/
+/todo.md
 /tools/_split_tus.py
+
+# Local tool state
+/.pnpm-store/
+/.summary.jsonl
+/.c2c.json

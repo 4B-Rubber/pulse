@@ -520,6 +520,13 @@ BEGIN
     IDS_MULTIPLE_LOCATIONS          "多个位置"
     IDS_CONTAINS_FORMAT             "%llu 个文件，%llu 个文件夹"
     IDS_SEARCH_RESULTS_FORMAT       "搜索 “%s” · %zu 项"
+    IDS_CONTENT_FOUND_FORMAT        "搜索 “%s” · 已匹配 %zu 个文件 · 搜索中…"
+    IDS_CONTENT_STATUS_MATCHES      "已匹配 %zu 个文件"
+    IDS_CONTENT_QUERY_PROGRESS      "搜索中 %llu / %llu"
+    IDS_CONTENT_PARTIAL_FORMAT      "搜索 “%s” · 已匹配 %zu 个文件 · 未完成"
+    IDS_CONTENT_MATCHES_FORMAT      "搜索 “%s” · 匹配 %zu 个文件"
+    IDS_CONTENT_SORTING_FORMAT      "搜索 “%s” · 匹配 %zu 个文件 · 排序中…"
+    IDS_CONTENT_FILES_BUSY          "部分文件被占用，结果可能不完整"
     IDS_SEARCH_RESULTS_PARTIAL_FMT  "搜索 “%s” · 共 %zu 项（已加载 %zu）"
     IDS_SAVED_SEARCH_UNAVAILABLE    "保存的搜索不可用"
     IDS_CANNOT_OPEN_SAVED_SEARCH    "无法打开保存的搜索"
@@ -1082,6 +1089,13 @@ BEGIN
     IDS_MULTIPLE_LOCATIONS          "Multiple locations"
     IDS_CONTAINS_FORMAT             "%llu files, %llu folders"
     IDS_SEARCH_RESULTS_FORMAT       "Search ""%s"" · %zu items"
+    IDS_CONTENT_FOUND_FORMAT        "Search ""%s"" · %zu matching files · Searching…"
+    IDS_CONTENT_STATUS_MATCHES      "%zu matching files"
+    IDS_CONTENT_QUERY_PROGRESS      "Searching %llu / %llu"
+    IDS_CONTENT_PARTIAL_FORMAT      "Search ""%s"" · %zu matching files · Incomplete"
+    IDS_CONTENT_MATCHES_FORMAT      "Search ""%s"" · %zu matching files"
+    IDS_CONTENT_SORTING_FORMAT      "Search ""%s"" · %zu matching files · Sorting…"
+    IDS_CONTENT_FILES_BUSY          "Some files are busy; results may be incomplete"
     IDS_SEARCH_RESULTS_PARTIAL_FMT  "Search ""%s"" · %zu items (%zu loaded)"
     IDS_SAVED_SEARCH_UNAVAILABLE    "Saved search unavailable"
     IDS_CANNOT_OPEN_SAVED_SEARCH    "Could not open saved search"
@@ -1373,4 +1387,593 @@ BEGIN
     IDS_RENAME_NO_PERMISSION "You do not have permission to rename this item."
     IDS_OPERATION_FAILED_MESSAGE "The operation failed."
     IDS_SETTINGS_SHOW_PERFORMANCE_DESC "Frame time, FPS, and memory for diagnosing jank"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+    IDS_SEARCH_ENH_0 "文件名"
+    IDS_SEARCH_ENH_1 "内容"
+    IDS_SEARCH_ENH_2 "搜索选项"
+    IDS_SEARCH_ENH_3 "文件名拼音搜索"
+    IDS_SEARCH_ENH_4 "支持全拼、首字母和中英文混合"
+    IDS_SEARCH_ENH_5 "按相关性排序"
+    IDS_SEARCH_ENH_6 "管理内容索引"
+    IDS_SEARCH_ENH_7 "添加本地文件夹…"
+    IDS_SEARCH_ENH_8 "加入内容索引"
+    IDS_SEARCH_ENH_9 "搜索此文件夹内容"
+    IDS_SEARCH_ENH_10 "暂停内容索引"
+    IDS_SEARCH_ENH_11 "继续内容索引"
+    IDS_SEARCH_ENH_12 "重建内容索引"
+    IDS_SEARCH_ENH_13 "移出内容索引"
+    IDS_SEARCH_ENH_14 "排除的目录名称"
+    IDS_SEARCH_ENH_15 "编码：自动识别"
+    IDS_SEARCH_ENH_16 "编码：UTF-8"
+    IDS_SEARCH_ENH_17 "编码：系统代码页"
+    IDS_SEARCH_ENH_18 "编码：GB18030"
+    IDS_SEARCH_ENH_19 "尚未启用本地索引磁盘"
+    IDS_SEARCH_ENH_20 "在“存储与维护”中启用本地磁盘，文件名和内容使用同一搜索范围。"
+    IDS_SEARCH_ENH_21 "此文件夹不在共用索引范围内"
+    IDS_SEARCH_ENH_22 "请在“存储与维护”中检查已启用磁盘和排除路径。"
+    IDS_SEARCH_ENH_23 "请选择本地磁盘上的文件夹；首版不索引网络共享内容。"
+    IDS_SEARCH_ENH_24 "正在建立内容索引"
+    IDS_SEARCH_ENH_25 "内容索引已暂停"
+    IDS_SEARCH_ENH_26 "内容索引已更新"
+    IDS_SEARCH_ENH_27 "内容搜索范围尚未完整"
+    IDS_SEARCH_ENH_28 "已索引 %llu · 待更新 %llu · 跳过 %llu · 失败 %llu"
+    IDS_SEARCH_ENH_29 "正在准备拼音索引，当前先显示文件名直接匹配结果。"
+    IDS_SEARCH_ENH_30 "已配置的文件夹"
+    IDS_SEARCH_ENH_31 "输入要查找的正文文字"
+    IDS_SEARCH_ENH_32 "正在扫描文件夹内容"
+    IDS_SEARCH_ENH_33 "选择搜索文件夹…"
+END
+
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+    IDS_SEARCH_ENH_0 "File name"
+    IDS_SEARCH_ENH_1 "Contents"
+    IDS_SEARCH_ENH_2 "Search options"
+    IDS_SEARCH_ENH_3 "Pinyin file-name search"
+    IDS_SEARCH_ENH_4 "Match full pinyin, initials and mixed text"
+    IDS_SEARCH_ENH_5 "Sort by relevance"
+    IDS_SEARCH_ENH_6 "Manage content index"
+    IDS_SEARCH_ENH_7 "Add local folder…"
+    IDS_SEARCH_ENH_8 "Add to content index"
+    IDS_SEARCH_ENH_9 "Scan this folder's contents"
+    IDS_SEARCH_ENH_10 "Pause content indexing"
+    IDS_SEARCH_ENH_11 "Resume content indexing"
+    IDS_SEARCH_ENH_12 "Rebuild content index"
+    IDS_SEARCH_ENH_13 "Remove from content index"
+    IDS_SEARCH_ENH_14 "Excluded directory names"
+    IDS_SEARCH_ENH_15 "Encoding: automatic"
+    IDS_SEARCH_ENH_16 "Encoding: UTF-8"
+    IDS_SEARCH_ENH_17 "Encoding: system code page"
+    IDS_SEARCH_ENH_18 "Encoding: GB18030"
+    IDS_SEARCH_ENH_19 "No local index drives enabled"
+    IDS_SEARCH_ENH_20 "Enable local drives in Storage & maintenance to search file names and contents in the same scope."
+    IDS_SEARCH_ENH_21 "This folder is outside the shared index scope"
+    IDS_SEARCH_ENH_22 "Check enabled drives and excluded paths in Storage & maintenance."
+    IDS_SEARCH_ENH_23 "Choose a local folder. Network content indexing is not available in this version."
+    IDS_SEARCH_ENH_24 "Indexing contents"
+    IDS_SEARCH_ENH_25 "Content indexing paused"
+    IDS_SEARCH_ENH_26 "Content index up to date"
+    IDS_SEARCH_ENH_27 "Content coverage is incomplete"
+    IDS_SEARCH_ENH_28 "Indexed %llu · Pending %llu · Skipped %llu · Failed %llu"
+    IDS_SEARCH_ENH_29 "Preparing pinyin index; direct file-name matches are available now."
+    IDS_SEARCH_ENH_30 "Configured folders"
+    IDS_SEARCH_ENH_31 "Enter text to find in files"
+    IDS_SEARCH_ENH_32 "Scanning folder contents"
+    IDS_SEARCH_ENH_33 "Choose search folder…"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1834 "全盘"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1834 "All"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1835 "当前目录"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1835 "This folder"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1836 "搜索文件名、全拼或首字母"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1836 "Search file names or pinyin"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1837 "搜索文件正文"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1837 "Search file contents"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1838 "仅搜索已加入索引的文件夹"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1838 "Searching content-indexed folders"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1839 "管理索引"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SEARCH_UI_1839 "Manage index"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1900 "查找设置"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1900 "Find a setting"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1901 "按你的习惯，调整 Pulse 的外观与行为。"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1901 "Make Pulse look and work the way you prefer."
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1902 "选择搜索方式，管理可以快速找到的文件。"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1902 "Choose how to search and which files to index."
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1903 "主题"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1903 "Theme"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1904 "选择应用的外观主题"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1904 "Choose the appearance of the app"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1905 "浅色"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1905 "Light"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1906 "深色"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1906 "Dark"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1907 "跟随系统"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1907 "System"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1908 "文件列表"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1908 "File list"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1909 "更多选项"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1909 "More options"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1910 "背景图片、文件显示、托盘与变化追踪"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1910 "Wallpaper, file visibility, tray and change tracking"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1911 "存储与维护"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1911 "Storage & maintenance"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1912 "磁盘、索引位置、排除路径与网络文件夹"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1912 "Drives, index location, excluded paths and network folders"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1913 "共用索引范围"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1913 "Shared index scope"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1914 "内容搜索使用与文件名相同的本地磁盘和排除路径。"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1914 "Contents use the same local drives and excluded paths as filenames."
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1915 "文本编码"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1915 "Text encoding"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1916 "选择纯文本文件的解码方式，应用于所有索引磁盘"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1916 "Choose the text encoding for all indexed drives"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1917 "更改即时生效"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1917 "Changes take effect immediately"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1918 "文件名索引"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1918 "File-name index"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1919 "没有匹配的设置"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1919 "No matching settings"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1920 "暂不可用"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1920 "Unavailable"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1921 "紧凑"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1921 "Compact"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1922 "标准"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1922 "Standard"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1923 "宽松"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1923 "Roomy"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1924 "小"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1924 "Small"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1925 "标准"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1925 "Standard"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1926 "大"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1926 "Large"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1927 "请在索引维护中启用本地磁盘，以搜索文档内容。"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1927 "Enable a local drive in index maintenance to search document contents."
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1928 "重新读取共用索引范围中的文档内容"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1928 "Read documents in the shared index scope again"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1929 "自定义菜单项"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1929 "Customize menu items"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1930 "%llu 个磁盘 · %llu 个文件"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1930 "%llu drives · %llu files"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1931 "先打开文件的右键菜单，即可在此管理发现的菜单项。"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_UI_1931 "Open a file context menu to discover its entries."
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_CONTENT_SEARCH_STOPPED "搜索已停止"
+ IDS_CONTENT_INSTANT_READY "按需搜索文件内容，任务结束后释放扫描资源"
+ IDS_CONTENT_UPDATES_PAUSED "自动更新已暂停"
+ IDS_CONTENT_UPDATES_PAUSED_DESC "结果已保留；刷新可获取最新变化。"
+ IDS_CONTENT_CANCEL_SEARCH "取消搜索 · Esc"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_CONTENT_SEARCH_STOPPED "Search stopped"
+ IDS_CONTENT_INSTANT_READY "Search contents on demand; release scan resources when finished"
+ IDS_CONTENT_UPDATES_PAUSED "Live updates paused"
+ IDS_CONTENT_UPDATES_PAUSED_DESC "Results kept. Refresh for latest changes."
+ IDS_CONTENT_CANCEL_SEARCH "Cancel search · Esc"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_GLOBAL_SEARCH "全局搜索"
+ IDS_GLOBAL_SEARCH_DESC "启用后关闭窗口仍可呼出；从托盘退出可结束"
+ IDS_GLOBAL_SEARCH_HOTKEY "呼出快捷键"
+ IDS_GLOBAL_SEARCH_HOTKEY_DESC "点击录入组合键；Esc 取消"
+ IDS_GLOBAL_SEARCH_RECORDING "请按组合键…"
+ IDS_GLOBAL_SEARCH_CONFLICT "快捷键已被占用，请更换"
+ IDS_GLOBAL_SEARCH_INVALID "请使用包含 Ctrl、Alt、Shift 或 Win 的组合键"
+ IDS_GLOBAL_SEARCH_REGISTER_FAILED "无法注册快捷键，请更换或重试"
+ IDS_GLOBAL_SEARCH_PLACEHOLDER "搜索文件和内容"
+ IDS_GLOBAL_SEARCH_EVERYWHERE "全部位置"
+ IDS_GLOBAL_SEARCH_CURRENT_FOLDER "当前文件夹"
+ IDS_GLOBAL_SEARCH_EMPTY "输入关键词，快速查找文件或内容"
+ IDS_GLOBAL_SEARCH_NO_RESULTS "没有匹配的结果"
+ IDS_GLOBAL_SEARCH_LOADING "正在搜索…"
+ IDS_GLOBAL_SEARCH_FAILED "搜索不可用，请稍后重试"
+ IDS_GLOBAL_SEARCH_RESULTS " 个结果"
+ IDS_GLOBAL_SEARCH_KEYS "↑ ↓ 选择    Enter 打开    Ctrl + Enter 打开所在位置"
+ IDS_GLOBAL_SEARCH_TRUNCATED "显示前 200 个结果，请缩小搜索范围"
+ IDS_GLOBAL_SEARCH_SELECT "选择"
+END
+
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_GLOBAL_SEARCH "Global search"
+ IDS_GLOBAL_SEARCH_DESC "Available after closing the window; exit from the tray to stop"
+ IDS_GLOBAL_SEARCH_HOTKEY "Activation shortcut"
+ IDS_GLOBAL_SEARCH_HOTKEY_DESC "Click to record a shortcut; Esc cancels"
+ IDS_GLOBAL_SEARCH_RECORDING "Press shortcut…"
+ IDS_GLOBAL_SEARCH_CONFLICT "Shortcut is already in use. Choose another."
+ IDS_GLOBAL_SEARCH_INVALID "Use a shortcut with Ctrl, Alt, Shift or Win"
+ IDS_GLOBAL_SEARCH_REGISTER_FAILED "Unable to register shortcut. Change it or try again."
+ IDS_GLOBAL_SEARCH_PLACEHOLDER "Search files and contents"
+ IDS_GLOBAL_SEARCH_EVERYWHERE "All locations"
+ IDS_GLOBAL_SEARCH_CURRENT_FOLDER "Current folder"
+ IDS_GLOBAL_SEARCH_EMPTY "Type to search files or contents"
+ IDS_GLOBAL_SEARCH_NO_RESULTS "No matching results"
+ IDS_GLOBAL_SEARCH_LOADING "Searching…"
+ IDS_GLOBAL_SEARCH_FAILED "Search unavailable. Try again later."
+ IDS_GLOBAL_SEARCH_RESULTS " results"
+ IDS_GLOBAL_SEARCH_KEYS "↑ ↓ Select    Enter Open    Ctrl + Enter Open location"
+ IDS_GLOBAL_SEARCH_TRUNCATED "Showing first 200 results. Refine your search."
+ IDS_GLOBAL_SEARCH_SELECT "Select"
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_CONTENT_TYPES "支持的文档类型"
+ IDS_SETTINGS_CONTENT_TYPES_DESC "文档：PDF、Word（DOCX）、Excel（XLSX）、PowerPoint（PPTX）\n文本与代码：TXT、MD、LOG、CSV、JSON、XML 等常见格式\nDOC、XLS、PPT、RTF 需系统安装相应文档筛选器。\nPDF 仅搜索可提取文字，暂不支持扫描图片文字识别。"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_SETTINGS_CONTENT_TYPES "Supported document types"
+ IDS_SETTINGS_CONTENT_TYPES_DESC "Documents: PDF, Word (DOCX), Excel (XLSX), PowerPoint (PPTX)\nText and code: TXT, MD, LOG, CSV, JSON, XML and other common formats\nDOC, XLS, PPT and RTF require the corresponding system document filters.\nPDF search requires extractable text; scanned-image OCR is not supported."
+END
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+ IDS_GLOBAL_SEARCH_SAVE_FAILED "无法保存设置，请重试"
+ IDS_GLOBAL_SEARCH_OPEN_FAILED "无法打开全局搜索，请重试"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+ IDS_GLOBAL_SEARCH_SAVE_FAILED "Unable to save settings. Try again."
+ IDS_GLOBAL_SEARCH_OPEN_FAILED "Unable to open global search. Try again."
 END

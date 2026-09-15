@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/version.txt" PULSE_VERSION LIMIT_COUNT 1)
-project(Pulse VERSION ${PULSE_VERSION} LANGUAGES CXX)
+project(Pulse VERSION ${PULSE_VERSION} LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -259,16 +259,20 @@ file(GLOB_RECURSE PULSE_APP_SOURCES CONFIGURE_DEPENDS
     src/app/*.cpp src/ui/*.cpp src/fs/*.cpp src/ops/*.cpp src/ipc/*.cpp src/index/*.cpp)
 list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "index_host\\.cpp$")
 list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "network_agent_main\\.cpp$")
-list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "content_agent\\.cpp$")
-list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "content_search\\.cpp$")
+list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "content_(agent|index|search|task_search|hit_aliases|instant_session)\\.cpp$")
+list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "filename_timing\\.cpp$")
+list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "text_task_reader\\.cpp$")
+list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "content_timing\\.cpp$")
+
 list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "lumatext_renderer\\.cpp$")
+list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "(document_(host_main|reader|filter)|office_ooxml|pdfium_text)\\.cpp$")
 
 # The local-volume engine runs in Pulse.Index.exe. Production keeps only the
 # lightweight query parser and per-user network index inside pulse.exe.
 option(PULSE_WITH_SELFTEST "Embed the legacy --selftest suite in Pulse.exe" OFF)
 if(NOT PULSE_WITH_SELFTEST)
     list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "selftest_1b2\\.cpp$")
-    list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "index_(engine|visibility|mft|paths|delta)\\.cpp$")
+    list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "index_(engine|engine_pinyin|visibility|mft|paths|delta)\\.cpp$")
 endif()
 list(APPEND PULSE_APP_SOURCES src/index/network_agent_client.cpp)
 if(PULSE_APP_SOURCES)
@@ -278,6 +282,7 @@ if(PULSE_APP_SOURCES)
     endif()
     target_sources(pulse PRIVATE src/app/pulse.rc)
     set_property(SOURCE src/app/pulse.rc APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/global-search-logo.png"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/app/pulse.ico"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/common/strings.rcinc"
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/fluent/cut_24_color.svg"
@@ -315,6 +320,7 @@ add_executable(pulse_index WIN32
     src/index/index_migration.cpp
     src/index/network_agent_main.cpp
     src/index/content_agent.cpp
+    src/index/content_instant_session.cpp
     src/index/content_search.cpp
     src/index/index_engine.cpp
     src/index/change_tracking.cpp
@@ -452,3 +458,124 @@ pulse_enable_lumatext(pulse_child_edit_test)
 # Focused folder change tracking regression tests.
 add_executable(pulse_change_tracking_test src/bench/change_tracking_test.cpp src/index/change_tracking.cpp)
 add_executable(pulse_change_tracking_client_test src/bench/change_tracking_client_test.cpp)
+add_executable(pulse_global_search_hotkey_test src/bench/global_search_hotkey_test.cpp src/app/global_search_hotkey.cpp)
+target_link_libraries(pulse_global_search_hotkey_test PRIVATE user32)
+
+# Search enhancement: native pinyin data and per-user full-text index.
+add_library(pulse_sqlite STATIC third_party/sqlite/sqlite3.c)
+# Mapping remains disabled by default. Only the short-lived task snapshot opts
+# into a RAM-budgeted mapping; the 2 GiB default cap cannot cover large caches.
+target_compile_definitions(pulse_sqlite PRIVATE SQLITE_ENABLE_FTS5 SQLITE_THREADSAFE=1 SQLITE_DQS=0 SQLITE_MAX_MMAP_SIZE=17179869184LL)
+target_include_directories(pulse_sqlite PUBLIC third_party/sqlite)
+set_source_files_properties(third_party/sqlite/sqlite3.c PROPERTIES COMPILE_OPTIONS "/W0;/TC")
+
+add_executable(pulse_filename_pinyin_test
+    src/bench/filename_pinyin_test.cpp src/index/index_query.cpp src/index/search_kinds.cpp)
+add_executable(pulse_index_pinyin_test
+    src/bench/index_pinyin_test.cpp src/index/index_engine.cpp
+    src/index/change_tracking.cpp src/index/index_visibility.cpp src/index/index_config.cpp
+    src/index/index_query.cpp src/index/search_kinds.cpp src/index/index_mft.cpp
+    src/index/index_paths.cpp src/index/index_delta.cpp src/index/index_shard.cpp src/fs/fs_enum.cpp)
+target_link_libraries(pulse_index_pinyin_test PRIVATE advapi32 shlwapi ole32 shell32 netapi32 mpr)
+
+foreach(search_target pulse pulse_index pulse_content_search_test)
+    if(NOT search_target STREQUAL "pulse")
+        target_sources(${search_target} PRIVATE src/index/content_index.cpp)
+    endif()
+    target_link_libraries(${search_target} PRIVATE pulse_sqlite)
+endforeach()
+target_sources(pulse_content_search_test PRIVATE src/index/index_query.cpp src/index/search_kinds.cpp)
+get_property(search_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(search_target IN LISTS search_targets)
+    get_target_property(search_sources ${search_target} SOURCES)
+    if("${search_sources}" MATCHES "index_query\\.cpp" AND NOT "${search_sources}" MATCHES "filename_pinyin\\.cpp")
+        target_sources(${search_target} PRIVATE src/index/filename_pinyin.cpp)
+    endif()
+    if("${search_sources}" MATCHES "index_engine\\.cpp" AND NOT "${search_sources}" MATCHES "index_engine_pinyin\\.cpp")
+        target_sources(${search_target} PRIVATE src/index/index_engine_pinyin.cpp)
+        target_sources(${search_target} PRIVATE src/index/filename_timing.cpp)
+        target_include_directories(${search_target} PRIVATE "${CMAKE_BINARY_DIR}/generated")
+    endif()
+endforeach()
+add_executable(pulse_content_index_test src/bench/content_index_test.cpp src/bench/content_instant_test.cpp
+    src/index/content_instant_session.cpp
+    src/index/content_index.cpp src/index/content_search.cpp src/index/content_search_client.cpp
+    src/index/index_query.cpp src/index/search_kinds.cpp src/index/filename_pinyin.cpp)
+target_link_libraries(pulse_content_index_test PRIVATE pulse_sqlite pulse_text bcrypt ole32)
+add_dependencies(pulse_content_index_test pulse_index)
+add_executable(pulse_search_enhancement_ui_test src/bench/search_enhancement_ui_test.cpp
+    src/ui/name_highlight.cpp src/app/search_query.cpp src/index/index_query.cpp
+    src/index/search_kinds.cpp src/index/filename_pinyin.cpp)
+
+foreach(paged_target pulse_content_search_test pulse_content_index_test)
+    if(TARGET ${paged_target})
+        target_sources(${paged_target} PRIVATE src/index/content_result_store.cpp)
+        target_link_libraries(${paged_target} PRIVATE pulse_sqlite)
+    endif()
+endforeach()
+
+add_executable(pulse_content_paging_test src/bench/content_paging_test.cpp
+    src/index/content_result_store.cpp src/index/content_index.cpp src/index/content_search.cpp
+    src/index/content_search_client.cpp src/index/index_query.cpp src/index/search_kinds.cpp src/index/filename_pinyin.cpp)
+target_link_libraries(pulse_content_paging_test PRIVATE pulse_sqlite pulse_text bcrypt ole32)
+add_dependencies(pulse_content_paging_test pulse_index)
+
+foreach(content_client_target pulse pulse_content_search_test pulse_content_index_test pulse_content_paging_test)
+    target_sources(${content_client_target} PRIVATE src/index/content_search_session.cpp)
+endforeach()
+
+# Document parsers never load into the UI or the persistent index writer.
+add_library(pulse_document_reader STATIC src/index/document_reader.cpp)
+target_link_libraries(pulse_document_reader PUBLIC pulse_text shell32 ole32)
+add_executable(pulse_document src/index/document_host_main.cpp
+    src/index/document_filter.cpp src/index/office_ooxml.cpp src/index/pdfium_text.cpp)
+add_custom_command(TARGET pulse_document POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pdfium/bin/pdfium.dll" "$<TARGET_FILE_DIR:pulse_document>/pdfium.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pdfium/licenses" "$<TARGET_FILE_DIR:pulse_document>/licenses/PDFium"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pdfium/LICENSE" "$<TARGET_FILE_DIR:pulse_document>/licenses/PDFium/binary-distribution.txt")
+set_target_properties(pulse_document PROPERTIES OUTPUT_NAME "Pulse.Document")
+target_link_libraries(pulse_document PRIVATE ole32 uuid xmllite shlwapi advapi32)
+add_executable(pulse_pdf_bench src/bench/pdf_bench.cpp)
+add_executable(pulse_document_admission_test src/bench/document_admission_test.cpp)
+add_executable(pulse_document_failure_fixture src/bench/document_failure_host.cpp)
+add_executable(pulse_document_pool_bench src/bench/document_pool_bench.cpp)
+target_link_libraries(pulse_document_pool_bench PRIVATE pulse_document_reader psapi)
+add_dependencies(pulse_document_pool_bench pulse_document)
+target_link_libraries(pulse_pdf_bench PRIVATE pulse_document_reader ole32 psapi)
+add_dependencies(pulse_pdf_bench pulse_document)
+pulse_add_version_resource(pulse_document "Pulse document text extractor" "Pulse.Document" "Pulse.Document.exe")
+foreach(document_target pulse pulse_index pulse_content_search_test pulse_content_index_test pulse_content_paging_test)
+    target_link_libraries(${document_target} PRIVATE pulse_document_reader)
+    add_dependencies(${document_target} pulse_document)
+endforeach()
+add_executable(pulse_office_ooxml_test src/bench/office_ooxml_test.cpp src/index/office_ooxml.cpp)
+target_include_directories(pulse_office_ooxml_test PRIVATE src)
+target_link_libraries(pulse_office_ooxml_test PRIVATE ole32 uuid xmllite)
+add_executable(pulse_office_index_test src/bench/office_index_test.cpp
+    src/index/content_index.cpp src/index/content_search.cpp src/index/content_result_store.cpp
+    src/index/index_query.cpp src/index/search_kinds.cpp src/index/filename_pinyin.cpp)
+target_link_libraries(pulse_office_index_test PRIVATE pulse_document_reader pulse_sqlite ole32 uuid bcrypt psapi)
+add_dependencies(pulse_office_index_test pulse_document)
+add_library(pulse_content_task STATIC src/index/content_task_search.cpp src/index/text_task_reader.cpp src/index/content_timing.cpp)
+target_link_libraries(pulse_content_task PUBLIC pulse_document_reader pulse_text)
+add_executable(pulse_content_timing_test src/bench/content_timing_test.cpp src/index/content_timing.cpp)
+add_executable(pulse_text_task_test src/bench/text_task_reader_test.cpp src/index/text_task_reader.cpp)
+target_link_libraries(pulse_text_task_test PRIVATE pulse_text)
+foreach(task_target pulse_index pulse_content_search_test pulse_content_index_test pulse_content_paging_test pulse_office_index_test)
+    target_link_libraries(${task_target} PRIVATE pulse_content_task)
+endforeach()
+
+add_library(pulse_fs_watch STATIC src/fs/fs_watch.cpp src/fs/fs_enum.cpp)
+target_link_libraries(pulse_fs_watch PUBLIC shell32 shlwapi netapi32)
+foreach(watch_target pulse pulse_index pulse_content_search_test pulse_content_index_test pulse_content_paging_test pulse_office_index_test)
+    target_link_libraries(${watch_target} PRIVATE pulse_fs_watch)
+endforeach()
+
+# Configuration storage is shared without linking the body extraction engine into the UI.
+get_property(configuration_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(configuration_target IN LISTS configuration_targets)
+    get_target_property(configuration_sources ${configuration_target} SOURCES)
+    if("${configuration_sources}" MATCHES "content_(index|search_client)\\.cpp" AND NOT "${configuration_sources}" MATCHES "content_configuration\\.cpp")
+        target_sources(${configuration_target} PRIVATE src/index/content_configuration.cpp)
+    endif()
+endforeach()

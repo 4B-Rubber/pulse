@@ -28,7 +28,7 @@ public:
     DirWatch();
     ~DirWatch();
 
-    bool Start(const std::wstring& path, ChangeCallback cb);
+    bool Start(const std::wstring& path, ChangeCallback cb, bool subtree = false);
     void Stop();
     bool Armed() const {
         return hDir_.load(std::memory_order_acquire) != INVALID_HANDLE_VALUE;
@@ -44,6 +44,7 @@ private:
     void WorkerThread();
 
     std::wstring path_;
+    bool subtree_ = false;
     ChangeCallback callback_;
     std::atomic<HANDLE> hDir_{INVALID_HANDLE_VALUE};
     HANDLE hStop_ = nullptr;

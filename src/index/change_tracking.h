@@ -42,7 +42,7 @@ public:
     void Record(ChangeRecord record);
     void Seed(const std::wstring& owner, std::vector<ChangeRecord> records);
     void Gap();
-    void Flush();
+    void Flush(bool force = true);
     ChangeResponse Summaries(const std::wstring& owner, const std::vector<std::wstring>& paths, uint64_t since = 0);
     ChangeResponse Details(const std::wstring& owner, const std::wstring& path,
                            uint64_t since, uint64_t before, uint32_t limit, uint32_t kind_filter = UINT32_MAX);
@@ -62,5 +62,6 @@ private:
     std::wstring directory_;
     std::unordered_map<std::wstring, Journal> journals_;
     uint64_t next_id_ = 1;
+    uint64_t last_flush_tick_ = 0;
 };
 }

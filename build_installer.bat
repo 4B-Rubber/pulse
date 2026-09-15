@@ -13,7 +13,9 @@ if /i "%~1"=="/skipbuild" goto after_release_build
 call "%~dp0build_release.bat" || exit /b 1
 :after_release_build
 
-for %%F in (build\pulse.exe build\Pulse.Index.exe build\Pulse.Preview.exe build\pulse_shell.exe build\lumatext.dll) do (
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\check_release_payload.ps1" -BuildDir "%~dp0build" || exit /b 1
+
+for %%F in (build\pulse.exe build\Pulse.Index.exe build\Pulse.Document.exe build\Pulse.Preview.exe build\pulse_shell.exe build\lumatext.dll) do (
     if not exist "%%F" (
         echo Missing build output: %%F
         exit /b 1

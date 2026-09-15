@@ -32,6 +32,14 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
     FillRect(dc, brStrokeDivider_.get(), lay.nav.right - 1.0f, lay.nav.top, 1.0f,
              lay.nav.bottom - lay.nav.top);
 
+    const bool compact_nav = lay.nav.right - lay.nav.left < 100*scale_;
+    MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
+    FillRect(dc, brStrokeDivider_.get(), lay.nav.left+16*scale_, lay.nav_row[3].top-12*scale_,
+        lay.nav.right-lay.nav.left-32*scale_, 1);
+    if (!compact_nav) painter_.DrawText(L"Pulse " + vm.settings_version,
+        D2D1::RectF(lay.nav.left+20*scale_,lay.nav.bottom-40*scale_,lay.nav.right-12*scale_,lay.nav.bottom-16*scale_),
+        compositor_->SmallFormat(),theme.text_secondary);
+
     static constexpr pulse::l10n::StringId kNav[] = {
         pulse::l10n::StringId::SettingsGeneral,
         pulse::l10n::StringId::SettingsSearchIndex,
@@ -51,11 +59,15 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
             FillRoundedRect(dc, brFillSelected_.get(), rc.left, rc.top,
                             rc.right - rc.left, rc.bottom - rc.top, 6.0f * scale_);
         }
-        DrawIconText(rc.left + 8.0f * scale_, rc.top, 22.0f * scale_, rc.bottom - rc.top,
+        if (active) {
+            MakeBrush(dc, theme.accent, brFillSelected_);
+            FillRoundedRect(dc, brFillSelected_.get(), rc.left, rc.top+10*scale_, 3*scale_, 20*scale_, 1.5f*scale_);
+        }
+        DrawIconText(rc.left + (compact_nav ? 13.0f : 12.0f) * scale_, rc.top, 22.0f * scale_, rc.bottom - rc.top,
                      kNavIcon[i], L"*", active ? theme.accent : theme.text_secondary, 0.85f);
         MakeBrush(dc, theme.text, brText_);
-        DrawTextRect(dc, compositor_->TextFormat(), brText_.get(), pulse::l10n::Get(kNav[i]),
-                     rc.left + 36.0f * scale_, rc.top, rc.right - rc.left - 44.0f * scale_,
+        if (!compact_nav) DrawTextRect(dc, compositor_->TextFormat(), brText_.get(), pulse::l10n::Get(kNav[i]),
+                     rc.left + 42.0f * scale_, rc.top, rc.right - rc.left - 48.0f * scale_,
                      rc.bottom - rc.top);
     }
 
@@ -72,11 +84,24 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         : vm.settings_page == 4 ? pulse::l10n::StringId::SettingsDuplicates
                                 : pulse::l10n::StringId::SettingsAboutDiagnostics;
     MakeBrush(dc, theme.text, brText_);
-    DrawTextRect(dc, compositor_->HeaderFormat(), brText_.get(), pulse::l10n::Get(page_title_id),
-                 lay.content.left + pad, origin + pad,
-                 lay.content.right - lay.content.left - pad * 2, 32.0f * scale_);
+    const auto& title = l10n::Get(page_title_id);
+    ComPtr<IDWriteTextLayout> title_layout;
+    compositor_->DwriteFactory()->CreateTextLayout(title.c_str(), static_cast<UINT32>(title.size()),
+        compositor_->HeaderFormat(), lay.content.right-lay.content.left-pad*2, 40*scale_, &title_layout);
+    if (title_layout.get()) {
+        title_layout->SetFontSize(26*scale_, {0,static_cast<UINT32>(title.size())});
+        title_layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0,static_cast<UINT32>(title.size())});
+        dc->DrawTextLayout(D2D1::Point2F(lay.content.left+pad,origin+pad),title_layout.get(),brText_.get());
+    }
+    if (vm.settings_page == 0 || vm.settings_page == 1)
+        painter_.DrawText(l10n::Get(vm.settings_page == 0 ? l10n::StringId::SettingsGeneralIntro : l10n::StringId::SettingsSearchIntro),
+            D2D1::RectF(lay.content.left+pad,origin+60*scale_,lay.content.right-pad,origin+84*scale_),
+            compositor_->SmallFormat(),theme.text_secondary);
+
 
     if (vm.settings_page == 0) {
+        DrawSettingsCore(vm, rect, theme);
+    } else if (vm.settings_page == 1) {
         auto draw_card = [&](const D2D1_RECT_F& card) {
             MakeBrush(dc, theme.fill_input, brFillInput_);
             FillRoundedRect(dc, brFillInput_.get(), card.left, card.top,
@@ -85,295 +110,8 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
             dc->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f * scale_, 8.0f * scale_),
                                      brStrokeCard_.get(), 1.0f);
         };
-
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsAppearance),
-                     lay.content.left + pad, origin + pad + 44.0f * scale_,
-                     200.0f * scale_, 22.0f * scale_);
-
-        draw_card(lay.accent_card);
-        const float accent_text_w = (std::max)(40.0f * scale_,
-            lay.accent_picker.left - lay.accent_card.left - 32.0f * scale_);
-        MakeBrush(dc, theme.text, brText_);
-        DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsThemeColor),
-                     lay.accent_card.left + 16.0f * scale_, lay.accent_card.top + 16.0f * scale_,
-                     accent_text_w, 22.0f * scale_);
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        const auto& accent_help = pulse::l10n::Get(pulse::l10n::StringId::SettingsThemeColorDesc);
-        ComPtr<IDWriteTextLayout> accent_help_layout;
-        compositor_->DwriteFactory()->CreateTextLayout(accent_help.c_str(),
-            static_cast<UINT32>(accent_help.size()), compositor_->SmallFormat(),
-            accent_text_w, 36.0f * scale_, &accent_help_layout);
-        if (accent_help_layout.get()) {
-            accent_help_layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-            accent_help_layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-            dc->DrawTextLayout(D2D1::Point2F(lay.accent_card.left + 16.0f * scale_,
-                                           lay.accent_card.top + 42.0f * scale_),
-                accent_help_layout.get(), brTextSecondary_.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        }
-        if (vm.settings_bloom) {
-            vm.settings_bloom->SetDisk(lay.accent_picker);
-            vm.settings_bloom->Draw(dc, theme);
-        }
-
-        draw_card(lay.effect_card);
-        MakeBrush(dc, theme.text, brText_);
-        DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsWindowEffect),
-                     lay.effect_card.left + 16.0f * scale_, lay.effect_card.top + 10.0f * scale_,
-                     lay.effect_card.right - lay.effect_card.left - 32.0f * scale_, 22.0f * scale_);
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                     pulse::l10n::Get(compat::ModernWindows() ? pulse::l10n::StringId::SettingsWindowEffectDesc : pulse::l10n::StringId::EffectUnavailable),
-                     lay.effect_card.left + 16.0f * scale_, lay.effect_card.top + 32.0f * scale_,
-                     lay.effect_card.right - lay.effect_card.left - 32.0f * scale_, 18.0f * scale_);
-        for (int i = 0; i < kWindowEffectCount; ++i) {
-            const auto effect = static_cast<WindowEffect>(i);
-            const auto& row = lay.effect_row[i];
-            if (IsHovered(vm, HitTestResult::SettingsEffect, i)) {
-                MakeBrush(dc, theme.fill_hover, brFillHover_);
-                FillRoundedRect(dc, brFillHover_.get(), row.left + 4.0f * scale_, row.top,
-                                row.right - row.left - 8.0f * scale_, row.bottom - row.top,
-                                4.0f * scale_);
-            }
-            fluent::ControlState st{};
-            st.enabled = compat::ModernWindows() || effect == WindowEffect::None;
-            st.checked = (compat::ModernWindows() ? vm.window_effect : WindowEffect::None) == effect;
-            st.hovered = IsHovered(vm, HitTestResult::SettingsEffect, i);
-            static constexpr pulse::l10n::StringId labels[] = {
-                pulse::l10n::StringId::EffectNone, pulse::l10n::StringId::EffectAcrylic,
-                pulse::l10n::StringId::EffectMica, pulse::l10n::StringId::EffectMicaAlt,
-            };
-            painter_.DrawRadioButton(D2D1::RectF(row.left + 16.0f * scale_, row.top,
-                                                 row.right - 16.0f * scale_, row.bottom),
-                                     pulse::l10n::Get(labels[i]), st);
-        }
-
-        draw_card(lay.density_card);
-        MakeBrush(dc, theme.text, brText_);
-        DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsRowHeight),
-                     lay.density_card.left + 16.0f * scale_, lay.density_card.top + 10.0f * scale_,
-                     lay.density_card.right - lay.density_card.left - 32.0f * scale_, 22.0f * scale_);
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsRowHeightDesc),
-                     lay.density_card.left + 16.0f * scale_, lay.density_card.top + 32.0f * scale_,
-                     lay.density_card.right - lay.density_card.left - 32.0f * scale_, 18.0f * scale_);
-        static constexpr pulse::l10n::StringId kDensityLabels[] = {
-            pulse::l10n::StringId::DensityCompact,
-            pulse::l10n::StringId::DensityStandard,
-            pulse::l10n::StringId::DensityComfortable,
-        };
-        static constexpr int kDensityDips[] = { 28, 34, 40 };
-        for (int i = 0; i < 3; ++i) {
-            const auto& row = lay.density_row[i];
-            if (IsHovered(vm, HitTestResult::SettingsDensity, i)) {
-                MakeBrush(dc, theme.fill_hover, brFillHover_);
-                FillRoundedRect(dc, brFillHover_.get(), row.left + 4.0f * scale_, row.top,
-                                row.right - row.left - 8.0f * scale_, row.bottom - row.top,
-                                4.0f * scale_);
-            }
-            fluent::ControlState st{};
-            st.checked = vm.settings_row_height == kDensityDips[i];
-            st.hovered = IsHovered(vm, HitTestResult::SettingsDensity, i);
-            painter_.DrawRadioButton(D2D1::RectF(row.left + 16.0f * scale_, row.top,
-                                                 row.right - 16.0f * scale_, row.bottom),
-                                     pulse::l10n::Get(kDensityLabels[i]), st);
-        }
-
-        draw_card(lay.tray_icon_card);
-        MakeBrush(dc, theme.text, brText_);
-        DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsTrayIcon),
-                     lay.tray_icon_card.left + 16.0f * scale_, lay.tray_icon_card.top + 10.0f * scale_,
-                     lay.tray_icon_card.right - lay.tray_icon_card.left - 32.0f * scale_, 22.0f * scale_);
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsTrayIconDesc),
-                     lay.tray_icon_card.left + 16.0f * scale_, lay.tray_icon_card.top + 32.0f * scale_,
-                     lay.tray_icon_card.right - lay.tray_icon_card.left - 32.0f * scale_, 18.0f * scale_);
-        static constexpr pulse::l10n::StringId kTrayIconLabels[] = {
-            pulse::l10n::StringId::TrayIconSmall,
-            pulse::l10n::StringId::TrayIconStandard,
-            pulse::l10n::StringId::TrayIconLarge,
-        };
-        static constexpr int kTrayIconDips[] = { 40, 48, 56 };
-        for (int i = 0; i < 3; ++i) {
-            const auto& row = lay.tray_icon_row[i];
-            if (IsHovered(vm, HitTestResult::SettingsTrayIcon, i)) {
-                MakeBrush(dc, theme.fill_hover, brFillHover_);
-                FillRoundedRect(dc, brFillHover_.get(), row.left + 4.0f * scale_, row.top,
-                                row.right - row.left - 8.0f * scale_, row.bottom - row.top,
-                                4.0f * scale_);
-            }
-            fluent::ControlState st{};
-            st.checked = vm.settings_tray_icon == kTrayIconDips[i];
-            st.hovered = IsHovered(vm, HitTestResult::SettingsTrayIcon, i);
-            painter_.DrawRadioButton(D2D1::RectF(row.left + 16.0f * scale_, row.top,
-                                                 row.right - 16.0f * scale_, row.bottom),
-                                     pulse::l10n::Get(kTrayIconLabels[i]), st);
-        }
-
-        draw_card(lay.language_card);
-        MakeBrush(dc, theme.text, brText_);
-        DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsLanguage),
-                     lay.language_card.left + 16.0f * scale_,
-                     lay.language_card.top + 10.0f * scale_,
-                     lay.language_card.right - lay.language_card.left - 32.0f * scale_,
-                     22.0f * scale_);
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsLanguageDesc),
-                     lay.language_card.left + 16.0f * scale_,
-                     lay.language_card.top + 32.0f * scale_,
-                     lay.language_card.right - lay.language_card.left - 32.0f * scale_,
-                     22.0f * scale_);
-        static constexpr pulse::l10n::StringId kLanguageLabels[] = {
-            pulse::l10n::StringId::LanguageSystem,
-            pulse::l10n::StringId::LanguageZhCN,
-            pulse::l10n::StringId::LanguageEnUS,
-        };
-        painter_.DrawSegmentedTrack(D2D1::RectF(lay.language_segment[0].left,
-            lay.language_segment[0].top, lay.language_segment[2].right, lay.language_segment[2].bottom));
-        for (int i = 0; i < 3; ++i) {
-            fluent::SegmentedItemSpec segment;
-            segment.bounds = lay.language_segment[i];
-            segment.bounds = D2D1::RectF(segment.bounds.left + 3 * scale_, segment.bounds.top + 3 * scale_,
-                segment.bounds.right - 3 * scale_, segment.bounds.bottom - 3 * scale_);
-            segment.shared_track = true;
-            segment.text = pulse::l10n::Get(kLanguageLabels[i]);
-            segment.position = i == 0 ? fluent::SegmentPosition::First
-                             : i == 2 ? fluent::SegmentPosition::Last
-                                      : fluent::SegmentPosition::Middle;
-            segment.state.selected = vm.settings_language == i;
-            segment.state.hovered = IsHovered(vm, HitTestResult::SettingsLanguage, i);
-            painter_.DrawSegmentedItem(segment);
-        }
-
-        draw_card(lay.wallpaper_card);
-        const auto& preview = lay.wallpaper_preview;
-        MakeBrush(dc, theme.fill_hover, brFillHover_);
-        FillRoundedRect(dc, brFillHover_.get(), preview.left, preview.top,
-                        preview.right - preview.left, preview.bottom - preview.top, 6.0f * scale_);
-        if (!vm.background_image.empty())
-            material_.DrawSourceCover(dc, preview, vm.background_image);
-        MakeBrush(dc, theme.stroke_card, brStrokeCard_);
-        dc->DrawRoundedRectangle(D2D1::RoundedRect(preview, 6.0f * scale_, 6.0f * scale_),
-                                 brStrokeCard_.get(), 1.0f);
-        const float text_left = preview.right + 12.0f * scale_;
-        const bool compact_wallpaper = lay.wallpaper_choose.top >
-            lay.wallpaper_card.top + 64.0f * scale_;
-        const float text_right = compact_wallpaper
-            ? lay.wallpaper_card.right - 16.0f * scale_
-            : lay.wallpaper_choose.left - 12.0f * scale_;
-        MakeBrush(dc, theme.text, brText_);
-        DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsWallpaper),
-                     text_left, lay.wallpaper_card.top + 18.0f * scale_,
-                     (std::max)(40.0f * scale_, text_right - text_left), 22.0f * scale_);
-        const std::wstring wallpaper_desc = vm.background_image.empty()
-            ? pulse::l10n::Get(pulse::l10n::StringId::SettingsWallpaperDesc)
-            : FileNameOf(vm.background_image);
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(), wallpaper_desc,
-                     text_left, lay.wallpaper_card.top + 42.0f * scale_,
-                     (std::max)(40.0f * scale_, text_right - text_left), 18.0f * scale_);
-        fluent::ControlState choose{};
-        choose.hovered = IsHovered(vm, HitTestResult::SettingsWallpaper, 0);
-        painter_.DrawButton({ lay.wallpaper_choose,
-                              pulse::l10n::Get(pulse::l10n::StringId::ChooseImage), {},
-                              fluent::ButtonKind::Standard, choose });
-        fluent::ControlState clear{};
-        clear.enabled = !vm.background_image.empty();
-        clear.hovered = clear.enabled && IsHovered(vm, HitTestResult::SettingsWallpaper, 1);
-        painter_.DrawButton({ lay.wallpaper_clear,
-                              pulse::l10n::Get(pulse::l10n::StringId::Clear), {},
-                              fluent::ButtonKind::Standard, clear });
-
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::SettingsStartupShutdown),
-                     lay.content.left + pad, lay.startup_row[0].top - 30.0f * scale_,
-                     200.0f * scale_, 22.0f * scale_);
-        const D2D1_RECT_F startup_card = D2D1::RectF(lay.startup_row[0].left, lay.startup_row[0].top,
-                                                     lay.startup_row[2].right, lay.startup_row[2].bottom);
-        draw_card(startup_card);
-        auto draw_row = [&](const D2D1_RECT_F& row, const std::wstring& title,
-                            const std::wstring& desc,
-                            bool on, int hit) {
-            if (IsHovered(vm, HitTestResult::SettingsToggle, hit)) {
-                MakeBrush(dc, theme.fill_hover, brFillHover_);
-                FillRoundedRect(dc, brFillHover_.get(), row.left + 4.0f * scale_, row.top,
-                                row.right - row.left - 8.0f * scale_, row.bottom - row.top,
-                                4.0f * scale_);
-            }
-            MakeBrush(dc, theme.text, brText_);
-            DrawTextRect(dc, compositor_->TextFormat(), brText_.get(), title,
-                         row.left + 16.0f * scale_, row.top + 8.0f * scale_,
-                         row.right - row.left - 80.0f * scale_, 22.0f * scale_);
-            MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-            DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(), desc,
-                         row.left + 16.0f * scale_, row.top + 30.0f * scale_,
-                         row.right - row.left - 80.0f * scale_, 18.0f * scale_);
-            fluent::ControlState st{};
-            st.checked = on;
-            st.hovered = IsHovered(vm, HitTestResult::SettingsToggle, hit);
-            painter_.DrawSwitch(D2D1::RectF(row.right - 16.0f * scale_ - switch_w,
-                                            row.top + (56.0f * scale_ - switch_h) * 0.5f,
-                                            row.right - 16.0f * scale_,
-                                            row.top + (56.0f * scale_ + switch_h) * 0.5f),
-                                L"", st);
-        };
-        draw_row(lay.startup_row[0],
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsLaunch),
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsLaunchDesc),
-                 vm.settings_launch_on_startup, 1);
-        MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
-        FillRect(dc, brStrokeDivider_.get(), startup_card.left + 16.0f * scale_,
-                 lay.startup_row[0].bottom, startup_card.right - startup_card.left - 32.0f * scale_, 1.0f);
-        draw_row(lay.startup_row[1],
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsKeepRunning),
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsKeepRunningDesc),
-                 vm.settings_keep_running, 2);
-        MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
-        FillRect(dc, brStrokeDivider_.get(), startup_card.left + 16.0f * scale_,
-                 lay.startup_row[1].bottom, startup_card.right - startup_card.left - 32.0f * scale_, 1.0f);
-        draw_row(lay.startup_row[2],
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsOpenFolders),
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsOpenFoldersDesc),
-                 vm.settings_open_folders, 3);
-        draw_card(lay.hidden_files_row);
-        draw_row(lay.hidden_files_row,
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsShowHidden),
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsShowHiddenDesc),
-                 vm.settings_show_hidden_files, 5);
-        draw_card(lay.pinned_names_row);
-        draw_row(lay.pinned_names_row,
-                 pulse::l10n::Get(pulse::l10n::StringId::PinnedNames),
-                 pulse::l10n::Get(pulse::l10n::StringId::PinnedNamesDesc),
-                 vm.show_pinned_tab_names, 6);
-        draw_card(lay.blank_click_row);
-        draw_row(lay.blank_click_row,
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsBlankClickBack),
-                 pulse::l10n::Get(pulse::l10n::StringId::SettingsBlankClickBackDesc),
-                 vm.settings_blank_click_go_back, 7);
-        draw_card(lay.change_tracking_row);
-        draw_row(lay.change_tracking_row, pulse::l10n::Get(pulse::l10n::StringId::SettingsChangeTracking), pulse::l10n::Get(pulse::l10n::StringId::SettingsChangeTrackingDesc), vm.settings_change_tracking, 8);
-        draw_card(lay.change_days_row);
-        painter_.DrawText(pulse::l10n::Get(pulse::l10n::StringId::SettingsChangeDays), D2D1::RectF(lay.change_days_row.left + 16 * scale_, lay.change_days_row.top + 8 * scale_, lay.change_days_row.right - 16 * scale_, lay.change_days_row.top + 36 * scale_), compositor_->TextFormat(), theme.text);
-        const std::wstring labels[] = { pulse::l10n::Get(pulse::l10n::StringId::ChangeToday), pulse::l10n::Get(pulse::l10n::StringId::ChangeLast3Days), pulse::l10n::Get(pulse::l10n::StringId::ChangeLast7Days) };
-        const int days[] = { 1, 3, 7 };
-        for (int i = 0; i < 3; ++i) {
-            fluent::ControlState state{};
-            state.checked = vm.settings_change_days == days[i];
-            state.hovered = IsHovered(vm, HitTestResult::SettingsChangeDays, i);
-            painter_.DrawRadioButton(lay.change_days[i], labels[i], state);
-        }
-    } else if (vm.settings_page == 1) {
+        DrawSettingsCore(vm, rect, theme);
+        if (vm.settings_expanded & 2u) {
         fluent::InfoBarSpec info;
         info.bounds = lay.index_info;
         info.title = pulse::l10n::Get((vm.settings_index_service || vm.settings_index_installed)
@@ -392,14 +130,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         info.show_close = false;
         painter_.DrawInfoBar(info);
 
-        auto draw_card = [&](const D2D1_RECT_F& card) {
-            MakeBrush(dc, theme.fill_input, brFillInput_);
-            FillRoundedRect(dc, brFillInput_.get(), card.left, card.top,
-                            card.right - card.left, card.bottom - card.top, 8.0f * scale_);
-            MakeBrush(dc, theme.stroke_card, brStrokeCard_);
-            dc->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f * scale_, 8.0f * scale_),
-                                     brStrokeCard_.get(), 1.0f);
-        };
+
         draw_card(lay.index_status);
         MakeBrush(dc, theme.text, brText_);
         DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
@@ -608,93 +339,9 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
                                   pulse::l10n::Get(pulse::l10n::StringId::Remove), {},
                                   fluent::ButtonKind::Standard, remove });
         }
-    } else if (vm.settings_page == 2) {
-        float y = origin + pad + 44.0f * scale_;
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                     pulse::l10n::Get(pulse::l10n::StringId::ContextMenuDesc),
-                     lay.content.left + pad, y, lay.content.right - lay.content.left - pad * 2,
-                     22.0f * scale_);
-        y += 30.0f * scale_;
-        static constexpr pulse::l10n::StringId kGroupTitle[] = {
-            pulse::l10n::StringId::ContextSoftware,
-            pulse::l10n::StringId::ContextOpenWith,
-            pulse::l10n::StringId::ContextShare,
-            pulse::l10n::StringId::ContextSystem,
-            pulse::l10n::StringId::ContextPrint,
-        };
-        static constexpr pulse::l10n::StringId kGroupDesc[] = {
-            pulse::l10n::StringId::ContextSoftwareDesc,
-            pulse::l10n::StringId::ContextOpenWithDesc,
-            pulse::l10n::StringId::ContextShareDesc,
-            pulse::l10n::StringId::ContextSystemDesc,
-            pulse::l10n::StringId::ContextPrintDesc,
-        };
-        for (int g = 0; g < 5; ++g) {
-            std::vector<int> rows;
-            for (int i = 0; i < static_cast<int>(vm.settings_items.size()); ++i)
-                if (vm.settings_items[static_cast<size_t>(i)].group == g) rows.push_back(i);
-            const float header = 56.0f * scale_;
-            const float desc = 36.0f * scale_;
-            const float row_h = 36.0f * scale_;
-            const float card_h = header + desc + rows.size() * row_h + 8.0f * scale_;
-            const D2D1_RECT_F card = D2D1::RectF(lay.content.left + pad, y,
-                                                 lay.content.right - pad, y + card_h);
-            MakeBrush(dc, theme.fill_input, brFillInput_);
-            FillRoundedRect(dc, brFillInput_.get(), card.left, card.top,
-                            card.right - card.left, card.bottom - card.top, 8.0f * scale_);
-            MakeBrush(dc, theme.stroke_card, brStrokeCard_);
-            dc->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f * scale_, 8.0f * scale_),
-                                     brStrokeCard_.get(), 1.0f);
-            MakeBrush(dc, theme.text, brText_);
-            DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
-                         pulse::l10n::Get(kGroupTitle[g]),
-                         card.left + 16.0f * scale_, y + 10.0f * scale_,
-                         card.right - card.left - 80.0f * scale_, 22.0f * scale_);
-            fluent::ControlState gst{};
-            gst.checked = vm.settings_group_on[g];
-            gst.hovered = IsHovered(vm, HitTestResult::SettingsToggle, 10 + g);
-            painter_.DrawSwitch(D2D1::RectF(card.right - 16.0f * scale_ - switch_w,
-                                            y + (header - switch_h) * 0.5f,
-                                            card.right - 16.0f * scale_,
-                                            y + (header + switch_h) * 0.5f),
-                                L"", gst);
-            MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-            DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                         pulse::l10n::Get(kGroupDesc[g]),
-                         card.left + 16.0f * scale_, y + header - 4.0f * scale_,
-                         card.right - card.left - 32.0f * scale_, desc - 8.0f * scale_);
-            float iy = y + header + desc;
-            for (int idx : rows) {
-                const auto& row = vm.settings_items[static_cast<size_t>(idx)];
-                if (IsHovered(vm, HitTestResult::SettingsToggle, 100 + idx)) {
-                    MakeBrush(dc, theme.fill_hover, brFillHover_);
-                    FillRoundedRect(dc, brFillHover_.get(), card.left + 4.0f * scale_, iy,
-                                    card.right - card.left - 8.0f * scale_, row_h, 4.0f * scale_);
-                }
-                MakeBrush(dc, theme.text, brText_);
-                DrawTextRect(dc, compositor_->SmallFormat(), brText_.get(), row.text,
-                             card.left + 16.0f * scale_, iy,
-                             card.right - card.left - 80.0f * scale_, row_h);
-                fluent::ControlState ist{};
-                ist.checked = row.on;
-                ist.hovered = IsHovered(vm, HitTestResult::SettingsToggle, 100 + idx);
-                painter_.DrawSwitch(D2D1::RectF(card.right - 16.0f * scale_ - switch_w,
-                                                iy + (row_h - switch_h) * 0.5f,
-                                                card.right - 16.0f * scale_,
-                                                iy + (row_h + switch_h) * 0.5f),
-                                    L"", ist);
-                iy += row_h;
-            }
-            y += card_h + 12.0f * scale_;
         }
-        fluent::ControlState restore{};
-        restore.hovered = IsHovered(vm, HitTestResult::SettingsRestore);
-        painter_.DrawButton({ D2D1::RectF(lay.content.left + pad, y,
-                                          lay.content.left + pad + 120.0f * scale_,
-                                          y + 32.0f * scale_),
-                              pulse::l10n::Get(pulse::l10n::StringId::RestoreDefaults), {},
-                              fluent::ButtonKind::Standard, restore });
+    } else if (vm.settings_page == 2) {
+        DrawSettingsContext(vm,rect,theme);
     } else if (vm.settings_page == 3) {
         auto draw_card = [&](const D2D1_RECT_F& card) {
             MakeBrush(dc, theme.fill_input, brFillInput_);
@@ -832,6 +479,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
             dc->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f * scale_, 8.0f * scale_),
                                      brStrokeCard_.get(), 1.0f);
         };
+        draw_card(lay.duplicate_options);
         MakeBrush(dc, theme.text_secondary, brTextSecondary_);
         DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(), vm.dup_hint,
                      lay.content.left + pad, origin + pad + 44.0f * scale_,
@@ -896,12 +544,12 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
             MakeBrush(dc, theme.text, brText_);
             DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
                          pulse::l10n::Get(pulse::l10n::StringId::DupMinSize),
-                         lay.content.left + pad, label_top,
+                         lay.content.left + pad + 16*scale_, label_top,
                          lay.content.right - lay.content.left - pad * 2, 20.0f * scale_);
             MakeBrush(dc, theme.text_secondary, brTextSecondary_);
             DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
                          pulse::l10n::Get(pulse::l10n::StringId::DupMinSizeDesc),
-                         lay.content.left + pad, label_top + 20.0f * scale_,
+                         lay.content.left + pad + 16*scale_, label_top + 20.0f * scale_,
                          lay.content.right - lay.content.left - pad * 2, 18.0f * scale_);
         }
         for (int i = 0; i < 3; ++i) {
@@ -1034,6 +682,44 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         bar.expand_progress = 1.0f;
         painter_.DrawScrollbar(bar);
     }
+}
+
+D2D1_RECT_F MainRenderer::SettingsDropdownBounds(const WindowViewModel& vm, int index, float window_w, float window_h) const {
+    const auto l=MakeSettingsLayout(vm,D2D1::RectF(0,0,window_w,window_h),scale_,title_bar_height_,status_height_,&painter_);
+    return index==0 ? l.effect_choice : l.language_choice;
+}
+
+float MainRenderer::SettingsDestinationOffset(const WindowViewModel& vm, int setting_id, float window_w, float window_h) const {
+    const auto l=MakeSettingsLayout(vm,D2D1::RectF(0,0,window_w,window_h),scale_,title_bar_height_,status_height_,&painter_);
+    using I=l10n::StringId;
+    D2D1_RECT_F target{};
+    switch(static_cast<I>(setting_id)) {
+    case I::SettingsTheme: target=l.theme_row;break;
+    case I::SettingsThemeColor: target=l.accent_card;break;
+    case I::SettingsWindowEffect: target=l.effect_card;break;
+    case I::SettingsLanguage: target=l.language_card;break;
+    case I::SettingsLaunch: target=l.startup_row[0];break;
+    case I::SettingsKeepRunning: target=l.startup_row[1];break;
+    case I::SettingsOpenFolders: target=l.startup_row[2];break;
+    case I::SettingsRowHeight: target=l.density_card;break;
+    case I::SettingsShowPerformance: target=l.performance_row;break;
+    case I::SettingsWallpaper: target=l.wallpaper_card;break;
+    case I::SettingsTrayIcon: target=l.tray_icon_card;break;
+    case I::SettingsShowHidden: target=l.hidden_files_row;break;
+    case I::PinnedNames: target=l.pinned_names_row;break;
+    case I::SettingsBlankClickBack: target=l.blank_click_row;break;
+    case I::SettingsChangeTracking: target=l.change_tracking_row;break;
+    case I::GlobalSearch: target=l.global_search_row;break;
+    case I::GlobalSearchHotkey: target=l.global_search_hotkey_row;break;
+    case I::SearchPinyin: target=l.search_pinyin_row;break;
+    case I::ContentIndexManage: target=l.content_header;break;
+    case I::IndexLocation: target=l.index_path;break;
+    case I::LocalDrives: if(!l.index_volume_rows.empty()) target=l.index_volume_rows.front();break;
+    case I::Exclusions: target=l.index_exclude_action;break;
+    case I::ServerFolders: target=l.network_action[0];break;
+    default: return 0;
+    }
+    return (std::max)(0.0f,target.top-l.content_origin-20*scale_);
 }
 
 float MainRenderer::SettingsMaxScroll(const WindowViewModel& vm, float window_w, float window_h) const {
