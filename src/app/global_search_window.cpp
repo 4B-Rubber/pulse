@@ -32,6 +32,7 @@ constexpr UINT_PTR kDebounce = 1;
 constexpr UINT_PTR kConnectTimeout = 2;
 constexpr uint64_t kSession = 0x50554c534547534full;
 constexpr float kHeader = 76, kTabs = 52, kFooter = 48, kRow = 88;
+constexpr float kEditCornerRadius = 4;
 constexpr size_t kMaximumResults = 200;
 const std::wstring& Text(StringId id) { return l10n::Get(id); }
 std::wstring ParentPath(const std::wstring& path) {
@@ -95,7 +96,7 @@ struct GlobalSearchWindow::Impl {
 
     ui::Theme Theme() const { return ui::IsHighContrast() ? ui::MakeHighContrastTheme() : ui::MakeTheme(dark, accent_color); }
     D2D1_COLOR_F EditBackground() const {
-        return compositor.LumaTextEnabled() && !ui::IsHighContrast() ? D2D1::ColorF(0, 0.0f) : Theme().header_bg;
+        return Theme().header_bg;
     }
     static UINT32 Rgb(D2D1_COLOR_F color) {
         return (static_cast<UINT32>(std::lround(color.r * 255)) << 16) |
@@ -239,6 +240,10 @@ struct GlobalSearchWindow::Impl {
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(edit_font), TRUE);
         MoveWindow(edit, Px(116), Px(23), Px(width - 188), Px(35), TRUE);
+        // Clip the redirected child as well as its parent-painted background.
+        const HRGN edit_region = CreateRoundRectRgn(0, 0, Px(width - 188) + 1, Px(35) + 1,
+            Px(kEditCornerRadius * 2), Px(kEditCornerRadius * 2));
+        if (edit_region && !SetWindowRgn(edit, edit_region, TRUE)) DeleteObject(edit_region);
         if (compositor.LumaTextEnabled() && edit_format)
             compositor.PresentLumaEdit(edit, edit_format.Get(), Theme().text, EditBackground());
         ClampSelection(); Invalidate();
@@ -357,8 +362,7 @@ struct GlobalSearchWindow::Impl {
             else if (drawn) tint.a = 0;
             else if (live && !ui::IsHighContrast() && backdrop && compositor.UsesTransparentComposition()) tint.a = dark ? 0.72f : 0.78f;
             brush->SetColor(tint); target->FillRectangle({0, 0, width, height}, brush.Get());
-            if (!compositor.LumaTextEnabled() || ui::IsHighContrast())
-                Fill({116, 23, width - 72, 58}, Rgb(theme.header_bg));
+            Fill({116, 23, width - 72, 58}, Rgb(theme.header_bg), kEditCornerRadius);
             DrawLogo();
             Fill({80, 24, 81, 54}, line);
             Label(L"\xE721", {91, 22, 115, 57}, 21, muted, false, L"Segoe Fluent Icons");
@@ -537,8 +541,11 @@ struct GlobalSearchWindow::Impl {
             edit = ui::CreateChildEdit(hwnd);
             if (!edit) { DestroyWindow(hwnd); hwnd = nullptr; return false; }
             SetWindowTheme(edit, L"", L"");
-            if (!EnsureTarget() || !compositor.LumaTextEnabled())
-                SetLayeredWindowAttributes(edit, 0, 255, LWA_ALPHA);
+            EnsureTarget();
+            // Match the address editor: uploaded layered bitmaps can disappear
+            // below the parent's composition surface on some display stacks.
+            // LumaText paints into the redirected child DC instead.
+            SetLayeredWindowAttributes(edit, 0, 255, LWA_ALPHA);
             ShowWindow(edit, SW_SHOW);
             SetWindowSubclass(edit, EditProc, 1, reinterpret_cast<DWORD_PTR>(this));
             SendMessageW(edit, EM_SETLIMITTEXT, 2048, 0);

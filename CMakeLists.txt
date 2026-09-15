@@ -460,8 +460,9 @@ target_link_libraries(pulse_dialog_close_test PRIVATE dwmapi user32)
 
 add_executable(pulse_child_edit_test
     src/bench/child_edit_test.cpp src/bench/child_edit_test.rc
-    src/ui/typography.cpp src/ui/ui_compositor.cpp)
+    src/ui/typography.cpp src/ui/ui_compositor.cpp src/ui/edit_host.cpp)
 target_compile_options(pulse_child_edit_test PRIVATE /W4 /permissive- /utf-8)
+target_compile_definitions(pulse_child_edit_test PRIVATE PULSE_TEST_LUMATEXT_INIT_FAILURE=1)
 target_link_options(pulse_child_edit_test PRIVATE /MANIFEST:NO)
 target_link_libraries(pulse_child_edit_test PRIVATE
     d3d11 d2d1 dwrite dxgi dcomp dwmapi shcore ole32 windowscodecs user32 gdi32 comctl32 pulse_localization)

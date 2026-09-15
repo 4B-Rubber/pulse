@@ -395,6 +395,11 @@ struct LumaTextRenderer::Impl {
         profile_desc.dark = profile_desc.light;
         profile_desc.regular_optical_weight = 0.06f;
         profile_desc.bold_optical_weight = 0.0f;
+#if defined(PULSE_TEST_LUMATEXT_INIT_FAILURE)
+        wchar_t fail_init[2]{};
+        if (GetEnvironmentVariableW(L"PULSE_TEST_LUMATEXT_INIT_FAILURE", fail_init, ARRAYSIZE(fail_init)))
+            return false;
+#endif
         return lt_render_profile_create(&profile_desc, profile.put()) == LT_OK;
     }
 
@@ -1085,7 +1090,11 @@ LRESULT LumaTextRenderer::CallEditDefaultMouse(HWND hwnd, UINT msg, WPARAM wPara
 bool LumaTextRenderer::Init(IDWriteFactory* dwrite, ID2D1RenderTarget* target) {
     Shutdown();
     if (!EnvironmentEnabled() || !dwrite || !target || !LoadOptionalLumaText()) return false;
-    return impl_->Init(dwrite, target);
+    if (impl_->Init(dwrite, target)) return true;
+    // The renderer is allocated before fonts, cascades and the profile. A late
+    // failure must not leave Enabled() true and suppress native EDIT painting.
+    Shutdown();
+    return false;
 }
 
 void LumaTextRenderer::Shutdown() noexcept {
