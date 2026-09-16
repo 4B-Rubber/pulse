@@ -105,8 +105,8 @@ void ShowAddressSearch(AppState& s) {
         s.addressSearchContent = tab->search_input_content;
     } else {
         s.addressSearchRoot = fs::IsVirtualPath(tab->current_path) ? L"" : tab->current_path;
-        s.addressSearchCurrent = false;
-        s.addressSearchContent = false;
+        s.addressSearchCurrent = s.appPrefs.address_search_current && !s.addressSearchRoot.empty();
+        s.addressSearchContent = s.appPrefs.address_search_content;
     }
     ShowAddressEditor(s);
     if (!s.addressEditing || !s.hwndAddressEdit) return;
@@ -137,6 +137,12 @@ void QueueAddressSearch(AppState& s) {
     auto* tab = ActiveTab(s);
     if (!s.addressSearching || !tab) return;
     s.addressLiveContext = tab->current_path;
+    if (s.appPrefs.address_search_current != s.addressSearchCurrent ||
+        s.appPrefs.address_search_content != s.addressSearchContent) {
+        s.appPrefs.address_search_current = s.addressSearchCurrent;
+        s.appPrefs.address_search_content = s.addressSearchContent;
+        if (!s.isolatedTest) s.appPrefs.Save();
+    }
     s.addressLiveDue = GetTickCount64() + (s.addressSearchContent ? 150 : 100);
     tab->search_allow_scan = false;
     s.addressHistoryDue = 0;

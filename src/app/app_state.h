@@ -356,6 +356,7 @@ struct AppState {
     bool addressSearching = false;
     bool searchHistoryOpen = false;
     bool searchScopePending = false;
+    bool sidebarResizing = false;
     bool addressSearchComposing = false;
     ULONGLONG addressLiveDue = 0;
     ULONGLONG addressHistoryDue = 0;

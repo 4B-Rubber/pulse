@@ -62,6 +62,9 @@ void AppPrefs::ResetToDefaults() {
     window_effect = L"mica-alt";
     background_image.clear();
     row_height = 34;
+    sidebar_width = 224;
+    address_search_current = false;
+    address_search_content = false;
     tray_icon_size = 48;
     accent_rgb.clear();
     custom_tag_colors.clear();
@@ -114,6 +117,9 @@ std::wstring AppPrefs::ToJson() const {
     out += escaped_image;
     out += L"\",\n  \"row_height\":";
     out += std::to_wstring(row_height);
+    out += L",\n  \"sidebar_width\":" + std::to_wstring(sidebar_width);
+    out += L",\n  \"address_search_current\":" + std::to_wstring(address_search_current);
+    out += L",\n  \"address_search_content\":" + std::to_wstring(address_search_content);
     out += L",\n  \"tray_icon_size\":";
     out += std::to_wstring(tray_icon_size);
     out += L",\n  \"accent_rgb\":\"";
@@ -179,6 +185,10 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     else if (window_effect.empty()) window_effect = L"mica-alt";
     background_image = pulse::json::ExtractString(json, L"background_image");
     row_height = pulse::json::ExtractInt(json, L"row_height", 34);
+    sidebar_width = pulse::json::ExtractInt(json, L"sidebar_width", 224);
+    if (sidebar_width < 160 || sidebar_width > 480) sidebar_width = 224;
+    address_search_current = pulse::json::ExtractInt(json, L"address_search_current", 0) != 0;
+    address_search_content = pulse::json::ExtractInt(json, L"address_search_content", 0) != 0;
     if (row_height < 24 || row_height > 48) row_height = 34;
     tray_icon_size = pulse::json::ExtractInt(json, L"tray_icon_size", 48);
     if (tray_icon_size < 32 || tray_icon_size > 64) tray_icon_size = 48;

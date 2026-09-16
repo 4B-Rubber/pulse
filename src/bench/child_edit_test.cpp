@@ -8,20 +8,22 @@
 
 namespace {
 int failures = 0;
+bool force_present_failure = false;
 void Check(bool ok, const char* message) {
     std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", message);
     if (!ok) ++failures;
 }
 LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
     auto& compositor = *reinterpret_cast<pulse::ui::Compositor*>(data);
+    auto* format = force_present_failure ? nullptr : compositor.TextFormat();
     const auto foreground = D2D1::ColorF(1, 1, 1);
     DWORD flags = 0;
     const bool redirected = GetLayeredWindowAttributes(hwnd, nullptr, nullptr, &flags) && (flags & LWA_ALPHA);
     const auto background = D2D1::ColorF(0, redirected ? 1.0f : 0.0f);
     LRESULT result = 0;
-    if (pulse::ui::HandleChildEditMessage(compositor, compositor.TextFormat(), foreground,
+    if (pulse::ui::HandleChildEditMessage(compositor, format, foreground,
         background, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)), hwnd, msg, wp, lp, result)) return result;
-    return pulse::ui::DefPresentedChildEditProc(compositor, compositor.TextFormat(), foreground,
+    return pulse::ui::DefPresentedChildEditProc(compositor, format, foreground,
         background, hwnd, msg, wp, lp);
 }
 bool HasRenderedText(pulse::ui::Compositor& compositor, HWND edit) {
@@ -113,6 +115,17 @@ int wmain() {
             GetWindowRect(edit, &after);
             Check(after.left == before.left + 70 && after.top == before.top + 40,
                 "moving parent moves child without manual repositioning");
+            force_present_failure = true;
+            SendMessageW(edit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L"fallback"));
+            force_present_failure = false;
+            LRESULT handled = 0;
+            Check(!pulse::ui::HandleChildEditMessage(compositor, compositor.TextFormat(),
+                D2D1::ColorF(1, 1, 1), D2D1::ColorF(0, 0, 0), nullptr,
+                edit, WM_PAINT, 0, 0, handled), "presentation failure restores native paint handling");
+            SendMessageW(edit, EM_SETSEL, 0, -1);
+            SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L"native 中文"));
+            GetWindowTextW(edit, text, ARRAYSIZE(text));
+            Check(std::wstring(text) == L"native 中文", "editing remains functional after presentation failure");
             ShowWindow(parent, SW_HIDE);
             Check(!IsWindowVisible(edit), "parent hide automatically hides the editor");
             DestroyWindow(edit);

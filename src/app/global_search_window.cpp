@@ -1,8 +1,11 @@
 #include "global_search_window.h"
 #include "resource.h"
 #include "../ui/empty_state_layout.h"
+#include "../ui/fluent_components.h"
+#include "../ui/typography.h"
 #include "../ui/svg_bitmap.h"
 #include "../ui/edit_host.h"
+#include "../common/path_utils.h"
 #include <uxtheme.h>
 #include "../common/localization.h"
 #include "../index/index_client.h"
@@ -30,9 +33,11 @@ constexpr UINT kIndexStatus = WM_APP + 181, kIndexResult = WM_APP + 182, kConten
 constexpr UINT kNetworkResult = WM_APP + 184;
 constexpr UINT_PTR kDebounce = 1;
 constexpr UINT_PTR kConnectTimeout = 2;
+constexpr UINT_PTR kScopeTooltipTimer = 3;
 constexpr uint64_t kSession = 0x50554c534547534full;
 constexpr float kHeader = 76, kTabs = 52, kFooter = 48, kRow = 88;
 constexpr float kEditCornerRadius = 4;
+constexpr float kEditLeft = 116, kEditRight = 72, kEditTextInset = 8;
 constexpr size_t kMaximumResults = 200;
 const std::wstring& Text(StringId id) { return l10n::Get(id); }
 std::wstring ParentPath(const std::wstring& path) {
@@ -67,7 +72,7 @@ struct GlobalSearchWindow::Impl {
     HBRUSH background = nullptr;
     bool dark = true, content_mode = false, current_only = false, composing = false, busy = false, truncated = false, search_pinyin = true;
     float scale = 1, width = 780, height = 488;
-    std::wstring current_folder, query, error;
+    std::wstring current_folder, current_folder_tip, query, error;
     struct Row { std::wstring name, path, snippet; bool directory = false; };
     std::vector<Row> rows;
     int selected = 0, first = 0;
@@ -88,11 +93,14 @@ struct GlobalSearchWindow::Impl {
     ID2D1RenderTarget* empty_art_target = nullptr;
     float empty_art_scale = 0;
     ui::Compositor compositor;
+    ui::fluent::Painter painter;
     ui::WindowMaterial material;
     ui::WindowEffect effect = ui::WindowEffect::None;
     std::wstring background_image;
     D2D1_COLOR_F accent_color = ui::GetAccentColor();
     bool backdrop = false;
+    bool scope_hover = false, scope_tooltip_visible = false, tracking_mouse = false;
+    float scope_pointer_x = 0, scope_pointer_y = 0;
 
     ui::Theme Theme() const { return ui::IsHighContrast() ? ui::MakeHighContrastTheme() : ui::MakeTheme(dark, accent_color); }
     D2D1_COLOR_F EditBackground() const {
@@ -134,7 +142,11 @@ struct GlobalSearchWindow::Impl {
         busy = false;
         if (hwnd) { KillTimer(hwnd, kDebounce); KillTimer(hwnd, kConnectTimeout); }
     }
-    void Hide() { Cancel(); if (hwnd) ShowWindow(hwnd, SW_HIDE); }
+    void Hide() {
+        Cancel();
+        HideScopeTooltip();
+        if (hwnd) ShowWindow(hwnd, SW_HIDE);
+    }
     void Changed() {
         Cancel();
         const int count = GetWindowTextLengthW(edit);
@@ -191,6 +203,26 @@ struct GlobalSearchWindow::Impl {
         auto path = rows[static_cast<size_t>(selected)].path;
         Hide(); OpenResult(std::move(path), location);
     }
+    void HideScopeTooltip() {
+        if (hwnd) KillTimer(hwnd, kScopeTooltipTimer);
+        const bool redraw = scope_tooltip_visible;
+        scope_hover = false;
+        scope_tooltip_visible = false;
+        if (redraw) Invalidate();
+    }
+    void UpdateScopeHover(float x, float y) {
+        const bool hovered = current_only && !current_folder_tip.empty() &&
+            x >= width - 126 && x < width - 12 && y >= 76 && y < 129;
+        scope_pointer_x = x;
+        scope_pointer_y = y;
+        if (hovered == scope_hover) {
+            if (hovered && scope_tooltip_visible) Invalidate();
+            return;
+        }
+        HideScopeTooltip();
+        scope_hover = hovered;
+        if (scope_hover) SetTimer(hwnd, kScopeTooltipTimer, 400, nullptr);
+    }
     bool Key(WPARAM key) {
         if (composing) return false;
         if (key == VK_ESCAPE) { Hide(); return true; }
@@ -239,9 +271,11 @@ struct GlobalSearchWindow::Impl {
         edit_font = CreateFontW(-Px(23), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(edit_font), TRUE);
-        MoveWindow(edit, Px(116), Px(23), Px(width - 188), Px(35), TRUE);
+        const float edit_left = kEditLeft + kEditTextInset;
+        const float edit_width = width - kEditRight - edit_left;
+        MoveWindow(edit, Px(edit_left), Px(23), Px(edit_width), Px(35), TRUE);
         // Clip the redirected child as well as its parent-painted background.
-        const HRGN edit_region = CreateRoundRectRgn(0, 0, Px(width - 188) + 1, Px(35) + 1,
+        const HRGN edit_region = CreateRoundRectRgn(0, 0, Px(edit_width) + 1, Px(35) + 1,
             Px(kEditCornerRadius * 2), Px(kEditCornerRadius * 2));
         if (edit_region && !SetWindowRgn(edit, edit_region, TRUE)) DeleteObject(edit_region);
         if (compositor.LumaTextEnabled() && edit_format)
@@ -260,6 +294,9 @@ struct GlobalSearchWindow::Impl {
         material.SetCompositor(&compositor);
         target = compositor.Dc();
         target->SetDpi(96 * scale, 96 * scale);
+        painter.SetCompositor(&compositor);
+        // This surface uses logical DIPs through its render-target DPI.
+        painter.SetScale(1.0f);
         return SUCCEEDED(target->CreateSolidColorBrush(Color(0xffffff), &brush));
     }
     void Fill(D2D1_RECT_F rect, UINT32 color, float radius = 0) {
@@ -342,6 +379,39 @@ struct GlobalSearchWindow::Impl {
             right -= key_width + (i == 1 ? 4 : 16);
         }
     }
+    void DrawScopeTooltip(const ui::Theme& theme) {
+        if (!scope_tooltip_visible || !current_only || current_folder_tip.empty()) return;
+        ComPtr<IDWriteTextFormat> format;
+        if (FAILED(ui::typography::CreateTextFormat(compositor.DwriteFactory(),
+            {ui::typography::FontRole::Text, 12 * scale}, &format))) return;
+        ComPtr<IDWriteTextLayout> layout;
+        if (FAILED(write_factory->CreateTextLayout(current_folder_tip.data(),
+            static_cast<UINT32>(current_folder_tip.size()), format.Get(),
+            std::max(1.0f, (width - 32) * scale), 10000, &layout))) return;
+        DWRITE_TEXT_METRICS metrics{};
+        if (FAILED(layout->GetMetrics(&metrics))) return;
+        const float tooltip_width = std::min(
+            ui::typography::MeasureLine(&compositor, format.Get(), current_folder_tip) + 16 * scale,
+            (width - 16) * scale);
+        const float tooltip_height = std::ceil(metrics.height) + 16 * scale;
+        const float x = std::round(std::clamp((scope_pointer_x + 12) * scale,
+            8 * scale, width * scale - tooltip_width - 8 * scale));
+        const float y = std::round(std::clamp((scope_pointer_y + 18) * scale,
+            8 * scale, std::max(8 * scale, height * scale - tooltip_height - 8 * scale)));
+        const D2D1_RECT_F bounds{x, y, x + tooltip_width, y + tooltip_height};
+        // Painter/LumaText rasterize at physical pixel sizes on a 96-DPI target.
+        // Restore the floating window's DIP coordinate system after the tooltip.
+        target->SetDpi(96, 96);
+        painter.SetScale(scale);
+        if (painter.BeginFrame(theme, ui::IsHighContrast())) {
+            painter.DrawTooltip(bounds, metrics.lineCount > 1 ? std::wstring_view{} : current_folder_tip);
+            if (metrics.lineCount > 1) {
+                brush->SetColor(theme.text);
+                target->DrawTextLayout({x + 8 * scale, y + 8 * scale}, layout.Get(), brush.Get());
+            }
+        }
+        target->SetDpi(96 * scale, 96 * scale);
+    }
     void Paint() {
         PAINTSTRUCT paint{}; BeginPaint(hwnd, &paint);
         if (EnsureTarget()) {
@@ -362,7 +432,7 @@ struct GlobalSearchWindow::Impl {
             else if (drawn) tint.a = 0;
             else if (live && !ui::IsHighContrast() && backdrop && compositor.UsesTransparentComposition()) tint.a = dark ? 0.72f : 0.78f;
             brush->SetColor(tint); target->FillRectangle({0, 0, width, height}, brush.Get());
-            Fill({116, 23, width - 72, 58}, Rgb(theme.header_bg), kEditCornerRadius);
+            Fill({kEditLeft, 23, width - kEditRight, 58}, Rgb(theme.header_bg), kEditCornerRadius);
             DrawLogo();
             Fill({80, 24, 81, 54}, line);
             Label(L"\xE721", {91, 22, 115, 57}, 21, muted, false, L"Segoe Fluent Icons");
@@ -373,7 +443,14 @@ struct GlobalSearchWindow::Impl {
             const float tab_center = (content_mode ? 124.0f : 28.0f) +
                 TextWidth(Text(content_mode ? StringId::SearchModeContent : StringId::SearchModeName), 16, true) * 0.5f;
             Fill({tab_center - 12, 124, tab_center + 12, 127}, accent, 1.5f);
-            Label((current_only ? Text(StringId::GlobalSearchCurrentFolder) : Text(StringId::GlobalSearchEverywhere)) + L"  ▾", {width - 210, 83, width - 22, 120}, 15, muted, false, L"Segoe UI", false, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            const UINT32 disabled = dark ? 0x6f7279 : 0x9a9da3;
+            Label(Text(StringId::GlobalSearchEverywhere), {width - 230, 83, width - 130, 120}, 15,
+                current_only ? muted : fg, !current_only, L"Segoe UI", false, DWRITE_TEXT_ALIGNMENT_CENTER);
+            Label(Text(StringId::GlobalSearchCurrentFolder), {width - 122, 83, width - 22, 120}, 15,
+                current_folder.empty() ? disabled : current_only ? fg : muted,
+                current_only && !current_folder.empty(), L"Segoe UI", false, DWRITE_TEXT_ALIGNMENT_CENTER);
+            const float scope_center = current_only ? width - 72 : width - 180;
+            Fill({scope_center - 12, 124, scope_center + 12, 127}, accent, 1.5f);
             Fill({0, 128, width, 129}, line);
             const float bottom = height - kFooter;
             target->PushAxisAlignedClip({0, 130, width, bottom}, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -421,6 +498,7 @@ struct GlobalSearchWindow::Impl {
             Label(!error.empty() ? error : busy ? Text(StringId::GlobalSearchLoading) : std::to_wstring(total) + Text(StringId::GlobalSearchResults), {25, bottom + 8, 155, height - 8}, 12, muted);
             if (truncated) Label(Text(StringId::GlobalSearchTruncated), {165, bottom + 8, width - 22, height - 8}, 12, muted, false, L"Segoe UI", false, DWRITE_TEXT_ALIGNMENT_TRAILING);
             else DrawKeys(bottom, muted);
+            DrawScopeTooltip(theme);
             const HRESULT rendered = target->EndDraw();
             if (FAILED(rendered)) { compositor.NotifyDeviceLost(rendered); empty_art.Reset(); empty_art_target = nullptr; logo.Reset(); logo_target = nullptr; brush.Reset(); target.Reset(); }
             else if (live) compositor.Present();
@@ -456,14 +534,38 @@ struct GlobalSearchWindow::Impl {
             else if (wp == kConnectTimeout) {
                 KillTimer(hwnd, kConnectTimeout);
                 if (busy && !content_mode) { busy = false; error = Text(StringId::GlobalSearchFailed); Invalidate(); }
+            } else if (wp == kScopeTooltipTimer) {
+                KillTimer(hwnd, kScopeTooltipTimer);
+                if (scope_hover && current_only && !current_folder_tip.empty()) {
+                    scope_tooltip_visible = true;
+                    Invalidate();
+                }
             }
+            return 0;
+        case WM_MOUSEMOVE: {
+            if (!tracking_mouse) {
+                TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, hwnd, 0};
+                tracking_mouse = TrackMouseEvent(&tracking) != FALSE;
+            }
+            UpdateScopeHover(static_cast<float>(GET_X_LPARAM(lp)) / scale,
+                static_cast<float>(GET_Y_LPARAM(lp)) / scale);
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            tracking_mouse = false;
+            HideScopeTooltip();
             return 0;
         case WM_LBUTTONDOWN: {
             const float x = static_cast<float>(GET_X_LPARAM(lp)) / scale, y = static_cast<float>(GET_Y_LPARAM(lp)) / scale;
+            HideScopeTooltip();
             if (y < 76 && x > width - 70) Hide();
             else if (y >= 76 && y < 129) {
                 if (x < 220) { content_mode = x >= 114; Changed(); }
-                else if (x > width - 220 && !current_folder.empty()) { current_only = !current_only; Changed(); }
+                else if (x >= width - 230 && x < width - 126) {
+                    if (current_only) { current_only = false; Changed(); }
+                } else if (x >= width - 126 && x < width - 12 && !current_folder.empty()) {
+                    if (!current_only) { current_only = true; Changed(); }
+                }
             } else if (y >= 136 && y < height - kFooter) {
                 selected = first + static_cast<int>((y - 136) / kRow); ClampSelection(); Invalidate();
             }
@@ -529,7 +631,10 @@ struct GlobalSearchWindow::Impl {
             FreeLibrary(shcore);
         }
         (void)owner;
-        current_folder = folder; if (folder.empty()) current_only = false;
+        current_folder = folder;
+        current_folder_tip = path::StripExtendedPathPrefix(folder);
+        if (folder.empty()) current_only = false;
+        HideScopeTooltip();
         if (!hwnd) {
             WNDCLASSEXW cls{sizeof(cls)}; cls.style = CS_DBLCLKS;
             cls.lpfnWndProc = WindowProc; cls.hInstance = GetModuleHandleW(nullptr);

@@ -106,11 +106,10 @@ HWND CreateHostedEdit(AppState& s, SUBCLASSPROC proc) {
     HWND hwnd = ui::CreateChildEdit(s.hwnd);
     if (!hwnd) return nullptr;
     SetWindowTheme(hwnd, L"", L"");
-    // Address/search and rename children use redirected surfaces: uploaded
+    // All hosted editors use redirected surfaces: uploaded
     // layered bitmaps can disappear under the main composition surface.
     // Their procedures suppress native drawing and present LumaText to the DC.
-    if (!s.compositor.LumaTextEnabled() || proc == RenameEditProc || proc == AddressEditProc)
-        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
     SendMessageW(hwnd, WM_SETFONT, (WPARAM)s.editFont, TRUE);
     SetWindowSubclass(hwnd, proc, 1, reinterpret_cast<DWORD_PTR>(&s));
     return hwnd;
@@ -620,7 +619,7 @@ LRESULT CALLBACK FilterEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
     case WM_CHAR:
         if (wParam != VK_RETURN && wParam != VK_ESCAPE) {
-            LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
+            LRESULT lr = DefPresentedHostedEditProc(s, hwnd, msg, wParam, lParam);
             SyncFilterEditor(*s);
             return lr;
         }
@@ -632,7 +631,7 @@ LRESULT CALLBACK FilterEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return EraseHostedEditBackground(hwnd, wParam, s) ? 1 : 0;
     }
     }
-    return DefSubclassProc(hwnd, msg, wParam, lParam);
+    return DefPresentedHostedEditProc(s, hwnd, msg, wParam, lParam);
 }
 
 LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
@@ -684,7 +683,7 @@ LRESULT CALLBACK TagRenameEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return EraseHostedEditBackground(hwnd, wParam, s) ? 1 : 0;
     }
     }
-    return DefSubclassProc(hwnd, msg, wParam, lParam);
+    return DefPresentedHostedEditProc(s, hwnd, msg, wParam, lParam);
 }
 
 } // namespace pulse

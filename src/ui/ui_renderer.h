@@ -673,6 +673,7 @@ public:
     float TitleBarHeight() const { return title_bar_height_; }
     float ToolbarHeight() const { return toolbar_height_; }
     float EffectiveSidebarWidth(float window_width) const;
+    void SetSidebarWidthDip(float width) { sidebar_width_dip_ = width; sidebar_width_ = width * scale_; }
     float PaneHeaderHeight() const { return pane_header_height_; }
     float ColumnHeaderHeight() const { return column_header_height_; }
     float RowHeight() const { return row_height_; }
@@ -931,6 +932,7 @@ private:
     float toolbar_height_ = 44.0f;
     float status_height_ = 28.0f;
     float sidebar_width_ = 224.0f;
+    float sidebar_width_dip_ = 224.0f;
     float pane_header_height_ = 40.0f;
     float column_header_height_ = 32.0f;
     float row_height_ = 34.0f;

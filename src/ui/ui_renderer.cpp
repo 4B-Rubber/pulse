@@ -69,7 +69,7 @@ void MainRenderer::SetScale(float scale) {
     title_bar_height_ = kTitleBarHeight * scale;
     toolbar_height_ = 44.0f * scale;
     status_height_ = 28.0f * scale;
-    sidebar_width_ = 224.0f * scale;
+    sidebar_width_ = sidebar_width_dip_ * scale;
     pane_header_height_ = 40.0f * scale;
     column_header_height_ = 32.0f * scale;
     row_height_ = row_height_dip_ * scale;

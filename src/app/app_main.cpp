@@ -1,6 +1,7 @@
 #include "../common/windows_compat.h"
 #include "quick_access.h"
 #include "filter_animation.h"
+#include "sidebar_resize.h"
 // app_main.cpp — Pulse UI process entry point, window, input, shot mode.
 #include "../ui/ui_compositor.h"
 #include "../ui/lumatext_renderer.h"
@@ -311,6 +312,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             StartShellRegistryWatch(hwnd);
         }
         s->renderer.SetRowHeightDip(static_cast<float>(s->appPrefs.row_height));
+        s->renderer.SetSidebarWidthDip(static_cast<float>(s->appPrefs.sidebar_width));
         s->renderer.SetTrayIconDip(static_cast<float>(s->appPrefs.tray_icon_size));
         ApplyAccentFromPrefs(*s, true);
         ApplyAppWindowChrome(*s);
@@ -910,6 +912,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         POINT pt{};
         GetCursorPos(&pt);
         ScreenToClient(hwnd, &pt);
+        if (s->sidebarResizing || SidebarResizeHit(*s, pt.x, pt.y)) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+            return TRUE;
+        }
         ui::WindowViewModel vm = BuildVm(*s, false);
         D2D1_RECT_F bounds = D2D1::RectF(0, 0,
             (float)s->compositor.Width(), (float)s->compositor.Height());
@@ -970,10 +976,12 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_CANCELMODE:
+        HandleSidebarResize(s, hwnd, msg, lParam);
         if (s) { s->detailsPreviewPanning = false; s->renderer.EndDetailsPreviewPan(); }
         if (GetCapture() == hwnd) ReleaseCapture();
         break;
     case WM_MOUSEMOVE:
+        if (HandleSidebarResize(s, hwnd, msg, lParam)) return 0;
         if (HandleDetailsPreviewPointer(s, hwnd, msg, wParam, lParam)) return 0;
         return HandleMouseMove(s, hwnd, msg, wParam, lParam);
 
@@ -981,6 +989,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return HandleMouseLeave(s, hwnd, msg, wParam, lParam);
 
     case WM_LBUTTONDOWN:
+        if (HandleSidebarResize(s, hwnd, msg, lParam)) return 0;
         if (HandleDetailsPreviewPointer(s, hwnd, msg, wParam, lParam)) return 0;
         return HandleLButtonDown(s, hwnd, msg, wParam, lParam);
 
@@ -988,10 +997,12 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return HandleLButtonDblClk(s, hwnd, msg, wParam, lParam);
 
     case WM_LBUTTONUP:
+        if (HandleSidebarResize(s, hwnd, msg, lParam)) return 0;
         if (HandleDetailsPreviewPointer(s, hwnd, msg, wParam, lParam)) return 0;
         return HandleLButtonUp(s, hwnd, msg, wParam, lParam);
 
     case WM_CAPTURECHANGED:
+        HandleSidebarResize(s, hwnd, msg, lParam);
         if (s) { s->detailsPreviewPanning = false; s->renderer.EndDetailsPreviewPan(); }
         return HandleCaptureChanged(s, hwnd, msg, wParam, lParam);
 

@@ -42,6 +42,26 @@ bool Report(const char* name, bool passed) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && std::wstring(argv[1]) == L"--layout-search-prefs") {
+        pulse::app::AppPrefs prefs;
+        prefs.persist = false;
+        prefs.sidebar_width = 360;
+        prefs.address_search_current = true;
+        prefs.address_search_content = true;
+        pulse::app::AppPrefs loaded;
+        loaded.persist = false;
+        loaded.FromJson(prefs.ToJson());
+        bool ok = Report("sidebar and search preferences round trip", loaded.sidebar_width == 360 &&
+            loaded.address_search_current && loaded.address_search_content);
+        loaded.FromJson(L"{\"sidebar_width\":9999}");
+        ok &= Report("invalid width restores default", loaded.sidebar_width == 224);
+        loaded.FromJson(L"{}");
+        ok &= Report("old preferences load defaults", loaded.sidebar_width == 224 &&
+            !loaded.address_search_current && !loaded.address_search_content);
+        loaded.ResetToDefaults();
+        ok &= Report("reset restores sidebar width", loaded.sidebar_width == 224);
+        return ok ? 0 : 1;
+    }
     pulse::l10n::Initialize(GetModuleHandleW(nullptr), L"zh-CN");
     if (argc == 2 && std::wstring(argv[1]) == L"--global-search") {
         pulse::app::AppPrefs prefs;
