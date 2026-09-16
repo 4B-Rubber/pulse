@@ -166,7 +166,9 @@ bool UpdateInstaller::Launch(HWND owner, DWORD& error) {
     SHELLEXECUTEINFOW execute{sizeof(execute)};
     execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
     execute.hwnd = owner;
-    execute.lpVerb = L"runas";
+    // Let Inno Setup elevate its worker while retaining the original user's
+    // token for post-install launch. Explicit runas makes Pulse elevated too.
+    execute.lpVerb = L"open";
     execute.lpFile = state_->file.c_str();
     execute.lpParameters = L"/SP- /NORESTART /LOG";
     execute.nShow = SW_SHOWNORMAL;

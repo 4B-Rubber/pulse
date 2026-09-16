@@ -99,7 +99,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 ; Index configuration runs in CurStepChanged so helper failures are not ignored.
 Filename: "{app}\pulse.exe"; Parameters: "--seed-shell-verbs"; StatusMsg: "正在缓存右键菜单项… / Caching context-menu verbs…"; Flags: runhidden waituntilterminated
-Filename: "{app}\pulse.exe"; Description: "{cm:LaunchProgram,Pulse}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\pulse.exe"; Description: "{cm:LaunchProgram,Pulse}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
 ; Runs before files are deleted.
