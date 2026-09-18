@@ -9,7 +9,7 @@ uint64_t FileTimeValue(FILETIME time) noexcept {
     return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
 }
 constexpr uint64_t kRotateBytes = 1024 * 1024;
-constexpr const char* kNames[]{"wait", "topology", "journal", "notify", "delta_flush", "merge", "rebuild", "recovery"};
+constexpr const char* kNames[]{"wait", "topology", "journal", "notify", "delta_flush", "merge", "rebuild", "recovery", "name_pool_compact"};
 std::string Utf8(const wchar_t* value) {
     const int size = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
     if (size <= 1) return {};
@@ -43,6 +43,7 @@ void Write(const std::string& line) {
 }
 }
 FilenameTiming::Token FilenameTiming::Begin() noexcept {
+    if (!IndexDiagnosticsEnabled()) return {};
     FILETIME created{}, exited{}, kernel{}, user{};
     GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user);
     LARGE_INTEGER now{}, frequency{};
@@ -52,6 +53,7 @@ FilenameTiming::Token FilenameTiming::Begin() noexcept {
         (FileTimeValue(kernel) + FileTimeValue(user)) / 10};
 }
 void FilenameTiming::End(FilenameStage stage, Token token, uint64_t changes, DWORD error, const char* reason, wchar_t volume) noexcept {
+    if (!IndexDiagnosticsEnabled()) return;
     const auto now = Begin();
     auto& counter = counters_[static_cast<size_t>(stage)];
     ++counter.calls;
@@ -63,9 +65,11 @@ void FilenameTiming::End(FilenameStage stage, Token token, uint64_t changes, DWO
     counter.volume = volume;
 }
 void FilenameTiming::Flush(bool force) noexcept {
+    if (!IndexDiagnosticsEnabled()) return;
     const auto now = GetTickCount64();
     if (!force && last_flush_ && now - last_flush_ < 60000) return;
     last_flush_ = now;
+    memory_.Capture(IndexMemoryPoint::TimingFlush);
     try {
         FILETIME time{}; GetSystemTimeAsFileTime(&time);
         std::string line = "{\"event\":\"filename_timing\",\"pid\":" + std::to_string(GetCurrentProcessId()) +
@@ -81,7 +85,7 @@ void FilenameTiming::Flush(bool force) noexcept {
                 ",\"last_error\":" + std::to_string(c.last_error) + ",\"reason\":\"" + c.reason +
                 "\",\"volume_letter\":\"" + (c.volume >= L'A' && c.volume <= L'Z' ? std::string(1, static_cast<char>(c.volume)) : "") + "\"}";
         }
-        line += "}}\n";
+        line += "},\"memory\":" + memory_.Json() + ",\"maintenance\":" + maintenance_.Json() + "}\n";
         Write(line);
     } catch (...) {}
 }

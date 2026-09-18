@@ -12,6 +12,7 @@
 #include "index_query.h"
 #include "index_delta.h"
 #include "change_tracking.h"
+#include "change_feed_history.h"
 #include <atomic>
 #include <bit>
 #include <cstdint>
@@ -281,8 +282,9 @@ private:
     std::atomic<uint64_t> revision_{1};
     std::atomic<uint64_t> feed_epoch_{(GetTickCount64() << 20) ^ GetCurrentProcessId()};
     uint64_t feed_sequence_ = 0;
-    std::deque<ChangeRecord> feed_changes_;
-    void RecordFeed(ChangeRecord record);
+    ChangeFeedHistory feed_changes_;
+    void RecordFeed(const ChangeRecord& record);
+    void CaptureMemoryState();
     void GapFeed() { changes_.Gap(); ++feed_epoch_; }
     void PinyinWorker();
     void RequestPinyinBuildLocked();
@@ -290,7 +292,8 @@ private:
     bool TryLoadCache();
     void SaveCache();
     void MergeBase(bool force, const char* reason = "forced");
-    const char* MaintenanceMergeReason(ULONGLONG now, uint64_t delta_bytes, bool compact) const;
+    const char* MaintenanceMergeReason(ULONGLONG now, uint64_t delta_bytes) const;
+    bool CompactNamePoolLocked(ULONGLONG now);
     void RecoverFailedVolumes(const std::vector<VolumeInfo>& volumes, ULONGLONG now,
                               const std::function<bool(const VolumeInfo&)>& rebuild);
     void FlushDeltas();
@@ -409,6 +412,7 @@ private:
     std::unordered_map<wchar_t, std::unique_ptr<DeltaLog>> delta_logs_;
     size_t deleted_ = 0;
     size_t pool_waste_ = 0;
+    ULONGLONG name_pool_retry_after_tick_ = 0;
     uint64_t built_unix_ = 0;
     uint64_t index_dir_frn_ = 0;
     std::wstring index_directory_;

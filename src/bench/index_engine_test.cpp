@@ -1,4 +1,6 @@
 #include "../index/index_engine.h"
+#include "../index/usn_stream.h"
+#include <cstring>
 #include "../index/index_shard.h"
 #include "../index/index_paths.h"
 #include "../index/index_delta.h"
@@ -9,8 +11,170 @@
 #include <chrono>
 
 namespace pulse::index {
+struct UsnStreamTestAccess {
+    static std::unique_ptr<UsnStream> Make(HANDLE signal) {
+        return std::unique_ptr<UsnStream>(new UsnStream(signal));
+    }
+    static bool Push(UsnStream& s, const std::vector<BYTE>& data) { return s.packets_.Push(data.data(), data.size()); }
+    static void Fail(UsnStream& s, DWORD error) { s.Failed(error); }
+};
 
 struct EngineTestAccess {
+    static bool NamePoolFixture();
+    static bool QuietDiagnosticsFixture();
+    static bool UsnQueueFixture() {
+        bool ok = true;
+        auto check = [&](bool valid, const char* label) {
+            std::cout << (valid ? "[PASS] " : "[FAIL] ") << label << '\n'; ok &= valid;
+        };
+        const auto dir = std::filesystem::absolute(std::filesystem::path(L"bench_data") /
+            (L"usn-queue-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64())));
+        std::filesystem::create_directories(dir);
+        SetMachineIndexScope(false); SetActiveIndexDirectory(dir.wstring());
+        {
+            Engine engine;
+            check(Build(engine), "build isolated USN consumer fixture without opening volumes");
+            auto& volume = engine.vols_.front(); volume.journal_id = 1; volume.next_usn = 10;
+            engine.change_signal_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            auto stream = UsnStreamTestAccess::Make(engine.change_signal_);
+            auto* collector = stream.get();
+            engine.journal_streams_[volume.volume_id] = std::move(stream);
+            engine.changes_.Open(dir.wstring()); engine.changes_.Lease(L"usn-queue-fixture", true);
+            const auto arm = engine.ReadFeed(true, L"", 0, 0);
+            auto push = [&](int64_t next, DWORD reason, const wchar_t* name) {
+                const auto length = static_cast<WORD>(wcslen(name) * sizeof(wchar_t));
+                const size_t record_bytes = (sizeof(USN_RECORD_V2) + length + 7) & ~size_t{7};
+                std::vector<BYTE> packet(sizeof(next) + record_bytes);
+                std::memcpy(packet.data(), &next, sizeof(next));
+                auto* record = reinterpret_cast<USN_RECORD_V2*>(packet.data() + sizeof(next));
+                record->RecordLength = static_cast<DWORD>(record_bytes); record->MajorVersion = 2;
+                record->FileReferenceNumber = 1000; record->ParentFileReferenceNumber = 20;
+                record->Usn = next - 1; record->Reason = reason;
+                record->FileNameOffset = static_cast<WORD>(offsetof(USN_RECORD_V2, FileName)); record->FileNameLength = length;
+                FILETIME now{}; GetSystemTimeAsFileTime(&now);
+                record->TimeStamp.QuadPart = (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+                std::memcpy(reinterpret_cast<BYTE*>(record) + record->FileNameOffset, name, length);
+                return UsnStreamTestAccess::Push(*collector, packet);
+            };
+            check(push(100, USN_REASON_FILE_CREATE, L"usn-queued.txt") &&
+                  push(200, USN_REASON_RENAME_OLD_NAME, L"usn-queued.txt") &&
+                  push(300, USN_REASON_RENAME_NEW_NAME, L"usn-renamed.txt") &&
+                  push(400, USN_REASON_FILE_DELETE, L"usn-renamed.txt"), "enqueue create/rename/delete packets");
+            const auto first_peak = collector->Memory();
+            bool changed = false, structural = false;
+            check(engine.CatchUpVolume(volume, &changed, &structural) && volume.next_usn == 400 && changed && structural,
+                  "real CatchUpVolume applies queued records and commits final cursor");
+            const auto page = engine.ReadFeed(true, L"", arm.epoch, arm.next);
+            check(!page.gap && page.records.size() == 3 && page.records[0].kind == ChangeKind::Created &&
+                  page.records[1].kind == ChangeKind::Renamed && page.records[2].kind == ChangeKind::Deleted &&
+                  page.records[1].old_path == L"C:\\Users\\TestUser\\usn-queued.txt" &&
+                  page.records[1].path == L"C:\\Users\\TestUser\\usn-renamed.txt",
+                  "queued records preserve create/rename/delete order and rename payload");
+            auto second = UsnStreamTestAccess::Make(engine.change_signal_);
+            std::vector<BYTE> header(sizeof(int64_t)); int64_t next = 500;
+            std::memcpy(header.data(), &next, sizeof(next));
+            check(UsnStreamTestAccess::Push(*second, header), "enqueue independent diagnostic stream");
+            const auto second_state = second->Memory();
+            engine.journal_streams_[L"diagnostic-only"] = std::move(second);
+            engine.CaptureMemoryState(); const auto& memory = engine.filename_timing_.Memory().retained;
+            check(memory.usn_streams == 2 && memory.usn_queue_packets == 1 &&
+                  memory.usn_queue_capacity_bytes == second_state.capacity_bytes &&
+                  memory.usn_queue_charged_bytes == second_state.charged_bytes &&
+                  memory.usn_sum_stream_peak_capacity_bytes == first_peak.peak_capacity_bytes + second_state.peak_capacity_bytes &&
+                  memory.usn_sum_stream_peak_charged_bytes == first_peak.peak_charged_bytes + second_state.peak_charged_bytes,
+                  "engine aggregates current queue bytes separately from independent lifetime peaks");
+            check(UsnStreamTestAccess::Push(*collector, header) && engine.CatchUpVolume(volume, &changed, &structural) &&
+                  volume.next_usn == 500, "header-only packet advances engine cursor without emitting an event");
+            next = 600; std::memcpy(header.data(), &next, sizeof(next)); UsnStreamTestAccess::Push(*collector, header);
+            UsnStreamTestAccess::Fail(*collector, ERROR_BUFFER_OVERFLOW);
+            check(!engine.CatchUpVolume(volume, &changed, &structural) && volume.next_usn == 500 &&
+                  collector->Memory().packets == 1 && engine.ReadFeed(true, L"", arm.epoch, page.next).records.empty(),
+                  "stream overflow reaches engine failure path without cursor advance or silent consumption");
+            engine.journal_streams_.clear(); engine.CaptureMemoryState();
+            check(!memory.usn_streams && !memory.usn_queue_packets && !memory.usn_queue_capacity_bytes &&
+                  !memory.usn_sum_stream_peak_charged_bytes, "collector replacement resets diagnostic aggregates");
+        }
+        SetActiveIndexDirectory(L""); std::error_code ec; std::filesystem::remove_all(dir, ec);
+        check(!ec, "isolated USN consumer fixture cleaned up");
+        return ok;
+    }
+
+    static bool FeedFixture() {
+        bool ok = true;
+        auto check = [&](bool valid, const char* label) {
+            std::cout << (valid ? "[PASS] " : "[FAIL] ") << label << '\n';
+            ok &= valid;
+        };
+        const auto dir = std::filesystem::absolute(std::filesystem::path(L"bench_data") /
+            (L"filename-feed-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64())));
+        std::filesystem::create_directories(dir);
+        SetMachineIndexScope(false);
+        SetActiveIndexDirectory(dir.wstring());
+        {
+            Engine engine;
+            check(Build(engine), "build isolated feed fixture");
+            auto arm = engine.ReadFeed(true, L"", 0, 0);
+            check(arm.ready && arm.done && arm.records.empty(), "arming starts at current sequence");
+            ChangeRecord event;
+            event.path = L"C:\\feed-fixture\\新.txt"; event.old_path = L"C:\\feed-fixture\\旧.txt";
+            event.kind = ChangeKind::Renamed; event.time = ChangeTracker::Now(); event.file_id = 99;
+            engine.changes_.Open(dir.wstring());
+            engine.changes_.Lease(L"feed-fixture", true);
+            engine.changes_.Record(event);
+            for (unsigned i = 0; i < 100020; ++i) engine.RecordFeed(event);
+            check(engine.ReadFeed(true, L"", arm.epoch, 0).gap, "slow consumer detects count-retention gap");
+            const auto page = engine.ReadFeed(true, L"", arm.epoch, 20);
+            check(!page.gap && !page.done && page.records.size() == 512 && page.next == 532 &&
+                page.records.front().id == 21 && page.records.front().path == event.path &&
+                page.records.front().old_path == event.old_path && page.records.front().file_id == event.file_id &&
+                page.records.front().kind == event.kind, "512-event page preserves cursor and rename payload");
+            check(engine.ReadFeed(true, L"", arm.epoch, 100020).done, "caught-up consumer returns done");
+            const auto path = (dir / L"snapshot.bin").wstring();
+            check(Save(engine, path), "save isolated feed-generation snapshot");
+            {
+                std::unique_lock lock(engine.mutex_);
+                check(Load(engine, path), "replace mapped snapshot under engine lock");
+            }
+            check(engine.ReadFeed(true, L"", arm.epoch, 100020).gap, "old generation still requires resynchronization");
+            check(engine.feed_changes_.Size() == 0, "snapshot replacement releases unreachable old-generation feed");
+            arm = engine.ReadFeed(true, L"", 0, 0);
+            check(arm.ready && arm.done && arm.records.empty() && arm.next == 100020,
+                "new subscription keeps monotonic sequence after generation change");
+            engine.RecordFeed(event);
+            const auto next = engine.ReadFeed(true, L"", arm.epoch, arm.next);
+            check(!next.gap && next.done && next.records.size() == 1 && next.records[0].id == 100021,
+                "new-generation event remains readable without false gaps");
+            check(engine.changes_.Details(L"feed-fixture", L"C:\\feed-fixture", 0, 0, 200).records.size() == 1,
+                "feed retirement does not discard persisted change history");
+            auto& memory = engine.filename_timing_.Memory();
+            engine.changes_.Flush(true, &memory);
+            engine.changes_.Flush(false, &memory);
+            check(memory.At(IndexMemoryPoint::ChangeFlushBefore).calls == 1 &&
+                memory.At(IndexMemoryPoint::ChangeFlushSnapshot).calls == 1 &&
+                memory.At(IndexMemoryPoint::ChangeFlushAfter).calls == 1 &&
+                memory.retained.flush_snapshot_records == 1 && memory.retained.history_records == 1,
+                "memory sampling preserves sixty-second batching and snapshot record counts");
+            engine.CaptureMemoryState();
+            check(memory.retained.feed_records == 1 && memory.retained.feed_page_capacity_bytes >= 65536 &&
+                memory.retained.aggregate_mapped_file_bytes > 0,
+                "memory diagnostics distinguish feed capacity from mapped file size");
+            engine.filename_timing_.Flush(true);
+            std::ifstream timing(dir / L"pulse-index-timing.jsonl");
+            const std::string line((std::istreambuf_iterator<char>(timing)), std::istreambuf_iterator<char>());
+            timing.close();
+            check(line.find("\"stages\":") != std::string::npos && line.find("\"memory\":") != std::string::npos &&
+                line.find("\"change_flush_snapshot\":") != std::string::npos &&
+                memory.At(IndexMemoryPoint::TimingFlush).failures == 0,
+                "existing timing log retains stages and adds sampled memory points");
+            engine.Stop();
+        }
+        SetActiveIndexDirectory(L"");
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        check(!ec, "isolated feed fixture cleaned up");
+        return ok;
+    }
+
     static bool MaintenanceFixture() {
         bool ok = true;
         auto check = [&](bool valid, const char* label) {
@@ -27,11 +191,11 @@ struct EngineTestAccess {
             engine.struct_changes_ = 1;
             engine.last_struct_tick_ = 1;
             engine.last_merge_tick_ = 1;
-            check(engine.MaintenanceMergeReason(600001, 0, false) != nullptr, "quiet pending changes request a merge");
+            check(engine.MaintenanceMergeReason(600001, 0) != nullptr, "quiet pending changes request a merge");
             engine.MergeBase(true, "fixture");
             check(engine.struct_changes_ == 0 && engine.merge_retry_after_tick_ == 0,
                 "successful merge clears pending structural work");
-            check(engine.MaintenanceMergeReason(GetTickCount64() + 1200000, 0, false) == nullptr,
+            check(engine.MaintenanceMergeReason(GetTickCount64() + 1200000, 0) == nullptr,
                 "a successful merge never repeats solely because the quiet timer expired");
             engine.Stop();
         }
@@ -50,7 +214,7 @@ struct EngineTestAccess {
                     "failed merge retains generation and pending changes and schedules retry");
                 engine.MergeBase(true, "fixture_failure");
                 check(engine.merge_retry_after_tick_ == retry &&
-                    engine.MaintenanceMergeReason(retry - 1, 100000000, true) == nullptr,
+                    engine.MaintenanceMergeReason(retry - 1, 100000000) == nullptr,
                     "forced compaction and delta triggers honor failure backoff");
                 CloseHandle(blocker);
                 engine.merge_retry_after_tick_ = 0;
@@ -445,7 +609,16 @@ void CheckSearch(Engine& e) {
 }
 }
 
+#include "index_name_pool_fixture.h"
+#include "index_quiet_diagnostics_fixture.h"
+
 int wmain(int argc, wchar_t** argv) {
+    const bool quiet = argc > 1 && std::wstring_view(argv[1]) == L"--quiet-maintenance-only";
+    if (!SetEnvironmentVariableW(L"PULSE_INDEX_DIAGNOSTICS", quiet ? nullptr : L"1")) return 2;
+    if (quiet) return EngineTestAccess::QuietDiagnosticsFixture() ? 0 : 1;
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--name-pool-only") return EngineTestAccess::NamePoolFixture() ? 0 : 1;
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--usn-only") return EngineTestAccess::UsnQueueFixture() ? 0 : 1;
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--feed-only") return EngineTestAccess::FeedFixture() ? 0 : 1;
     if (argc > 1 && std::wstring_view(argv[1]) == L"--maintenance-only") return EngineTestAccess::MaintenanceFixture() ? 0 : 1;
     if (argc > 2 && std::wstring_view(argv[1]) == L"--idle-seconds") return EngineTestAccess::IdleFixture(static_cast<unsigned>(wcstoul(argv[2], nullptr, 10))) ? 0 : 1;
     if (argc > 1 && std::wstring_view(argv[1]) == L"--parent-cycle-only") return EngineTestAccess::ParentCycleFixture() ? 0 : 1;

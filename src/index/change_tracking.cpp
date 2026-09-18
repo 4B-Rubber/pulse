@@ -1,4 +1,7 @@
 #include "change_tracking.h"
+#include "change_journal_writer.h"
+#include "change_summary_accumulator.h"
+#include "index_memory_probe.h"
 #include "../ipc/protocol.h"
 #include <windows.h>
 #include <algorithm>
@@ -57,6 +60,12 @@ std::wstring Identity(const ChangeRecord& e) {
 }
 Aliases EventAliases(const std::vector<ChangeRecord>& records, uint64_t since, uint64_t now) {
     Aliases aliases;
+    // Stable file IDs already identify NTFS events. Path aliases are only
+    // needed for ID-less events or legacy initial-mtime suppression.
+    if (std::none_of(records.begin(), records.end(), [&](const ChangeRecord& e) {
+            return e.time >= since && e.time + kRetention >= now &&
+                (!e.file_id || e.source == ChangeSource::InitialMtime);
+        })) return aliases;
     for (const auto& e : records) if (e.source == ChangeSource::Event && e.time >= since && e.time + kRetention >= now) {
         auto key = Identity(e);
         const auto existing = aliases.find(Normalize(e.path));
@@ -194,18 +203,19 @@ void ChangeTracker::Prune(Journal& j) {
 }
 bool ChangeTracker::Save(const std::wstring& owner, const Journal& j) {
     if (directory_.empty()) return false;
-    ipc::PayloadWriter w; w.PutU32(0x33484350); w.PutU32(static_cast<uint32_t>(j.records.size()));
+    auto path = File(directory_, owner), temp = path + L".tmp";
+    std::ofstream out(std::filesystem::path(temp), std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    ChangeJournalWriter w(out); w.PutU32(0x33484350); w.PutU32(static_cast<uint32_t>(j.records.size()));
     w.PutU64(j.tracking_since); w.PutU64(j.paused_at); w.PutU64(j.gap_end); w.PutU64(j.gap_until);
     w.PutU32(j.active ? 1u : 0u);
     for (const auto& e : j.records) {
         w.PutU64(e.id); w.PutU64(e.time); w.PutU64(e.file_id); w.PutU32(static_cast<uint32_t>(e.kind));
         w.PutU32(e.is_dir ? 1u : 0u); w.PutU32(static_cast<uint32_t>(e.source)); w.PutString(e.path); w.PutString(e.old_path);
     }
-    auto path = File(directory_, owner), temp = path + L".tmp";
-    std::ofstream out(std::filesystem::path(temp), std::ios::binary | std::ios::trunc);
-    out.write(reinterpret_cast<const char*>(w.data().data()), static_cast<std::streamsize>(w.data().size()));
+    const bool written = w.Flush();
     out.close();
-    return out.good() && MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    return written && out.good() && MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 bool ChangeTracker::Lease(const std::wstring& owner, bool enabled) {
     if (owner.empty()) return false;
@@ -252,7 +262,8 @@ void ChangeTracker::Record(ChangeRecord e) {
         j.dirty = true;
     }
 }
-void ChangeTracker::Flush(bool force) {
+void ChangeTracker::Flush(bool force, IndexMemoryProbe* memory) {
+    if (!IndexDiagnosticsEnabled()) memory = nullptr;
     std::vector<std::pair<std::wstring, Journal>> pending;
     {
         std::lock_guard lock(mutex_);
@@ -261,21 +272,38 @@ void ChangeTracker::Flush(bool force) {
         // copying the entire retained history on every journal notification.
         if (!force && last_flush_tick_ && tick - last_flush_tick_ < 60000) return;
         last_flush_tick_ = tick;
+        if (memory) {
+            memory->Capture(IndexMemoryPoint::ChangeFlushBefore);
+            memory->retained.history_records = 0;
+            memory->retained.history_vector_capacity_bytes = 0;
+            memory->retained.flush_snapshot_records = 0;
+            memory->retained.history_tick = tick;
+        }
         for (auto& [owner, journal] : journals_) {
             Prune(journal);
+            if (memory) {
+                memory->retained.history_records += journal.records.size();
+                memory->retained.history_vector_capacity_bytes += journal.records.capacity() * sizeof(ChangeRecord);
+            }
             if (!journal.dirty) continue;
             Journal snapshot; snapshot.records = journal.records;
+            if (memory) memory->retained.flush_snapshot_records += snapshot.records.size();
             snapshot.tracking_since = journal.tracking_since; snapshot.paused_at = journal.paused_at;
             snapshot.gap_end = journal.gap_end; snapshot.gap_until = journal.gap_until; snapshot.active = journal.active;
             pending.emplace_back(owner, std::move(snapshot)); journal.dirty = false;
         }
     }
     // Serialization and disk I/O hold neither the index lock nor the tracker lock.
+    if (memory) memory->Capture(IndexMemoryPoint::ChangeFlushSnapshot);
     for (const auto& [owner, snapshot] : pending) {
         if (Save(owner, snapshot)) continue;
         std::lock_guard lock(mutex_);
         auto& journal = journals_[owner]; journal.gap = true;
         journal.gap_end = Now(); journal.gap_until = journal.gap_end + kRetention; journal.dirty = true;
+    }
+    if (memory) {
+        pending.clear();
+        memory->Capture(IndexMemoryPoint::ChangeFlushAfter);
     }
 }
 void ChangeTracker::Gap() {
@@ -323,9 +351,9 @@ ChangeResponse ChangeTracker::Summaries(const std::wstring& owner, const std::ve
     if (j.cache_revision != j.revision || since < j.cache_since || since > j.cache_oldest || now >= j.cache_expires) {
         const auto aliases = EventAliases(j.records, since, now);
         j.cache_expires = now + kRetention; j.cache_oldest = UINT64_MAX;
-        struct Rollup { uint64_t time = 0; ChangeKind kind = ChangeKind::Modified; };
-        std::unordered_map<std::wstring, std::unordered_map<uint32_t, Rollup>> rollups;
-        std::unordered_map<std::wstring, uint32_t> identities;
+        struct Chain { size_t first, last; };
+        std::unordered_map<std::wstring, Chain> identities;
+        std::vector<size_t> next(j.records.size(), SIZE_MAX);
         std::unordered_set<std::wstring> initial_paths;
         j.summaries.clear();
         for (const auto& event : j.records) {
@@ -343,23 +371,28 @@ ChangeResponse ChangeTracker::Summaries(const std::wstring& owner, const std::ve
                 continue;
             }
             const auto key = Key(event, aliases);
-            const auto [identity, inserted] = identities.try_emplace(key, static_cast<uint32_t>(identities.size()));
-            (void)inserted;
-            VisitAncestors(event, [&](const std::wstring& ancestor) {
-                const auto kind = event.kind == ChangeKind::Renamed ? Relative(event, ancestor).kind : event.kind;
-                auto& aggregate = rollups[ancestor][identity->second];
-                aggregate.time = (std::max)(aggregate.time, event.time);
-                if (Priority(kind) >= Priority(aggregate.kind) ||
-                    (aggregate.kind == ChangeKind::Deleted && kind == ChangeKind::Created)) aggregate.kind = kind;
-            });
-        }
-        for (auto& [path, items] : rollups) {
-            auto& summary = j.summaries[path];
-            for (const auto& [key, item] : items) {
-                ++summary.count; summary.last_change = (std::max)(summary.last_change, item.time);
-                ++summary.counts[static_cast<uint32_t>(item.kind)];
-                summary.has_deleted |= item.kind == ChangeKind::Deleted;
+            const size_t index = static_cast<size_t>(&event - j.records.data());
+            const auto [identity, inserted] = identities.try_emplace(key, Chain{index, index});
+            if (!inserted) {
+                next[identity->second.last] = index;
+                identity->second.last = index;
             }
+        }
+        // Aggregate one file identity at a time, in original event order. The
+        // scratch vector scales with its ancestors, not all files x ancestors.
+        // unordered_map rehash preserves the summary pointers stored here.
+        ChangeSummaryAccumulator rollups;
+        for (const auto& [key, chain] : identities) {
+            (void)key;
+            rollups.Reset();
+            for (size_t index = chain.first; index != SIZE_MAX; index = next[index]) {
+                const auto& event = j.records[index];
+                VisitAncestors(event, [&](const std::wstring& ancestor) {
+                    const auto kind = event.kind == ChangeKind::Renamed ? Relative(event, ancestor).kind : event.kind;
+                    rollups.Add(j.summaries[ancestor], kind, event.time, Priority(kind));
+                });
+            }
+            rollups.Commit();
         }
         j.cache_revision = j.revision; j.cache_since = since;
     }
