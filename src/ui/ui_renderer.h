@@ -6,6 +6,7 @@
 #include "fluent_components.h"
 #include "shell_icons.h"
 #include "view_layout.h"
+#include "panel_metrics.h"
 #include "thumbnail_cache.h"
 #include "name_highlight.h"
 #include "preview_handler_host.h"
@@ -674,7 +675,10 @@ public:
     float TitleBarHeight() const { return title_bar_height_; }
     float ToolbarHeight() const { return toolbar_height_; }
     float EffectiveSidebarWidth(float window_width) const;
-    void SetSidebarWidthDip(float width) { sidebar_width_dip_ = width; sidebar_width_ = width * scale_; }
+    void SetSidebarWidthDip(float width) {
+        sidebar_width_dip_ = std::clamp(width, kSidebarMinWidthDip, kPanelWidthMaxDip);
+        sidebar_width_ = sidebar_width_dip_ * scale_;
+    }
     float PaneHeaderHeight() const { return pane_header_height_; }
     float ColumnHeaderHeight() const { return column_header_height_; }
     float RowHeight() const { return row_height_; }
@@ -694,13 +698,15 @@ public:
         details_visible_ = visible;
         if (!visible) { EndDetailsPreviewPan(); details_preview_ready_ = false; }
     }
-    float DetailsPanelWidth(float window_w) const {
-        return details_visible_ && window_w >= 1000.0f * scale_
-            ? details_width_ * scale_ + margin_ : 0.0f;
-    }
+    // Preferred width, capped by the window so the file list keeps a usable width.
+    float DetailsPanelWidth(float window_w) const;
     void SetDetailsPanelWidth(float width_dip) {
-        details_width_ = std::clamp(width_dip, 300.0f, 480.0f);
+        details_width_ = std::clamp(width_dip, kDetailsMinWidthDip, kPanelWidthMaxDip);
     }
+    // Splitter drag limits in DIPs for the current window size.
+    float SidebarMaxWidthDip(float window_w) const;
+    float DetailsMaxWidthDip(float window_w) const;
+    float SidebarWidthDip() const { return sidebar_width_dip_; }
     // Unclipped content height (DIPs) of the details panel, for wheel clamping.
     float DetailsContentHeightDip(const WindowViewModel& vm, float w, float h);
     bool CachedPreviewProperties(const std::wstring& path, uint64_t modified, uint64_t size,

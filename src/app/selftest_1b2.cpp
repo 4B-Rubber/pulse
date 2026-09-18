@@ -4499,6 +4499,41 @@ void TestDetailsPreviewInteraction() {
             }
         }
     }
+
+    // Pane widths follow the window the way File Explorer does: the file list keeps
+    // its minimum width and either panel can grow into whatever is left.
+    {
+        ui::MainRenderer renderer;
+        renderer.SetScale(1.0f);
+        renderer.SetDetailsPanelVisible(true);
+        renderer.SetDetailsPanelWidth(480.0f);
+        renderer.SetSidebarWidthDip(224.0f);
+        Check(std::abs(renderer.DetailsMaxWidthDip(1600.0f) - 1256.0f) < 0.5f,
+            L"panels: the details panel grows until the list reaches its minimum");
+        Check(std::abs(renderer.SidebarMaxWidthDip(1600.0f) - 1000.0f) < 0.5f,
+            L"panels: the open details panel is reserved by the sidebar limit");
+        renderer.SetDetailsPanelVisible(false);
+        Check(std::abs(renderer.SidebarMaxWidthDip(1600.0f) - 1480.0f) < 0.5f,
+            L"panels: hiding the details panel frees the sidebar limit");
+        renderer.SetDetailsPanelVisible(true);
+        renderer.SetSidebarWidthDip(700.0f);
+        const float list_left = renderer.EffectiveSidebarWidth(1000.0f) + renderer.Margin();
+        const float list_right = 1000.0f - renderer.Margin() - renderer.DetailsPanelWidth(1000.0f);
+        Check(list_right - list_left >= ui::kListMinWidthDip - 0.5f,
+            L"panels: a narrow window pushes the panes back instead of starving the list");
+        Check(std::abs(renderer.EffectiveSidebarWidth(880.0f) - ui::kSidebarRailWidthDip) < 0.5f,
+            L"panels: a narrow window still folds the sidebar into its rail");
+        // Same window in DIPs at 150%: the sidebar preference must not be mixed
+        // into the DIP math as pixels.
+        ui::MainRenderer scaled;
+        scaled.SetScale(1.5f);
+        scaled.SetDetailsPanelVisible(true);
+        scaled.SetDetailsPanelWidth(480.0f);
+        scaled.SetSidebarWidthDip(224.0f);
+        Check(std::abs(scaled.DetailsMaxWidthDip(2400.0f) - 1256.0f) < 0.5f &&
+              std::abs(scaled.SidebarMaxWidthDip(2400.0f) - 1000.0f) < 0.5f,
+            L"panels: window limits stay in DIPs when the window is scaled");
+    }
     wchar_t previous[32768]{};
     GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
     const auto data_dir = std::wstring(kSandbox) + L"\\preview-session";

@@ -1,6 +1,7 @@
 // app_prefs.cpp — Persist general settings; sync 开机自启 with the Run key.
 #include "app_prefs.h"
 #include "session.h"
+#include "../ui/panel_metrics.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
 #include <windows.h>
@@ -190,7 +191,9 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     background_image = pulse::json::ExtractString(json, L"background_image");
     row_height = pulse::json::ExtractInt(json, L"row_height", 34);
     sidebar_width = pulse::json::ExtractInt(json, L"sidebar_width", 224);
-    if (sidebar_width < 160 || sidebar_width > 480) sidebar_width = 224;
+    // The stored value is the user's intent; the window caps it while drawing.
+    if (sidebar_width < static_cast<int>(ui::kSidebarMinWidthDip) ||
+        sidebar_width > static_cast<int>(ui::kPanelWidthMaxDip)) sidebar_width = 224;
     address_search_current = pulse::json::ExtractInt(json, L"address_search_current", 0) != 0;
     address_search_content = pulse::json::ExtractInt(json, L"address_search_content", 0) != 0;
     if (row_height < 24 || row_height > 48) row_height = 34;

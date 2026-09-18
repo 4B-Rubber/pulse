@@ -7,10 +7,12 @@
 #include "../app/unc_probe_scheduler.h"
 #include "../common/localization.h"
 #include "../common/path_utils.h"
+#include "../ui/panel_metrics.h"
 #include "../index/index_client.h"
 #include "../index/network_agent_client.h"
 
 #include <cstdio>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -60,6 +62,22 @@ int wmain(int argc, wchar_t** argv) {
             !loaded.address_search_current && !loaded.address_search_content);
         loaded.ResetToDefaults();
         ok &= Report("reset restores sidebar width", loaded.sidebar_width == 224);
+        {
+            // The panes are limited by the window, not by a fixed cap: whatever the
+            // user drags, the file list keeps its minimum width.
+            using namespace pulse::ui;
+            ok &= Report("panel limit: without the details panel the list minimum is all that is reserved",
+                std::abs(MaxSidebarWidthDip(1600.0f, 340.0f, false, 8.0f) - 1480.0f) < 0.5f);
+            ok &= Report("panel limit: an open details panel is reserved by the sidebar",
+                std::abs(MaxSidebarWidthDip(1600.0f, 340.0f, true, 8.0f) - 1140.0f) < 0.5f);
+            ok &= Report("panel limit: the details panel keeps the sidebar and the list",
+                std::abs(MaxDetailsWidthDip(1600.0f, 224.0f, false, 8.0f) - 1256.0f) < 0.5f);
+            ok &= Report("panel limit: a collapsed sidebar leaves its rail",
+                std::abs(MaxDetailsWidthDip(880.0f, 224.0f, true, 8.0f) - 712.0f) < 0.5f);
+            ok &= Report("panel limit: narrow windows stop at the pane minimums",
+                MaxSidebarWidthDip(400.0f, 340.0f, true, 8.0f) == kSidebarMinWidthDip &&
+                MaxDetailsWidthDip(400.0f, 224.0f, false, 8.0f) == kDetailsMinWidthDip);
+        }
         return ok ? 0 : 1;
     }
     pulse::l10n::Initialize(GetModuleHandleW(nullptr), L"zh-CN");
