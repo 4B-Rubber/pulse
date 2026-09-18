@@ -233,6 +233,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     r.index = 5;
                     return r;
                 }
+                if (ContainsPt(lay.protected_files_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 16; return r;
+                }
                 if (ContainsPt(lay.pinned_names_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle;
                     r.index = 6;

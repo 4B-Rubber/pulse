@@ -49,6 +49,7 @@ struct Tab {
     std::array<float, 4> search_column_dividers{};
     std::wstring filter_text;
     bool show_hidden_files = false;
+    bool show_protected_os_files = false;
     std::wstring virtual_title; // tag/search views; empty for real folders
     std::wstring banner_title;
     std::wstring banner_message;
@@ -132,7 +133,13 @@ struct Tab {
 
     void ClearSelection();
     bool EntryVisible(int index) const;
+    // A hidden entry needs "show hidden"; an entry that is hidden *and* system is
+    // also a protected operating system file and needs its own option, the way
+    // File Explorer gates desktop.ini and friends behind a second checkbox.
+    bool AllowsAttributes(DWORD attrs) const;
+    bool ShowsEveryEntry() const { return show_hidden_files && show_protected_os_files; }
     void SetShowHiddenFiles(bool show);
+    void SetShowProtectedOsFiles(bool show);
     int CountBound() const;
     void MaterializeSelection();
     void SelectOnly(int index);

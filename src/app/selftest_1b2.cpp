@@ -2788,9 +2788,13 @@ void TestHiddenFiles() {
     AppPrefs prefs;
     Check(prefs.FromJson(L"{}") && !prefs.show_hidden_files,
           L"hidden: old preferences default to hidden off");
+    Check(!prefs.show_protected_os_files,
+          L"hidden: protected operating system files start hidden");
     prefs.show_hidden_files = true;
+    prefs.show_protected_os_files = true;
     AppPrefs loaded;
-    Check(loaded.FromJson(prefs.ToJson()) && loaded.show_hidden_files,
+    Check(loaded.FromJson(prefs.ToJson()) && loaded.show_hidden_files &&
+          loaded.show_protected_os_files,
           L"hidden: preference JSON roundtrip");
     Pane pane;
     auto& tab = pane.view;
@@ -2820,8 +2824,13 @@ void TestHiddenFiles() {
           L"hidden: select all excludes invisible files");
     tab.SetShowHiddenFiles(true);
     FillPaneViewModel(vm, pane);
-    Check(vm.EntryCount() == 4 && tab.SelectedCount() == 0,
-          L"hidden: toggle restores files without enumeration or stale selection");
+    Check(vm.EntryCount() == 3 && tab.SelectedCount() == 0,
+          L"hidden: toggle restores hidden files and still gates protected system files");
+    tab.SetShowProtectedOsFiles(true);
+    FillPaneViewModel(vm, pane);
+    Check(vm.EntryCount() == 4,
+          L"hidden: protected system files follow their own option");
+    tab.SetShowProtectedOsFiles(false);
     tab.SelectOnly(1);
     tab.SetShowHiddenFiles(false);
     FillPaneViewModel(vm, pane);

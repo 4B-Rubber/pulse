@@ -318,6 +318,14 @@ int wmain(int argc, wchar_t** argv) {
         prefs.show_hidden_files && HasEffect(last_effect, SettingsEffect::FileVisibility));
     settings_ui.ToggleUi(5);
     passed &= Report("settings hidden visibility toggle is reversible", !prefs.show_hidden_files);
+    pulse::app::AppPrefs protected_prefs;
+    settings_ui.ToggleUi(16);
+    passed &= Report("settings protected system files toggle persists and refreshes panes",
+        prefs.show_protected_os_files && HasEffect(last_effect, SettingsEffect::FileVisibility) &&
+        protected_prefs.FromJson(prefs.ToJson()) && protected_prefs.show_protected_os_files);
+    settings_ui.ToggleUi(16);
+    passed &= Report("settings protected system files toggle is reversible",
+        !prefs.show_protected_os_files);
     settings_ui.ToggleUi(6);
     pulse::app::AppPrefs parsed_prefs;
     passed &= Report("pinned tab names toggle off and persist",

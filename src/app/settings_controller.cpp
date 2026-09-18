@@ -378,6 +378,9 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 5) {
         prefs_->show_hidden_files = !prefs_->show_hidden_files;
         SaveAndApply(SettingsEffect::FileVisibility);
+    } else if (index == 16) {
+        prefs_->show_protected_os_files = !prefs_->show_protected_os_files;
+        SaveAndApply(SettingsEffect::FileVisibility);
     } else if (index == 6) {
         prefs_->show_pinned_tab_names = !prefs_->show_pinned_tab_names;
         SaveAndApply(SettingsEffect::None);

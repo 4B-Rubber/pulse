@@ -285,6 +285,47 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
     H toggle;toggle.region=H::SettingsDisclosure;toggle.index=0;HandleSettingsControl(s,toggle);
     vm=BuildVm(s,false);const auto expanded_max=s.renderer.SettingsMaxScroll(vm,window.right,window.bottom);
     check((s.settingsExpanded&1u) && expanded_max>collapsed_max,"expanding advanced settings updates scroll range");
+    {
+        // The advanced group owns both the hidden-files switch and the protected
+        // operating system files switch; both need a reachable row and fitting text.
+        auto advanced=BuildVm(s,false);advanced.settings_expanded|=1u;advanced.settings_scroll=0;
+        const auto lay=ui::MakeSettingsLayout(advanced,window,s.scale,s.renderer.TitleBarHeight(),28*s.scale,&painter);
+        check(lay.protected_files_row.top>=lay.hidden_files_row.bottom &&
+            lay.protected_files_row.bottom-lay.protected_files_row.top>=64*s.scale-1.0f &&
+            lay.protected_files_row.bottom<=lay.footer.top,
+            "protected system files row sits between the hidden row and the footer");
+        const float text_width=lay.hidden_files_row.right-lay.hidden_files_row.left-126*s.scale;
+        for(const auto* locale:{L"zh-CN",L"en-US"}) {
+            l10n::SetLanguage(locale);bool fits=true;
+            // An out-of-range id resolves to an empty string, which would also fit.
+            check(!l10n::Get(I::SettingsShowProtected).empty() &&
+                !l10n::Get(I::SettingsShowProtectedDesc).empty(),
+                "protected system files labels exist in both languages");
+            const I descriptions[]={I::SettingsShowHiddenDesc,I::SettingsShowProtectedDesc};
+            for(I id:descriptions) {
+                const auto& value=l10n::Get(id);ui::ComPtr<IDWriteTextLayout> measured;
+                s.compositor.DwriteFactory()->CreateTextLayout(value.c_str(),static_cast<UINT32>(value.size()),
+                    s.compositor.SmallFormat(),4000*s.scale,100*s.scale,&measured);
+                DWRITE_TEXT_METRICS metrics{};if(measured.get()) measured->GetMetrics(&metrics);
+                fits &= measured.get() && metrics.widthIncludingTrailingWhitespace<=text_width;
+            }
+            check(fits,"hidden and protected descriptions fit the row in both languages");
+        }
+        l10n::SetLanguage(L"zh-CN");
+        // Scrolled into view, both rows must answer with their own toggle target.
+        s.settings.SetScroll(lay.hidden_files_row.top-lay.content.top,10000);
+        auto scrolled=BuildVm(s,false);
+        const auto visible=ui::MakeSettingsLayout(scrolled,window,s.scale,s.renderer.TitleBarHeight(),28*s.scale,&painter);
+        auto row_hit=[&](D2D1_RECT_F r) {
+            return s.renderer.HitTest(scrolled,window,(r.left+r.right)/2,(r.top+r.bottom)/2); };
+        const auto hidden=row_hit(visible.hidden_files_row);
+        const auto guarded=row_hit(visible.protected_files_row);
+        check(hidden.region==H::SettingsToggle && hidden.index==5,"hidden files row keeps its toggle target");
+        check(guarded.region==H::SettingsToggle && guarded.index==16,"protected system files row exposes its own toggle");
+        Render(s);
+        check(s.compositor.SaveSnapshot((std::filesystem::path(output).parent_path()/L"settings-advanced.png").c_str()),
+            "advanced settings screenshot captured");
+    }
     s.settings.SetScroll(expanded_max,expanded_max);HandleSettingsControl(s,toggle);
     check(s.settings.scroll()<=collapsed_max,"collapsing advanced settings clamps existing scroll");
     OpenSettingsTab(s,1);s.settings.SetScroll(0,0);

@@ -1656,7 +1656,10 @@ void EnsureEditVisuals(AppState& s);
 void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
     if (app::HasEffect(effects, app::SettingsEffect::FileVisibility)) {
         ForEachPane(s, [&](app::Pane& pane) {
-            if (auto* tab = pane.ActiveTab()) tab->SetShowHiddenFiles(s.appPrefs.show_hidden_files);
+            if (auto* tab = pane.ActiveTab()) {
+                tab->SetShowHiddenFiles(s.appPrefs.show_hidden_files);
+                tab->SetShowProtectedOsFiles(s.appPrefs.show_protected_os_files);
+            }
         });
         s.scrollTargetY = 0.0f;
         s.tagAdsLastSnapshot = nullptr;

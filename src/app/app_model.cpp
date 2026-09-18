@@ -116,7 +116,7 @@ void Tab::SetSnapshot(fs::SnapshotPtr value) {
     view_tag_dots.reset();
     snapshot_path = snapshot ? current_path : L"";
     if(content_results) { directory_count=0; file_count=content_results->Count(); return; }
-    if (all_selected && !show_hidden_files) MaterializeSelection();
+    if (all_selected && !ShowsEveryEntry()) MaterializeSelection();
     std::erase_if(selected, [&](int i) { return !EntryVisible(i); });
     if (selected_index >= 0 && !EntryVisible(selected_index)) {
         selected_index = selected.empty() ? -1 : *selected.begin();
@@ -127,8 +127,7 @@ void Tab::SetSnapshot(fs::SnapshotPtr value) {
     if (!snapshot) return;
 
     for (const auto& entry : *snapshot) {
-        if (!show_hidden_files && !current_path.starts_with(L"pulse:recycle") &&
-            (entry.attrs & FILE_ATTRIBUTE_HIDDEN)) continue;
+        if (!AllowsAttributes(entry.attrs)) continue;
         if (entry.is_dir) ++directory_count;
         else ++file_count;
     }
@@ -137,14 +136,30 @@ void Tab::SetSnapshot(fs::SnapshotPtr value) {
 bool Tab::EntryVisible(int index) const {
     if(index < 0 || static_cast<size_t>(index) >= EntryCount()) return false;
     if(content_results) return true;
+    return AllowsAttributes((*snapshot)[static_cast<size_t>(index)].attrs);
+}
+
+bool Tab::AllowsAttributes(DWORD attrs) const {
     // Recycle Bin lists payloads whose hidden attributes belong to Windows.
-    return show_hidden_files || current_path.starts_with(L"pulse:recycle") ||
-        (((*snapshot)[static_cast<size_t>(index)].attrs & FILE_ATTRIBUTE_HIDDEN) == 0);
+    if (current_path.starts_with(L"pulse:recycle")) return true;
+    if ((attrs & FILE_ATTRIBUTE_HIDDEN) == 0) return true; // system-only entries stay visible
+    if (!show_hidden_files) return false;
+    if ((attrs & FILE_ATTRIBUTE_SYSTEM) != 0) return show_protected_os_files;
+    return true;
 }
 
 void Tab::SetShowHiddenFiles(bool show) {
     if (show_hidden_files == show) return;
     show_hidden_files = show;
+    ClearSelection();
+    SetSnapshot(snapshot);
+    scroll_y = 0.0f;
+    ++view_generation;
+}
+
+void Tab::SetShowProtectedOsFiles(bool show) {
+    if (show_protected_os_files == show) return;
+    show_protected_os_files = show;
     ClearSelection();
     SetSnapshot(snapshot);
     scroll_y = 0.0f;
@@ -225,7 +240,7 @@ void Tab::SelectRange(int from, int to) {
 
 void Tab::SelectAll() {
     ++selection_revision;
-    if (!content_results && !show_hidden_files) {
+    if (!content_results && !ShowsEveryEntry()) {
         std::vector<int> visible;
         for (int i = 0; i < CountBound(); ++i) if (EntryVisible(i)) visible.push_back(i);
         SelectIndices(visible);
@@ -1164,7 +1179,7 @@ void CollectFilterMatches(const Tab& tab, const PlacesCatalog* places, std::vect
     if (!tab.snapshot) return;
     const int n = static_cast<int>(tab.EntryCount());
     if(tab.content_results) { out.reserve(n); for(int i=0;i<n;++i) out.push_back(i); return; }
-    if (tab.filter_text.empty() && tab.show_hidden_files) {
+    if (tab.filter_text.empty() && tab.ShowsEveryEntry()) {
         out.reserve(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) if (tab.EntryVisible(i)) out.push_back(i);
         return;
@@ -1282,7 +1297,8 @@ void FillPaneViewModel(ui::PaneViewModel& out, const Pane& pane, const PlacesCat
     }
     out.row_cache = tab->view_row_cache;
     out.tag_dots = tab->view_tag_dots;
-    if (!tab->content_results && tab->snapshot && (!tab->show_hidden_files || !tab->filter_text.empty())) {
+    if (!tab->content_results && tab->snapshot &&
+        (!tab->ShowsEveryEntry() || !tab->filter_text.empty())) {
         if (!tab->view_filter_map || tab->view_cache_filter_text != tab->filter_text) {
             auto filtered = std::make_shared<ui::PaneViewModel::FilterMap>();
             CollectFilterMatches(*tab, places, *filtered);

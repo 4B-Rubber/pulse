@@ -343,6 +343,7 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             vm.settings_launch_on_startup = s.appPrefs.launch_on_startup;
             vm.settings_keep_running = s.appPrefs.keep_running_on_close;
             vm.settings_show_hidden_files = s.appPrefs.show_hidden_files;
+            vm.settings_show_protected_os_files = s.appPrefs.show_protected_os_files;
             vm.settings_search_pinyin = s.appPrefs.search_pinyin;
             vm.settings_global_search_enabled = s.appPrefs.global_search_enabled;
             vm.settings_global_search_capturing = s.settings.global_search_hotkey_capturing();
@@ -1119,7 +1120,10 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     if (!s.pane) return {};
     s.changes.visible_paths.clear();
     ForEachPane(s, [&](app::Pane& pane) {
-        if (auto* tab = pane.ActiveTab()) tab->SetShowHiddenFiles(s.appPrefs.show_hidden_files);
+        if (auto* tab = pane.ActiveTab()) {
+            tab->SetShowHiddenFiles(s.appPrefs.show_hidden_files);
+            tab->SetShowProtectedOsFiles(s.appPrefs.show_protected_os_files);
+        }
     });
     ui::WindowViewModel vm = app::BuildWindowViewModel(*s.pane, s.sidebar,
         s.pane->focused, s.maximized, s.darkMode, &s.places, s.sidebarCollapsedMask,

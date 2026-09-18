@@ -1214,6 +1214,7 @@ struct SettingsLayout {
     D2D1_RECT_F wallpaper_clear{};
     D2D1_RECT_F startup_row[3]{};
     D2D1_RECT_F hidden_files_row{};
+    D2D1_RECT_F protected_files_row{};
     D2D1_RECT_F pinned_names_row{};
     D2D1_RECT_F blank_click_row{};
     D2D1_RECT_F change_tracking_row{}, change_days_row{}, change_days[3]{};

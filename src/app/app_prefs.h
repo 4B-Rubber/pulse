@@ -19,6 +19,8 @@ struct AppPrefs {
     uint32_t global_search_modifiers = 1; // MOD_ALT
     uint32_t global_search_key = 32; // VK_SPACE
     bool show_hidden_files = false;
+    // Hidden + system attributes; File Explorer keeps these behind a separate option.
+    bool show_protected_os_files = false;
     bool blank_click_go_back = false;
     bool change_tracking_enabled = false;
     int change_tracking_days = 7;
