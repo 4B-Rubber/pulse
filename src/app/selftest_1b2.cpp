@@ -4533,6 +4533,17 @@ void TestDetailsPreviewInteraction() {
         Check(std::abs(scaled.DetailsMaxWidthDip(2400.0f) - 1256.0f) < 0.5f &&
               std::abs(scaled.SidebarMaxWidthDip(2400.0f) - 1000.0f) < 0.5f,
             L"panels: window limits stay in DIPs when the window is scaled");
+        for (const float scale : {1.0f, 1.25f, 1.5f, 2.0f}) {
+            scaled.SetScale(scale);
+            scaled.SetSidebarWidthDip(224.0f);
+            Check(std::abs(scaled.EffectiveSidebarWidth(1600.0f * scale) - 224.0f * scale) < 0.5f,
+                L"panels: preferred sidebar width is scaled exactly once");
+            scaled.SetSidebarWidthDip(1800.0f);
+            Check(std::abs(scaled.EffectiveSidebarWidth(1600.0f * scale) - 1000.0f * scale) < 0.5f,
+                L"panels: capped sidebar width is converted from DIPs to pixels");
+            Check(std::abs(scaled.EffectiveSidebarWidth(880.0f * scale) - ui::kSidebarRailWidthDip * scale) < 0.5f,
+                L"panels: collapsed sidebar rail scales exactly once");
+        }
     }
     wchar_t previous[32768]{};
     GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
@@ -4569,6 +4580,13 @@ int RunSelfTest1B2() {
     g_skip_visual = GetEnvironmentVariableW(L"PULSE_SELFTEST_NO_SCREENSHOTS", skip_visual, ARRAYSIZE(skip_visual)) > 0;
     if (g_skip_visual) LogLine(L"[SKIP] Screenshot capture disabled\n");
     wchar_t test_case[64]{};
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"release-panels-hidden") == 0) {
+        TestDetailsPreviewInteraction();
+        TestHiddenFiles();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
     if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
         wcscmp(test_case, L"filter-controls") == 0) {
         TestFilterControls();

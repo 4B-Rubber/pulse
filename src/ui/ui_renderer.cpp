@@ -85,7 +85,7 @@ float MainRenderer::EffectiveSidebarWidth(float window_width) const {
     const bool details_open = details_visible_ && window_dip >= kDetailsVisibleWindowDip;
     const float max_dip = MaxSidebarWidthDip(window_dip, details_width_, details_open,
                                              2.0f * margin_ / scale_);
-    return (std::min)(sidebar_width_, max_dip) * scale_;
+    return (std::min)(sidebar_width_dip_, max_dip) * scale_;
 }
 
 // The preferred width is only capped while drawing, so narrowing the window pushes
