@@ -1,5 +1,6 @@
 // session.cpp
 #include "session.h"
+#include "../ui/panel_metrics.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
 #include <commctrl.h>
@@ -303,7 +304,9 @@ bool SaveSession(const SessionSnapshot& snap) {
     f << L"  \"sidebarCollapsed\":" << snap.sidebar_collapsed << L",\n";
     f << L"  \"starredExpanded\":" << (snap.starred_expanded ? L"true" : L"false") << L",\n";
     f << L"  \"detailsPanel\":" << (snap.details_panel ? 1 : 0) << L",\n";
-    f << L"  \"detailsPanelWidth\":" << std::clamp(snap.details_panel_width, 300, 480)
+    f << L"  \"detailsPanelWidth\":" << std::clamp(snap.details_panel_width,
+        static_cast<int>(ui::kDetailsMinWidthDip),
+        static_cast<int>(ui::kPanelWidthMaxDip))
       << L",\n";
     f << L"  \"detailsPreviewOnly\":" << (snap.details_preview_only ? L"true" : L"false") << L",\n";
     f << L"  \"tray\":" << trayJson << L",\n";
@@ -334,7 +337,9 @@ bool LoadSession(SessionSnapshot& snap) {
     snap.details_panel = pulse::json::ExtractInt(json, L"detailsPanel") != 0;
     snap.details_preview_only = pulse::json::ExtractBool(json, L"detailsPreviewOnly", false);
     snap.details_panel_width = pulse::json::ExtractInt(json, L"detailsPanelWidth");
-    if (snap.details_panel_width < 300 || snap.details_panel_width > 480)
+    // The stored value is the user's intent; the window caps it while drawing.
+    if (snap.details_panel_width < static_cast<int>(ui::kDetailsMinWidthDip) ||
+        snap.details_panel_width > static_cast<int>(ui::kPanelWidthMaxDip))
         snap.details_panel_width = 340;
     const std::array<int, 3> columnEdges{
         pulse::json::ExtractInt(json, L"detailsColumn0"),
