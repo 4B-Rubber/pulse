@@ -55,6 +55,7 @@ void AppPrefs::ResetToDefaults() {
     global_search_modifiers = 1;
     global_search_key = 32;
     show_hidden_files = false;
+    show_protected_os_files = false;
     blank_click_go_back = false;
     change_tracking_enabled = false;
     change_tracking_days = 7;
@@ -95,6 +96,8 @@ std::wstring AppPrefs::ToJson() const {
     out += show_pinned_tab_names ? L"true" : L"false";
     out += L",\n  \"show_hidden_files\":";
     out += show_hidden_files ? L"true" : L"false";
+    out += L",\n  \"show_protected_os_files\":";
+    out += show_protected_os_files ? L"true" : L"false";
     out += L",\n  \"search_pinyin\":";
     out += search_pinyin ? L"true" : L"false";
     out += L",\n  \"global_search_enabled\":";
@@ -171,6 +174,7 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     global_search_modifiers = modifiers > 0 && modifiers <= 15 ? static_cast<uint32_t>(modifiers) : 1;
     global_search_key = key > 0 && key <= 254 ? static_cast<uint32_t>(key) : 32;
     show_hidden_files = pulse::json::ExtractBool(json, L"show_hidden_files", false);
+    show_protected_os_files = pulse::json::ExtractBool(json, L"show_protected_os_files", false);
     blank_click_go_back = pulse::json::ExtractBool(json, L"blank_click_go_back", false);
     change_tracking_enabled = pulse::json::ExtractBool(json, L"change_tracking_enabled", false);
     change_tracking_days = pulse::json::ExtractInt(json, L"change_tracking_days", 7);

@@ -799,3 +799,7 @@
 #define IDS_GLOBAL_SEARCH_SELECT 1976
 #define IDS_SETTINGS_CONTENT_TYPES 1977
 #define IDS_SETTINGS_CONTENT_TYPES_DESC 1978
+
+// Protected operating system files (hidden + system attributes).
+#define IDS_SETTINGS_SHOW_PROTECTED 1979
+#define IDS_SETTINGS_SHOW_PROTECTED_DESC 1980

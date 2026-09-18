@@ -123,6 +123,8 @@ enum class StringId : UINT {
     IndexMigratingShort = IDS_INDEX_MIGRATING_SHORT,
     SettingsShowHidden = IDS_SETTINGS_SHOW_HIDDEN,
     SettingsShowHiddenDesc = IDS_SETTINGS_SHOW_HIDDEN_DESC,
+    SettingsShowProtected = IDS_SETTINGS_SHOW_PROTECTED,
+    SettingsShowProtectedDesc = IDS_SETTINGS_SHOW_PROTECTED_DESC,
     PreviewCollapseDetails = IDS_PREVIEW_COLLAPSE_DETAILS,
     PreviewExpandDetails = IDS_PREVIEW_EXPAND_DETAILS,
     PreviewGrabHint = IDS_PREVIEW_GRAB_HINT,

@@ -483,6 +483,7 @@ struct WindowViewModel {
     bool settings_launch_on_startup = false;
     bool settings_keep_running = false;
     bool settings_show_hidden_files = false;
+    bool settings_show_protected_os_files = false;
     bool show_pinned_tab_names = true;
     bool settings_open_folders = false;
     bool settings_blank_click_go_back = false;
