@@ -21,7 +21,11 @@ inline bool HandleSidebarResize(AppState* s, HWND hwnd, UINT message, LPARAM lp)
     }
     if (!s->sidebarResizing) return false;
     if (message == WM_MOUSEMOVE) {
-        const int width = std::clamp(static_cast<int>(std::lround(GET_X_LPARAM(lp) / s->scale)), 160, 480);
+        // Explorer-style limit: the window decides how far the splitter goes.
+        const int max_width = static_cast<int>(std::lround(
+            s->renderer.SidebarMaxWidthDip(static_cast<float>(s->compositor.Width()))));
+        const int width = std::clamp(static_cast<int>(std::lround(GET_X_LPARAM(lp) / s->scale)),
+            static_cast<int>(ui::kSidebarMinWidthDip), max_width);
         s->appPrefs.sidebar_width = width;
         s->renderer.SetSidebarWidthDip(static_cast<float>(width));
         InvalidateRect(hwnd, nullptr, FALSE);

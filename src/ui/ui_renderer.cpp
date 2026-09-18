@@ -80,7 +80,35 @@ void MainRenderer::SetScale(float scale) {
 }
 
 float MainRenderer::EffectiveSidebarWidth(float window_width) const {
-    return window_width < 900.0f * scale_ ? 48.0f * scale_ : sidebar_width_;
+    const float window_dip = window_width / scale_;
+    if (window_dip < kSidebarRailWindowDip) return kSidebarRailWidthDip * scale_;
+    const bool details_open = details_visible_ && window_dip >= kDetailsVisibleWindowDip;
+    const float max_dip = MaxSidebarWidthDip(window_dip, details_width_, details_open,
+                                             2.0f * margin_ / scale_);
+    return (std::min)(sidebar_width_, max_dip) * scale_;
+}
+
+// The preferred width is only capped while drawing, so narrowing the window pushes
+// the panel back temporarily and widening it restores what the user dragged.
+float MainRenderer::DetailsPanelWidth(float window_w) const {
+    const float window_dip = window_w / scale_;
+    if (!details_visible_ || window_dip < kDetailsVisibleWindowDip) return 0.0f;
+    const float max_dip = MaxDetailsWidthDip(window_dip, sidebar_width_dip_,
+                                             window_dip < kSidebarRailWindowDip,
+                                             2.0f * margin_ / scale_);
+    return (std::min)(details_width_, max_dip) * scale_ + margin_;
+}
+
+float MainRenderer::SidebarMaxWidthDip(float window_w) const {
+    const float window_dip = window_w / scale_;
+    const bool details_open = details_visible_ && window_dip >= kDetailsVisibleWindowDip;
+    return MaxSidebarWidthDip(window_dip, details_width_, details_open, 2.0f * margin_ / scale_);
+}
+
+float MainRenderer::DetailsMaxWidthDip(float window_w) const {
+    const float window_dip = window_w / scale_;
+    return MaxDetailsWidthDip(window_dip, sidebar_width_dip_,
+                              window_dip < kSidebarRailWindowDip, 2.0f * margin_ / scale_);
 }
 
 D2D1_RECT_F MainRenderer::ContentRect(float w, float h) const {

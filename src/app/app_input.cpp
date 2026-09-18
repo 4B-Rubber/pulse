@@ -727,7 +727,10 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             } else {
                 const float width = (static_cast<float>(s->compositor.Width())
                     - s->renderer.Margin() - static_cast<float>(mx)) / s->scale;
-                s->detailsPanelWidth = std::clamp(width, 300.0f, 480.0f);
+                // Explorer-style limit: the window decides how far the splitter goes.
+                const float max_width = s->renderer.DetailsMaxWidthDip(
+                    static_cast<float>(s->compositor.Width()));
+                s->detailsPanelWidth = std::clamp(width, ui::kDetailsMinWidthDip, max_width);
                 s->renderer.SetDetailsPanelWidth(s->detailsPanelWidth);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }

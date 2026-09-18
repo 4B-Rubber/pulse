@@ -565,7 +565,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // Arrives before WM_CREATE; GWLP_USERDATA is not set yet.
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
         float sc = s ? s->scale : 1.0f;
-        mmi->ptMinTrackSize.x = (LONG)(640 * sc);
+        // The window may shrink until only the sidebar rail and the file list are
+        // left, the way File Explorer does; below this the toolbar starts to clip.
+        mmi->ptMinTrackSize.x = (LONG)(320 * sc);
         mmi->ptMinTrackSize.y = (LONG)(420 * sc);
         MONITORINFO monitor{sizeof(monitor)};
         if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
