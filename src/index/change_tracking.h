@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <vector>
 namespace pulse::index {
+class IndexMemoryProbe;
 std::wstring NormalizeChangePath(std::wstring path);
 bool IsChangeJournalName(std::wstring_view name);
 enum class ChangeKind : uint32_t { Created, Modified, Deleted, Renamed, MovedIn, MovedOut };
@@ -42,7 +43,7 @@ public:
     void Record(ChangeRecord record);
     void Seed(const std::wstring& owner, std::vector<ChangeRecord> records);
     void Gap();
-    void Flush(bool force = true);
+    void Flush(bool force = true, IndexMemoryProbe* memory = nullptr);
     ChangeResponse Summaries(const std::wstring& owner, const std::vector<std::wstring>& paths, uint64_t since = 0);
     ChangeResponse Details(const std::wstring& owner, const std::wstring& path,
                            uint64_t since, uint64_t before, uint32_t limit, uint32_t kind_filter = UINT32_MAX);

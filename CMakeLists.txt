@@ -469,7 +469,12 @@ target_link_libraries(pulse_child_edit_test PRIVATE
 pulse_enable_lumatext(pulse_child_edit_test)
 
 # Focused folder change tracking regression tests.
+add_executable(pulse_change_tracking_polling_test src/bench/change_tracking_polling_test.cpp)
+target_link_libraries(pulse_change_tracking_polling_test PRIVATE user32)
 add_executable(pulse_change_tracking_test src/bench/change_tracking_test.cpp src/index/change_tracking.cpp)
+add_executable(pulse_change_tracking_memory_test src/bench/change_tracking_memory_test.cpp)
+add_executable(pulse_change_feed_memory_test src/bench/change_feed_memory_test.cpp)
+add_executable(pulse_usn_packet_queue_test src/bench/usn_packet_queue_test.cpp)
 add_executable(pulse_change_tracking_client_test src/bench/change_tracking_client_test.cpp)
 add_executable(pulse_global_search_hotkey_test src/bench/global_search_hotkey_test.cpp src/app/global_search_hotkey.cpp)
 target_link_libraries(pulse_global_search_hotkey_test PRIVATE user32)

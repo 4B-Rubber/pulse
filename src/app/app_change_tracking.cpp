@@ -1,5 +1,6 @@
 #include "app_internal.h"
 #include "change_time.h"
+#include "change_tracking_polling.h"
 #include "../common/localization.h"
 #include "../common/text_format.h"
 #include "../ui/fluent_menu.h"
@@ -129,6 +130,15 @@ bool TickChangeTracking(AppState& s) {
         changed = true;
     }
     if (!state.enabled || s.isolatedTest || s.shot.active) return changed;
+    // Closing to the tray keeps the UI timer alive. Keep event collection and
+    // its lease active, but do not aggregate history for an invisible view.
+    if (!app::ShouldPollChangeTracking(s.hwnd)) {
+        if (state.popover.visible) {
+            state.popover.visible = false;
+            changed = true;
+        }
+        return changed;
+    }
     const uint64_t now = GetTickCount64();
     if (now - state.last_detail_refresh >= 5000) {
         state.last_detail_refresh = now;

@@ -3,6 +3,7 @@
 #include "index_engine.h"
 #include "search_trace.h"
 #include "index_parent_chain.h"
+#include "index_name_pool.h"
 #include "index_config.h"
 #include "index_query.h"
 #include "index_mft.h"
@@ -36,6 +37,8 @@ constexpr size_t kIndexCap = 5000000;
 constexpr size_t kFrnMergeThreshold = 4096;
 constexpr ULONGLONG kMinMergeIntervalMs = 10ull * 60ull * 1000ull;
 constexpr ULONGLONG kMergeFailureRetryMs = 5000;
+constexpr ULONGLONG kNamePoolIntervalMs = 60000;
+constexpr size_t kNamePoolWasteChars = 1ull << 20;
 constexpr ULONGLONG kIdleMergeQuietMs = 10ull * 60ull * 1000ull;
 constexpr ULONGLONG kDeltaFlushMs = 15ull * 1000ull;
 constexpr size_t kMergeStructChanges = 100000;
@@ -359,11 +362,40 @@ void Engine::SetStatus(std::wstring s) {
     std::lock_guard<std::mutex> lock(status_mu_);
     status_ = std::move(s);
 }
-void Engine::RecordFeed(ChangeRecord record) {
-    record.id = ++feed_sequence_;
-    TraceSearch("filename_event",record.id,record.path);
-    feed_changes_.push_back(std::move(record));
-    if(feed_changes_.size()>100000) feed_changes_.pop_front();
+void Engine::RecordFeed(const ChangeRecord& record) {
+    const auto id = ++feed_sequence_;
+    TraceSearch("filename_event", id, record.path);
+    feed_changes_.Append(record, id);
+}
+void Engine::CaptureMemoryState() {
+    if (!IndexDiagnosticsEnabled()) return;
+    std::shared_lock lock(mutex_);
+    auto& retained = filename_timing_.Memory().retained;
+    retained.containers_tick = GetTickCount64();
+    retained.feed_records = feed_changes_.Size();
+    retained.feed_page_capacity_bytes = feed_changes_.PageCapacityBytes();
+    retained.aggregate_mapped_file_bytes = map_ ? map_->size : 0;
+    retained.shard_mapped_file_bytes = 0;
+    for (const auto& shard : query_shards_) if (shard.mapped) retained.shard_mapped_file_bytes += shard.mapped->size;
+    retained.overlay_nodes = live_.nodes.size();
+    retained.overlay_patches = patches_.size();
+    // Stream ownership is worker-only; producers touch only their own queue.
+    retained.usn_streams = journal_streams_.size();
+    retained.usn_queue_packets = retained.usn_queue_payload_bytes = 0;
+    retained.usn_queue_capacity_bytes = retained.usn_queue_charged_bytes = 0;
+    retained.usn_sum_stream_peak_capacity_bytes = retained.usn_sum_stream_peak_charged_bytes = 0;
+    retained.usn_queue_overflows = 0;
+    for (const auto& entry : journal_streams_) {
+        const auto memory = entry.second->Memory();
+        retained.usn_queue_packets += memory.packets;
+        retained.usn_queue_payload_bytes += memory.payload_bytes;
+        retained.usn_queue_capacity_bytes += memory.capacity_bytes;
+        retained.usn_queue_charged_bytes += memory.charged_bytes;
+        // Independent lifetime peaks, NOT a simultaneous aggregate high-water mark.
+        retained.usn_sum_stream_peak_capacity_bytes += memory.peak_capacity_bytes;
+        retained.usn_sum_stream_peak_charged_bytes += memory.peak_charged_bytes;
+        retained.usn_queue_overflows += memory.overflows;
+    }
 }
 FileFeedPage Engine::ReadFeed(bool changes, const std::wstring& root, uint64_t epoch, uint64_t cursor) const {
     std::shared_lock lock(mutex_);
@@ -373,13 +405,10 @@ FileFeedPage Engine::ReadFeed(bool changes, const std::wstring& root, uint64_t e
     if(!page.ready) return page;
     if(changes) {
         if(!epoch) {page.next=feed_sequence_;page.done=true;return page;}
-        if(!feed_changes_.empty() && cursor+1<feed_changes_.front().id) {page.gap=true;return page;}
+        if(!feed_changes_.Empty() && cursor+1<feed_changes_.FirstId()) {page.gap=true;return page;}
         page.next=cursor;
-        for(const auto& record:feed_changes_) {
-            if(record.id<=cursor) continue;
-            page.records.push_back(record);page.next=record.id;
-            if(page.records.size()>=512) break;
-        }
+        feed_changes_.ReadAfter(cursor, 512, page.records);
+        if (!page.records.empty()) page.next = page.records.back().id;
         page.done=page.next==feed_sequence_;return page;
     }
     const auto count=static_cast<uint64_t>(LiveCount());
@@ -1828,6 +1857,9 @@ bool Engine::MapIndexFile(const std::wstring& path, std::unique_ptr<MappedFile>&
 
 void Engine::AdoptMappedLocked(std::unique_ptr<MappedFile> mapped) {
     ++feed_epoch_;
+    // Old subscribers must already resynchronize; these events cannot bridge
+    // the snapshot generation. Keep sequence IDs monotonic, not stale payloads.
+    feed_changes_.Clear();
     pinyin_snapshot_ = nullptr;
     pinyin_version_ = 0;
     pinyin_chinese_ids_.clear();
@@ -2268,6 +2300,7 @@ void Engine::ReplayDeltasLocked() {
             }
             if (which & static_cast<uint8_t>(PatchBits::Name)) {
                 if (!name.data() && !name.empty()) return;
+                if (p.has_name) pool_waste_ += p.len;
                 p.off = static_cast<uint32_t>(live_.pool.size());
                 p.len = static_cast<uint16_t>(name.size());
                 live_.pool.insert(live_.pool.end(), name.begin(), name.end());
@@ -2303,9 +2336,44 @@ void Engine::ReplayDeltasLocked() {
     InvalidateFilterLocked();
 }
 
-const char* Engine::MaintenanceMergeReason(ULONGLONG now, uint64_t delta_bytes, bool compact) const {
+bool Engine::CompactNamePoolLocked(ULONGLONG now) {
+    // Amortize copying: at least 2 MiB of garbage, at least 25% of the pool,
+    // and no more than one attempt per minute (including allocation failures).
+    if (now < name_pool_retry_after_tick_ || pool_waste_ < kNamePoolWasteChars ||
+        pool_waste_ < (live_.pool.size() + 3) / 4) return false;
+    const auto timing = FilenameTiming::Begin();
+    const bool diagnostics = IndexDiagnosticsEnabled();
+    auto& stats = filename_timing_.Maintenance().pool;
+    if (diagnostics) {
+        ++stats.attempts;
+        stats.tick = now;
+        stats.waste_chars = pool_waste_;
+        stats.before_chars = live_.pool.size();
+        stats.before_capacity_bytes = live_.pool.capacity() * sizeof(wchar_t);
+    }
+    const DWORD error = CompactOverlayNamePool(live_.pool, live_.nodes, patches_);
+    if (error == ERROR_SUCCESS) pool_waste_ = 0;
+    name_pool_retry_after_tick_ = GetTickCount64() + kNamePoolIntervalMs;
+    if (diagnostics) {
+        stats.after_chars = live_.pool.size();
+        stats.after_capacity_bytes = live_.pool.capacity() * sizeof(wchar_t);
+        if (error == ERROR_SUCCESS) {
+            ++stats.successes;
+            stats.reclaimed_chars += stats.before_chars - stats.after_chars;
+        } else {
+            ++stats.failures;
+        }
+        filename_timing_.End(FilenameStage::NamePoolCompact, timing,
+            error == ERROR_SUCCESS ? stats.before_chars - stats.after_chars : 0,
+            error, "overlay_name_waste");
+    }
+    return error == ERROR_SUCCESS;
+}
+
+const char* Engine::MaintenanceMergeReason(ULONGLONG now, uint64_t delta_bytes) const {
     if (now < merge_retry_after_tick_) return nullptr;
-    if (compact) return "fragmentation";
+    const auto count = static_cast<size_t>(LiveCount());
+    if (count && deleted_ > count / 10) return "deleted_ratio";
     if (struct_changes_ >= kMergeStructChanges) return "structural_threshold";
     if (delta_bytes >= kMergeDeltaBytes) return "delta_threshold";
     if (struct_changes_ && last_struct_tick_ && now - last_struct_tick_ >= kIdleMergeQuietMs &&
@@ -2335,6 +2403,7 @@ void Engine::MergeBase(bool force, const char* reason) {
     const auto timing = FilenameTiming::Begin();
     const auto pending = struct_changes_;
     const auto previous_built = built_unix_;
+    filename_timing_.Memory().Capture(IndexMemoryPoint::MergeBefore);
     std::vector<VolState> vols;
     uint64_t built = static_cast<uint64_t>(std::time(nullptr));
     TraceSearch("filename_merge_begin", revision_.load());
@@ -2346,7 +2415,23 @@ void Engine::MergeBase(bool force, const char* reason) {
             merging_ = false;
             return;
         }
+        if (IndexDiagnosticsEnabled()) {
+            auto& stats = filename_timing_.Maintenance();
+            stats.RecordMerge(reason);
+            stats.merge.tick = now;
+            stats.merge.since_previous_ms = last_merge_tick_ ? now - last_merge_tick_ : 0;
+            stats.merge.nodes = static_cast<uint64_t>(LiveCount());
+            stats.merge.deleted = deleted_;
+            stats.merge.pool_chars = live_.pool.size();
+            stats.merge.pool_waste_chars = pool_waste_;
+            stats.merge.base_pool_chars = map_ && map_->hdr ? map_->hdr->pool_chars : 0;
+            stats.merge.struct_changes = struct_changes_;
+            stats.merge.delta_bytes = 0;
+            for (const auto& entry : delta_logs_)
+                if (entry.second) stats.merge.delta_bytes += entry.second->BytesOnDisk();
+        }
         FlattenLocked(snap, vols);
+        filename_timing_.Memory().Capture(IndexMemoryPoint::MergeFlattened);
         built_unix_ = built;
     }
     const bool wrote = WriteIndexFile(path, snap, vols, built);
@@ -2376,6 +2461,12 @@ void Engine::MergeBase(bool force, const char* reason) {
     TraceSearch(committed ? "filename_merge_done" : "filename_merge_failed", revision_.load());
     filename_timing_.End(FilenameStage::Merge, timing, pending,
         committed ? ERROR_SUCCESS : (save_error ? save_error : ERROR_WRITE_FAULT), reason);
+    if (IndexDiagnosticsEnabled()) {
+        auto& merge_stats = filename_timing_.Maintenance().merge;
+        merge_stats.last_wall_us = FilenameTiming::Begin().wall - timing.wall;
+        merge_stats.last_committed = committed;
+    }
+    CaptureMemoryState();
     filename_timing_.Flush();
     merging_ = false;
 }
@@ -2641,6 +2732,7 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
             p.parent = parent;
             p.flags = flags;
             p.has_meta = true;
+            if (p.has_name) pool_waste_ += p.len;
             p.has_name = true;
             p.off = static_cast<uint32_t>(live_.pool.size());
             p.len = static_cast<uint16_t>((std::min)(name.size(), static_cast<size_t>(65535)));
@@ -3420,7 +3512,7 @@ void Engine::Worker() {
         filename_timing_.End(FilenameStage::Wait, wait_timing, wake == WAIT_TIMEOUT ? 0 : 1,
             wake == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS, wake == WAIT_TIMEOUT ? "maintenance" : "event");
         PollWalkWatches();
-        changes_.Flush(false);
+        changes_.Flush(false, &filename_timing_.Memory());
         if (!running_) break;
         if (rebuild_requested_.exchange(false)) {
             journal_streams_.clear();
@@ -3434,7 +3526,6 @@ void Engine::Worker() {
         bool changed = false;
         bool structural = false;
         bool failed = false;
-        bool need_compact = false;
         std::vector<VolumeInfo> failed_volumes;
         const auto loop_tick = GetTickCount64();
         if (fixture_root_.empty() && loop_tick - topology_tick >= 30000) {
@@ -3474,16 +3565,6 @@ void Engine::Worker() {
                               live_tracked ? L"实时更新" : L"部分磁盘未实时更新"));
                 }
             }
-            const size_t n = static_cast<size_t>(LiveCount());
-            // live_.pool only contains names introduced by the delta layer;
-            // comparing waste against it made any single rename look like a
-            // full-store fragmentation event. Compare against the mapped
-            // base pool and require a meaningful absolute amount of waste.
-            const uint64_t base_pool = map_ && map_->hdr ? map_->hdr->pool_chars : 0;
-            if (n > 0 && (deleted_ * 10 > n ||
-                          pool_waste_ >= (1ull << 20) ||
-                          (base_pool && pool_waste_ * 10 > base_pool)))
-                need_compact = true;
         }
         if (failed && running_) {
             RecoverFailedVolumes(failed_volumes, loop_tick,
@@ -3498,10 +3579,13 @@ void Engine::Worker() {
         uint64_t delta_bytes = 0;
         const char* merge_reason = nullptr;
         {
-            std::shared_lock<std::shared_mutex> lock(mutex_);
+            std::unique_lock<std::shared_mutex> lock(mutex_);
             for (const auto& [k, log] : delta_logs_)
                 if (log) delta_bytes += log->BytesOnDisk() + (log->HasPending() ? 1 : 0);
-            merge_reason = MaintenanceMergeReason(now, delta_bytes, need_compact);
+            merge_reason = MaintenanceMergeReason(now, delta_bytes);
+            // A pending full merge already reclaims the pool. Otherwise keep
+            // all IDs/generations and compact only heap-owned name references.
+            if (!merge_reason) CompactNamePoolLocked(now);
         }
         // Merge triggers must measure unmerged work only. (A live-node count
         // here forced a full rewrite every loop on any machine over the old
@@ -3509,6 +3593,7 @@ void Engine::Worker() {
         if (merge_reason) {
             MergeBase(std::strcmp(merge_reason, "quiet_changes") != 0, merge_reason);
         }
+        if (filename_timing_.Due()) CaptureMemoryState();
         filename_timing_.Flush();
     }
     journal_streams_.clear();
@@ -3733,6 +3818,7 @@ uint64_t Engine::ApplyNotifyLocked(const std::wstring& root, const BYTE* buf, DW
                     pt.parent = new_parent;
                     pt.flags = old.flags;
                     pt.has_meta = true;
+                    if (pt.has_name) pool_waste_ += pt.len;
                     pt.has_name = true;
                     pt.off = static_cast<uint32_t>(live_.pool.size());
                     pt.len = static_cast<uint16_t>((std::min)(new_name.size(), static_cast<size_t>(65535)));

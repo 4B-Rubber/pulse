@@ -154,6 +154,7 @@ bool RunChangeTrackingAppTest() {
     ApplyChangeDetails(*state, 3, {});
     check(tab.snapshot == old, "disabled tracking ignores in-flight detail response");
     auto polling = std::make_unique<AppState>();
+    polling->hwnd = GetDesktopWindow();
     polling->places.persist = false;
     polling->appPrefs.persist = false;
     polling->appPrefs.change_tracking_enabled = true;

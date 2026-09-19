@@ -46,7 +46,9 @@ New-Item -ItemType Directory -Path $build -Force | Out-Null
 # Release verification is scoped to the changes being shipped. pulse already
 # depends on all three packaged hosts; standalone tests need explicit targets.
 $testNames = @('pulse_rename_ops_test', 'pulse_child_edit_test', 'pulse_localization_test',
-    'pulse_update_test', 'pulse_update_installer_test')
+    'pulse_update_test', 'pulse_update_installer_test', 'pulse_app_controllers_test',
+    'pulse_change_tracking_polling_test', 'pulse_change_tracking_test',
+    'pulse_change_tracking_memory_test', 'pulse_change_feed_memory_test', 'pulse_usn_packet_queue_test')
 $testTargets = (@('pulse', 'pulse_index_engine_test', 'pulse_index_host_stress') + $testNames) -join ' '
 $batch = Join-Path $build 'compile-release.bat'
 @"
@@ -72,14 +74,21 @@ foreach ($mode in @('--startup-stop', '--shell-roundtrip')) {
     if ($LASTEXITCODE -ne 0) { throw "Rename lifecycle check $mode failed" }
 }
 $env:PULSE_SELFTEST_NO_SCREENSHOTS = '1'
-& (Join-Path $build 'pulse_index_engine_test.exe') --parent-cycle-only
-if ($LASTEXITCODE -ne 0) { throw 'Index parent-cycle regression failed' }
+foreach ($mode in @('--parent-cycle-only', '--quiet-maintenance-only', '--name-pool-only',
+    '--maintenance-only', '--usn-only', '--feed-only')) {
+    & (Join-Path $build 'pulse_index_engine_test.exe') $mode
+    if ($LASTEXITCODE -ne 0) { throw "Index regression $mode failed" }
+}
+& (Join-Path $build 'pulse_app_controllers_test.exe') --layout-search-prefs
+if ($LASTEXITCODE -ne 0) { throw 'Panel layout/preferences regression failed' }
+& (Join-Path $build 'pulse_change_feed_memory_test.exe') --probe
+if ($LASTEXITCODE -ne 0) { throw 'Opt-in memory probe regression failed' }
 foreach ($mode in @('--service-start-only', '--shutdown-only')) {
     & (Join-Path $build 'pulse_index_host_stress.exe') $mode
     if ($LASTEXITCODE -ne 0) { throw "Index lifecycle check $mode failed" }
 }
 $selftestCases = @('rename-editor', 'rename-editor-native', 'operation-toast',
-    'filter-controls', 'rename-outside', 'address-editor', 'address-editor-native')
+    'filter-controls', 'rename-outside', 'address-editor', 'address-editor-native', 'release-panels-hidden')
 $selftestLogs = @{
     'rename-editor' = 'bench_data/rename-editor/results.log'
     'rename-editor-native' = 'bench_data/rename-editor/results.log'
