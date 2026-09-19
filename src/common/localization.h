@@ -132,6 +132,8 @@ enum class StringId : UINT {
     SidebarHideSection = IDS_SIDEBAR_HIDE_SECTION,
     PreviewToggle = IDS_PREVIEW_TOGGLE,
     PreviewOff = IDS_PREVIEW_OFF,
+    PreviewHide = IDS_PREVIEW_HIDE,
+    PreviewShow = IDS_PREVIEW_SHOW,
     OneDrivePersonal = IDS_ONEDRIVE_PERSONAL,
     PreviewCollapseDetails = IDS_PREVIEW_COLLAPSE_DETAILS,
     PreviewExpandDetails = IDS_PREVIEW_EXPAND_DETAILS,

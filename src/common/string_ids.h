@@ -811,8 +811,12 @@
 #define IDS_SIDEBAR_COLLAPSE_SECTION 1984
 #define IDS_SIDEBAR_HIDE_SECTION 1985
 // Details panel preview on/off chip (1986 is taken by the OneDrive rows).
+// The first two are the pane label / placeholder, the last two the tooltip that
+// names what clicking the switch will do.
 #define IDS_PREVIEW_TOGGLE 1988
 #define IDS_PREVIEW_OFF 1989
+#define IDS_PREVIEW_HIDE 1990
+#define IDS_PREVIEW_SHOW 1991
 
 // OneDrive account rows: "<account name> - <Personal|tenant>".
 #define IDS_ONEDRIVE_PERSONAL 1986

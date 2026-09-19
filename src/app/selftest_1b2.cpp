@@ -4406,6 +4406,18 @@ void TestColorPickerModel() {
 
 
 void TestDetailsPreviewInteraction() {
+    // The preview switch names the action it performs, like the star and rename
+    // hints beside it in the details name row.
+    {
+        AppState tip;
+        tip.hoverRegion = static_cast<int>(ui::HitTestResult::DetailsPreviewEnable);
+        tip.detailsPreviewEnabled = true;
+        Check(TooltipForHover(tip) == l10n::Get(l10n::StringId::PreviewHide),
+              L"preview switch: the hint offers to hide the preview while it is on");
+        tip.detailsPreviewEnabled = false;
+        Check(TooltipForHover(tip) == l10n::Get(l10n::StringId::PreviewShow),
+              L"preview switch: the hint offers to show it again while it is off");
+    }
     ui::PreviewViewport view;
     const auto rect = D2D1::RectF(20, 30, 420, 330);
     view.SetContent(rect, 1600, 1200, true);

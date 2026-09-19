@@ -1647,6 +1647,9 @@ std::wstring TooltipForHover(AppState& s) {
     case R::DetailsTagAdd: return text(I::AddTag);
     case R::DetailsResize: return text(I::ResizeDetails);
     case R::DetailsPreviewToggle: return text(s.detailsPreviewOnly ? I::PreviewExpandDetails : I::PreviewCollapseDetails);
+    // Names the action, matching the star and rename hints beside it.
+    case R::DetailsPreviewEnable:
+        return text(s.detailsPreviewEnabled ? I::PreviewHide : I::PreviewShow);
     case R::DetailsPreview: return L"";
     case R::StatusBarTask: return text(I::OpDetails);
     case R::StatusBarCancelSearch: return text(I::ContentCancelSearch);
