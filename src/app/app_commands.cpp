@@ -1682,7 +1682,9 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
     if (app::HasEffect(effects, app::SettingsEffect::TrayDeckIcon))
         s.renderer.SetTrayIconDip(static_cast<float>(s.appPrefs.tray_icon_size));
     if (app::HasEffect(effects, app::SettingsEffect::TrayVisibility))
-        s.tray_controller.SetVisible(s.appPrefs.keep_running_on_close || s.appPrefs.global_search_enabled);
+        // A second window owns no tray icon: the primary keeps the only one.
+    s.tray_controller.SetVisible(!s.secondaryInstance &&
+        (s.appPrefs.keep_running_on_close || s.appPrefs.global_search_enabled));
     if (app::HasEffect(effects, app::SettingsEffect::GlobalSearch))
         ApplyGlobalSearchSettings(s);
     if (app::HasEffect(effects, app::SettingsEffect::StatusBarPerformance))

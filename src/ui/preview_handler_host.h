@@ -43,6 +43,12 @@ public:
     State state() const;
     static bool CanHost(const std::wstring& path);
 
+#ifdef PULSE_PREVIEW_HANDLER_TESTING
+    // The overlay HWND the apartment owns, or null while it has none. Tests use
+    // it to measure how quickly the preview follows a moving owner.
+    HWND overlay_window_for_test() const;
+#endif
+
 private:
     struct WorkerState;
     void EnsureWorker();

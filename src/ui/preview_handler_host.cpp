@@ -153,6 +153,11 @@ std::mutex g_association_mutex;
 std::once_flag g_register_class_once;
 #ifdef PULSE_PREVIEW_HANDLER_TESTING
 std::atomic<uint32_t> g_test_open_attempts{0};
+// PlaceOverlay entries and returns. They differ only while the window manager
+// is inside the provider's window, which is what makes a preview trail its
+// owner during a drag.
+std::atomic<uint32_t> g_test_place_calls{0};
+std::atomic<uint32_t> g_test_place_done{0};
 #endif
 
 std::wstring ShellPath(const std::wstring& path) {
@@ -419,6 +424,12 @@ struct PreviewHandlerHost::WorkerState {
 
     void PlaceOverlay() {
         if (!hwnd || !owner) return;
+#ifdef PULSE_PREVIEW_HANDLER_TESTING
+        g_test_place_calls.fetch_add(1, std::memory_order_relaxed);
+        struct PlaceDone {
+            ~PlaceDone() { g_test_place_done.fetch_add(1, std::memory_order_relaxed); }
+        } place_done;
+#endif
         POINT origin{bounds.left, bounds.top};
         if (!ClientToScreen(owner, &origin)) return;
         const int width = std::max(1L, bounds.right - bounds.left);
@@ -440,8 +451,13 @@ struct PreviewHandlerHost::WorkerState {
         placed_w = width;
         placed_h = height;
         pan.Disable();
-        SetWindowPos(hwnd, HWND_TOPMOST, origin.x, origin.y, width, height,
-                     SWP_NOACTIVATE | (shown ? SWP_SHOWWINDOW : SWP_NOREDRAW));
+        // A move keeps the z-order it already has. Re-asserting HWND_TOPMOST on
+        // every step of a window drag only makes the window manager re-evaluate
+        // the topmost band, with the provider's window (another process) inside.
+        const bool raise = !shown || size_changed;
+        SetWindowPos(hwnd, raise ? HWND_TOPMOST : nullptr, origin.x, origin.y, width, height,
+                     SWP_NOACTIVATE | (raise ? 0 : SWP_NOZORDER) |
+                         (shown ? SWP_SHOWWINDOW : SWP_NOREDRAW));
         if (handler && shown && size_changed) {
             ComPtr<IPreviewHandler> preview;
             if (SUCCEEDED(handler->QueryInterface(IID_PPV_ARGS(&preview)))) {
@@ -982,8 +998,25 @@ uint32_t PreviewHandlerOpenAttemptsForTest() {
     return g_test_open_attempts.load(std::memory_order_relaxed);
 }
 
+void ResetOverlayPlaceCountsForTest() {
+    g_test_place_calls.store(0, std::memory_order_relaxed);
+    g_test_place_done.store(0, std::memory_order_relaxed);
+}
+
+uint32_t OverlayPlaceCallsForTest() {
+    return g_test_place_calls.load(std::memory_order_relaxed);
+}
+
+uint32_t OverlayPlaceDoneForTest() {
+    return g_test_place_done.load(std::memory_order_relaxed);
+}
+
 void ResetSlowPreviewProvidersForTest() {
     ResetSlowProvidersForTest();
+}
+
+HWND PreviewHandlerHost::overlay_window_for_test() const {
+    return worker_ ? worker_->overlay.load(std::memory_order_acquire) : nullptr;
 }
 
 bool PreviewHandlerCanActivateIsolatedForTest(const std::wstring& path) {

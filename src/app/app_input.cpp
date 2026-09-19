@@ -1,5 +1,6 @@
 // app_input.cpp — extracted from app_main.cpp.
 #include "quick_access.h"
+#include "jump_list.h"
 #include "tab_shortcuts.h"
 #include "app_updates.h"
 #include "app_internal.h"
@@ -21,6 +22,8 @@
 #include "batch_rename.h"
 #include "blank_pane_click.h"
 #include "link_resolve.h"
+#include "instance_launcher.h"
+#include "single_instance_coordinator.h"
 #include "resource.h"
 #include "../ops/clipboard.h"
 #include "../ipc/ctx_menu_util.h"
@@ -364,6 +367,71 @@ void StartDragOut(AppState& s) {
         RefreshActiveTab(s, RefreshReason::OperationCompleted);
     }
     InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
+// Resets every field a tab (or collapsed-chip) drag owns and drops the capture
+// it took. Shared by the plain drop and by the hand-off to another window.
+void ResetTabDrag(AppState& s, HWND hwnd) {
+    s.tabDragPending = false;
+    s.tabDragging = false;
+    s.tabDragIndex = -1;
+    s.tabDragRunPos = 0;
+    s.tabDragRunLen = 1;
+    s.tabDragFromChip = false;
+    s.tabDragGroupId = 0;
+    s.tabDragSlots = 1.0f;
+    s.tabDragExternal = false;
+    s.tabOrder.clear();
+    s.tabDragGhost.Hide();
+    if (GetCapture() == hwnd) ReleaseCapture();
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// Moves the dragged tab to the Pulse window under the cursor, the way Explorer
+// moves a tab between its own windows. Returns false when no other Pulse window
+// is there, or when the tab cannot travel: a window left without tabs has
+// nothing to show, and a virtual location (search results, a tag) means nothing
+// to the window that receives it.
+bool HandOffTabUnderCursor(AppState& s, HWND hwnd) {
+    if (s.tabDragIndex < 0 || s.tabDragIndex >= static_cast<int>(s.window_tabs.items.size()))
+        return false;
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) return false;
+    const HWND target = app::PulseWindowUnderPoint(cursor, hwnd);
+    RECT self{};
+    GetWindowRect(hwnd, &self);
+    // Released away from every Pulse window: the tab becomes a window of its own,
+    // the way Explorer tears a tab out to the desktop. Released back on this
+    // window's own strip, it is still just a reorder.
+    const bool torn_out = target == nullptr && !PtInRect(&self, cursor);
+    if (!target && !torn_out) return false;
+    const app::LayoutTab* layout =
+        s.window_tabs.items[static_cast<size_t>(s.tabDragIndex)].get();
+    const app::Tab* folder = layout ? layout->ActiveFolder() : nullptr;
+    // Virtual views travel too: "最近使用", a tag or a saved search is a location
+    // like any other, and a new window starts on one of them.
+    if (!folder || folder->current_path.empty()) return false;
+    // Handing over the only tab is a merge, not a move: this window has nothing
+    // left to show afterwards, so it closes and the window that took the tab
+    // takes over the tray, the hotkey and the session from it.
+    const bool last_tab = s.window_tabs.items.size() <= 1;
+    // Every hand-off uses the transfer message: the target always opens a tab of
+    // its own, even when it already shows that folder. (The "open path" message
+    // is for shell forwards, where activating an existing tab is what the user
+    // means by double-clicking a folder.) The takeover it triggers is moot while
+    // this window stays alive, and it simply gives up after a moment.
+    const bool sent = torn_out
+        ? app::LaunchNewWindow(folder->current_path)
+        : app::SingleInstanceCoordinator::SendTabTransfer(target, folder->current_path);
+    if (!sent) return false;
+    if (last_tab) {
+        s.mergedAway = true; // closing now: this window must not be persisted
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return true;
+    }
+    s.window_tabs.CloseTab(static_cast<size_t>(s.tabDragIndex));
+    BindCurrentLayout(s);
+    return true;
 }
 
 float MaxScrollForActivePane(AppState& s, ui::PaneViewModel* out) {
@@ -917,7 +985,9 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 s->tabOrder.clear();
                 if (GetCapture() == hwnd) ReleaseCapture();
             } else if (s->tabDragging ||
-                       (s->pane && s->window_tabs.items.size() >= 2 &&
+                       // A lone tab is draggable too: dragging it out of the
+                       // window is how a window with one tab is merged away.
+                       (s->pane && !s->window_tabs.items.empty() &&
                         std::abs(mx - s->tabDragStartPt.x) >= 2)) {
                 if (!s->tabDragging && s->pane &&
                     s->tabDragIndex >= 0 &&
@@ -947,9 +1017,19 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                             }
                         }
                     }
-                    if (n0 >= 2 && n0 == static_cast<int>(s->window_tabs.items.size()) &&
+                    // One tab is enough: there is nothing to reorder, but the drag
+                    // is also how a lone tab leaves for another window.
+                    if (n0 >= 1 && n0 == static_cast<int>(s->window_tabs.items.size()) &&
                         haveEnds && selfOk) {
                         s->tabDragging = true;
+                        // The strip's hover hint belonged to the tab that is being
+                        // carried away, and the pointer leaves the strip while the
+                        // drag is on - so nothing would ever clear it again, and a
+                        // stale path would stay pinned to this window.
+                        s->hoverPath.clear();
+                        s->hoverLabel.clear();
+                        s->tooltipText.clear();
+                        s->hoverSince = 0;
                         s->tabFlowLeft = first.left;
                         s->tabFlowRight = last.right;
                         s->tabSlotW = self.right - self.left;
@@ -1036,7 +1116,45 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         s->tabDragPressLeft + static_cast<float>(mx - s->tabDragStartPt.x),
                         s->tabFlowLeft,
                         std::max(s->tabFlowLeft, s->tabFlowRight - dragBlockW));
-                    if (std::abs(dx) >= 2 && s->tabDragFromChip) {
+                    // Past the window edge the tab is on its way to another Pulse
+                    // window rather than to a slot in this strip: the floating
+                    // block parks at the strip edge, the reorder math below stays
+                    // out of the way, and the release decides where it lands.
+                    s->tabDragExternal = mx < 0 || my < 0 ||
+                        mx >= static_cast<int>(s->compositor.Width()) ||
+                        my >= static_cast<int>(s->compositor.Height());
+                    // Back inside the window the tab is drawn here again, so the
+                    // card that followed the cursor goes away.
+                    if (!s->tabDragExternal && s->tabDragGhost.visible())
+                        s->tabDragGhost.Hide();
+                    if (s->tabDragExternal) {
+                        POINT cursor{};
+                        const bool have_cursor = GetCursorPos(&cursor) != FALSE;
+                        if (have_cursor && app::PulseWindowUnderPoint(cursor, hwnd))
+                            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                        // This window cannot draw outside its own client area, so
+                        // the dragged tab becomes a card of its own while the user
+                        // carries it over another window.
+                        const app::LayoutTab* dragged =
+                            (s->tabDragIndex >= 0 &&
+                             s->tabDragIndex < static_cast<int>(s->window_tabs.items.size()))
+                                ? s->window_tabs.items[static_cast<size_t>(s->tabDragIndex)].get()
+                                : nullptr;
+                        if (dragged && have_cursor) {
+                            const app::Tab* folder = dragged->ActiveFolder();
+                            // Same label the strip shows: a renamed tab keeps its
+                            // name, a virtual view its title ("最近使用"), and only
+                            // a plain folder falls back to its own name.
+                            std::wstring title = dragged->title;
+                            if (title.empty() && folder) title = folder->virtual_title;
+                            if (title.empty())
+                                title = BaseName(folder ? folder->current_path : std::wstring{});
+                            if (!s->tabDragGhost.visible())
+                                s->tabDragGhost.Show(s->scale, title, s->darkMode,
+                                                     s->tabDragGrabDx, s->tabDragGrabDy);
+                            s->tabDragGhost.Follow(cursor);
+                        }
+                    } else if (std::abs(dx) >= 2 && s->tabDragFromChip) {
                         // Whole-group drag: rotate the run as a block when its
                         // leading/trailing edge crosses the neighbor's center.
                         s->tabDragLastX = mx;
@@ -1947,8 +2065,21 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             s->tabDragPending = true;
             s->tabDragging = false;
             s->tabDragFromChip = false;
+            s->tabDragExternal = false;
             s->tabDragIndex = hit.index;
             s->tabDragStartPt = POINT{ mx, my };
+            // Where inside the tab the press landed. The card that follows the
+            // cursor to another window hangs by that same offset, so the tab
+            // reads as picked up rather than as a badge beside the pointer.
+            {
+                ui::WindowViewModel grabVm = BuildVm(*s);
+                D2D1_RECT_F tabRc{};
+                if (s->renderer.TabItemRect(grabVm, static_cast<float>(s->compositor.Width()),
+                                            hit.index, &tabRc)) {
+                    s->tabDragGrabDx = mx - static_cast<int>(tabRc.left);
+                    s->tabDragGrabDy = my - static_cast<int>(tabRc.top);
+                }
+            }
             SetCapture(hwnd);
         } else if (hit.region == ui::HitTestResult::TabClose && hit.index >= 0) {
             CloseLayoutTab(*s, static_cast<size_t>(hit.index));
@@ -2526,6 +2657,8 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (was_active && s->pinDragToIndex >= 0)
                     s->places.ReorderQuickAccessPinned(path,
                         static_cast<size_t>(s->pinDragToIndex));
+                // The taskbar jump list keeps the same order.
+                if (was_active) app::RefreshJumpList(s->places.quick_access_paths);
                 ResetSidebarPinDrag(*s);
                 if (GetCapture() == hwnd) ReleaseCapture();
                 if (!was_active && !path.empty()) NavigateTo(*s, path);
@@ -2606,6 +2739,16 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             }
             if (s->tabDragPending || s->tabDragging) {
                 const bool wasActive = s->tabDragging;
+                // The card is under the cursor by design, so it must be gone
+                // before the window under the cursor is resolved - otherwise the
+                // drop lands on the card and the hand-off is skipped.
+                s->tabDragGhost.Hide();
+                // Released over another Pulse window: the tab belongs to that
+                // window now, so this one drops it instead of reordering.
+                if (wasActive && HandOffTabUnderCursor(*s, hwnd)) {
+                    ResetTabDrag(*s, hwnd);
+                    return 0;
+                }
                 if (wasActive && s->pane && s->tabDragIndex >= 0 &&
                     s->tabDragIndex < static_cast<int>(s->window_tabs.items.size())) {
                     int cur = -1;
@@ -2715,17 +2858,7 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     s->tabs.ToggleGroupCollapse(s->window_tabs, s->tabDragGroupId);
                     BindCurrentLayout(*s);
                 }
-                s->tabDragPending = false;
-                s->tabDragging = false;
-                s->tabDragIndex = -1;
-                s->tabDragRunPos = 0;
-                s->tabDragRunLen = 1;
-                s->tabDragFromChip = false;
-                s->tabDragGroupId = 0;
-                s->tabDragSlots = 1.0f;
-                s->tabOrder.clear();
-                if (GetCapture() == hwnd) ReleaseCapture();
-                InvalidateRect(hwnd, nullptr, FALSE);
+                ResetTabDrag(*s, hwnd);
                 return 0;
             }
             if (s->marqueeActive || s->marqueePending) {
@@ -2870,6 +3003,8 @@ LRESULT HandleCaptureChanged(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LP
                 s->tabDragPending = false;
                 s->tabDragging = false;
                 s->tabDragIndex = -1;
+                s->tabDragExternal = false;
+                s->tabDragGhost.Hide();
                 s->tabOrder.clear();
                 s->tabTracks.clear();
                 s->tabOffsets.clear();

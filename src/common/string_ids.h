@@ -820,3 +820,8 @@
 
 // OneDrive account rows: "<account name> - <Personal|tenant>".
 #define IDS_ONEDRIVE_PERSONAL 1986
+
+// Second window: tab menu entry and tray menu entry.
+#define IDS_TAB_OPEN_NEW_WINDOW 1992
+#define IDS_TRAY_NEW_WINDOW 1993
+#define IDS_JUMPLIST_PINNED 1994

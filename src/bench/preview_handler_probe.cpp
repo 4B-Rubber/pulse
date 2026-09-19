@@ -12,6 +12,9 @@ void ResetPreviewHandlerOpenAttemptsForTest();
 uint32_t PreviewHandlerOpenAttemptsForTest();
 bool PreviewHandlerCanActivateIsolatedForTest(const std::wstring& path);
 void ResetSlowPreviewProvidersForTest();
+void ResetOverlayPlaceCountsForTest();
+uint32_t OverlayPlaceCallsForTest();
+uint32_t OverlayPlaceDoneForTest();
 }
 
 namespace {
@@ -145,6 +148,93 @@ int wmain(int argc, wchar_t** argv) {
                 destroy_ok ? L"PASS" : L"FAIL", destroy_ms);
         wprintf(L"[%s] rapid switches coalesce to one open attempt (%u)\n",
                 coalesced ? L"PASS" : L"FAIL", open_attempts);
+
+        // Moving the window moves the pane, and the preview that lives in the
+        // overlay window has to land on the new screen position right away: a
+        // preview that follows late visibly trails the window while the user
+        // drags it. The Office and PDF providers own a window in another process,
+        // which is exactly the case that used to lag.
+        bool follow_ok = true;
+        if (!pulse::ui::PreviewHandlerHost::CanHost(path)) {
+            wprintf(L"[SKIP] overlay follow needs a file with a system preview handler\n");
+        } else {
+            double worst_follow_ms = 0.0;
+            double total_follow_ms = 0.0;
+            int steps = 0;
+            int missed = 0;
+            bool shown = false;
+            {
+                auto host = std::make_unique<pulse::ui::PreviewHandlerHost>();
+                host->SetNotifyWindow(owner);
+                host->Sync(owner, bounds, path, attrs, 31, modified, size, true, bg, fg, true, true);
+                const ULONGLONG shown_deadline = GetTickCount64() + 20000;
+                while (GetTickCount64() < shown_deadline) {
+                    MSG message{};
+                    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                    if (host->state() == pulse::ui::PreviewHandlerHost::State::Shown) {
+                        shown = true;
+                        break;
+                    }
+                    if (host->state() == pulse::ui::PreviewHandlerHost::State::Failed) break;
+                    Sleep(10);
+                }
+                const HWND overlay = host->overlay_window_for_test();
+                RECT rest_owner{};
+                RECT rest_overlay{};
+                if (shown && overlay && GetWindowRect(owner, &rest_owner) &&
+                    GetWindowRect(overlay, &rest_overlay)) {
+                    // The overlay keeps the same client-relative bounds, so it has
+                    // to move by exactly as much as the owner moved.
+                    const LONG offset = rest_overlay.left - rest_owner.left;
+                    // One step per frame of a drag, with no settling in between:
+                    // this is the rate the pane sees while the window is moving.
+                    pulse::ui::ResetOverlayPlaceCountsForTest();
+                    for (int step = 1; step <= 16; ++step) {
+                        const LONG want = rest_owner.left + 12 * step;
+                        SetWindowPos(owner, nullptr, want, rest_owner.top, 0, 0,
+                                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                        host->Reposition(); // what the app does from WM_MOVE
+                        const auto start = std::chrono::steady_clock::now();
+                        double elapsed = -1.0;
+                        RECT now{};
+                        for (;;) {
+                            const double waited = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - start).count();
+                            if (GetWindowRect(overlay, &now) && now.left == want + offset) {
+                                elapsed = waited;
+                                break;
+                            }
+                            if (waited > 500.0) break;
+                        }
+                        if (step <= 3 && elapsed < 0.0) {
+                            wprintf(L"    step %d want_overlay_left=%ld actual=%ld visible=%d\n",
+                                    step, want + offset, now.left,
+                                    IsWindowVisible(overlay) ? 1 : 0);
+                        }
+                        ++steps;
+                        if (elapsed < 0.0) {
+                            ++missed;
+                        } else {
+                            worst_follow_ms = (std::max)(worst_follow_ms, elapsed);
+                            total_follow_ms += elapsed;
+                        }
+                    }
+                }
+                host->Reset();
+                host.reset();
+                Sleep(200);
+            }
+            const double average = steps > missed ? total_follow_ms / (steps - missed) : 0.0;
+            follow_ok = shown && steps == 16 && missed == 0 && worst_follow_ms < 40.0;
+            wprintf(L"[%s] the overlay follows a moving owner (%d steps, shown=%d, "
+                    L"worst %.1f ms, average %.1f ms, missed %d, placements %u/%u)\n",
+                    follow_ok ? L"PASS" : L"FAIL", steps, shown ? 1 : 0,
+                    worst_follow_ms, average, missed,
+                    pulse::ui::OverlayPlaceDoneForTest(), pulse::ui::OverlayPlaceCallsForTest());
+        }
 
         // A provider that never comes back from its open used to stall this and
         // every later preview, because the apartment that opens it is also the
@@ -384,7 +474,7 @@ int wmain(int argc, wchar_t** argv) {
         DestroyWindow(owner);
         CoUninitialize();
         return sync_ok && reposition_ok && reset_ok && destroy_ok && coalesced && stall_ok &&
-                slow_ok ? 0 : 4;
+                slow_ok && follow_ok ? 0 : 4;
     }
 
     pulse::ui::PreviewHandlerHost host;

@@ -52,6 +52,12 @@ void SyncVisibleWatches(AppState& s);
 void BindCurrentLayout(AppState& s);
 std::wstring ResolveOpenFolderPath(std::wstring path);
 void OpenFolderInNewTab(AppState& s, const std::wstring& raw);
+// No window is "the primary": the singleton mutex, the tray icon, the global
+// hotkey and the session file belong to whoever is left. A window that started
+// as an extra one calls this when the window that owned them is closing (it took
+// its last tab); the mutex may still be held for a moment, so it retries from
+// the UI tick and gives up if somebody else claimed it in the meantime.
+void AdoptSingletonOwnership(AppState& s);
 void PostWorkerResult(AppState& s, app::WorkResult res);
 D2D1_RECT_F FocusedPaneRect(const AppState& s);
 app::Pane* PaneAtSlot(AppState& s, int index);

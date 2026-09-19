@@ -17,6 +17,8 @@
 #include "context_menu.h"
 #include "batch_rename.h"
 #include "link_resolve.h"
+#include "global_search_controller.h"
+#include "jump_list.h"
 #include "duplicate_scan.h"
 #include "resource.h"
 #include "pulse_version.h"
@@ -240,9 +242,36 @@ std::wstring ResolveOpenFolderPath(std::wstring path) {
 
 void OpenFolderInNewTab(AppState& s, const std::wstring& raw) {
     s.tray_controller.RestoreWindow();
-    const std::wstring path = ResolveOpenFolderPath(raw);
+    // Handed over tabs and shell forwards can name a virtual view ("pulse:recent",
+    // a tag, a saved search): those open as they are.
+    const std::wstring path = fs::IsVirtualPath(raw) ? raw : ResolveOpenFolderPath(raw);
     if (!path.empty() && !ActivateExistingFolderTab(s, path)) NewTab(s, path);
     else InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
+void AdoptSingletonOwnership(AppState& s) {
+    if (!s.secondaryInstance) return;
+    if (!s.adoptPending) {
+        s.adoptPending = true;
+        s.adoptDeadline = GetTickCount64() + 3000;
+    }
+    const auto result = s.single_instance.Acquire();
+    if (result != app::SingleInstanceCoordinator::AcquireResult::Primary) {
+        // The window that is closing still holds the mutex, or a freshly started
+        // window claimed it. Keep trying for a moment, then leave it alone: it
+        // belongs to whoever owns it, not to us.
+        if (GetTickCount64() >= s.adoptDeadline) s.adoptPending = false;
+        return;
+    }
+    s.adoptPending = false;
+    // From here on this window behaves like any other first window: it saves the
+    // session, keeps the tray icon and answers the global hotkey.
+    s.secondaryInstance = false;
+    ApplyGlobalSearchSettings(s);
+    s.tray_controller.SetVisible(s.appPrefs.keep_running_on_close ||
+                                 s.appPrefs.global_search_enabled);
+    app::RefreshJumpList(s.places.quick_access_paths);
+    InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
 void PostWorkerResult(AppState& s, app::WorkResult res) {
@@ -1537,6 +1566,15 @@ void ApplyHoverTarget(AppState& s, const ui::HitTestResult& hit) {
     s.hoverRegion = static_cast<int>(hit.region);
     s.hoverControlIndex = hit.index;
     s.hoverSubIndex = hit.sub_index;
+    // A tab that is being dragged is on its way out of the strip; a hint pinned
+    // to where it used to sit would stay behind in this window.
+    if (s.tabDragging || s.tabDragPending) {
+        s.hoverPath.clear();
+        s.hoverLabel.clear();
+        s.tooltipText.clear();
+        s.hoverSince = GetTickCount64();
+        return;
+    }
     s.hoverPath = hit.path;
     s.hoverLabel = hit.label;
     s.hoverSince = GetTickCount64();
