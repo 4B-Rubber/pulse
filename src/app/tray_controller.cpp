@@ -81,6 +81,7 @@ TrayController::CallbackResult TrayController::HandleCallback(LPARAM event) {
         if (!menu) return CallbackResult::Handled;
         AppendMenuW(menu, MF_STRING, 1, l10n::Get(l10n::StringId::Open).c_str());
         AppendMenuW(menu, MF_STRING, 2, l10n::Get(l10n::StringId::TrayExit).c_str());
+        AppendMenuW(menu, MF_STRING, 3, l10n::Get(l10n::StringId::TrayNewWindow).c_str());
         SetForegroundWindow(hwnd_);
         const int command = TrackPopupMenu(
             menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
@@ -88,7 +89,8 @@ TrayController::CallbackResult TrayController::HandleCallback(LPARAM event) {
         DestroyMenu(menu);
         PostMessageW(hwnd_, WM_NULL, 0, 0);
         if (command == 1) RestoreWindow();
-        return command == 2 ? CallbackResult::ExitRequested : CallbackResult::Handled;
+        if (command == 2) return CallbackResult::ExitRequested;
+        return command == 3 ? CallbackResult::NewWindowRequested : CallbackResult::Handled;
     }
     default:
         return CallbackResult::NotHandled;

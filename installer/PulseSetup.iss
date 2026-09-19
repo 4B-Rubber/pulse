@@ -91,9 +91,9 @@ Source: "{#BuildDir}\Pulse.Preview.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\pulse_shell.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Pulse"; Filename: "{app}\pulse.exe"; WorkingDir: "{app}"
+Name: "{group}\Pulse"; Filename: "{app}\pulse.exe"; WorkingDir: "{app}"; AppUserModelID: "Pulse.FileManager"
 Name: "{group}\{cm:UninstallProgram,Pulse}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Pulse"; Filename: "{app}\pulse.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\Pulse"; Filename: "{app}\pulse.exe"; WorkingDir: "{app}"; Tasks: desktopicon; AppUserModelID: "Pulse.FileManager"
 
 [Registry]
 ; Same key the in-app preference manages (src/app/app_prefs.cpp).

@@ -20,6 +20,8 @@
 #include "app_hosted_edit.h"
 #include "app_navigation.h"
 #include "app_runtime.h"
+#include "instance_launcher.h"
+#include "single_instance_coordinator.h"
 #include "../ui/address_search_layout.h"
 #include "search_query.h"
 #include "../common/localization.h"
@@ -52,6 +54,7 @@
 #include "../ui/color_picker.h"
 #include "../ui/bloom_accent_picker.h"
 #include "../ui/drag_drop.h"
+#include "../ui/drag_ghost.h"
 #include "../ui/ui_renderer.h"
 #include "../ui/preview_footer_layout.h"
 #include "../ops/ops_manager.h"
@@ -5043,6 +5046,86 @@ void TestDetailsPreviewInteraction() {
     SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous[0] ? previous : nullptr);
 }
 
+// A tab dragged out of its strip is dropped on whichever Pulse window is under
+// the cursor, and the floating card that follows the pointer must never count as
+// one: the card is a topmost window of its own, so a card left visible would
+// swallow the very drop it belongs to. This pins down the two halves a window
+// drag depends on - where the drop lands, and where the card hangs - because
+// both are pure window-manager behavior that no model test can reach.
+void TestTabHandoff() {
+    const wchar_t* main_class = SingleInstanceCoordinator::WindowClassName();
+    const wchar_t* card_class = L"PulseTabDragGhost";
+    // The card first: looking it up by class name below must not pick up one of
+    // the probe windows that carry the same name.
+    {
+        ui::TabDragGhost card;
+        card.Show(1.0f, L"文档", false, 40, 12);
+        card.Follow(POINT{300, 300});
+        RECT card_rect{};
+        const HWND card_hwnd = FindWindowW(card_class, nullptr);
+        Check(card.visible() && card_hwnd != nullptr && GetWindowRect(card_hwnd, &card_rect) &&
+            card_rect.left == 300 - 40 && card_rect.top == 300 - 12,
+            L"tab-handoff: the drag card hangs by the grab offset");
+        card.Hide();
+        Check(!card.visible(), L"tab-handoff: the drag card is hidden before the hand-off");
+    }
+
+    // The classes may already exist - the card registers its own on the first
+    // Show - and a probe window only needs the name, not a class of its own.
+    auto ensure_class = [](const wchar_t* name) -> int {
+        WNDCLASSW desc{};
+        desc.lpfnWndProc = DefWindowProcW;
+        desc.hInstance = GetModuleHandleW(nullptr);
+        desc.lpszClassName = name;
+        if (RegisterClassW(&desc)) return 1;
+        return GetLastError() == ERROR_CLASS_ALREADY_EXISTS ? 0 : -1;
+    };
+    const int main_state = ensure_class(main_class);
+    const int card_state = ensure_class(card_class);
+    if (main_state < 0 || card_state < 0) {
+        LogLine(L"[SKIP] tab-handoff: the probe window classes are unavailable\n");
+        return;
+    }
+    auto make_probe = [](const wchar_t* cls, int x) {
+        HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, cls, L"", WS_POPUP,
+                                    x, 0, 80, 80, nullptr, nullptr,
+                                    GetModuleHandleW(nullptr), nullptr);
+        if (hwnd) {
+            // Topmost so the probe wins the hit test over whatever else is on
+            // screen, never activated so running the self-test does not steal
+            // the keyboard from the window the user is working in.
+            SetWindowPos(hwnd, HWND_TOPMOST, x, 0, 80, 80, SWP_NOACTIVATE);
+            ShowWindow(hwnd, SW_SHOWNA);
+            UpdateWindow(hwnd);
+        }
+        return hwnd;
+    };
+    HWND first = make_probe(main_class, 0);
+    HWND second = make_probe(main_class, 100);
+    HWND card_window = make_probe(card_class, 200);
+    Check(first && second && card_window, L"tab-handoff: the probe windows open");
+    if (first && second && card_window) {
+        MSG pending{};
+        while (PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&pending);
+            DispatchMessageW(&pending);
+        }
+        Check(PulseWindowUnderPoint(POINT{40, 40}, nullptr) == first,
+            L"tab-handoff: the window under the cursor takes the tab");
+        Check(PulseWindowUnderPoint(POINT{140, 40}, nullptr) == second,
+            L"tab-handoff: the other window takes it when the cursor moves on");
+        Check(PulseWindowUnderPoint(POINT{40, 40}, first) == nullptr,
+            L"tab-handoff: the window that owns the tab is never its own target");
+        Check(PulseWindowUnderPoint(POINT{240, 40}, nullptr) == nullptr,
+            L"tab-handoff: a window carrying the drag card's class is never a target");
+    }
+    if (card_window) DestroyWindow(card_window);
+    if (second) DestroyWindow(second);
+    if (first) DestroyWindow(first);
+    if (card_state == 1) UnregisterClassW(card_class, GetModuleHandleW(nullptr));
+    if (main_state == 1) UnregisterClassW(main_class, GetModuleHandleW(nullptr));
+}
+
 int RunSelfTest1B2() {
     // These model assertions use the Chinese resource strings explicitly.
     l10n::Initialize(GetModuleHandleW(nullptr), L"zh-CN");
@@ -5158,6 +5241,12 @@ int RunSelfTest1B2() {
         if (g_log) { fclose(g_log); g_log = nullptr; }
         return g_fail ? 1 : 0;
     }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"tab-handoff") == 0) {
+        TestTabHandoff();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
 
     TestDetailsPreviewInteraction();
     TestBreadcrumb();
@@ -5204,6 +5293,7 @@ int RunSelfTest1B2() {
     TestTabShortcuts();
     TestStagingTrayDeletion();
     TestLayoutOwnedTabs();
+    TestTabHandoff();
     TestUtf8PersistFile();
     TestColorPickerModel();
     TestBloomAccentGeometry();

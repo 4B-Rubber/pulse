@@ -1,6 +1,7 @@
 #include "tab_controller.h"
 
 #include "context_menu.h"
+#include "instance_launcher.h"
 #include "../common/localization.h"
 
 #include <algorithm>
@@ -231,6 +232,8 @@ void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt
     std::vector<ui::FluentMenuItem> items;
     items.push_back(MenuItem(CmdTabNewRight, TabText(Text::TabNewRight), L"\xE710"));
     items.push_back(MenuItem(CmdTabDuplicate, TabText(Text::TabDuplicate), L"\xE8C8"));
+    items.push_back(MenuItem(CmdTabOpenInNewWindow,
+        pulse::l10n::Get(pulse::l10n::StringId::TabOpenNewWindow).c_str()));
     items.push_back(MenuItem(CmdTabRename,
         pulse::l10n::Get(pulse::l10n::StringId::TabRename).c_str(), L"\xE8AC"));
     ui::FluentMenuItem colors;
@@ -288,6 +291,11 @@ void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt
             if (Tab* created = tabs.Active()->ActiveFolder())
                 callbacks_.load_tab(*created);
         }
+    } else if (command == CmdTabOpenInNewWindow) {
+        // A second window for this folder. Virtual paths (home, search, settings)
+        // are not folders: the new window then picks its own start folder.
+        const Tab* folder = tab.ActiveFolder();
+        app::LaunchNewWindow(folder ? folder->current_path : std::wstring{});
     } else if (command == CmdTabRename) {
         std::wstring draft = LayoutTabTitle(tab);
         menu.SetFilterPlaceholder(pulse::l10n::Get(pulse::l10n::StringId::TabNameHint));

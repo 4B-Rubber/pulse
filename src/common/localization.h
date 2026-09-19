@@ -819,6 +819,9 @@ enum class StringId : UINT {
     ContentSortingFormat = IDS_CONTENT_SORTING_FORMAT,
     ContentFilesBusy = IDS_CONTENT_FILES_BUSY,
     SearchCount = IDS_AUDIT_SEARCHCOUNT,
+    TabOpenNewWindow = IDS_TAB_OPEN_NEW_WINDOW,
+    TrayNewWindow = IDS_TRAY_NEW_WINDOW,
+    JumpListPinned = IDS_JUMPLIST_PINNED,
 };
 
 bool IsLanguageId(std::wstring_view id) noexcept;
