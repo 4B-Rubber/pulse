@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace pulse::ui {
 
@@ -48,12 +49,25 @@ private:
     void Publish(bool enabled, HWND owner, const RECT& bounds,
                  const std::wstring& path, const std::wstring& identity,
                  DWORD attrs, bool immediate);
+    // One apartment serves every preview, and it also owns the overlay window.
+    // A provider that never returns from its open would therefore stall every
+    // later preview, so the apartment is retired and the next selection starts a
+    // fresh one. The request the pane is still showing is allowed to be slow
+    // (starting an Office preview starts its application); anything else, and a
+    // request the pane no longer asks for, is given up on early. Returns true
+    // when the stalled apartment was retired.
+    bool RetireStalledApartment(const std::wstring& requested_identity, bool requested);
+    void ReapRetired();
     static DWORD WINAPI WorkerMain(void* parameter);
 
     std::shared_ptr<WorkerState> worker_;
+    // Apartments that were retired while stuck. They keep themselves alive until
+    // the provider call they are inside returns, then unload and exit.
+    std::vector<std::shared_ptr<WorkerState>> retired_;
     HWND notify_ = nullptr;
     bool app_active_ = true;
     std::wstring last_identity_;
+    std::wstring last_path_;
     RECT last_bounds_{};
     HWND last_owner_ = nullptr;
     bool last_enabled_ = false;
