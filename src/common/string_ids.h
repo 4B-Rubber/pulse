@@ -1358,3 +1358,9 @@
 #define IDS_UI_FONT_DEFAULT 2522
 #define IDS_UI_FONT_LARGE 2523
 #define IDS_UI_FONT_LARGER 2524
+
+// Second window: tab menu entry and tray menu entry. (Renumbered past the newest
+// upstream ids, which landed on main after this branch started.)
+#define IDS_TAB_OPEN_NEW_WINDOW 2525
+#define IDS_TRAY_NEW_WINDOW 2526
+#define IDS_JUMPLIST_PINNED 2527

@@ -31,6 +31,8 @@
 #include "snapshot_patch.h"
 #include "session.h"
 #include "session_save.h"
+#include "instance_launcher.h"
+#include "jump_list.h"
 #include "context_menu.h"
 #include "context_menu_controller.h"
 #include "shell_verbs.h"
@@ -474,6 +476,15 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         RefreshSidebarModel(*s);
         ui::typography::SetUiFontScale(s->appPrefs.ui_font_scale);
+        // The taskbar jump list mirrors what is pinned to quick access. It needs
+        // the localized category and task names, so it runs after l10n::Initialize;
+        // only the primary window owns the taskbar identity.
+        if (!s->secondaryInstance) app::RefreshJumpList(s->places.quick_access_paths);
+        // A window that was started as an extra one may be the only one left (a
+        // tab torn out to the desktop closes its window), and then the tray, the
+        // hotkey and the session belong to it. Retried in the background, so a
+        // window with a living owner simply gives up.
+        if (s->secondaryInstance) AdoptSingletonOwnership(*s);
         ui::typography::InvalidateCaches();
         s->compositor.RecreateTextFormats(s->scale);
         if (s->safeMode) {
@@ -733,6 +744,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         else if (!s->shot.active && !s->open_path.empty())
             startPath = app::IsThisPcArgument(s->open_path) ? std::wstring()
                                                             : ResolveOpenFolderPath(s->open_path);
+        // A new window nobody aimed anywhere: the recent view, not whatever the
+        // window that spawned it happened to be showing.
+        else if (!s->shot.active && s->secondaryInstance) startPath = app::MakeRecentPath();
         else if (open_default_location)
             startPath = app::DefaultLocation(s->appPrefs); // empty = This PC
         s->pane->NewTab(startPath);
@@ -745,7 +759,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             SelectLaunchedFile(*s, s->open_path);
         }
 
-        if (!s->shot.active && !s->open_path.empty() &&
+        // The restored-primary case: the requested folder joins the restored tabs.
+        // A new window has exactly one tab, so it never lands here.
+        if (!s->shot.active && !s->secondaryInstance && !s->open_path.empty() &&
             (!s->session_layout_tabs.empty() || !s->session_path.empty())) {
             const bool this_pc = app::IsThisPcArgument(s->open_path);
             const std::wstring open_path = this_pc ? std::wstring() : ResolveOpenFolderPath(s->open_path);
@@ -872,7 +888,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (wParam == HTCLOSE) {
             SuspendContentSearches(*s);
             s->globalSearchWindow.Hide();
-            if (s->appPrefs.keep_running_on_close || s->appPrefs.global_search_enabled) HideMainWindowToTray(*s);
+            // A second window has no tray icon to hide behind.
+            if (!s->secondaryInstance &&
+                (s->appPrefs.keep_running_on_close || s->appPrefs.global_search_enabled))
+                HideMainWindowToTray(*s);
             else DestroyWindow(hwnd);
             return 0;
         }
@@ -881,7 +900,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_CLOSE: {
         if (s) { SuspendContentSearches(*s); s->globalSearchWindow.Hide(); }
-        if (s && (s->appPrefs.keep_running_on_close || s->appPrefs.global_search_enabled)) {
+        // A window whose last tab went to a sibling has nothing to hide: it is
+        // closing for good, whether or not it used to keep the tray icon.
+        if (s && !s->mergedAway && !s->secondaryInstance &&
+            (s->appPrefs.keep_running_on_close || s->appPrefs.global_search_enabled)) {
             HideMainWindowToTray(*s);
             return 0;
         }
@@ -905,6 +927,20 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             return TRUE; // acceptance, not a claim that asynchronous enumeration succeeded
         }
         std::wstring path;
+        if (s && app::SingleInstanceCoordinator::DecodeTabTransfer(cds, path)) {
+            // The window that sent this is closing: the tab it could not keep is
+            // ours now, and so are the resources it used to own. Always a new
+            // tab - the tab the user dragged has to show up here, even when this
+            // window already has that folder open (the forwarded path below
+            // activates the existing tab instead).
+            // A virtual location ("pulse:recent", a tag, a search) is opened as
+            // it is; only a real path is resolved to its folder.
+            const std::wstring resolved =
+                fs::IsVirtualPath(path) ? path : ResolveOpenFolderPath(path);
+            if (!resolved.empty()) NewTab(*s, resolved);
+            AdoptSingletonOwnership(*s);
+            return TRUE;
+        }
         if (!s || !app::SingleInstanceCoordinator::DecodeOpenPath(cds, path)) return FALSE;
         OpenFolderInNewTab(*s, path);
         return TRUE;
@@ -913,6 +949,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case app::TrayController::kCallbackMessage: {
         if (!s) return 0;
         const auto result = s->tray_controller.HandleCallback(lParam);
+        if (result == app::TrayController::CallbackResult::NewWindowRequested) {
+            const app::Tab* tab = ActiveTab(*s);
+            app::LaunchNewWindow(tab ? tab->current_path : std::wstring{});
+            return 0;
+        }
         if (result == app::TrayController::CallbackResult::ExitRequested)
             DestroyWindow(hwnd);
         return 0;
@@ -1111,6 +1152,13 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (PumpRecycleRefresh(*s, now)) dirty = true;
             MaybePrefetchHoverCtxMenu(*s);
             s->places.FlushPendingSave(false);
+            // A window that took a closing sibling's last tab becomes the window
+            // that owns the tray, the hotkey and the session. The mutex may still
+            // be held for a moment, so the takeover is retried from here.
+            if (s->adoptPending && now - s->adoptLastTry >= 150) {
+                s->adoptLastTry = now;
+                AdoptSingletonOwnership(*s);
+            }
             if (s->renameClickCandidate && s->renameClickDue != 0 &&
                 now >= s->renameClickDue) {
                 app::Tab* tab = ActiveTab(*s);
@@ -1908,7 +1956,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!s->shot.active && !s->menushot && !s->isolatedTest) {
                 // A hidden tag-only launch must not overwrite the real
                 // window/tab session (SessionWritable); tags and places still save below.
-                if (!s->updateSessionPrepared) SaveWindowSession(*s, hwnd, true);
+                // A second window owns none of that either: saving its own tabs,
+                // tray deck and undo stack would replace the primary's.
+                if (!s->secondaryInstance && !s->mergedAway && !s->updateSessionPrepared)
+                    SaveWindowSession(*s, hwnd, true);
                 s->places.Save();
                 s->ctxMenuPrefs.Save();
                 if (!s->updateSessionPrepared) s->appPrefs.Save();
@@ -2160,6 +2211,7 @@ bool SkipSingletonFromArgv() {
             wcscmp(__wargv[i], L"--shot") == 0 ||
             wcscmp(__wargv[i], L"--menushot") == 0 ||
             wcscmp(__wargv[i], L"--test-instance") == 0 ||
+            wcscmp(__wargv[i], L"--new-window") == 0 ||
             wcscmp(__wargv[i], L"--colorpickshot") == 0 ||
             wcscmp(__wargv[i], L"--colorpickdialog") == 0)
             return true;
@@ -2169,6 +2221,9 @@ bool SkipSingletonFromArgv() {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     pulse::crash::Initialize({pulse::crash::ProcessRole::App, false, {}});
+    // One taskbar identity for every Pulse window; the installer puts the same
+    // one on the shortcuts so a pinned button and a running window agree.
+    SetCurrentProcessExplicitAppUserModelID(app::kAppUserModelId);
     pulse::compat::EnableDpiAwareness();
     // OLE init (drag & drop + clipboard); implies STA COM init.
     OleInitialize(nullptr);
@@ -2200,6 +2255,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         state.isolatedTestPersist = true;
 #endif
     for (int i = 1; i < __argc; ++i)
+        if (wcscmp(__wargv[i], L"--new-window") == 0) state.secondaryInstance = true;
+    for (int i = 1; i < __argc; ++i)
         if (state.isolatedTest && wcscmp(__wargv[i], L"--content-index-observer") == 0) state.contentIndexObserver = true;
 
 #ifdef PULSE_WITH_SELFTEST
@@ -2217,6 +2274,34 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     // Load previous session before parsing overrides.
     app::SessionSnapshot session;
     if ((!state.isolatedTest || state.isolatedTestPersist) && app::LoadSession(session)) {
+        // A second window starts where the primary was, but owns its own tabs:
+        // the persisted layout, tray deck and undo stack stay with the primary.
+        if (state.secondaryInstance) {
+            session.layout_tabs.clear();
+            session.tab_groups.clear();
+            session.tray.Clear();
+            session.undo_json.clear();
+            // The window opens what it was asked for - or the recent view - as its
+            // only tab. Starting from the primary's location would hand it a tab
+            // the user never asked for, on top of the one they dropped it on.
+            session.active_path.clear();
+            // Cascade past the Pulse windows that are already open, so the new
+            // one does not land exactly on the window that asked for it.
+            int open_windows = 0;
+            HWND other = nullptr;
+            while (open_windows < 8) {
+                other = FindWindowExW(nullptr, other,
+                                      app::SingleInstanceCoordinator::WindowClassName(),
+                                      nullptr);
+                if (!other) break;
+                ++open_windows;
+            }
+            const LONG step = 32 * static_cast<LONG>(open_windows);
+            session.window_rect.left += step;
+            session.window_rect.top += step;
+            session.window_rect.right += step;
+            session.window_rect.bottom += step;
+        }
         state.session_path = session.active_path;
         state.session_layout_tabs = std::move(session.layout_tabs);
         state.session_tab_groups = std::move(session.tab_groups);
@@ -2323,7 +2408,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
                 state.shot.width = std::max(320, requestedWidth);
                 state.shot.height = std::max(240, requestedHeight);
             }
-        } else if (i == __argc - 1) {
+        } else if (i == __argc - 1 && __wargv[i][0] != L'-') {
+            // A trailing switch is not a path: `--new-window` with no folder used
+            // to open a tab titled after the flag itself.
             state.shot.path = __wargv[i];
         } else if (__wargv[i][0] != L'-' && state.shot.path.empty()) {
             state.shot.path = __wargv[i]; // tolerate path not being the last argument

@@ -10,7 +10,7 @@ namespace {
 
 constexpr UINT kFirstString = IDS_SETTINGS;
 // Must stay on the highest allocated string id, otherwise Get() returns empty.
-constexpr UINT kLastString = IDS_UI_FONT_LARGER;
+constexpr UINT kLastString = IDS_JUMPLIST_PINNED;
 static_assert(static_cast<UINT>(StringId::UiFontLarger) <= kLastString);
 static_assert(static_cast<UINT>(StringId::UpdateWaitingOperations) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SidebarShowHidden) <= kLastString);
@@ -21,6 +21,9 @@ static_assert(static_cast<UINT>(StringId::NetworkLiveAddFailed) <= kLastString);
 static_assert(static_cast<UINT>(StringId::IntegrationReapply) <= kLastString);
 static_assert(static_cast<UINT>(StringId::UpdateDescManual) <= kLastString);
 static_assert(static_cast<UINT>(StringId::Downloads) <= kLastString);
+static_assert(static_cast<UINT>(StringId::TabOpenNewWindow) <= kLastString);
+static_assert(static_cast<UINT>(StringId::TrayNewWindow) <= kLastString);
+static_assert(static_cast<UINT>(StringId::JumpListPinned) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SettingsChangeTracking) >= kFirstString &&
               static_cast<UINT>(StringId::ChangeDisabled) <= kLastString &&
               static_cast<UINT>(StringId::FolderSortMixed) <= kLastString &&

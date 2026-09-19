@@ -3111,5 +3111,21 @@ BEGIN
     IDS_UI_FONT_LARGER "Larger"
 END
 
+// Second window: tab and tray menu entries.
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+    IDS_TAB_OPEN_NEW_WINDOW "在新窗口中打开"
+    IDS_TRAY_NEW_WINDOW "新建窗口"
+    IDS_JUMPLIST_PINNED "已固定"
+END
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+    IDS_TAB_OPEN_NEW_WINDOW "Open in new window"
+    IDS_TRAY_NEW_WINDOW "New window"
+    IDS_JUMPLIST_PINNED "Pinned"
+END
+
 // Traditional Chinese (Taiwan), generated from the Simplified blocks above.
 #include "strings_zh_tw.rcinc"
