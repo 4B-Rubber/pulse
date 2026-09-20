@@ -20,6 +20,7 @@
 #include "app_hosted_edit.h"
 #include "app_navigation.h"
 #include "app_runtime.h"
+#include "tab_controller.h"
 #include "instance_launcher.h"
 #include "single_instance_coordinator.h"
 #include "../ui/address_search_layout.h"
@@ -5110,20 +5111,152 @@ void TestTabHandoff() {
             TranslateMessage(&pending);
             DispatchMessageW(&pending);
         }
-        Check(PulseWindowUnderPoint(POINT{40, 40}, nullptr) == first,
-            L"tab-handoff: the window under the cursor takes the tab");
-        Check(PulseWindowUnderPoint(POINT{140, 40}, nullptr) == second,
-            L"tab-handoff: the other window takes it when the cursor moves on");
-        Check(PulseWindowUnderPoint(POINT{40, 40}, first) == nullptr,
-            L"tab-handoff: the window that owns the tab is never its own target");
-        Check(PulseWindowUnderPoint(POINT{240, 40}, nullptr) == nullptr,
-            L"tab-handoff: a window carrying the drag card's class is never a target");
+        // WindowFromPoint answers who is physically on top, so a later topmost
+        // window - a notification, an IME candidate or another always-on-top
+        // app - can sit over a probe and make the hit test "fail" for reasons
+        // Pulse does not own. Skip rather than report it: a flaky red here would
+        // hide a real regression, and the drop logic is still exercised whenever
+        // the desktop happens to be clear.
+        auto probe_on_top = [](POINT point, HWND probe) {
+            const HWND top = WindowFromPoint(point);
+            return top != nullptr && GetAncestor(top, GA_ROOT) == probe;
+        };
+        if (!probe_on_top(POINT{40, 40}, first) || !probe_on_top(POINT{140, 40}, second) ||
+            !probe_on_top(POINT{240, 40}, card_window)) {
+            LogLine(L"[SKIP] tab-handoff: the probe windows are covered\n");
+        } else {
+            Check(PulseWindowUnderPoint(POINT{40, 40}, nullptr) == first,
+                L"tab-handoff: the window under the cursor takes the tab");
+            Check(PulseWindowUnderPoint(POINT{140, 40}, nullptr) == second,
+                L"tab-handoff: the other window takes it when the cursor moves on");
+            Check(PulseWindowUnderPoint(POINT{40, 40}, first) == nullptr,
+                L"tab-handoff: the window that owns the tab is never its own target");
+            Check(PulseWindowUnderPoint(POINT{240, 40}, nullptr) == nullptr,
+                L"tab-handoff: a window carrying the drag card's class is never a target");
+        }
     }
     if (card_window) DestroyWindow(card_window);
     if (second) DestroyWindow(second);
     if (first) DestroyWindow(first);
     if (card_state == 1) UnregisterClassW(card_class, GetModuleHandleW(nullptr));
     if (main_state == 1) UnregisterClassW(main_class, GetModuleHandleW(nullptr));
+}
+
+// A group chip is a control, not a label: clicking it folds the group's tabs out
+// of the strip, clicking it again brings them back, and the folded flag is what
+// the session stores. The chip press used to bail out before arming, which left
+// ToggleGroupCollapse unreachable from the window.
+void TestTabGroupCollapse() {
+    WindowTabs tabs;
+    tabs.EnsureDefault();
+    tabs.NewTab(L"C:\\work");
+    tabs.NewTab(L"D:\\media");
+    TabGroup group;
+    group.id = 1;
+    group.name = L"group";
+    group.color_rgb = 0x0078D4;
+    tabs.tab_groups.push_back(group);
+    for (auto& item : tabs.items) item->tab_group = 1;
+
+    ui::WindowViewModel expanded;
+    FillWindowTabStrip(expanded, tabs);
+    Check(expanded.tabs.size() == tabs.items.size() && !expanded.tabs[0].hidden &&
+        !expanded.tabs[1].hidden,
+        L"tab-groups: an expanded group shows its members");
+    const auto expanded_rows = TabGroupCardRows(tabs, 1);
+    Check(expanded_rows.size() == 2 && expanded_rows[0].new_tab &&
+        expanded_rows[1].edit && expanded_rows[0].tab_index < 0,
+        L"tab-groups: an expanded chip card offers only the two actions");
+
+    TabController controller;
+    controller.ToggleGroupCollapse(tabs, 1);
+    Check(tabs.tab_groups[0].collapsed, L"tab-groups: the chip folds the group");
+    ui::WindowViewModel folded;
+    FillWindowTabStrip(folded, tabs);
+    Check(folded.tabs.size() > 1 && folded.tabs[0].hidden && folded.tabs[1].hidden,
+        L"tab-groups: folded members leave the strip");
+    Check(folded.tab_groups.size() == 1 && folded.tab_groups[0].has_active,
+        L"tab-groups: the folded chip marks the group holding the active tab");
+    const auto folded_rows = TabGroupCardRows(tabs, 1);
+    const size_t members = tabs.items.size();
+    Check(folded_rows.size() == members + 2 &&
+        folded_rows[0].tab_index == 0 &&
+        folded_rows[members - 1].separator_after &&
+        folded_rows[members].new_tab && folded_rows[members + 1].edit,
+        L"tab-groups: a folded chip card lists its members above the actions");
+    bool card_active_ok = true;
+    for (const auto& row : folded_rows) {
+        const bool expected = row.tab_index == static_cast<int>(tabs.active);
+        if (row.active != expected) card_active_ok = false;
+    }
+    Check(card_active_ok, L"tab-groups: the card marks exactly the active member row");
+    controller.ToggleGroupCollapse(tabs, 1);
+    Check(!tabs.tab_groups[0].collapsed, L"tab-groups: the chip unfolds it again");
+
+    // The marker tracks the active tab: moving it outside the group clears it.
+    tabs.items[0]->tab_group = 0;
+    tabs.active = 0;
+    ui::WindowViewModel unmarked;
+    FillWindowTabStrip(unmarked, tabs);
+    Check(unmarked.tab_groups.size() == 1 && !unmarked.tab_groups[0].has_active,
+        L"tab-groups: a chip without the active tab is not marked");
+
+    // The card belongs to the group it was opened for: an unknown id has none,
+    // and a second group never lends it members.
+    Check(TabGroupCardRows(tabs, 99).empty(),
+        L"tab-groups: an unknown group has no card");
+    TabGroup other;
+    other.id = 2;
+    other.name = L"other";
+    other.collapsed = true;
+    tabs.tab_groups.push_back(other);
+    tabs.tab_groups[0].collapsed = true;
+    tabs.items[1]->tab_group = 2;
+    const auto own_rows = TabGroupCardRows(tabs, 1);
+    const auto other_rows = TabGroupCardRows(tabs, 2);
+    Check(own_rows.size() == 3 && other_rows.size() == 3 &&
+        own_rows[0].tab_index == 2 && other_rows[0].tab_index == 1 &&
+        own_rows[1].new_tab && own_rows[2].edit &&
+        other_rows[1].new_tab && other_rows[2].edit,
+        L"tab-groups: a card lists only the members of its own group");
+
+    // A tab added to a folded group unfolds it: the new tab is the active one,
+    // and an active tab hidden inside a fold would leave the strip unchanged.
+    controller.NewTabInGroup(tabs, 1);
+    const LayoutTab* created = tabs.Active();
+    Check(!tabs.tab_groups[0].collapsed && created && created->tab_group == 1,
+        L"tab-groups: a tab added to a folded group unfolds it");
+
+    // Group 1 now holds items[2] and the tab NewTabInGroup just created, with
+    // the new tab active. The card tells "you are here" apart from "you were
+    // here": while the group owns the active tab the memory is ignored, and a
+    // group the window has left marks the remembered member with a faint check.
+    const LayoutTab* remembered = tabs.items[2].get();
+    tabs.tab_groups[0].collapsed = true;
+    const auto owns_active_rows = TabGroupCardRows(tabs, 1, remembered);
+    int active_rows = 0;
+    bool memory_suppressed = true;
+    for (const auto& row : owns_active_rows) {
+        if (row.active) ++active_rows;
+        memory_suppressed &= !row.was_active;
+    }
+    Check(owns_active_rows.size() == 4 && active_rows == 1 && memory_suppressed,
+        L"tab-groups: the active row wins over the remembered tab");
+
+    tabs.active = 0; // the active tab now sits outside group 1
+    const auto history_rows = TabGroupCardRows(tabs, 1, remembered);
+    bool history_ok = history_rows.size() == 4; // two members plus the actions
+    int faint_rows = 0;
+    for (const auto& row : history_rows) {
+        if (row.was_active) {
+            ++faint_rows;
+            history_ok &= !row.active && row.tab_index == 2;
+        } else {
+            history_ok &= !row.active;
+        }
+    }
+    Check(history_ok && faint_rows == 1,
+        L"tab-groups: only the remembered member carries the faint mark");
 }
 
 int RunSelfTest1B2() {
@@ -5247,6 +5380,12 @@ int RunSelfTest1B2() {
         if (g_log) { fclose(g_log); g_log = nullptr; }
         return g_fail ? 1 : 0;
     }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"tab-groups") == 0) {
+        TestTabGroupCollapse();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
 
     TestDetailsPreviewInteraction();
     TestBreadcrumb();
@@ -5294,6 +5433,7 @@ int RunSelfTest1B2() {
     TestStagingTrayDeletion();
     TestLayoutOwnedTabs();
     TestTabHandoff();
+    TestTabGroupCollapse();
     TestUtf8PersistFile();
     TestColorPickerModel();
     TestBloomAccentGeometry();

@@ -196,6 +196,13 @@ bool ChipBlockCrossed(float block_left, float block_w, float neighbor_center, in
 // sits at old_rest + cur_off and must land at new_rest.
 float DisplacedRestDelta(float old_rest, float cur_off, float new_rest);
 
+// Centre (px) a dragged tab's leading edge must pass to cross a neighbor run:
+// the member it meets for an expanded run ([block_left, block_right] px, one
+// slot wide: slot_w), or the whole block for a folded chip, which is already
+// that cheap. dir < 0 moves left (the right-hand member leads), dir > 0 right.
+float RunCrossCenter(bool collapsed, float block_left, float block_right,
+                     float slot_w, int dir);
+
 // Contiguous run [pos, pos+len) of group gid's members in a strip order
 // (display position -> tab index; tab_group_of maps tab index -> group id)
 // that contains display position at. {0,0} when at is out of range or the
@@ -313,6 +320,15 @@ std::unique_ptr<LayoutTab> MakeSingleLayoutTab(const std::wstring& path,
 void RebuildLayoutRoot(LayoutTab& tab);
 std::wstring LayoutTabTitle(const LayoutTab& tab);
 void FillWindowTabStrip(ui::WindowViewModel& vm, const WindowTabs& tabs);
+// Rows of the group-chip hover card: one row per member tab (collapsed groups
+// only, separated from the actions) followed by "New tab in group" and
+// "Edit group". Empty when the group no longer exists.
+// `group_last_active` is the tab the window last used inside that group (see
+// RememberGroupActivation); it is marked with `was_active` only while the group
+// does not own the active tab, so the card can tell "you are here" apart from
+// "you were here".
+std::vector<ui::TabGroupCardRow> TabGroupCardRows(const WindowTabs& tabs, int group_id,
+                                                  const LayoutTab* group_last_active = nullptr);
 
 // Pull every group's members into one contiguous run (group order by first
 // appearance; member order preserved). Chromium keeps groups always

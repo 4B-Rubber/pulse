@@ -389,9 +389,9 @@ void ResetTabDrag(AppState& s, HWND hwnd) {
 
 // Moves the dragged tab to the Pulse window under the cursor, the way Explorer
 // moves a tab between its own windows. Returns false when no other Pulse window
-// is there, or when the tab cannot travel: a window left without tabs has
-// nothing to show, and a virtual location (search results, a tag) means nothing
-// to the window that receives it.
+// is there, or when the tab has nothing to hand over. A virtual view ("最近使用",
+// a tag, a search) travels like any other location, and a window that is left
+// without tabs closes instead of staying empty.
 bool HandOffTabUnderCursor(AppState& s, HWND hwnd) {
     if (s.tabDragIndex < 0 || s.tabDragIndex >= static_cast<int>(s.window_tabs.items.size()))
         return false;
@@ -430,6 +430,8 @@ bool HandOffTabUnderCursor(AppState& s, HWND hwnd) {
         return true;
     }
     s.window_tabs.CloseTab(static_cast<size_t>(s.tabDragIndex));
+    // The tab left this window; drop any memory that still points at it.
+    PruneGroupActivations(s);
     BindCurrentLayout(s);
     return true;
 }
@@ -1442,9 +1444,20 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                             break;
                                         }
                                     }
+                                    // Crossing an expanded run costs what crossing
+                                    // one tab costs: the dragged tab's leading edge
+                                    // only has to pass the centre of the member it
+                                    // meets, not the centre of the whole run (a
+                                    // three-tab group asked for ~250 px of travel,
+                                    // which read as "dropping on a group does not
+                                    // work"). A folded run is a chip, and its own
+                                    // centre is already as cheap.
+                                    const float nearCenter = app::RunCrossCenter(
+                                        chipGi >= 0, blockLeft, blockRight,
+                                        s->tabSlotW, dx);
                                     if (haveBlock &&
                                         app::ChipBlockCrossed(s->tabDragFloatLeft, s->tabSlotW,
-                                            (blockLeft + blockRight) * 0.5f + blockOff, dx)) {
+                                            nearCenter + blockOff, dx)) {
                                         // The run slides one slot against the
                                         // drag direction (MoveTabRun keeps the
                                         // group contiguous by construction).
@@ -1740,7 +1753,7 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                     for (int p = 0; p < n; ++p)
                                         if (s->tagOrder[static_cast<size_t>(p)] == idx) {
                                             oldPos = p;
-                                            return DefWindowProcW(hwnd, msg, wParam, lParam);
+                                            break;
                                         }
                                     if (oldPos < 0 || oldPos == pos) continue;
                                     const std::wstring& label =
@@ -1880,6 +1893,7 @@ LRESULT HandleMouseLeave(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             s->hoverLabel.clear();
             s->hoverSince = 0;
             s->tooltipText.clear();
+            HideTabGroupCard(*s);
             s->bloom_accent.SetPointer(0.0f, 0.0f, false);
             if (GetCapture() != hwnd) s->dragPending = false;
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -2038,6 +2052,39 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             s->dragStartPt = POINT{ mx, my };
             SetCapture(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (hit.region == ui::HitTestResult::TabGroupCardRow ||
+                   hit.region == ui::HitTestResult::TabGroupCard) {
+            // Group hover card. Member rows switch to that tab and leave the
+            // group folded - the card is how a folded group is read, and
+            // unfolding on every pick would shuffle the strip for a tab the user
+            // chose out of a list. The trailing rows run the two group actions.
+            // Both cases dismiss the card.
+            const int group_id = vm.tab_group_card.group_id;
+            const ui::TabGroupCardRow* row =
+                hit.region == ui::HitTestResult::TabGroupCardRow && hit.index >= 0 &&
+                hit.index < static_cast<int>(vm.tab_group_card.rows.size())
+                    ? &vm.tab_group_card.rows[static_cast<size_t>(hit.index)] : nullptr;
+            HideTabGroupCard(*s);
+            if (row && group_id != 0) {
+                if (row->tab_index >= 0) {
+                    if (row->tab_index < static_cast<int>(s->window_tabs.items.size()))
+                        SwitchTab(*s, row->tab_index);
+                } else if (row->new_tab) {
+                    RememberGroupActivation(*s, s->window_tabs.Active());
+                    s->tabs.NewTabInGroup(s->window_tabs, group_id);
+                    BindCurrentLayout(*s);
+                } else if (row->edit) {
+                    POINT sp{ mx, my };
+                    ClientToScreen(hwnd, &sp);
+                    if (s->pane && EnsureMenu(*s)) {
+                        RememberGroupActivation(*s, s->window_tabs.Active());
+                        s->tabs.ShowGroupMenu(s->window_tabs, group_id, sp, *s->menu);
+                        BindCurrentLayout(*s);
+                    }
+                }
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
         } else if (hit.region == ui::HitTestResult::TabGroup) {
             // Group chip (Chromium behavior): press arms a whole-group drag;
             // a plain release toggles collapse; right-click opens the editor.
@@ -2048,7 +2095,7 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 for (int i = 0; i < static_cast<int>(s->window_tabs.items.size()); ++i)
                     if (s->window_tabs.items[static_cast<size_t>(i)]->tab_group == gid) {
                         first = i;
-                        return DefWindowProcW(hwnd, msg, wParam, lParam);
+                        break;
                     }
                 if (first >= 0) {
                     s->tabDragPending = true;
@@ -2615,6 +2662,10 @@ LRESULT HandleLButtonDblClk(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPA
 }
 
 LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        // The release is described by the cursor position and the modifiers the
+        // caller already folded into AppState; the raw message is not needed.
+        (void)msg;
+        (void)wParam;
         if (s) {
             if (s->bloom_accent.Pressed() >= 0) {
                 const int pressed = s->bloom_accent.Pressed();
@@ -2772,7 +2823,7 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                     D2D1_RECT_F chipRc{};
                                     if (s->renderer.TabGroupChipRect(vmDrop, wwDrop, gi, &chipRc))
                                         targetLeft = chipRc.left;
-                                    return DefWindowProcW(hwnd, msg, wParam, lParam);
+                                    break;
                                 }
                             } else {
                                 D2D1_RECT_F curRc{};
@@ -2843,6 +2894,9 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         }
                         if (joined != 0) moved->tab_group = joined;
                         if (moved->tab_group != 0) app::NormalizeGroupRuns(s->window_tabs);
+                        // A tab changing groups may be the one a group remembers
+                        // as its last active tab, so the memory has to follow.
+                        PruneGroupActivations(*s);
                         // Groups with no members left disappear.
                         auto& groups = s->window_tabs.tab_groups;
                         for (auto git = groups.begin(); git != groups.end();) {
@@ -2855,6 +2909,9 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 }
                 // Plain chip click (press without drag): toggle collapse.
                 if (s->tabDragFromChip && !wasActive && s->tabDragGroupId != 0) {
+                    // Collapsing the group that holds the active tab moves the
+                    // window to a visible one, so remember the tab left behind.
+                    RememberGroupActivation(*s, s->window_tabs.Active());
                     s->tabs.ToggleGroupCollapse(s->window_tabs, s->tabDragGroupId);
                     BindCurrentLayout(*s);
                 }
@@ -3076,6 +3133,14 @@ LRESULT HandleRButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         ui::WindowViewModel vm = BuildVm(*s);
         D2D1_RECT_F rect = D2D1::RectF(0, 0, (float)s->compositor.Width(), (float)s->compositor.Height());
         ui::HitTestResult hit = s->renderer.HitTest(vm, rect, (float)mx, (float)my);
+        if (hit.region == ui::HitTestResult::TabGroupCardRow ||
+            hit.region == ui::HitTestResult::TabGroupCard) {
+            // The card owns that area while it is open, so a right-click there
+            // dismisses it. The hit is stale from here on, and no branch below
+            // matches a card region, so nothing else happens.
+            HideTabGroupCard(*s);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         if (hit.pane_index >= 0) {
             if (app::Pane* p = PaneAtSlot(*s, hit.pane_index)) FocusPane(*s, p);
         }
@@ -3086,6 +3151,7 @@ LRESULT HandleRButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             hit.index < static_cast<int>(vm.tab_groups.size())) {
             // Group chip right-click: the Edge-style editor bubble.
             if (s->pane && EnsureMenu(*s)) {
+                RememberGroupActivation(*s, s->window_tabs.Active());
                 s->tabs.ShowGroupMenu(s->window_tabs,
                     vm.tab_groups[static_cast<size_t>(hit.index)].id, sp, *s->menu);
                 BindCurrentLayout(*s);
@@ -3095,6 +3161,7 @@ LRESULT HandleRButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             // Every tab gets the Edge-style tab menu; group editing lives on
             // the chip (right-click) and in the editor bubble.
             if (s->pane && EnsureMenu(*s)) {
+                RememberGroupActivation(*s, s->window_tabs.Active());
                 s->tabs.ShowTabMenu(s->window_tabs, hit.index, sp, *s->menu);
                 BindCurrentLayout(*s);
             }

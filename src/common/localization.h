@@ -822,6 +822,7 @@ enum class StringId : UINT {
     TabOpenNewWindow = IDS_TAB_OPEN_NEW_WINDOW,
     TrayNewWindow = IDS_TRAY_NEW_WINDOW,
     JumpListPinned = IDS_JUMPLIST_PINNED,
+    TabGroupEdit = IDS_TAB_GROUP_EDIT,
 };
 
 bool IsLanguageId(std::wstring_view id) noexcept;

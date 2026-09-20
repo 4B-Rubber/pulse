@@ -1513,8 +1513,31 @@ std::wstring NewTabPath(const AppState& s) {
     return tab->current_path;
 }
 
+void RememberGroupActivation(AppState& s, const app::LayoutTab* outgoing) {
+    if (!outgoing) return;
+    const int group_id = outgoing->tab_group;
+    if (group_id == 0) return;
+    s.lastActiveInGroup[group_id] = outgoing;
+}
+
+void PruneGroupActivations(AppState& s) {
+    auto& memory = s.lastActiveInGroup;
+    for (auto it = memory.begin(); it != memory.end();) {
+        bool still_member = false;
+        for (const auto& item : s.window_tabs.items) {
+            if (item.get() == it->second && item->tab_group == it->first) {
+                still_member = true;
+                break;
+            }
+        }
+        if (still_member) ++it;
+        else it = memory.erase(it);
+    }
+}
+
 void NewTab(AppState& s, const std::wstring& path) {
     RememberLayoutFocus(s);
+    RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.NewTab(path.empty() ? L"C:\\" : path);
     BindCurrentLayout(s);
     if (app::Tab* tab = ActiveTab(s)) {
@@ -1555,7 +1578,10 @@ void OpenSettingsTab(AppState& s, int page) {
 void CloseLayoutTab(AppState& s, size_t idx) {
     if (idx >= s.window_tabs.items.size()) return;
     RememberLayoutFocus(s);
+    RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.CloseTab(idx);
+    // The closed tab is gone; drop any memory that still points at it.
+    PruneGroupActivations(s);
     BindCurrentLayout(s);
     RevalidateVisibleFolders(s);
     InvalidateRect(s.hwnd, nullptr, FALSE);
@@ -1569,6 +1595,7 @@ void SwitchTab(AppState& s, size_t idx) {
     if (idx >= s.window_tabs.items.size()) return;
     if (s.addressSearching) HideAddressEditor(s, false);
     RememberLayoutFocus(s);
+    RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.SwitchTab(idx);
     BindCurrentLayout(s);
     RevalidateVisibleFolders(s);

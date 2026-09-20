@@ -667,6 +667,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->hoverSubIndex = -1;
             s->hoverSince = 0;
             s->tooltipText.clear();
+            HideTabGroupCard(*s);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -731,11 +732,6 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case app::TrayController::kCallbackMessage: {
         if (!s) return 0;
         const auto result = s->tray_controller.HandleCallback(lParam);
-        if (result == app::TrayController::CallbackResult::NewWindowRequested) {
-            const app::Tab* tab = ActiveTab(*s);
-            app::LaunchNewWindow(tab ? tab->current_path : std::wstring{});
-            return 0;
-        }
         if (result == app::TrayController::CallbackResult::ExitRequested)
             DestroyWindow(hwnd);
         return 0;
@@ -815,6 +811,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s) {
             s->compositor.Resize(LOWORD(lParam), HIWORD(lParam));
             s->maximized = (wParam == SIZE_MAXIMIZED);
+            // The card is anchored to the chip; a resize invalidates that.
+            HideTabGroupCard(*s);
             if (s->addressEditing) LayoutAddressEditor(*s);
             if (s->filterEditing && !s->filterFocusPending) LayoutFilterEditor(*s);
             if (!s->tagRenameId.empty()) LayoutTagRenameOverlay(*s);
@@ -951,9 +949,47 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     if (page == 4 && s->duplicateScan.scanning) dirty = true;
                 }
             }
+            // Edge-style group hover card: 150 ms dwell on a chip opens it.
+            // Leaving both the chip and the card, or starting a tab drag,
+            // closes it.
+            const bool group_dragging = s->tabDragging || s->tabDragPending;
+            const bool on_chip =
+                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroup);
+            const bool on_card =
+                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroupCardRow) ||
+                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroupCard);
+            if (s->groupCardGroupId != 0 &&
+                (group_dragging || (!on_chip && !on_card))) {
+                HideTabGroupCard(*s);
+                dirty = true;
+            }
+            if (!group_dragging && on_chip && s->groupCardSince != 0 &&
+                now - s->groupCardSince >= 150 && s->hoverControlIndex >= 0 &&
+                s->hoverControlIndex <
+                    static_cast<int>(s->window_tabs.tab_groups.size())) {
+                const int group_id = s->window_tabs.tab_groups[
+                    static_cast<size_t>(s->hoverControlIndex)].id;
+                if (s->groupCardGroupId != group_id) {
+                    s->groupCardGroupId = group_id;
+                    s->groupCardChipIndex = s->hoverControlIndex;
+                    s->groupCardHoverRow = -1;
+                    // The card replaces any hint the chip would have shown.
+                    s->tooltipText.clear();
+                    dirty = true;
+                }
+            }
+            const int card_row =
+                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroupCardRow)
+                    ? s->hoverControlIndex : -1;
+            if (s->groupCardGroupId != 0 && card_row != s->groupCardHoverRow) {
+                s->groupCardHoverRow = card_row;
+                dirty = true;
+            }
             // 150 ms: the icon rail relies on the hint to name each row, and the
-            // old 400 ms delay read as "no tooltip at all".
-            if (s->hoverRegion != 0 && s->tooltipText.empty() && s->hoverSince != 0 &&
+            // old 400 ms delay read as "no tooltip at all". The group hover card
+            // owns that spot while it is open.
+            if (s->groupCardGroupId == 0 && s->hoverRegion != 0 &&
+                s->tooltipText.empty() && s->hoverSince != 0 &&
                 GetTickCount64() - s->hoverSince >= 150) {
                 s->tooltipText = TooltipForHover(*s);
                 dirty = !s->tooltipText.empty() || dirty;

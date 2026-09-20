@@ -79,9 +79,12 @@ TrayController::CallbackResult TrayController::HandleCallback(LPARAM event) {
         GetCursorPos(&point);
         HMENU menu = CreatePopupMenu();
         if (!menu) return CallbackResult::Handled;
+        // Open first, the one that ends the session last: a menu that grows from
+        // the top keeps Exit where the pointer expects to find it. A second
+        // window is not on this menu - the tab menu and the taskbar jump list
+        // both offer it, and the tray stays the place for the session itself.
         AppendMenuW(menu, MF_STRING, 1, l10n::Get(l10n::StringId::Open).c_str());
         AppendMenuW(menu, MF_STRING, 2, l10n::Get(l10n::StringId::TrayExit).c_str());
-        AppendMenuW(menu, MF_STRING, 3, l10n::Get(l10n::StringId::TrayNewWindow).c_str());
         SetForegroundWindow(hwnd_);
         const int command = TrackPopupMenu(
             menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
@@ -89,8 +92,7 @@ TrayController::CallbackResult TrayController::HandleCallback(LPARAM event) {
         DestroyMenu(menu);
         PostMessageW(hwnd_, WM_NULL, 0, 0);
         if (command == 1) RestoreWindow();
-        if (command == 2) return CallbackResult::ExitRequested;
-        return command == 3 ? CallbackResult::NewWindowRequested : CallbackResult::Handled;
+        return command == 2 ? CallbackResult::ExitRequested : CallbackResult::Handled;
     }
     default:
         return CallbackResult::NotHandled;

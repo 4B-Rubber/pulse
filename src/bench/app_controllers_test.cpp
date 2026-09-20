@@ -1,4 +1,5 @@
 #include "../app/settings_controller.h"
+#include "../app/app_model.h"
 #include "../app/session.h"
 #include "../app/context_menu_controller.h"
 #include "../app/single_instance_coordinator.h"
@@ -484,6 +485,20 @@ int wmain(int argc, wchar_t** argv) {
         restored_tabs.tab_groups.size() == 1 &&
         restored_tabs.next_tab_group_id == 5 && restored_tabs.items.size() == 1 &&
         restored_tabs.items[0]->tab_group == 4);
+
+    // Dragging a tab across a group: an expanded run is crossed at the member
+    // the dragged tab meets (its leading edge only has to pass that member's
+    // centre), while a folded run is a chip crossed at the chip's own centre.
+    {
+        using pulse::app::RunCrossCenter;
+        passed &= Report("group crossing: dragging right crosses at the first member centre",
+            RunCrossCenter(false, 100.0f, 260.0f, 40.0f, 1) == 120.0f);
+        passed &= Report("group crossing: dragging left crosses at the last member centre",
+            RunCrossCenter(false, 100.0f, 260.0f, 40.0f, -1) == 240.0f);
+        passed &= Report("group crossing: a folded group crosses at the block centre",
+            RunCrossCenter(true, 100.0f, 260.0f, 40.0f, 1) == 180.0f &&
+            RunCrossCenter(true, 100.0f, 260.0f, 40.0f, -1) == 180.0f);
+    }
 
     ContextMenuController context_menu;
     uint32_t queried_token = 0;
