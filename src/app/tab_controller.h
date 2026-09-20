@@ -18,6 +18,8 @@ public:
         std::function<bool(std::wstring&)> default_new_tab;
         // Closing the only tab closes the window when this returns true.
         std::function<bool()> last_tab_closes_window;
+        // Closing the window's last tab closes the window: the controller holds
+        // no window handle, so it asks its owner instead of doing it itself.
         std::function<void()> close_window;
     };
 
@@ -40,7 +42,6 @@ private:
     void CreateGroupAndEdit(WindowTabs& tabs, int tab_index, POINT screen_pt,
                             ui::FluentMenu& menu);
     void RemoveGroup(WindowTabs& tabs, int group_id) const;
-    void PruneEmptyGroups(WindowTabs& tabs) const;
     void CloseTabs(WindowTabs& tabs, int first, int last, int except = -1) const;
     void TogglePin(WindowTabs& tabs, int index);
     void Changed() const;

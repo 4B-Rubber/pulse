@@ -2310,6 +2310,8 @@ void CloseLayoutTab(AppState& s, size_t idx) {
     RememberLayoutFocus(s);
     RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.CloseTab(idx);
+    // The group that lost its last member has nothing left to show.
+    app::PruneEmptyGroups(s.window_tabs);
     // The closed tab is gone; drop any memory that still points at it.
     PruneGroupActivations(s);
     BindCurrentLayout(s);
