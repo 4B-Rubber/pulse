@@ -385,22 +385,66 @@ bool FolderOpenCommandIsOurs(const std::wstring& command, const std::wstring& ex
 
 namespace {
 
-constexpr const wchar_t* kFolderOpenClasses[] = { L"Directory", L"Drive" };
+// The classes Pulse can take over, and what taking each one over involves.
+struct FolderOpenClass {
+    const wchar_t* cls;
+    // Folder routes both its verbs into an Explorer COM handler, so it comes with its
+    // explore verb too. Directory and Drive define neither verb: they fall through to
+    // Folder, which is what makes Folder the one that covers every folder item.
+    bool explore;
+    // HKCR ships Directory/Drive with the class default verb "none" (an explicit "do
+    // not use open"), so double-click only reaches our verb once HKCU says "open".
+    // Folder ships no default verb at all, so there is nothing to override.
+    bool force_default_verb;
+    // HKCR keeps Explorer's handler as a named value on the verb's command key
+    // ({11dbb47c-...}), which stays visible through HKCU unless shadowed by an empty
+    // value there.
+    bool blank_inherited_delegate;
+};
+
+constexpr FolderOpenClass kFolderOpenClasses[] = {
+    { L"Directory", false, true, false },
+    { L"Drive", false, true, false },
+    { L"Folder", true, false, true },
+};
+constexpr const wchar_t* kFolderOpenVerb = L"open";
+constexpr const wchar_t* kFolderExploreVerb = L"explore";
+
+// Executable name of a shell command line, for the ownership checks below.
+std::wstring CommandExecutableName(const std::wstring& command) {
+    const std::wstring token = CommandToken(command);
+    if (token.empty()) return {};
+    const size_t separator = token.find_last_of(L"\\/");
+    return separator == std::wstring::npos ? token : token.substr(separator + 1);
+}
+
+bool CommandNames(const std::wstring& command, const wchar_t* name) {
+    const std::wstring exe = CommandExecutableName(command);
+    return !exe.empty() && _wcsicmp(exe.c_str(), name) == 0;
+}
 
 // "Ours" in the loose sense: the first token names pulse.exe, wherever that copy
 // lives. A value left behind by an install that moved (or by an older version) is
 // still ours and gets repointed; a verb another program owns is left alone.
 bool CommandIsPulse(const std::wstring& command) {
-    const std::wstring token = CommandToken(command);
-    if (token.empty()) return false;
-    const size_t separator = token.find_last_of(L"\\/");
-    const std::wstring name = separator == std::wstring::npos
-        ? token : token.substr(separator + 1);
-    return _wcsicmp(name.c_str(), L"pulse.exe") == 0;
+    return CommandNames(command, L"pulse.exe");
 }
 
-std::wstring FolderOpenKey(const wchar_t* cls) {
-    return RegPath(std::wstring(L"Software\\Classes\\") + cls + L"\\shell\\open");
+// A command naming explorer.exe is the shell's own default: Windows keeps a per-user
+// copy of the Folder verbs and HKLM is where it comes from. It is not a handler
+// another program installed, so the takeover may replace it, and switching back off
+// falls through to it again.
+bool CommandIsShellDefault(const std::wstring& command) {
+    return CommandNames(command, L"explorer.exe");
+}
+
+// A verb Pulse must not touch: neither ours nor the shell's own default.
+bool VerbOwnedByAnother(const std::wstring& command) {
+    return !command.empty() && !CommandIsPulse(command) && !CommandIsShellDefault(command);
+}
+
+std::wstring FolderVerbKey(const wchar_t* cls, const wchar_t* verb) {
+    return RegPath(std::wstring(L"Software\\Classes\\") + cls + L"\\shell\\" + verb);
 }
 
 std::wstring FolderShellKey(const wchar_t* cls) {
@@ -422,33 +466,52 @@ std::wstring ReadRegString(const std::wstring& key, const wchar_t* name = nullpt
     return value;
 }
 
-bool WriteFolderOpenClass(const wchar_t* cls, const std::wstring& exe) {
-    const std::wstring open = FolderOpenKey(cls);
-    const std::wstring command = open + L"\\command";
+bool RegKeyExists(HKEY root, const std::wstring& path) {
     HKEY h = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, command.c_str(), 0, nullptr, 0,
+    const LONG st = RegOpenKeyExW(root, path.c_str(), 0, KEY_QUERY_VALUE, &h);
+    if (h) RegCloseKey(h);
+    return st == ERROR_SUCCESS;
+}
+
+// One verb of one class: the command line, plus empty DelegateExecute values so the
+// shell runs it instead of a handler inherited from HKCR. The command is written
+// first, so a failure leaves nothing the shell would pick up instead.
+bool WriteFolderVerb(const FolderOpenClass& spec, const wchar_t* verb,
+                     const std::wstring& exe) {
+    const std::wstring key = FolderVerbKey(spec.cls, verb);
+    const std::wstring line = FolderOpenCommandLine(exe);
+    const wchar_t empty[] = L"";
+    HKEY h = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, (key + L"\\command").c_str(), 0, nullptr, 0,
                         KEY_SET_VALUE, nullptr, &h, nullptr) != ERROR_SUCCESS)
         return false;
-    const std::wstring line = FolderOpenCommandLine(exe);
-    const LONG st = RegSetValueExW(h, nullptr, 0, REG_SZ,
-                                   reinterpret_cast<const BYTE*>(line.c_str()),
-                                   static_cast<DWORD>((line.size() + 1) * sizeof(wchar_t)));
+    LONG st = RegSetValueExW(h, nullptr, 0, REG_SZ,
+                             reinterpret_cast<const BYTE*>(line.c_str()),
+                             static_cast<DWORD>((line.size() + 1) * sizeof(wchar_t)));
+    if (st == ERROR_SUCCESS && spec.blank_inherited_delegate) {
+        st = RegSetValueExW(h, L"DelegateExecute", 0, REG_SZ,
+                            reinterpret_cast<const BYTE*>(empty), sizeof(wchar_t));
+    }
     RegCloseKey(h);
     if (st != ERROR_SUCCESS) return false;
+
     h = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, open.c_str(), 0, nullptr, 0,
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0,
                         KEY_SET_VALUE, nullptr, &h, nullptr) != ERROR_SUCCESS)
         return false;
-    const wchar_t empty[] = L"";
     const LONG de = RegSetValueExW(h, L"DelegateExecute", 0, REG_SZ,
                                    reinterpret_cast<const BYTE*>(empty), sizeof(wchar_t));
     RegCloseKey(h);
-    if (de != ERROR_SUCCESS) return false;
+    return de == ERROR_SUCCESS;
+}
 
-    // HKLM Directory/Drive shell default is "none", so double-click never uses
-    // the open verb and falls through to Folder → Explorer. Point HKCU at open.
-    h = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, FolderShellKey(cls).c_str(), 0, nullptr, 0,
+bool WriteFolderOpenClass(const FolderOpenClass& spec, const std::wstring& exe) {
+    bool ok = WriteFolderVerb(spec, kFolderOpenVerb, exe);
+    if (spec.explore) ok = WriteFolderVerb(spec, kFolderExploreVerb, exe) && ok;
+    if (!spec.force_default_verb) return ok;
+
+    HKEY h = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, FolderShellKey(spec.cls).c_str(), 0, nullptr, 0,
                         KEY_SET_VALUE, nullptr, &h, nullptr) != ERROR_SUCCESS)
         return false;
     const wchar_t open_verb[] = L"open";
@@ -456,24 +519,42 @@ bool WriteFolderOpenClass(const wchar_t* cls, const std::wstring& exe) {
                                     reinterpret_cast<const BYTE*>(open_verb),
                                     sizeof(open_verb));
     RegCloseKey(h);
-    return def == ERROR_SUCCESS;
+    return def == ERROR_SUCCESS && ok;
 }
 
-// Ownership is judged loosely here (any command naming a pulse.exe, whatever the
-// path), unlike FolderOpenClassIsConfigured: a value left by an install that moved
-// still hijacks double-click with an executable that is not there any more, and a
-// user who turns the setting off has to be able to turn it off. A command another
-// program owns is refused, which is the only line this must not cross.
-bool ClearFolderOpenClass(const wchar_t* cls) {
-    const std::wstring command = ReadRegString(FolderOpenKey(cls) + L"\\command");
-    if (!command.empty() && !CommandIsPulse(command)) return true;
-    SHDeleteKeyW(HKEY_CURRENT_USER, FolderOpenKey(cls).c_str());
-    const std::wstring shell = FolderShellKey(cls);
-    if (_wcsicmp(ReadRegString(shell).c_str(), L"open") == 0) {
-        HKEY h = nullptr;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, shell.c_str(), 0, KEY_SET_VALUE, &h) == ERROR_SUCCESS) {
-            RegDeleteValueW(h, nullptr);
-            RegCloseKey(h);
+// True when this verb holds something of ours that has to go: a command naming a
+// pulse.exe (loose: a value an install that moved left behind still hijacks
+// double-click with an executable that is not there any more), or only the blank
+// DelegateExecute an interrupted registration left. A command naming another program,
+// or the shell's own default, is never ours to remove.
+bool FolderVerbNeedsClear(const wchar_t* cls, const wchar_t* verb) {
+    const std::wstring key = FolderVerbKey(cls, verb);
+    const std::wstring command = ReadRegString(key + L"\\command");
+    if (!command.empty()) return CommandIsPulse(command);
+    return RegKeyExists(HKEY_CURRENT_USER, key) &&
+           ReadRegString(key, L"DelegateExecute").empty();
+}
+
+void ClearFolderVerb(const wchar_t* cls, const wchar_t* verb) {
+    SHDeleteKeyW(HKEY_CURRENT_USER, FolderVerbKey(cls, verb).c_str());
+}
+
+// Verb by verb, so an explore verb another program owns stays even when the open verb
+// is ours (and the other way round).
+bool ClearFolderOpenClass(const FolderOpenClass& spec) {
+    if (FolderVerbNeedsClear(spec.cls, kFolderOpenVerb))
+        ClearFolderVerb(spec.cls, kFolderOpenVerb);
+    if (spec.explore && FolderVerbNeedsClear(spec.cls, kFolderExploreVerb))
+        ClearFolderVerb(spec.cls, kFolderExploreVerb);
+    if (spec.force_default_verb) {
+        const std::wstring shell = FolderShellKey(spec.cls);
+        if (_wcsicmp(ReadRegString(shell).c_str(), L"open") == 0) {
+            HKEY h = nullptr;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, shell.c_str(), 0, KEY_SET_VALUE, &h) ==
+                ERROR_SUCCESS) {
+                RegDeleteValueW(h, nullptr);
+                RegCloseKey(h);
+            }
         }
     }
     return true;
@@ -483,23 +564,42 @@ void NotifyAssocChanged() {
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
 }
 
-bool FolderOpenClassIsConfigured(const wchar_t* cls, const std::wstring& exe) {
-    const std::wstring command = ReadRegString(FolderOpenKey(cls) + L"\\command");
-    if (!FolderOpenCommandIsOurs(command, exe)) return false;
-    // Keep the repair path for older installs that wrote the command but left
-    // the class default verb as "none" (the HKLM default).
-    return _wcsicmp(ReadRegString(FolderShellKey(cls)).c_str(), L"open") == 0;
+bool FolderOpenClassIsConfigured(const FolderOpenClass& spec, const std::wstring& exe) {
+    if (!FolderOpenCommandIsOurs(
+            ReadRegString(FolderVerbKey(spec.cls, kFolderOpenVerb) + L"\\command"), exe))
+        return false;
+    if (spec.explore &&
+        !FolderOpenCommandIsOurs(
+            ReadRegString(FolderVerbKey(spec.cls, kFolderExploreVerb) + L"\\command"), exe))
+        return false;
+    // Keep the repair path for older installs that wrote the command but left the
+    // class default verb as "none" (the HKLM default).
+    if (spec.force_default_verb &&
+        _wcsicmp(ReadRegString(FolderShellKey(spec.cls)).c_str(), L"open") != 0)
+        return false;
+    return true;
 }
 
-bool FolderOpenClassNeedsClear(const wchar_t* cls) {
-    const std::wstring command = ReadRegString(FolderOpenKey(cls) + L"\\command");
-    // Loose, like the cleanup itself: residue from an install that moved is ours and
-    // has to go, otherwise "off" never clears it and it keeps pointing at a path that
-    // no longer exists.
-    if (!command.empty()) return CommandIsPulse(command);
-    // A previous cleanup or an interrupted registration can leave only the
-    // HKCU shell default behind; ClearFolderOpenClass removes that residue.
-    return _wcsicmp(ReadRegString(FolderShellKey(cls)).c_str(), L"open") == 0;
+// Another program's handler on any of the class's verbs: not ours to take over.
+bool FolderOpenClassBlocksTakeover(const FolderOpenClass& spec) {
+    if (VerbOwnedByAnother(
+            ReadRegString(FolderVerbKey(spec.cls, kFolderOpenVerb) + L"\\command")))
+        return true;
+    return spec.explore &&
+           VerbOwnedByAnother(
+               ReadRegString(FolderVerbKey(spec.cls, kFolderExploreVerb) + L"\\command"));
+}
+
+bool FolderOpenClassNeedsClear(const FolderOpenClass& spec) {
+    if (FolderVerbNeedsClear(spec.cls, kFolderOpenVerb)) return true;
+    if (spec.explore && FolderVerbNeedsClear(spec.cls, kFolderExploreVerb)) return true;
+    if (!spec.force_default_verb) return false;
+    // A previous cleanup or an interrupted registration can leave only the HKCU shell
+    // default behind, but only when no command sits under it: a verb another program
+    // owns keeps the default verb that belongs to its registration.
+    if (!ReadRegString(FolderVerbKey(spec.cls, kFolderOpenVerb) + L"\\command").empty())
+        return false;
+    return _wcsicmp(ReadRegString(FolderShellKey(spec.cls)).c_str(), L"open") == 0;
 }
 
 } // namespace
@@ -508,7 +608,7 @@ bool AppPrefs::ReadFolderOpen() const {
     const std::wstring exe = ExePath();
     if (exe.empty()) return false;
     const std::wstring command =
-        ReadRegString(FolderOpenKey(L"Directory") + L"\\command");
+        ReadRegString(FolderVerbKey(L"Directory", kFolderOpenVerb) + L"\\command");
     return FolderOpenCommandIsOurs(command, exe);
 }
 
@@ -519,20 +619,22 @@ bool AppPrefs::ApplyFolderOpen(bool on) {
     if (exe.empty()) return false;
     bool ok = true;
     bool changed = false;
-    for (const wchar_t* cls : kFolderOpenClasses) {
+    for (const FolderOpenClass& spec : kFolderOpenClasses) {
         if (on) {
             // The only caller is the settings toggle (settings_controller.cpp:373);
             // startup repair belongs to ReconcileRegistryWithFile(). An association
             // that already points at this executable is left alone, so flipping the
-            // setting never rebroadcasts a global Explorer refresh.
-            if (!FolderOpenClassIsConfigured(cls, exe)) {
+            // setting never rebroadcasts a global Explorer refresh. Turning it on is
+            // the user asking for Pulse, so unlike the repair path this takes over a
+            // verb another program installed.
+            if (!FolderOpenClassIsConfigured(spec, exe)) {
                 changed = true;
-                ok = WriteFolderOpenClass(cls, exe) && ok;
+                ok = WriteFolderOpenClass(spec, exe) && ok;
             }
         } else {
-            if (FolderOpenClassNeedsClear(cls)) {
+            if (FolderOpenClassNeedsClear(spec)) {
                 changed = true;
-                ok = ClearFolderOpenClass(cls) && ok;
+                ok = ClearFolderOpenClass(spec) && ok;
             }
         }
     }
@@ -705,28 +807,30 @@ bool AppPrefs::ReconcileRegistryWithFile() {
 
     const std::wstring exe = ExePath();
     bool associations_changed = false;
-    for (const wchar_t* cls : kFolderOpenClasses) {
-        const std::wstring command = ReadRegString(FolderOpenKey(cls) + L"\\command");
-        const bool ours = CommandIsPulse(command);
-        const bool another_owner = !ours && !command.empty();
+    for (const FolderOpenClass& spec : kFolderOpenClasses) {
         if (open_folders_in_pulse) {
-            // Strict here: "configured" means this executable answers the verb right
-            // now, so a value naming an older path is rewritten rather than kept.
-            if (!FolderOpenClassIsConfigured(cls, exe) && !another_owner) {
-                WriteFolderOpenClass(cls, exe);
+            // Strict here: "configured" means this executable answers every verb the
+            // class owns right now, so a value naming an older path is rewritten rather
+            // than kept, and a class the file wants but never got (Folder, for an
+            // install from before it was covered) is written. A verb another program
+            // owns blocks the class; the shell's own Explorer default does not — it is
+            // exactly what Pulse replaces and falls back to.
+            if (!FolderOpenClassIsConfigured(spec, exe) &&
+                !FolderOpenClassBlocksTakeover(spec)) {
+                WriteFolderOpenClass(spec, exe);
                 associations_changed = true;
             }
-        } else if (FolderOpenClassIsConfigured(cls, exe)) {
+        } else if (FolderOpenClassIsConfigured(spec, exe)) {
             // Reverse protection, same as the Run key: the association works, so the
             // file lost the "on" and must not turn it off behind the user's back.
             open_folders_in_pulse = true;
             adopted = true;
-        } else if (FolderOpenClassNeedsClear(cls)) {
-            // Ours but unusable: a command without the open verb, a path left by an
-            // install that moved, or only the verb an interrupted cleanup left behind.
+        } else if (FolderOpenClassNeedsClear(spec)) {
+            // Ours but unusable: a path left by an install that moved, or only the
+            // blank DelegateExecute an interrupted registration left behind.
             // ClearFolderOpenClass refuses anything another program owns, so this never
             // reaches past our own residue.
-            ClearFolderOpenClass(cls);
+            ClearFolderOpenClass(spec);
             associations_changed = true;
         }
     }

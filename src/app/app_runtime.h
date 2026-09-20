@@ -51,6 +51,13 @@ std::vector<std::wstring> VisibleFolderPaths(const AppState& s);
 void SyncVisibleWatches(AppState& s);
 void BindCurrentLayout(AppState& s);
 std::wstring ResolveOpenFolderPath(std::wstring path);
+// The single funnel for a forwarded or launched path. Pinned shell items resolve their
+// open verb through the Folder class, which the folder takeover owns, so the taskbar's
+// File Explorer button ("Home") and the desktop's Recycle Bin icon arrive as a shell
+// namespace (fs::IsShellNamespacePath) rather than as a path: the ones Pulse has a view
+// for become that view, the rest report nothing to open — never a tab named after the
+// CLSID. A "pulse:" view passes through as it is; a real path resolves to its folder.
+std::wstring ResolveIncomingPath(const std::wstring& raw);
 void OpenFolderInNewTab(AppState& s, const std::wstring& raw);
 // No window is "the primary": the singleton mutex, the tray icon, the global
 // hotkey and the session file belong to whoever is left. A window that started

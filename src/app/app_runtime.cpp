@@ -258,11 +258,59 @@ std::wstring ResolveOpenFolderPath(std::wstring path) {
     return fs::NormalizePath(path);
 }
 
+namespace {
+// The shell namespaces Pulse has an answer for, and the view that answers them. Home
+// (~Quick access) is what "open the file manager" means when nothing in particular is
+// aimed at, and Recent is already this app's own answer to that (see the new-window
+// default); the Recycle Bin has a view of its own. The rest — This PC, Control Panel,
+// Network — have no Pulse view, so they must not turn into a tab.
+struct NamespaceView {
+    const wchar_t* id;   // the GUID inside "::{...}", without braces
+    const wchar_t* view;
+};
+constexpr NamespaceView kNamespaceViews[] = {
+    { L"f874310e-b6b7-47dc-bc84-b9e6b38f5903", L"pulse:recent" },   // Home (Windows 11)
+    { L"679f85cb-0220-4080-b29b-5540cc05aab6", L"pulse:recent" },   // Quick access
+    { L"645ff040-5081-101b-9f08-00aa002f954e", L"pulse:recycle" },  // Recycle Bin
+};
+
+// The GUID a "::{...}" path carries, or "" when it carries none. A namespace can nest
+// ("::{GUID}\sub") and the shell spells the id in either case, so only the first group
+// is read and it is compared without case.
+std::wstring NamespaceGuid(const std::wstring& raw) {
+    const size_t open = raw.find(L'{');
+    if (open == std::wstring::npos) return {};
+    const size_t close = raw.find(L'}', open + 1);
+    if (close == std::wstring::npos || close == open + 1) return {};
+    return raw.substr(open + 1, close - open - 1);
+}
+
+std::wstring ShellNamespaceView(const std::wstring& raw) {
+    const std::wstring guid = NamespaceGuid(raw);
+    if (guid.empty()) return {};
+    for (const auto& entry : kNamespaceViews) {
+        if (_wcsicmp(guid.c_str(), entry.id) == 0) return entry.view;
+    }
+    return {};
+}
+} // namespace
+
+std::wstring ResolveIncomingPath(const std::wstring& raw) {
+    // A namespace has no view when Pulse does not recognise it: report nothing to open
+    // rather than opening the CLSID as a folder.
+    if (fs::IsShellNamespacePath(raw)) return ShellNamespaceView(raw);
+    if (fs::IsVirtualPath(raw)) return raw;
+    return ResolveOpenFolderPath(raw);
+}
+
 void OpenFolderInNewTab(AppState& s, const std::wstring& raw) {
     s.tray_controller.RestoreWindow();
     // Handed over tabs and shell forwards can name a virtual view ("pulse:recent",
-    // a tag, a saved search): those open as they are.
-    const std::wstring path = fs::IsVirtualPath(raw) ? raw : ResolveOpenFolderPath(raw);
+    // a tag, a saved search), a shell namespace (the taskbar's Explorer button and the
+    // desktop's Recycle Bin reach us through the Folder class), or a real folder. A
+    // namespace Pulse has no view for leaves the window without a new tab instead of
+    // opening one named after a CLSID.
+    const std::wstring path = ResolveIncomingPath(raw);
     if (!path.empty() && !ActivateExistingFolderTab(s, path)) NewTab(s, path);
     else InvalidateRect(s.hwnd, nullptr, FALSE);
 }

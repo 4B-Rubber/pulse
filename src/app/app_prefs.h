@@ -67,9 +67,11 @@ struct AppPrefs : AppPrefsValues {
     bool ReadLaunchOnStartup() const;
     bool ApplyLaunchOnStartup(bool on);
 
-    // Same split for the HKCU Directory/Drive open verbs: app.json holds the intent,
-    // ReadFolderOpen() reports the current state, Load() consults it only when no
-    // usable file exists, and the toggle goes through ApplyFolderOpen().
+    // Same split for the HKCU folder-open verbs (Directory and Drive, plus the Folder
+    // class's open and explore): app.json holds the intent, ReadFolderOpen() reports
+    // the current state, Load() consults it only when no usable file exists, and the
+    // toggle goes through ApplyFolderOpen(). Explorer's Win+E entry point (a CLSID of
+    // its own) is deliberately left alone.
     bool ReadFolderOpen() const;
     bool ApplyFolderOpen(bool on);
 

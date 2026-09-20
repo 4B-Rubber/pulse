@@ -548,13 +548,22 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             else if (app::Tab* t = ActiveTab(*s))
                 RememberPath(*s, t->current_path);
         } else {
-        std::wstring startPath = s->shot.active ? s->shot.path : L"C:\\";
-        if (!s->shot.active && !s->session_path.empty()) startPath = s->session_path;
-        else if (!s->shot.active && !s->open_path.empty())
-            startPath = ResolveOpenFolderPath(s->open_path);
+        // A shell namespace (the taskbar's Explorer button, the desktop's Recycle Bin)
+        // is translated to its Pulse view, or to nothing when Pulse has no view for it:
+        // the window still opens, it just has nothing of its own to show. A capture that
+        // names a namespace follows the same translation, so the capture shows what a
+        // real launch with that argument does.
+        const std::wstring incoming = s->shot.active
+            ? (fs::IsShellNamespacePath(s->shot.path) ? ResolveIncomingPath(s->shot.path)
+                                                      : s->shot.path)
+            : ResolveIncomingPath(s->open_path);
+        std::wstring startPath = L"C:\\";
+        if (s->shot.active) startPath = incoming.empty() ? L"C:\\" : incoming;
+        else if (!s->session_path.empty()) startPath = s->session_path;
+        else if (!incoming.empty()) startPath = incoming;
         // A new window nobody aimed anywhere: the recent view, not whatever the
         // window that spawned it happened to be showing.
-        else if (!s->shot.active && s->secondaryInstance) startPath = app::MakeRecentPath();
+        else if (s->secondaryInstance) startPath = app::MakeRecentPath();
         s->pane->NewTab(startPath);
         if (s->shot.active) s->pane->ActiveTab()->view_mode = s->shot.view_mode;
         StartLoadingPath(*s, *s->pane->ActiveTab(), startPath,
@@ -567,7 +576,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // A new window has exactly one tab, so it never lands here.
         if (!s->shot.active && !s->secondaryInstance && !s->open_path.empty() &&
             (!s->session_layout_tabs.empty() || !s->session_path.empty())) {
-            const std::wstring open_path = ResolveOpenFolderPath(s->open_path);
+            const std::wstring open_path = ResolveIncomingPath(s->open_path);
             if (!open_path.empty() && !ActivateExistingFolderTab(*s, open_path))
                 NewTab(*s, open_path);
         }
@@ -721,8 +730,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // activates the existing tab instead).
             // A virtual location ("pulse:recent", a tag, a search) is opened as
             // it is; only a real path is resolved to its folder.
-            const std::wstring resolved =
-                fs::IsVirtualPath(path) ? path : ResolveOpenFolderPath(path);
+            const std::wstring resolved = ResolveIncomingPath(path);
             if (!resolved.empty()) NewTab(*s, resolved);
             AdoptSingletonOwnership(*s);
             return TRUE;

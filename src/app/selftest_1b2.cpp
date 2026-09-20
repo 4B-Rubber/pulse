@@ -477,6 +477,81 @@ void TestThisPcEnumeration() {
     Check(has_c, L"thispc: contains the C: drive");
 }
 
+void TestShellNamespaceForward() {
+    // The folder takeover owns Folder\shell\open, so pinned items that resolve their
+    // open verb through the Folder class (the taskbar's Explorer button, the desktop's
+    // This PC and Recycle Bin icons) reach Pulse as a namespace, never as a path.
+    Check(fs::IsShellNamespacePath(L"::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}") &&
+          fs::IsShellNamespacePath(L"shell:RecycleBinFolder") &&
+          fs::IsShellNamespacePath(L"\\\\?\\::{20D04FE0-3AEA-1069-A2D8-08002B30309D}") &&
+          !fs::IsShellNamespacePath(L"C:\\") &&
+          !fs::IsShellNamespacePath(L"pulse:recent"),
+          L"shell namespace: ::{GUID} and shell: are namespaces, paths and views are not");
+
+    // Home (Windows 11) and Quick access are what "open the file manager" means when
+    // nothing in particular is aimed at; Recent is already this app's own answer to that.
+    Check(ResolveIncomingPath(L"::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}") == L"pulse:recent" &&
+          ResolveIncomingPath(L"::{679f85cb-0220-4080-b29b-5540cc05aab6}") == L"pulse:recent",
+          L"shell namespace: Home and Quick access open the recent view");
+    Check(ResolveIncomingPath(L"::{645FF040-5081-101B-9F08-00AA002F954E}") == L"pulse:recycle",
+          L"shell namespace: the Recycle Bin opens the recycle view");
+    // Nothing to open: not a tab named after the CLSID, and no fallback to anywhere else.
+    Check(ResolveIncomingPath(L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}").empty() &&
+          ResolveIncomingPath(L"shell:AppsFolder").empty() &&
+          ResolveIncomingPath(L"::{").empty(),
+          L"shell namespace: This PC and the rest report nothing to open");
+    Check(ResolveIncomingPath(L"pulse:starred") == L"pulse:starred",
+          L"shell namespace: virtual views still pass through");
+
+    wchar_t temp[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, temp)) {
+        const std::wstring folder =
+            fs::NormalizePath(std::wstring(temp) + L"pulse-shell-namespace-test");
+        CreateDirectoryW(folder.c_str(), nullptr);
+        Check(ResolveIncomingPath(folder) == folder &&
+              ResolveIncomingPath(L"\"" + folder + L"\"") == folder,
+              L"shell namespace: a real folder still resolves to itself, quotes and all");
+        RemoveDirectoryW(folder.c_str());
+    }
+
+    // The recent list only holds places someone can come back to: a namespace that
+    // reached it while the takeover opened CLSIDs as folders is dropped on load.
+    {
+        wchar_t previous[MAX_PATH * 2]{};
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+        const std::wstring dir = WorkspacePath(L"bench_data\\shell-namespace");
+        CreateDirectoryW(WorkspacePath(L"bench_data").c_str(), nullptr);
+        CreateDirectoryW(dir.c_str(), nullptr);
+        SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+        PlacesCatalog cat;
+        cat.persist = false;
+        cat.RecordRecent(L"::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}", PlaceItemKind::Folder);
+        cat.RecordRecent(L"pulse:recent", PlaceItemKind::Folder);
+        cat.RecordRecent(L"C:\\", PlaceItemKind::Folder);
+        Check(cat.recent_items.size() == 1,
+              L"shell namespace: opening a namespace is not a recent entry");
+
+        PlacesCatalog writer;
+        writer.persist = true;
+        // The form an affected profile carries: the namespace with the path normalizer's
+        // prefix, next to a real folder stored the way the loader writes it.
+        writer.recent_items.push_back(
+            { L"\\\\?\\::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", PlaceItemKind::Folder, 1 });
+        writer.recent_items.push_back({ L"\\\\?\\C:\\", PlaceItemKind::Folder, 2 });
+        Check(writer.Save(), L"shell namespace: seed a profile carrying a namespace entry");
+        PlacesCatalog loaded;
+        const bool loaded_ok = loaded.Load();
+        Check(loaded_ok && loaded.recent_items.size() == 1,
+              L"shell namespace: the loaded profile drops the namespace entry");
+        Check(loaded_ok && !loaded.recent_items.empty() &&
+              loaded.recent_items[0].path == fs::NormalizePath(L"C:\\"),
+              L"shell namespace: the real entry survives the load");
+
+        SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous[0] ? previous : nullptr);
+    }
+}
+
 void TestLoadingPresentation() {
     Pane pane;
     pane.NewTab(L"C:\\pending-folder");
@@ -2529,11 +2604,19 @@ struct FolderOpenRegistrySnapshot {
     std::wstring directory_verb;
     std::wstring drive_command;
     std::wstring drive_verb;
+    std::wstring folder_command;
+    std::wstring folder_command_delegate;
+    std::wstring folder_explore_command;
+    std::wstring folder_explore_delegate;
 
     bool operator==(const FolderOpenRegistrySnapshot& other) const {
         return directory_command == other.directory_command &&
                directory_verb == other.directory_verb &&
-               drive_command == other.drive_command && drive_verb == other.drive_verb;
+               drive_command == other.drive_command && drive_verb == other.drive_verb &&
+               folder_command == other.folder_command &&
+               folder_command_delegate == other.folder_command_delegate &&
+               folder_explore_command == other.folder_explore_command &&
+               folder_explore_delegate == other.folder_explore_delegate;
     }
 };
 
@@ -2552,6 +2635,24 @@ std::wstring ReadRegString(const std::wstring& key, const wchar_t* name = nullpt
     return value;
 }
 
+// Presence checks: an absent value and an empty one both read as "", which is not
+// enough to tell "Pulse shadowed the handler" apart from "nothing was there".
+bool RegValuePresent(const std::wstring& key, const wchar_t* name) {
+    HKEY h = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &h) != ERROR_SUCCESS)
+        return false;
+    const LONG st = RegQueryValueExW(h, name, nullptr, nullptr, nullptr, nullptr);
+    RegCloseKey(h);
+    return st == ERROR_SUCCESS;
+}
+
+bool RegKeyPresent(const std::wstring& key) {
+    HKEY h = nullptr;
+    const LONG st = RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &h);
+    if (h) RegCloseKey(h);
+    return st == ERROR_SUCCESS;
+}
+
 FolderOpenRegistrySnapshot ReadFolderOpenRegistry() {
     FolderOpenRegistrySnapshot snapshot;
     snapshot.directory_command =
@@ -2559,6 +2660,13 @@ FolderOpenRegistrySnapshot ReadFolderOpenRegistry() {
     snapshot.directory_verb = ReadRegString(L"Software\\Classes\\Directory\\shell");
     snapshot.drive_command = ReadRegString(L"Software\\Classes\\Drive\\shell\\open\\command");
     snapshot.drive_verb = ReadRegString(L"Software\\Classes\\Drive\\shell");
+    snapshot.folder_command = ReadRegString(L"Software\\Classes\\Folder\\shell\\open\\command");
+    snapshot.folder_command_delegate =
+        ReadRegString(L"Software\\Classes\\Folder\\shell\\open\\command", L"DelegateExecute");
+    snapshot.folder_explore_command =
+        ReadRegString(L"Software\\Classes\\Folder\\shell\\explore\\command");
+    snapshot.folder_explore_delegate =
+        ReadRegString(L"Software\\Classes\\Folder\\shell\\explore\\command", L"DelegateExecute");
     return snapshot;
 }
 
@@ -2797,6 +2905,12 @@ void TestPrefsRegistryReconcile() {
     auto folder_open = [&](const wchar_t* cls) {
         return base + L"\\Software\\Classes\\" + cls + L"\\shell\\open\\command";
     };
+    auto folder_explore = [&](const wchar_t* cls) {
+        return base + L"\\Software\\Classes\\" + cls + L"\\shell\\explore\\command";
+    };
+    auto folder_verb = [&](const wchar_t* cls, const wchar_t* verb) {
+        return base + L"\\Software\\Classes\\" + cls + L"\\shell\\" + verb;
+    };
     auto folder_shell = [&](const wchar_t* cls) {
         return base + L"\\Software\\Classes\\" + cls + L"\\shell";
     };
@@ -2833,13 +2947,20 @@ void TestPrefsRegistryReconcile() {
               L"prefs-registry: a missing folder-open command is written back");
         Check(ReadRegString(folder_shell(L"Directory").c_str()) == L"open",
               L"prefs-registry: the class default verb is set to open");
+        Check(ReadRegString(folder_open(L"Folder").c_str()) == folder_command &&
+                  ReadRegString(folder_explore(L"Folder").c_str()) == folder_command,
+              L"prefs-registry: the Folder class open and explore verbs are written back");
+        Check(RegValuePresent(folder_open(L"Folder"), L"DelegateExecute") &&
+                  ReadRegString(folder_open(L"Folder"), L"DelegateExecute").empty(),
+              L"prefs-registry: the Folder verb carries a blank delegated handler");
     }
 
     // The keys hold another program: Pulse stays out of it.
     {
         reset();
         Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
-        const std::wstring other = L"\"C:\\Windows\\explorer.exe\" \"%1\"";
+        const std::wstring other =
+            L"\"C:\\Program Files\\Files\\Files.App.Launcher.exe\" \"%1\"";
         Check(SetRegNamedString(run_key, L"Pulse", L"\"C:\\Windows\\notepad.exe\"") &&
               SetRegDefaultString(folder_open(L"Directory"), other) &&
               SetRegDefaultString(folder_shell(L"Directory"), L"open"),
@@ -2898,7 +3019,8 @@ void TestPrefsRegistryReconcile() {
     {
         reset();
         Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
-        const std::wstring foreign = L"\"C:\\Windows\\explorer.exe\" \"%1\"";
+        const std::wstring foreign =
+            L"\"C:\\Program Files\\Files\\Files.App.Launcher.exe\" \"%1\"";
         Check(SetRegDefaultString(folder_open(L"Directory"), foreign) &&
               SetRegDefaultString(folder_shell(L"Directory"), L"open") &&
               SetRegDefaultString(folder_open(L"Drive"), foreign),
@@ -2930,6 +3052,98 @@ void TestPrefsRegistryReconcile() {
         Check(file_says(L"launch_on_startup", true) &&
               file_says(L"open_folders_in_pulse", true),
               L"prefs-registry: the adopted value is written back into app.json");
+    }
+
+    // The machine's own Folder copy names explorer.exe and hands the verb to the shell
+    // handler; the file says on, so both are replaced — the empty DelegateExecute is
+    // what stops the inherited handler from answering instead of Pulse.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        const std::wstring shell_default = L"%SystemRoot%\\Explorer.exe";
+        const std::wstring shell_handler = L"{11dbb47c-a525-400b-9e80-a54615a090c0}";
+        Check(SetRegDefaultString(folder_open(L"Folder"), shell_default) &&
+              SetRegNamedString(folder_open(L"Folder"), L"DelegateExecute", shell_handler) &&
+              SetRegDefaultString(folder_explore(L"Folder"), shell_default),
+              L"prefs-registry: seed the shell's own Folder default");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Folder").c_str()) == folder_command,
+              L"prefs-registry: the shell's own default is replaced by Pulse");
+        Check(RegValuePresent(folder_open(L"Folder"), L"DelegateExecute") &&
+                  ReadRegString(folder_open(L"Folder"), L"DelegateExecute").empty(),
+              L"prefs-registry: Explorer's delegated handler is shadowed, not inherited");
+        Check(ReadRegString(folder_explore(L"Folder").c_str()) == folder_command,
+              L"prefs-registry: the explore verb is taken over as well");
+    }
+
+    // A handler another program installed on the Folder class blocks the whole class —
+    // no open, no explore — while the classes it does not touch are still written.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        const std::wstring other = L"\"C:\\Tools\\Files\\Files.App.Launcher.exe\" \"%1\"";
+        Check(SetRegDefaultString(folder_open(L"Folder"), other),
+              L"prefs-registry: seed a Folder handler another program owns");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Folder").c_str()) == other,
+              L"prefs-registry: another program's Folder verb is left alone");
+        Check(!RegKeyPresent(folder_verb(L"Folder", L"explore")),
+              L"prefs-registry: its explore verb is not created either");
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == folder_command,
+              L"prefs-registry: a blocked Folder class does not block Directory");
+    }
+
+    // The file says off and the Folder residue is ours: both verbs go, so double-click
+    // cannot keep calling an executable that is not there any more.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        const std::wstring stale = L"\"D:\\old install\\pulse.exe\" \"%1\"";
+        Check(SetRegDefaultString(folder_open(L"Folder"), stale) &&
+              SetRegDefaultString(folder_explore(L"Folder"), stale),
+              L"prefs-registry: seed Folder residue from an install that moved");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(!RegKeyPresent(folder_verb(L"Folder", L"open")) &&
+                  !RegKeyPresent(folder_verb(L"Folder", L"explore")),
+              L"prefs-registry: both Folder verbs of a stale install are cleared");
+    }
+
+    // A mixed class: Pulse owns open, another program owns explore, the file says off.
+    // Only our verb goes.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        const std::wstring other = L"\"C:\\Tools\\manager.exe\" \"%1\"";
+        Check(SetRegDefaultString(folder_open(L"Folder"),
+                                  L"\"D:\\old install\\pulse.exe\" \"%1\"") &&
+              SetRegDefaultString(folder_explore(L"Folder"), other),
+              L"prefs-registry: seed a Folder class split between two owners");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(!RegKeyPresent(folder_verb(L"Folder", L"open")),
+              L"prefs-registry: Pulse's own verb is cleared in a split class");
+        Check(ReadRegString(folder_explore(L"Folder").c_str()) == other,
+              L"prefs-registry: the other program's verb survives the cleanup");
+    }
+
+    // A command naming explorer.exe is the shell's own default: it is replaced when the
+    // file says on, but it is not Pulse residue either, so a file that says off leaves
+    // it — and the default verb that belongs to it — in place.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        const std::wstring shell_default = L"%SystemRoot%\\Explorer.exe";
+        Check(SetRegDefaultString(folder_open(L"Directory"), shell_default) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open"),
+              L"prefs-registry: seed the shell's own default while the file says off");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == shell_default &&
+                  ReadRegString(folder_shell(L"Directory").c_str()) == L"open",
+              L"prefs-registry: the shell's own default is not residue to clean");
     }
 
     Check(ReadFolderOpenRegistry() == registry_before,
@@ -3554,7 +3768,6 @@ void TestMultiSelect() {
     tab.InvertIndices({0, 1, 2, 3});
     Check(tab.SelectedCount() == 0, L"select: invert of all_selected clears");
 }
-
 void TestHiddenFiles() {
     AppPrefs prefs;
     Check(prefs.FromJson(L"{}") && !prefs.show_hidden_files,
@@ -5977,10 +6190,17 @@ int RunSelfTest1B2() {
         if (g_log) { fclose(g_log); g_log = nullptr; }
         return g_fail ? 1 : 0;
     }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"shell-namespace") == 0) {
+        TestShellNamespaceForward();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
 
     TestDetailsPreviewInteraction();
     TestBreadcrumb();
     TestThisPcEnumeration();
+    TestShellNamespaceForward();
     TestLoadingPresentation();
     TestNavigationReturnSelection();
     TestMouseHistoryNavigation();
