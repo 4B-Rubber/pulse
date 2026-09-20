@@ -1364,3 +1364,6 @@
 #define IDS_TAB_OPEN_NEW_WINDOW 2525
 #define IDS_TRAY_NEW_WINDOW 2526
 #define IDS_JUMPLIST_PINNED 2527
+
+// Tab-group hover card.
+#define IDS_TAB_GROUP_EDIT 2528

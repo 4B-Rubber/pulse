@@ -17,7 +17,7 @@ inline bool TrayIconWanted(bool background, int mode, bool window_hidden) {
 
 class TrayController {
 public:
-    enum class CallbackResult { NotHandled, Handled, ExitRequested, NewWindowRequested };
+    enum class CallbackResult { NotHandled, Handled, ExitRequested };
     static constexpr UINT kCallbackMessage = WM_APP + 50;
 
     TrayController() = default;

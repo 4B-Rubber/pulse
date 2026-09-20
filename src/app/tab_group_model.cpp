@@ -35,6 +35,13 @@ float DisplacedRestDelta(float old_rest, float cur_off, float new_rest) {
     return old_rest + cur_off - new_rest;
 }
 
+float RunCrossCenter(bool collapsed, float block_left, float block_right,
+                     float slot_w, int dir) {
+    if (collapsed) return (block_left + block_right) * 0.5f;
+    if (dir < 0) return block_right - slot_w * 0.5f;
+    return block_left + slot_w * 0.5f;
+}
+
 GroupRun FindGroupRun(const std::vector<int>& order,
                       const std::vector<int>& tab_group_of,
                       int at, int gid) {
