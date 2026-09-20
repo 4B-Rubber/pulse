@@ -2521,6 +2521,535 @@ void TestAppPrefsAndSettingsPath() {
           L"appprefs: invalid accent_rgb falls back to follow");
 }
 
+// The folder-open overrides live in HKCU and AppPrefs::Load() repairs them, so a
+// self-test must leave them alone. Read-only: a missing value and an empty one both
+// read as "" and compare equal, which is what "the user never enabled this" is.
+struct FolderOpenRegistrySnapshot {
+    std::wstring directory_command;
+    std::wstring directory_verb;
+    std::wstring drive_command;
+    std::wstring drive_verb;
+
+    bool operator==(const FolderOpenRegistrySnapshot& other) const {
+        return directory_command == other.directory_command &&
+               directory_verb == other.directory_verb &&
+               drive_command == other.drive_command && drive_verb == other.drive_verb;
+    }
+};
+
+// Reads one string value; |name| null means the key's default value.
+std::wstring ReadRegString(const std::wstring& key, const wchar_t* name = nullptr) {
+    HKEY h = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &h) != ERROR_SUCCESS)
+        return {};
+    wchar_t value[1024]{};
+    DWORD bytes = sizeof(value);
+    DWORD type = 0;
+    const LONG st = RegQueryValueExW(h, name, nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(value), &bytes);
+    RegCloseKey(h);
+    if (st != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) return {};
+    return value;
+}
+
+FolderOpenRegistrySnapshot ReadFolderOpenRegistry() {
+    FolderOpenRegistrySnapshot snapshot;
+    snapshot.directory_command =
+        ReadRegString(L"Software\\Classes\\Directory\\shell\\open\\command");
+    snapshot.directory_verb = ReadRegString(L"Software\\Classes\\Directory\\shell");
+    snapshot.drive_command = ReadRegString(L"Software\\Classes\\Drive\\shell\\open\\command");
+    snapshot.drive_verb = ReadRegString(L"Software\\Classes\\Drive\\shell");
+    return snapshot;
+}
+
+// A file nobody can read is the only copy of those bytes: a window that could not load
+// it has no business replacing it with its own defaults. Both settings files share the
+// same Save() policy, so they share this check too; |label| keeps each case's
+// assertions byte-identical to the ones the two hand-written copies used to emit.
+template <class Prefs, class Seed, class Touch>
+void CheckLockedFileSaveRefused(const wchar_t* label, const std::wstring& file,
+                                const std::wstring& backup, const std::wstring& quarantine,
+                                Seed seed, Touch touch) {
+    const std::wstring prefix = std::wstring(label) + L": ";
+    const size_t slash = file.find_last_of(L"\\/");
+    const std::wstring name = slash == std::wstring::npos ? file : file.substr(slash + 1);
+    {
+        Prefs writer;
+        seed(writer);
+        Check(writer.Save(), (prefix + L"seed the file the lock test uses").c_str());
+    }
+    // That save kept a backup of the previous file; drop it so the locked file is the
+    // only copy left and "nothing could be read" is actually the case here.
+    DeleteFileW(backup.c_str());
+    std::wstring before;
+    Check(ReadUtf8File(file, before) && !before.empty(),
+          (prefix + L"read the file before locking it").c_str());
+    HANDLE held = CreateFileW(file.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (held == INVALID_HANDLE_VALUE) {
+        Check(false, (prefix + L"the test could lock " + name).c_str());
+    } else {
+        Prefs blocked;
+        blocked.Load();
+        touch(blocked);
+        Check(!blocked.loaded_from_file(), (prefix + L"a locked file is not read").c_str());
+        Check(!blocked.Save(), (prefix + L"save refuses to replace it").c_str());
+        CloseHandle(held);
+        std::wstring after;
+        Check(ReadUtf8File(file, after) && after == before,
+              (prefix + L"the locked file is byte-identical").c_str());
+        Check(!Exists(quarantine), (prefix + L"a failed quarantine leaves no residue").c_str());
+    }
+}
+
+// PULSE_SELFTEST_CASE=prefs-persist: app.json has to round-trip, survive a second
+// window that still holds the values from before, and never be replaced by defaults
+// when it cannot be read. Everything runs in a temp profile, so the real
+// %LOCALAPPDATA%\Pulse is untouched.
+void TestPrefsPersistence() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulsePrefsPersist-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring file = dir + L"\\app.json";
+    const std::wstring backup = file + L".bak";
+    const std::wstring quarantine = file + L".bad";
+
+    // GetPulseDataDir() honours PULSE_TEST_DATA_DIR in a selftest build. The caller's
+    // value is put back below so the rest of the suite keeps its own profile.
+    wchar_t previous[32768]{};
+    const DWORD had_previous =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+    // Every Load() below runs with persistence enabled; the redirected profile is what
+    // keeps them off the real HKCU, so the case ends by proving the keys are untouched.
+    const FolderOpenRegistrySnapshot registry_before = ReadFolderOpenRegistry();
+
+    DeleteFileW(file.c_str());
+    DeleteFileW(backup.c_str());
+    DeleteFileW(quarantine.c_str());
+
+    // What the settings page writes comes back after a reload.
+    {
+        AppPrefs prefs;
+        prefs.keep_running_on_close = true;
+        prefs.show_hidden_files = true;
+        prefs.global_search_enabled = true;
+        prefs.row_height = 40;
+        prefs.language = L"en-US";
+        Check(prefs.Save(), L"prefs-persist: save writes app.json");
+        AppPrefs loaded;
+        Check(loaded.Load() && loaded.loaded_from_file() && loaded.keep_running_on_close &&
+              loaded.show_hidden_files && loaded.global_search_enabled &&
+              loaded.row_height == 40 && loaded.language == L"en-US",
+              L"prefs-persist: settings survive a reload");
+    }
+
+    // The regression this covers: a window that loaded app.json before another
+    // window wrote it must not roll that write back when it saves its own setting.
+    {
+        AppPrefs first;
+        Check(first.Load() && first.show_hidden_files && first.global_search_enabled,
+              L"prefs-persist: an open window loads the current file");
+        AppPrefs second;
+        Check(second.Load() && second.show_hidden_files,
+              L"prefs-persist: the second window loads the same file");
+        second.show_hidden_files = false;
+        Check(second.Save(), L"prefs-persist: the second window saves its setting");
+        first.global_search_enabled = false;
+        Check(first.Save(), L"prefs-persist: the stale window saves afterwards");
+        AppPrefs merged;
+        Check(merged.Load() && !merged.show_hidden_files && !merged.global_search_enabled &&
+              merged.keep_running_on_close && merged.language == L"en-US",
+              L"prefs-persist: the stale save keeps the other window's change");
+        // Saving again from the same stale window must not resurrect its value: the
+        // baseline is what it holds, not what the previous save wrote.
+        Check(first.Save(), L"prefs-persist: the stale window saves a second time");
+        AppPrefs stable;
+        Check(stable.Load() && !stable.show_hidden_files && !stable.global_search_enabled,
+              L"prefs-persist: a second save does not resurrect the stale value");
+    }
+
+    // A file nobody can read is the only copy of those bytes: a window that could not
+    // load it has no business replacing it with its own defaults.
+    CheckLockedFileSaveRefused<AppPrefs>(
+        L"prefs-persist", file, backup, quarantine,
+        [](AppPrefs& p) {
+            p.keep_running_on_close = true;
+            p.search_pinyin = false;
+        },
+        [](AppPrefs& p) { p.show_hidden_files = true; });
+
+    // A truncated main file next to a complete backup: the backup wins, and the next
+    // save repairs the main file from it.
+    {
+        DeleteFileW(file.c_str());
+        DeleteFileW(backup.c_str());
+        DeleteFileW(quarantine.c_str());
+        AppPrefs good;
+        good.keep_running_on_close = true;
+        good.show_hidden_files = true;
+        good.row_height = 40;
+        good.language = L"en-US";
+        const std::wstring complete = good.ToJson();
+        Check(WriteUtf8FileAtomic(backup, complete),
+              L"prefs-persist: the backup holds a complete file");
+        Check(WriteUtf8FileAtomic(file, complete.substr(0, complete.size() / 3)),
+              L"prefs-persist: the main file is truncated");
+        AppPrefs healed;
+        Check(healed.Load() && healed.loaded_from_file() && healed.keep_running_on_close &&
+              healed.show_hidden_files && healed.row_height == 40 &&
+              healed.language == L"en-US",
+              L"prefs-persist: a truncated app.json falls back to the backup");
+        healed.show_hidden_files = false;
+        Check(healed.Save(), L"prefs-persist: a save repairs the truncated file");
+        AppPrefs repaired;
+        Check(repaired.Load() && repaired.loaded_from_file() && !repaired.show_hidden_files &&
+              repaired.keep_running_on_close && repaired.language == L"en-US",
+              L"prefs-persist: the repaired file holds the merged values");
+    }
+
+    Check(ReadFolderOpenRegistry() == registry_before,
+          L"prefs-persist: the test left the folder-open registry untouched");
+
+    DeleteFileW(file.c_str());
+    DeleteFileW(backup.c_str());
+    DeleteFileW(quarantine.c_str());
+    RemoveDirectoryW(dir.c_str());
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous ? previous : nullptr);
+}
+
+namespace {
+
+std::wstring SelfExePath() {
+    wchar_t path[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+    return n ? std::wstring(path, n) : std::wstring();
+}
+
+// Creates the key so a value can be written into an empty sandbox.
+bool CreateRegKey(const std::wstring& key) {
+    HKEY h = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                        nullptr, &h, nullptr) != ERROR_SUCCESS)
+        return false;
+    RegCloseKey(h);
+    return true;
+}
+
+bool SetRegNamedString(const std::wstring& key, const wchar_t* name,
+                       const std::wstring& value) {
+    HKEY h = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                        nullptr, &h, nullptr) != ERROR_SUCCESS)
+        return false;
+    const LONG st = RegSetValueExW(h, name, 0, REG_SZ,
+                                   reinterpret_cast<const BYTE*>(value.c_str()),
+                                   static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(h);
+    return st == ERROR_SUCCESS;
+}
+
+bool SetRegDefaultString(const std::wstring& key, const std::wstring& value) {
+    return SetRegNamedString(key, nullptr, value);
+}
+
+void DeleteRegTree(const std::wstring& key) {
+    RegDeleteTreeW(HKEY_CURRENT_USER, key.c_str());
+}
+
+} // namespace
+
+// PULSE_SELFTEST_CASE=prefs-registry: app.json holds the intent and the registry is a
+// projection of it, so an install that moved (or a key an uninstaller deleted) has to
+// be repaired at startup instead of reading "missing" as "off" and freezing that into
+// the file. PULSE_TEST_REGISTRY_BASE sends every registry path into a sandbox key, so
+// the machine's own Run value and folder-open verbs are never involved.
+void TestPrefsRegistryReconcile() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulsePrefsRegistry-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring file = dir + L"\\app.json";
+    const std::wstring backup = file + L".bak";
+    const std::wstring quarantine = file + L".bad";
+
+    wchar_t previous_data[32768]{};
+    const DWORD had_previous_data =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous_data, ARRAYSIZE(previous_data));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+    const std::wstring base = L"Software\\Pulse\\SelftestSandbox";
+    SetEnvironmentVariableW(L"PULSE_TEST_REGISTRY_BASE", base.c_str());
+
+    // The real keys, read before and after: the sandbox is only working if these are
+    // identical when the case ends.
+    const FolderOpenRegistrySnapshot registry_before = ReadFolderOpenRegistry();
+    const std::wstring run_before =
+        ReadRegString(L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Pulse");
+
+    const std::wstring exe = SelfExePath();
+    const std::wstring start_command = L"\"" + exe + L"\"";
+    const std::wstring folder_command = L"\"" + exe + L"\" \"%1\"";
+    const std::wstring run_key = base + L"\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    auto folder_open = [&](const wchar_t* cls) {
+        return base + L"\\Software\\Classes\\" + cls + L"\\shell\\open\\command";
+    };
+    auto folder_shell = [&](const wchar_t* cls) {
+        return base + L"\\Software\\Classes\\" + cls + L"\\shell";
+    };
+    auto reset = [&]() {
+        DeleteRegTree(base);
+        DeleteFileW(file.c_str());
+        DeleteFileW(backup.c_str());
+        DeleteFileW(quarantine.c_str());
+    };
+    auto seed_file = [&](bool startup, bool folder_open_on) {
+        AppPrefs seed;
+        seed.launch_on_startup = startup;
+        seed.open_folders_in_pulse = folder_open_on;
+        return seed.Save();
+    };
+    auto file_says = [&](const wchar_t* key, bool expected) {
+        std::wstring json;
+        if (!ReadUtf8File(file, json)) return false;
+        return json.find(std::wstring(L"\"") + key + L"\":") != std::wstring::npos &&
+               json.find(std::wstring(L"\"") + key + L"\":" + (expected ? L"true" : L"false")) !=
+                   std::wstring::npos;
+    };
+
+    // The setting is on and the keys are gone: startup repairs them.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        Check(CreateRegKey(run_key), L"prefs-registry: create the sandboxed Run key");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(run_key, L"Pulse") == start_command,
+              L"prefs-registry: a missing Run value is written back");
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == folder_command,
+              L"prefs-registry: a missing folder-open command is written back");
+        Check(ReadRegString(folder_shell(L"Directory").c_str()) == L"open",
+              L"prefs-registry: the class default verb is set to open");
+    }
+
+    // The keys hold another program: Pulse stays out of it.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        const std::wstring other = L"\"C:\\Windows\\explorer.exe\" \"%1\"";
+        Check(SetRegNamedString(run_key, L"Pulse", L"\"C:\\Windows\\notepad.exe\"") &&
+              SetRegDefaultString(folder_open(L"Directory"), other) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open"),
+              L"prefs-registry: seed keys another program owns");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(run_key, L"Pulse") == L"\"C:\\Windows\\notepad.exe\"",
+              L"prefs-registry: someone else's Run value is left alone");
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == other,
+              L"prefs-registry: someone else's folder-open verb is left alone");
+        Check(prefs.launch_on_startup && prefs.open_folders_in_pulse,
+              L"prefs-registry: the file still says on after a verb was left alone");
+    }
+
+    // The keys name a Pulse that is no longer this executable: repoint them.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        const std::wstring stale = L"\"D:\\old install\\pulse.exe\" \"%1\"";
+        Check(SetRegNamedString(run_key, L"Pulse", L"\"D:\\old install\\pulse.exe\"") &&
+              SetRegDefaultString(folder_open(L"Directory"), stale) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open"),
+              L"prefs-registry: seed keys left by an install that moved");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(run_key, L"Pulse") == start_command,
+              L"prefs-registry: a stale Run value is repointed at this executable");
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == folder_command,
+              L"prefs-registry: a stale folder-open command is repointed");
+    }
+
+    // The file says off and what is left in the registry is ours — the loose sense
+    // counts a path an install left behind: clear it, or the setting can never be
+    // switched off and double-click keeps calling an executable that is gone.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        Check(SetRegDefaultString(folder_open(L"Directory"),
+                                  L"\"D:\\old install\\pulse.exe\" \"%1\"") &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open") &&
+              SetRegDefaultString(folder_shell(L"Drive"), L"open"),
+              L"prefs-registry: seed residue from an install that moved");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Directory").c_str()).empty(),
+              L"prefs-registry: a stale pulse.exe command is cleared when the file says off");
+        Check(ReadRegString(folder_shell(L"Directory").c_str()).empty(),
+              L"prefs-registry: its class default verb is cleared with it");
+        Check(ReadRegString(folder_shell(L"Drive").c_str()).empty(),
+              L"prefs-registry: a leftover class default verb alone is cleared too");
+        Check(!prefs.open_folders_in_pulse,
+              L"prefs-registry: the file stays off after the cleanup");
+    }
+
+    // The file says off and the verb belongs to another program: not one byte moves.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        const std::wstring foreign = L"\"C:\\Windows\\explorer.exe\" \"%1\"";
+        Check(SetRegDefaultString(folder_open(L"Directory"), foreign) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open") &&
+              SetRegDefaultString(folder_open(L"Drive"), foreign),
+              L"prefs-registry: seed a verb another program owns");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == foreign,
+              L"prefs-registry: another program's command survives a file that says off");
+        Check(ReadRegString(folder_shell(L"Directory").c_str()) == L"open",
+              L"prefs-registry: another program's class default verb survives too");
+        Check(ReadRegString(folder_open(L"Drive").c_str()) == foreign,
+              L"prefs-registry: the second class is left alone as well");
+    }
+
+    // The file says off but the registry is ours and working: the file lost the value,
+    // so it is adopted back and written instead of switching the setting off.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        Check(CreateRegKey(run_key) &&
+              SetRegNamedString(run_key, L"Pulse", start_command) &&
+              SetRegDefaultString(folder_open(L"Directory"), folder_command) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open"),
+              L"prefs-registry: seed working keys the file disagrees with");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(prefs.launch_on_startup && prefs.open_folders_in_pulse,
+              L"prefs-registry: a working registry value is adopted, not discarded");
+        Check(file_says(L"launch_on_startup", true) &&
+              file_says(L"open_folders_in_pulse", true),
+              L"prefs-registry: the adopted value is written back into app.json");
+    }
+
+    Check(ReadFolderOpenRegistry() == registry_before,
+          L"prefs-registry: the sandbox left the real folder-open keys untouched");
+    Check(ReadRegString(L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Pulse") ==
+              run_before,
+          L"prefs-registry: the sandbox left the real Run value untouched");
+
+    DeleteRegTree(base);
+    DeleteFileW(file.c_str());
+    DeleteFileW(backup.c_str());
+    DeleteFileW(quarantine.c_str());
+    RemoveDirectoryW(dir.c_str());
+    SetEnvironmentVariableW(L"PULSE_TEST_REGISTRY_BASE", nullptr);
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous_data ? previous_data : nullptr);
+}
+
+// PULSE_SELFTEST_CASE=ctxmenu-persist: context_menu.json is a setting like app.json, so
+// it gets the same guarantees — round-trip, a window holding older values does not roll
+// another one back, and a file nobody can read is never replaced.
+void TestContextMenuPersistence() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulseCtxMenuPrefs-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring file = dir + L"\\context_menu.json";
+    const std::wstring backup = file + L".bak";
+    const std::wstring quarantine = file + L".bad";
+
+    wchar_t previous[32768]{};
+    const DWORD had_previous =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+    auto reset = [&]() {
+        DeleteFileW(file.c_str());
+        DeleteFileW(backup.c_str());
+        DeleteFileW(quarantine.c_str());
+    };
+
+    // What the settings page and the catalog write comes back after a reload.
+    {
+        reset();
+        ContextMenuPrefs prefs;
+        prefs.share = true;
+        prefs.explorer_cap = 12;
+        prefs.SetItemEnabled(L":folder", false);
+        prefs.RecordSeen(L"v:copy", L"复制", false, ipc::CtxMenuCategory::Software, true);
+        Check(prefs.Save(), L"ctxmenu-persist: save writes context_menu.json");
+        ContextMenuPrefs loaded;
+        Check(loaded.Load() && loaded.loaded_from_file() && loaded.share &&
+                  loaded.explorer_cap == 12 && loaded.seen.size() == 1 &&
+                  !loaded.ItemEnabled(L":folder", ipc::CtxMenuCategory::Software, false),
+              L"ctxmenu-persist: the prefs survive a reload");
+    }
+
+    // A window that loaded before another one wrote must not roll that write back.
+    {
+        reset();
+        // Start from the defaults so each save below is a change of exactly one field.
+        ContextMenuPrefs seed;
+        Check(seed.Save(), L"ctxmenu-persist: seed the file the merge test uses");
+        ContextMenuPrefs first;
+        Check(first.Load(), L"ctxmenu-persist: an open window loads the file");
+        ContextMenuPrefs second;
+        Check(second.Load(), L"ctxmenu-persist: the second window loads the same file");
+        second.share = true;
+        Check(second.Save(), L"ctxmenu-persist: the second window saves its setting");
+        first.print = false;
+        Check(first.Save(), L"ctxmenu-persist: the stale window saves afterwards");
+        ContextMenuPrefs merged;
+        Check(merged.Load() && merged.share && !merged.print,
+              L"ctxmenu-persist: the stale save keeps the other window's change");
+        Check(first.Save(), L"ctxmenu-persist: the stale window saves a second time");
+        ContextMenuPrefs stable;
+        Check(stable.Load() && stable.share && !stable.print,
+              L"ctxmenu-persist: a second save does not resurrect the stale value");
+    }
+
+    // A file nobody can read is the only copy of those bytes.
+    reset();
+    CheckLockedFileSaveRefused<ContextMenuPrefs>(
+        L"ctxmenu-persist", file, backup, quarantine,
+        [](ContextMenuPrefs& p) { p.share = true; },
+        [](ContextMenuPrefs& p) { p.rotate = true; });
+
+    // A file truncated mid-write still parses into a couple of keys, so the key count
+    // has to send Load() to the backup instead of reading the fragment as the config.
+    {
+        reset();
+        ContextMenuPrefs good;
+        good.share = true;
+        good.explorer_cap = 12;
+        good.RecordSeen(L"v:copy", L"复制", false, ipc::CtxMenuCategory::Software, true);
+        const std::wstring complete = good.ToJson();
+        const size_t cut = complete.find(L"\"categories\"");
+        Check(WriteUtf8FileAtomic(backup, complete),
+              L"ctxmenu-persist: the backup holds a complete file");
+        Check(cut != std::wstring::npos && WriteUtf8FileAtomic(file, complete.substr(0, cut)),
+              L"ctxmenu-persist: the main file is truncated to a couple of keys");
+        ContextMenuPrefs healed;
+        Check(healed.Load() && healed.loaded_from_file() && healed.share &&
+                  healed.explorer_cap == 12 && healed.seen.size() == 1,
+              L"ctxmenu-persist: a truncated context_menu.json falls back to the backup");
+        healed.rotate = true;
+        Check(healed.Save(), L"ctxmenu-persist: a save repairs the truncated file");
+        ContextMenuPrefs repaired;
+        Check(repaired.Load() && repaired.share && repaired.rotate &&
+                  repaired.explorer_cap == 12 && repaired.seen.size() == 1,
+              L"ctxmenu-persist: the repaired file holds the merged values");
+    }
+
+    DeleteFileW(file.c_str());
+    DeleteFileW(backup.c_str());
+    DeleteFileW(quarantine.c_str());
+    RemoveDirectoryW(dir.c_str());
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous ? previous : nullptr);
+}
+
 void TestBloomAccentGeometry() {
     Check(ui::kBloomDotCount == 19, L"bloom: 19 dots");
     Check(std::fabs(ui::BloomDotHue(1, 0, 6) - 90.0f) < 0.01f,
@@ -4771,6 +5300,50 @@ void TestLayoutOwnedTabs() {
           restored.items[1]->panes.size() == 1 &&
           restored.items[1]->panes[0]->view.current_path.find(L"raw") != std::wstring::npos,
           L"layouttabs: session restore keeps the second tab's single folder");
+
+    // A window's last tab is not just removed: closing it closes the window.
+    // The model reports that and refuses to empty the strip on its own, so its
+    // callers (the strip's x, the tab menu, Ctrl+W) can post WM_CLOSE instead.
+    WindowTabs single;
+    single.EnsureDefault();
+    Check(single.items.size() == 1 && single.ClosingLastTab(0) && !single.ClosingLastTab(1),
+          L"layouttabs: the only tab asks its window to close");
+    single.CloseTab(0);
+    Check(single.items.size() == 1 && single.active == 0,
+          L"layouttabs: the model never empties the strip by itself");
+    single.items[0]->pinned = true;
+    Check(!single.ClosingLastTab(0),
+          L"layouttabs: a pinned single tab never closes its window");
+    single.items[0]->pinned = false;
+    single.NewTab(L"C:\\second");
+    Check(single.items.size() == 2 && !single.ClosingLastTab(0) && !single.ClosingLastTab(1),
+          L"layouttabs: a tab with a sibling closes as a tab");
+    single.CloseTab(0);
+    Check(single.items.size() == 1 && single.active == 0,
+          L"layouttabs: closing one of two tabs keeps the other");
+
+    // A group that lost its last member is worth nothing: nothing left to show,
+    // nothing left to ungroup. The prune has to cover every close path, so it
+    // only touches the group list and never the tabs.
+    WindowTabs grouped;
+    grouped.NewTab(L"C:\\group-one");
+    grouped.NewTab(L"C:\\group-two");
+    const int group_id = grouped.next_tab_group_id++;
+    TabGroup group;
+    group.id = group_id;
+    grouped.tab_groups.push_back(group);
+    grouped.items[0]->tab_group = group_id;
+    PruneEmptyGroups(grouped);
+    Check(grouped.tab_groups.size() == 1 && grouped.tab_groups[0].id == group_id,
+          L"layouttabs: a group with a member tab survives the prune");
+    Check(grouped.items[0]->tab_group == group_id && grouped.items[1]->tab_group == 0,
+          L"layouttabs: pruning groups leaves tab membership alone");
+    grouped.CloseTab(0);
+    PruneEmptyGroups(grouped);
+    Check(grouped.tab_groups.empty() && grouped.next_tab_group_id == group_id + 1,
+          L"layouttabs: a group that lost its last member is dropped");
+    Check(grouped.items.size() == 1 && grouped.items[0]->tab_group == 0,
+          L"layouttabs: pruning groups keeps the surviving tabs");
 }
 
 void TestUtf8PersistFile() {
@@ -4800,7 +5373,7 @@ void TestUtf8PersistFile() {
     }
     Check(utf8, L"utf8file: on-disk bytes are UTF-8");
     DeleteFileW(path.c_str());
-    DeleteFileW((path + L".tmp").c_str());
+    DeleteFileW((path + L".tmp." + std::to_wstring(GetCurrentProcessId())).c_str());
 }
 
 void TestColorPickerModel() {
@@ -5386,6 +5959,24 @@ int RunSelfTest1B2() {
         if (g_log) { fclose(g_log); g_log = nullptr; }
         return g_fail ? 1 : 0;
     }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"prefs-persist") == 0) {
+        TestPrefsPersistence();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"prefs-registry") == 0) {
+        TestPrefsRegistryReconcile();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"ctxmenu-persist") == 0) {
+        TestContextMenuPersistence();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
 
     TestDetailsPreviewInteraction();
     TestBreadcrumb();
@@ -5399,6 +5990,9 @@ int RunSelfTest1B2() {
     TestShellMenuMerge();
     TestContextMenuPrefs();
     TestAppPrefsAndSettingsPath();
+    TestPrefsPersistence();
+    TestPrefsRegistryReconcile();
+    TestContextMenuPersistence();
     TestDragDropPure();
     TestAddressSearch();
     TestAddressSearchHistoryInteraction();

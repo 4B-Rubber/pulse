@@ -1577,9 +1577,18 @@ void OpenSettingsTab(AppState& s, int page) {
 }
 void CloseLayoutTab(AppState& s, size_t idx) {
     if (idx >= s.window_tabs.items.size()) return;
+    // The window's last tab closes the window, the way Explorer does. WM_CLOSE
+    // owns the tray-or-exit decision, so this is the same as pressing the
+    // window's own close button.
+    if (s.window_tabs.ClosingLastTab(idx)) {
+        PostMessageW(s.hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
     RememberLayoutFocus(s);
     RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.CloseTab(idx);
+    // The group that lost its last member has nothing left to show.
+    app::PruneEmptyGroups(s.window_tabs);
     // The closed tab is gone; drop any memory that still points at it.
     PruneGroupActivations(s);
     BindCurrentLayout(s);

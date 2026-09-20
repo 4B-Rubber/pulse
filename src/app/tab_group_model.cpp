@@ -105,4 +105,14 @@ void NormalizeGroupRuns(WindowTabs& tabs) {
     }
 }
 
+void PruneEmptyGroups(WindowTabs& tabs) {
+    tabs.tab_groups.erase(std::remove_if(tabs.tab_groups.begin(), tabs.tab_groups.end(),
+        [&tabs](const TabGroup& group) {
+            return std::none_of(tabs.items.begin(), tabs.items.end(),
+                [&group](const std::unique_ptr<LayoutTab>& tab) {
+                    return tab->tab_group == group.id;
+                });
+        }), tabs.tab_groups.end());
+}
+
 } // namespace pulse::app

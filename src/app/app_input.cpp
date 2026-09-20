@@ -430,6 +430,8 @@ bool HandOffTabUnderCursor(AppState& s, HWND hwnd) {
         return true;
     }
     s.window_tabs.CloseTab(static_cast<size_t>(s.tabDragIndex));
+    // The group that lost its last member has nothing left to show.
+    app::PruneEmptyGroups(s.window_tabs);
     // The tab left this window; drop any memory that still points at it.
     PruneGroupActivations(s);
     BindCurrentLayout(s);
@@ -2898,13 +2900,7 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         // as its last active tab, so the memory has to follow.
                         PruneGroupActivations(*s);
                         // Groups with no members left disappear.
-                        auto& groups = s->window_tabs.tab_groups;
-                        for (auto git = groups.begin(); git != groups.end();) {
-                            bool used = false;
-                            for (const auto& t : s->window_tabs.items)
-                                if (t->tab_group == git->id) { used = true; break; }
-                            if (used) ++git; else git = groups.erase(git);
-                        }
+                        app::PruneEmptyGroups(s->window_tabs);
                     }
                 }
                 // Plain chip click (press without drag): toggle collapse.

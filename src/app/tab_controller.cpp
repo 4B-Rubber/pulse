@@ -178,6 +178,18 @@ void TabController::ShowGroupMenu(WindowTabs& tabs, int group_id, POINT screen_p
     } else if (command == CmdTabGroupUngroup) {
         RemoveGroup(tabs, id);
     } else if (command == CmdTabGroupClose) {
+        // Closing a group whose only member is the window's last tab closes the
+        // window: the model refuses to empty the strip, so the owner decides
+        // instead - exactly like the tab's own x. Without an owner the tab stays
+        // and the group is merely ungrouped, as before.
+        bool closes_window = false;
+        for (size_t i = 0; i < tabs.items.size(); ++i) {
+            if (tabs.items[i]->tab_group == id && tabs.ClosingLastTab(i)) closes_window = true;
+        }
+        if (closes_window && callbacks_.close_window) {
+            callbacks_.close_window();
+            return;
+        }
         WillChangeLayout();
         for (int i = static_cast<int>(tabs.items.size()) - 1; i >= 0; --i) {
             if (tabs.items[static_cast<size_t>(i)]->tab_group == id) {
@@ -197,16 +209,6 @@ void TabController::RemoveGroup(WindowTabs& tabs, int group_id) const {
     tabs.tab_groups.erase(std::remove_if(tabs.tab_groups.begin(), tabs.tab_groups.end(),
         [group_id](const TabGroup& group) { return group.id == group_id; }),
         tabs.tab_groups.end());
-}
-
-void TabController::PruneEmptyGroups(WindowTabs& tabs) const {
-    tabs.tab_groups.erase(std::remove_if(tabs.tab_groups.begin(), tabs.tab_groups.end(),
-        [&](const TabGroup& group) {
-            return std::none_of(tabs.items.begin(), tabs.items.end(),
-                [&](const std::unique_ptr<LayoutTab>& tab) {
-                    return tab->tab_group == group.id;
-                });
-        }), tabs.tab_groups.end());
 }
 
 void TabController::CloseTabs(WindowTabs& tabs, int first, int last, int except) const {
@@ -285,7 +287,8 @@ void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt
         items.back().separator_after = true;
     }
     items.push_back(MenuItem(CmdTabClose, TabText(Text::TabClose), L"\xE711"));
-    items.back().enabled = !tab.pinned && tabs.items.size() > 1;
+    // The window's last tab is closable too: it closes the window.
+    items.back().enabled = !tab.pinned;
     items.push_back(MenuItem(CmdTabCloseOthers, TabText(Text::TabCloseOthers)));
     items.push_back(MenuItem(CmdTabCloseRight, TabText(Text::TabCloseRight)));
 
@@ -344,6 +347,12 @@ void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt
         NormalizeGroupRuns(tabs);
         PruneEmptyGroups(tabs);
     } else if (command == CmdTabClose) {
+        // Closing the only tab of a window closes the window: the model refuses
+        // to empty the strip, so hand the decision to the window's owner.
+        if (tabs.ClosingLastTab(static_cast<size_t>(tab_index))) {
+            if (callbacks_.close_window) callbacks_.close_window();
+            return;
+        }
         CloseTabs(tabs, tab_index, tab_index);
     } else if (command == CmdTabCloseOthers) {
         CloseTabs(tabs, 0, static_cast<int>(tabs.items.size()) - 1, tab_index);

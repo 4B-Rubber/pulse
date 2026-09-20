@@ -533,6 +533,8 @@ LayoutTab& WindowTabs::NewTabAt(size_t index, const std::wstring& path) {
 }
 
 void WindowTabs::CloseTab(size_t idx) {
+    // Never empty the window: the last tab goes away by closing the window
+    // (see WindowTabs::ClosingLastTab), and a pinned tab is not closable.
     if (idx >= items.size() || items.size() <= 1) return;
     if (items[idx]->pinned) return;
     items.erase(items.begin() + static_cast<ptrdiff_t>(idx));

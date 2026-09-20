@@ -265,6 +265,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             [hwnd] { InvalidateRect(hwnd, nullptr, FALSE); },
             [s] { BindCurrentLayout(*s); },
             [s] { RememberLayoutFocus(*s); },
+            // The tab menu closes the window through the same WM_CLOSE the title
+            // bar uses, so the tray settings decide hide-versus-exit.
+            [hwnd] { PostMessageW(hwnd, WM_CLOSE, 0, 0); },
         });
         if (s->isolatedTest) {
             s->places.persist = false;

@@ -311,6 +311,13 @@ struct WindowTabs {
     LayoutTab& NewTab(const std::wstring& path);
     LayoutTab& NewTabAt(size_t index, const std::wstring& path);
     void CloseTab(size_t idx);
+    // True when closing tab `idx` means closing the window instead of removing
+    // a tab: it is the window's last tab, and a pinned tab has no close
+    // affordance at all. The model never posts messages; the window owner turns
+    // this into WM_CLOSE, so the tray settings decide hide-versus-exit.
+    bool ClosingLastTab(size_t idx) const {
+        return idx < items.size() && items.size() == 1 && !items[idx]->pinned;
+    }
     void SwitchTab(size_t idx);
     void MoveTab(size_t from, size_t to);
 };
@@ -335,6 +342,13 @@ std::vector<ui::TabGroupCardRow> TabGroupCardRows(const WindowTabs& tabs, int gr
 // contiguous (TabGroup::ListTabs contract); call after membership changes
 // that can split a run. Remaps WindowTabs::active by pointer identity.
 void NormalizeGroupRuns(WindowTabs& tabs);
+
+// Drop every group that owns no member tab. A group whose tabs are all gone has
+// nothing left to show and nothing to ungroup, so its chip would be a ghost;
+// call this after any tab close. Group ids are never reused, so the surviving
+// groups keep their identity. Only the group list changes: tab order, the
+// active tab and WindowTabs::next_tab_group_id are left alone.
+void PruneEmptyGroups(WindowTabs& tabs);
 
 // ---------------------------------------------------------------------------
 // Staging tray: collect file paths into batches.
