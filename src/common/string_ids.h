@@ -1367,3 +1367,5 @@
 
 // Tab-group hover card.
 #define IDS_TAB_GROUP_EDIT 2528
+// Recent/starred item menu: reveal the row in its containing folder.
+#define IDS_OPEN_ITEM_LOCATION 2529
