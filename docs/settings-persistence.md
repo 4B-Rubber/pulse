@@ -29,6 +29,8 @@
 2. **反向保护**：文件说关、但注册表明确是"我们的"且正在工作 → 判定为"文件丢过值"，**采用注册表的值并把文件写成开**，不静默关掉用户本来好用的设置。开机自启那一项没有"存在但关"的状态（设置页关掉时直接删值），所以"文件说关 + Run 值是我们的"只可能是文件丢过值，一律采用为开。
 3. **首次迁移**：`app.json` 整体不可用（没有文件或读不出来）→ 保持旧行为，以注册表为准填这两项，继承老用户的现状。
 
+这条对账与安装器侧是**两半**，互相不依赖、同时存在也不冲突：安装器（`installer/PulseSetup.iss`，上游已合 `fb122c0`）在升级前捕获 Run 键与 `Directory`/`Drive` 的 open 命令、装完写回，覆盖"旧卸载器先清再装"的那段空窗；应用侧（本文件描述的对账）以 `app.json` 为准，能补回安装器没有捕获的 `Folder` 类、换过安装目录的旧路径残留，以及两次升级之间用户自己改过的意图。
+
 **接管范围**：`Directory`、`Drive`（写 `shell\open`，并把类的默认动词从 `none` 改成 `open`）以及 `Folder`（写 `shell\open` + `shell\explore`）。接管 `Folder` 也意味着**系统命名空间**会交过来（任务栏的"文件资源管理器"按钮、桌面上的"此电脑""回收站"图标走的就是这个类），它们由应用侧翻译或忽略，见 `shell-namespace-forward.md`。Folder 的两个动词在 HKCR 里都由委派处理器 `{11dbb47c-...}` 承载，所以还要在 verb 的 `\command` 下写一个空 `DelegateExecute` 把它遮蔽掉，否则执行权仍在 Explorer 的处理器手里。Directory/Drive 自身不定义这两个动词，双击本来就 fall through 到 `Folder` 类，所以补上 Folder 才覆盖到所有文件夹项。**Explorer 的 Win+E 入口（它自己的 CLSID）刻意不接管**：写坏它会让 Win+E/任务栏报错，收益只是把一条快捷键换个程序。同样接不到的还有第三方程序**硬编码**的 `explorer.exe /select,"%1"` 与 `SHOpenFolderAndSelectItems`：它们绕过类动词直接调 Explorer，注册表里没有任何可拦截的钩子（FDM 的"在文件夹中显示"两条路都用，实测仍会弹出资源管理器；Files 也受同一限制）。
 
 "是不是我们的"分三档，**用途不同**：
@@ -63,7 +65,7 @@
 
 ## 定向验证
 
-只构建 `pulse` 与 `pulse_app_controllers_test`（Release），只跑与本次改动直接相关的用例：
+只构建 `pulse` 与 `pulse_app_controllers_test`（Release），只跑与本次改动直接相关的用例。换基到 `upstream/main`（`187240e`，含 #7/#8/#10）后重跑的结论：`pulse_app_controllers_test`（全量 + `--layout-search-prefs`）全绿、全量 `--selftest` **1244 通过 / 0 失败 / 0 跳过**。
 
 - `PULSE_SELFTEST_CASE=prefs-persist`（21 条）：往返、过期写入不回滚（两个 `AppPrefs` 交叉写，且连存两次也不会复活旧值）、独占文件时拒绝覆盖且逐字节不变、坏主文件 + 好备份自愈并修复主文件，最后再比对一遍 `HKCU\Software\Classes\Directory|Drive\Folder\shell` 与对应 `\shell\open|explore\command`（含 `DelegateExecute`）的默认值确认整个用例没动过注册表。
 - `PULSE_SELFTEST_CASE=prefs-registry`（53 条）：对账十例——缺失写回（含 Folder 的 open/explore 与空委派值）、explorer.exe 系统默认镜像可替换且委派处理器被遮蔽成空、说关时该镜像不被当残留清理、别人（另一个程序）的不动（Folder 类被占时连 explore 都不建，但不影响 Directory）、旧路径重写、说关时清掉旧路径与半截残留、说关且命令属于别的程序时一个字节都不动（默认动词也留下）、混合所有者时只清我们那一半、说关但注册表在工作则采用并写回文件；最后比对真实 Run 值与 Directory/Drive/Folder 关联键未被沙箱之外的任何动作改动。
