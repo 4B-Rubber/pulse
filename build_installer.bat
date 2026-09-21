@@ -32,6 +32,8 @@ if not defined ISCC (
     exit /b 1
 )
 
-"%ISCC%" /DAppVersion=%PULSE_VERSION% installer\PulseSetup.iss || exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\stage_installer_runtime.ps1" -BuildDir "%~dp0build" || exit /b 1
+
+"%ISCC%" /DAppVersion=%PULSE_VERSION% /DAppLocalRuntime installer\PulseSetup.iss || exit /b 1
 echo.
 echo Installer written to dist\

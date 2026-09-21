@@ -75,6 +75,10 @@ Name: "startup"; Description: "开机自动启动 Pulse / Launch Pulse at sign-i
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "其他 / Other:"; Flags: unchecked
 
 [Files]
+#ifdef AppLocalRuntime
+; Local MD builds bundle the matching CRT; the static Win81 CI path is unchanged.
+Source: "{#BuildDir}\msvc-runtime\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+#endif
 Source: "{#BuildDir}\pulse.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\lumatext.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion

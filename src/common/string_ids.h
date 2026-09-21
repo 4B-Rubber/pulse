@@ -820,3 +820,11 @@
 
 // OneDrive account rows: "<account name> - <Personal|tenant>".
 #define IDS_ONEDRIVE_PERSONAL 1986
+
+// Shared status-bar update progress.
+#define IDS_UPDATE_CONNECTING 1992
+#define IDS_UPDATE_DOWNLOAD_PROGRESS 1993
+#define IDS_UPDATE_DOWNLOAD_UNKNOWN 1994
+#define IDS_UPDATE_VERIFYING 1995
+#define IDS_UPDATE_LAUNCHING 1996
+#define IDS_UPDATE_INSTALLING_STATUS 1997

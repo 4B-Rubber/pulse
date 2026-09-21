@@ -185,6 +185,7 @@ struct AppState {
     bool update_result_ready = false;
     app::UpdateInstaller update_installer;
     DWORD update_install_error = ERROR_SUCCESS;
+    ULONGLONG next_update_progress_paint = 0;
     ULONGLONG next_update_check = GetTickCount64() + 15000;
     std::wstring notified_update_version;
     app::TabController tabs;

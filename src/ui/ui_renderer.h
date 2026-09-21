@@ -353,7 +353,8 @@ struct StatusBarView {
     std::wstring selection_text;
     std::wstring hint_text;        // contextual shortcut / hover prompt
     std::wstring task_text;        // active/completed op summary; empty = idle
-    float task_progress = -1.0f;   // 0..100 while an op runs; <0 hides the bar
+    float task_progress = -1.0f;   // 0..100; negative: hidden for ops, indeterminate for updates.
+    bool task_is_update = false;   // Noninteractive, centered progress; never opens file operations.
     std::wstring performance_text; // development diagnostics; empty hides it
     std::wstring performance_compact_text;
 };

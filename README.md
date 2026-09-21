@@ -63,7 +63,7 @@ pwsh ./scripts/build_release_ci.ps1 -Channel windows
 pwsh ./scripts/build_release_ci.ps1 -Channel win81 -BuildDir build-ci-win81
 ```
 
-发布脚本使用 Visual Studio 2022 v143，并自动下载、校验固定版本的 LumaText SDK。开发构建可通过 `LUMATEXT_SOURCE_DIR` 指定源码；未找到 LumaText 时使用 DirectWrite。
+发布脚本使用 Visual Studio 2022 v143，并校验仓库内固定版本的 LumaText 静态运行库 SDK。`cmake/lumatext-sdk.json` 固定 SDK 清单的 SHA-256，清单覆盖 DLL、导入库、头文件、CMake 导出和许可证。开发构建可通过 `LUMATEXT_SOURCE_DIR` 指定源码；未找到 LumaText 时使用 DirectWrite。
 
 技术栈为 C++20、Win32、Direct2D 和 DirectComposition。文件系统、索引、预览与 Shell 任务分别放在对应模块，避免阻塞界面。
 

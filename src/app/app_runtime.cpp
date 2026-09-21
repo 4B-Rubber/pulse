@@ -1,5 +1,6 @@
 // app_runtime.cpp — extracted from app_main.cpp.
 #include "app_internal.h"
+#include "update_status.h"
 #include "../ui/lumatext_renderer.h"
 #include "../ui/fluent_menu.h"
 #include "../ui/drag_drop.h"
@@ -141,6 +142,23 @@ void RefreshDuplicateGroupViews(AppState& s) {
 } // namespace
 
 namespace pulse {
+namespace {
+app::UpdateProgress UpdateProgressForView(const AppState& s) {
+    if (s.shot.active) {
+        using app::UpdatePhase;
+        const auto& phase = s.shot.update_state;
+        if (phase == L"connecting") return {UpdatePhase::Connecting};
+        if (phase == L"downloading") return {UpdatePhase::Downloading, 3 * 1024 * 1024, 8 * 1024 * 1024};
+        if (phase == L"downloading-unknown") return {UpdatePhase::Downloading, 3 * 1024 * 1024, 0};
+        if (phase == L"verifying") return {UpdatePhase::Verifying};
+        if (phase == L"launching") return {UpdatePhase::Launching};
+        if (phase == L"installing") return {UpdatePhase::Installing};
+        return {};
+    }
+    return s.update_installer.Progress();
+}
+}
+
 void PrefetchDetailsMeta(HWND hwnd, const std::wstring& path) {
     GetDetailsMetaWorker().Submit(hwnd, path);
 }
@@ -401,7 +419,8 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             vm.settings_update_installing = s.update_installer.installing();
             DWORD update_install_error = s.update_install_error;
             if (s.shot.active) {
-                vm.settings_update_downloading |= s.shot.update_state == L"downloading";
+                const auto progress = UpdateProgressForView(s);
+                vm.settings_update_downloading |= progress.active() && progress.phase != app::UpdatePhase::Installing;
                 vm.settings_update_installing |= s.shot.update_state == L"installing";
                 if (s.shot.update_state == L"cancelled") update_install_error = ERROR_CANCELLED;
                 if (s.shot.update_state == L"failed") update_install_error = ERROR_CRC;
@@ -414,7 +433,9 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             if (vm.settings_update_installing) {
                 vm.settings_update_status = l10n::Get(l10n::StringId::InstallingUpdate);
             } else if (vm.settings_update_downloading) {
-                vm.settings_update_status = l10n::Get(l10n::StringId::DownloadingUpdate);
+                vm.settings_update_status = app::UpdateProgressText(UpdateProgressForView(s));
+                if (vm.settings_update_status.empty())
+                    vm.settings_update_status = l10n::Get(l10n::StringId::DownloadingUpdate);
             } else if (update_install_error != ERROR_SUCCESS) {
                 const auto message = update_install_error == ERROR_CANCELLED ? l10n::StringId::UpdateCancelled :
                     update_install_error == ERROR_BUSY ? l10n::StringId::UpdateBusy : l10n::StringId::UpdateInstallFailed;
@@ -1147,6 +1168,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         vm.status.task_progress = st.active ? st.percent : -1.0f;
         if(s.contentSelectionAction) vm.status.selection_text=l10n::Get(l10n::StringId::OpPreparingList);
     }
+    app::ApplyUpdateStatus(vm.status, UpdateProgressForView(s), st.active);
     {
         std::wstring idx = s.index.Status();
         app::Tab* active = ActiveTab(s);

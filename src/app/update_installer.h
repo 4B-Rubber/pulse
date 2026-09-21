@@ -1,5 +1,6 @@
 #pragma once
 #include "update_checker.h"
+#include "update_progress.h"
 #include <memory>
 
 namespace pulse::app {
@@ -16,6 +17,7 @@ public:
     bool Start(const UpdateResult& update, HWND notify, UINT message);
     bool downloading() const noexcept;
     bool installing() const noexcept;
+    UpdateProgress Progress() const;
     bool TakeResult(DWORD& error);
     bool TakeInstallResult(DWORD& error);
     bool Launch(HWND owner, DWORD& error);

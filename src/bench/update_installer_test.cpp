@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 
 int wmain(int argc, wchar_t** argv) {
     using namespace pulse::app;
@@ -22,10 +23,45 @@ int wmain(int argc, wchar_t** argv) {
         check(installer.Start(release, window, WM_APP + 1), "live installer download starts");
         const auto deadline = GetTickCount64() + 180000;
         DWORD error = ERROR_TIMEOUT;
-        while (GetTickCount64() < deadline && !installer.TakeResult(error)) Sleep(20);
+        unsigned samples = 0;
+        uint64_t largest_sample = 0;
+        bool bounds_ok = true;
+        while (GetTickCount64() < deadline && !installer.TakeResult(error)) {
+            const auto progress = installer.Progress();
+            largest_sample = (std::max)(largest_sample, progress.received_bytes);
+            bounds_ok &= progress.percent() >= -1 && progress.percent() <= 100;
+            ++samples;
+            Sleep(20);
+        }
+        const auto final_progress = installer.Progress();
+        check(bounds_ok && samples > 0, "live progress snapshots stay bounded");
+        check(final_progress.phase == UpdatePhase::Ready && final_progress.received_bytes > 0,
+            "verified package retains actual consumed byte count at ready stage");
+        check(final_progress.percent() == -1, "ready-to-install is a stage, not installation percentage");
+        std::cout << "progress_samples=" << samples << " largest_sample=" << largest_sample
+            << " received=" << final_progress.received_bytes << " total=" << final_progress.total_bytes << '\n';
         check(error == ERROR_SUCCESS, "live HTTPS installer downloaded and hash verified without execution");
         std::cout << "diagnostic=" << error << '\n';
         installer.Stop();
+        check(!installer.Progress().active() && installer.Progress().received_bytes == 0,
+            "stop clears the progress snapshot without installer execution");
+        // Exercise the actual HTTPS reader with a failing consumer: rejected bytes must not count.
+        std::atomic<bool> stop{false};
+        UpdateError category = UpdateError::None;
+        DWORD failure = 0;
+        uint64_t notified_bytes = 0;
+        bool rejected_chunk = false;
+        const bool result = ReadUpdateWithFallback(release.download_page, 512ull * 1024 * 1024, stop,
+            [&] { notified_bytes = 0; return true; },
+            [&](const void*, DWORD) { rejected_chunk = true; SetLastError(ERROR_WRITE_FAULT); return false; },
+            category, failure,
+            [&](std::wstring_view url, uint64_t limit, const std::atomic<bool>& cancelled,
+                const std::function<bool(const void*, DWORD)>& consume, UpdateError& kind, DWORD& error) {
+                return ReadUpdateResponseWithProgress(url, limit, cancelled, consume, kind, error,
+                    [&](uint64_t bytes, uint64_t) { notified_bytes = bytes; });
+            });
+        check(!result && rejected_chunk && category == UpdateError::LocalIo && notified_bytes == 0,
+            "actual HTTPS reader never reports rejected/unwritten chunk bytes");
         DestroyWindow(window);
         return failures ? 1 : 0;
     }
@@ -58,7 +94,60 @@ int wmain(int argc, wchar_t** argv) {
     cancelled = true;
     check(!ReadUpdateResponse(L"https://example.test/update.exe", 100, cancelled, consume, category, error) &&
         error == ERROR_CANCELLED, "cancelled request does not access the network");
+    check(ParseUpdateContentLength(L"8388608") == 8388608, "response length parses exact byte count");
+    check(ParseUpdateContentLength(L"4294967296") == 4294967296ull, "response length is not limited to DWORD");
+    for (const auto header : {L"", L"0", L"-1", L"123x", L"1,2", L"18446744073709551616"})
+        check(ParseUpdateContentLength(header) == 0, "missing, zero, malformed or overflowing length is unknown");
+    check(ParseUpdateContentLength(L"18446744073709551615") == (std::numeric_limits<uint64_t>::max)(),
+        "maximum uint64 length parses without wrapping");
+    UpdateProgress progress{UpdatePhase::Downloading, 3, 8};
+    check(progress.percent() == 37, "download percentage derives only from consumed bytes");
+    bool exact_boundaries = true;
+    for (uint64_t value = 0; value <= 100; ++value)
+        exact_boundaries &= UpdateProgress{UpdatePhase::Downloading, value, 100}.percent() == value;
+    check(exact_boundaries, "all integer percentage boundaries are exact including 29 and 58 percent");
+    const auto maximum_count = (std::numeric_limits<uint64_t>::max)();
+    check(UpdateProgress{UpdatePhase::Downloading, maximum_count / 2, maximum_count}.percent() == 49 &&
+          UpdateProgress{UpdatePhase::Downloading, maximum_count, maximum_count}.percent() == 100,
+        "percentage calculation neither overflows nor rounds up enormous counters");
+    progress.total_bytes = 0;
+    check(progress.percent() == -1, "unknown response length stays indeterminate");
+    progress = {UpdatePhase::Downloading, 9, 8};
+    check(progress.percent() == -1, "contradictory total never fabricates a percentage");
+    for (const auto phase : {UpdatePhase::Connecting, UpdatePhase::Verifying, UpdatePhase::Ready,
+                            UpdatePhase::Launching, UpdatePhase::Installing}) {
+        progress = {phase, 8, 8};
+        check(progress.active() && progress.percent() == -1, "non-download stages never imply installation percentage");
+    }
+    // Exercise the actual fallback driver: new source must see zero bytes and unknown total.
+    cancelled = false;
+    unsigned attempts = 0, resets = 0;
+    bool clean_attempt = true;
+    std::string destination;
+    const auto reset = [&] { ++resets; destination.clear(); progress = {UpdatePhase::Connecting}; return true; };
+    const auto write = [&](const void* bytes, DWORD size) { destination.append(static_cast<const char*>(bytes), size); return true; };
+    const auto reader = [&](std::wstring_view, uint64_t, const std::atomic<bool>&,
+                            const std::function<bool(const void*, DWORD)>& sink, UpdateError& kind, DWORD& error) {
+        ++attempts;
+        clean_attempt &= progress.phase == UpdatePhase::Connecting && !progress.received_bytes &&
+            !progress.total_bytes && destination.empty();
+        sink("abc", 3);
+        progress = {UpdatePhase::Downloading, 3, attempts == 1 ? 8ull : 0ull};
+        kind = attempts == 1 ? UpdateError::Network : UpdateError::None;
+        error = attempts == 1 ? ERROR_CONNECTION_ABORTED : ERROR_SUCCESS;
+        return attempts != 1;
+    };
+    check(ReadUpdateWithFallback(L"https://github.com/jimmgreen/pulse/releases/download/v1/test.exe", 100,
+        cancelled, reset, write, category, error, reader) && clean_attempt && attempts == 2 && resets == 2 &&
+        destination == "abc" && progress.received_bytes == 3 && progress.percent() == -1,
+        "fallback resets partial bytes and previous source denominator before next attempt");
+    cancelled = true;
+    const auto before_attempts = attempts;
+    check(!ReadUpdateWithFallback(L"https://github.com/jimmgreen/pulse/releases/download/v1/test.exe", 100,
+        cancelled, reset, write, category, error, reader) && attempts == before_attempts && error == ERROR_CANCELLED,
+        "cancellation prevents fallback and cannot revive prior progress");
     UpdateInstaller installer;
+    check(!installer.Progress().active(), "new installer has no active status-bar progress");
     UpdateResult invalid;
     check(UpdateInstallErrorFromExitCode(0) == ERROR_SUCCESS, "completed setup succeeds");
     check(UpdateInstallErrorFromExitCode(2) == ERROR_CANCELLED &&
@@ -72,6 +161,7 @@ int wmain(int argc, wchar_t** argv) {
     const auto before = GetTickCount64();
     installer.Stop();
     check(GetTickCount64() - before < 100, "shutdown does not wait for network activity");
+    check(!installer.Progress().active() && !installer.Progress().received_bytes, "idle stop clears all progress fields");
     check(!installer.Launch(window, error), "installer cannot launch before successful verification");
     fs::remove_all(root);
     DestroyWindow(window);

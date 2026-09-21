@@ -1,4 +1,6 @@
 {
-  "url": "https://github.com/jimmgreen/pulse/releases/download/build-deps-20260909/lumatext-sdk-win64-v1.zip",
-  "sha256": "1ba6d8cfa5987ccefe893bbefc30a7ac616e6e42b8f2974c3d7011a2843793b8"
+  "source": "committed",
+  "path": "third_party/lumatext",
+  "manifest": "sdk-manifest.json",
+  "sha256": "71f1574f0b0fbe6ce124a495d2e0e7412c377283c241dfefa8fa2cf562a0addc"
 }

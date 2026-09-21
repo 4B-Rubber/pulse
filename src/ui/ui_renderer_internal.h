@@ -1049,15 +1049,16 @@ struct StatusBarMetrics {
 StatusBarMetrics MakeStatusBarMetrics(const WindowViewModel& vm, const D2D1_RECT_F& rect,
                                       float scale, float status_height,
                                       IDWriteFactory2* factory, IDWriteTextFormat* small_format) {
+    const bool centered_progress = vm.status.query_active || vm.status.task_is_update;
     StatusBarMetrics m;
     m.bar = D2D1::RectF(rect.left, rect.bottom - status_height, rect.right, rect.bottom);
     m.pad = kStatusBarPadDip * scale;
     m.right_reserved = m.pad;
     const std::wstring* trailing = nullptr;
-    if (!vm.status.query_active && !vm.status.performance_text.empty()) {
+    if (!centered_progress && !vm.status.performance_text.empty()) {
         trailing = rect.right < 1100.0f * scale
             ? &vm.status.performance_compact_text : &vm.status.performance_text;
-    } else if (!vm.status.query_active && !vm.status.hint_text.empty()) {
+    } else if (!centered_progress && !vm.status.hint_text.empty()) {
         trailing = &vm.status.hint_text;
     }
     if (trailing && factory && small_format) {
@@ -1076,10 +1077,10 @@ StatusBarMetrics MakeStatusBarMetrics(const WindowViewModel& vm, const D2D1_RECT
         m.task = D2D1::RectF(rect.right * (vm.status.query_cancellable ? 0.40f : 0.48f), m.bar.top,
                              rect.right - m.right_reserved, m.bar.bottom);
     }
-    if (vm.status.query_active) {
+    if (centered_progress) {
         const float cancel_width = vm.status.query_cancellable ? 30.0f * scale : 0.0f;
         const float width = std::min(std::max(0.0f, rect.right - rect.left - 2.0f * m.pad),
-            MeasureTextWidth(factory, small_format, vm.status.query_text) + 112.0f * scale + cancel_width);
+            MeasureTextWidth(factory, small_format, vm.status.query_active ? vm.status.query_text : vm.status.task_text) + 112.0f * scale + cancel_width);
         const float left = (rect.left + rect.right - width) * 0.5f;
         m.task = D2D1::RectF(left, m.bar.top, left + width - cancel_width, m.bar.bottom);
         if (vm.status.query_cancellable)
@@ -1643,7 +1644,7 @@ HitTestResult::Region StatusBarHitRegion(const WindowViewModel& vm, const D2D1_R
     const StatusBarMetrics sb = MakeStatusBarMetrics(
         vm, rect, scale, status_height, factory, fmt);
     if (vm.status.query_cancellable && ContainsPt(sb.cancel_search, x, y)) return HitTestResult::StatusBarCancelSearch;
-    return !vm.status.query_active && ContainsPt(sb.task, x, y) ? HitTestResult::StatusBarTask
+    return !vm.status.query_active && !vm.status.task_is_update && ContainsPt(sb.task, x, y) ? HitTestResult::StatusBarTask
                                     : HitTestResult::StatusBar;
 }
 
