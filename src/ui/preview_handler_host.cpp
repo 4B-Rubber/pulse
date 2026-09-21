@@ -490,6 +490,19 @@ struct PreviewHandlerHost::WorkerState {
 
     bool OpenCurrent() {
         Unload();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            provider_path = path;
+        }
+#ifdef PULSE_PREVIEW_HANDLER_TESTING
+        g_test_open_attempts.fetch_add(1, std::memory_order_relaxed);
+        wchar_t delay_text[16]{};
+        if (GetEnvironmentVariableW(L"PULSE_PREVIEW_HANDLER_TEST_DELAY_MS",
+                                    delay_text, ARRAYSIZE(delay_text)) > 0) {
+            const int delay = _wtoi(delay_text);
+            if (delay > 0) Sleep(static_cast<DWORD>(std::min(delay, 10000)));
+        }
+#endif
         if (path.empty() || !EnsureWindow()) return false;
         CLSID clsid{};
         if (!FindPreviewHandlerClsid(ExtensionOf(path), clsid)) return false;
@@ -571,6 +584,9 @@ struct PreviewHandlerHost::WorkerState {
     // read by the owner's watchdog, so both sides go through mutex. Empty while
     // the apartment has nothing in flight.
     std::wstring working_identity;
+    // Retained through Unload: a completed open may still block while releasing
+    // its provider, after the owner has already selected a different file.
+    std::wstring provider_path;
     DWORD attrs = 0;
     bool app_active = true;
     bool shown = false;
@@ -767,9 +783,11 @@ bool PreviewHandlerHost::RetireStalledApartment(const std::wstring& requested_id
     // previous one. Only the request the apartment is working on right now - the
     // one the pane is therefore still showing - keeps the longer budget above.
     bool superseded = !requested;
+    std::wstring stalled_path;
     {
         std::lock_guard<std::mutex> lock(worker->mutex);
         if (worker->working_identity != requested_identity) superseded = true;
+        stalled_path = worker->provider_path.empty() ? last_path_ : worker->provider_path;
     }
     const ULONGLONG budget = superseded ? CommandBudgetMs() : SlowOpenBudgetMs();
 
@@ -792,7 +810,7 @@ bool PreviewHandlerHost::RetireStalledApartment(const std::wstring& requested_id
 
     // Remember the provider, so the pane asks the thumbnail path instead of
     // queueing behind the same provider on a fresh apartment.
-    NoteStalledProvider(ExtensionOf(last_path_));
+    NoteStalledProvider(ExtensionOf(stalled_path));
     DetachOverlay(worker->overlay.load(std::memory_order_acquire));
     {
         std::lock_guard<std::mutex> lock(worker->mutex);
@@ -929,15 +947,7 @@ DWORD WINAPI PreviewHandlerHost::WorkerMain(void* parameter) {
             // tell that this apartment is busy and since when.
             self->open_started_tick.store(GetTickCount64(), std::memory_order_release);
             self->opens_started.fetch_add(1, std::memory_order_release);
-#ifdef PULSE_PREVIEW_HANDLER_TESTING
-            g_test_open_attempts.fetch_add(1, std::memory_order_relaxed);
-            wchar_t delay_text[16]{};
-            if (GetEnvironmentVariableW(L"PULSE_PREVIEW_HANDLER_TEST_DELAY_MS",
-                                        delay_text, ARRAYSIZE(delay_text)) > 0) {
-                const int delay = _wtoi(delay_text);
-                if (delay > 0) Sleep(static_cast<DWORD>(std::min(delay, 10000)));
-            }
-#endif
+
             const bool opened = self->OpenCurrent();
             self->opens_finished.fetch_add(1, std::memory_order_release);
             if (opened) ClearSlowProvider(ExtensionOf(self->path));
@@ -1009,6 +1019,10 @@ uint32_t OverlayPlaceCallsForTest() {
 
 uint32_t OverlayPlaceDoneForTest() {
     return g_test_place_done.load(std::memory_order_relaxed);
+}
+
+bool PreviewProviderCoolingDownForTest(const std::wstring& path) {
+    return ProviderCoolingDown(ExtensionOf(path));
 }
 
 void ResetSlowPreviewProvidersForTest() {

@@ -240,6 +240,7 @@ private:
 bool RunThumbnailCacheTests();
 
 int wmain(int argc, wchar_t** argv) {
+    const bool vector_only = argc == 2 && wcscmp(argv[1], L"--vector-only") == 0;
     // GDI+ writes the EMF+ fixture, and the host renders metafiles through it.
     Gdiplus::GdiplusStartupInput gdiplus_input;
     ULONG_PTR gdiplus_token = 0;
@@ -248,27 +249,30 @@ int wmain(int argc, wchar_t** argv) {
     (void)gdiplus_token;
     Check(gdiplus_ready, L"start GDI+ for the metafile fixtures");
 
-    Check(preview::VideoCodecDisplayName(L"{34363248-0000-0010-8000-00AA00389B71}") == L"H.264 (AVC)",
-          L"codec: screenshot H264 subtype is a readable codec name");
-    Check(preview::VideoCodecDisplayName(L" 34363268-0000-0010-8000-00aa00389b71 ") == L"H.264 (AVC)",
-          L"codec: lowercase subtype and missing braces are supported");
-    Check(preview::VideoCodecDisplayName(L"{43564548-0000-0010-8000-00AA00389B71}") == L"H.265 (HEVC)",
-          L"codec: HEVC subtype is recognized");
-    Check(preview::VideoCodecDisplayName(L"avc1") == L"H.264 (AVC)" &&
-          preview::VideoCodecDisplayName(L"hvc1") == L"H.265 (HEVC)" &&
-          preview::VideoCodecDisplayName(L"av01") == L"AV1" &&
-          preview::VideoCodecDisplayName(L"VP90") == L"VP9",
-          L"codec: common video FOURCC aliases are recognized");
-    Check(preview::VideoCodecDisplayName(L"{44434241-0000-0010-8000-00AA00389B71}") == L"ABCD",
-          L"codec: unknown printable FOURCC remains readable without guessing");
-    Check(preview::VideoCodecDisplayName(L"{34363248-1111-0010-8000-00AA00389B71}").empty() &&
-          preview::VideoCodecDisplayName(L"{00000001-0000-0010-8000-00AA00389B71}").empty() &&
-          preview::VideoCodecDisplayName(L"{34363248-broken}").empty(),
-          L"codec: unrelated GUIDs and malformed identifiers are not mislabeled");
-    Check(preview::VideoCodecDisplayName(L"Apple ProRes 422") == L"Apple ProRes 422" &&
-          preview::VideoCodecDisplayName(L" ").empty(),
-          L"codec: existing descriptive names and empty properties are preserved");
-    Check(RunThumbnailCacheTests(), L"thumbnail cache regressions");
+    if (!vector_only) {
+        Check(preview::VideoCodecDisplayName(L"{34363248-0000-0010-8000-00AA00389B71}") == L"H.264 (AVC)",
+              L"codec: screenshot H264 subtype is a readable codec name");
+        Check(preview::VideoCodecDisplayName(L" 34363268-0000-0010-8000-00aa00389b71 ") == L"H.264 (AVC)",
+              L"codec: lowercase subtype and missing braces are supported");
+        Check(preview::VideoCodecDisplayName(L"{43564548-0000-0010-8000-00AA00389B71}") == L"H.265 (HEVC)",
+              L"codec: HEVC subtype is recognized");
+        Check(preview::VideoCodecDisplayName(L"avc1") == L"H.264 (AVC)" &&
+              preview::VideoCodecDisplayName(L"hvc1") == L"H.265 (HEVC)" &&
+              preview::VideoCodecDisplayName(L"av01") == L"AV1" &&
+              preview::VideoCodecDisplayName(L"VP90") == L"VP9",
+              L"codec: common video FOURCC aliases are recognized");
+        Check(preview::VideoCodecDisplayName(L"{44434241-0000-0010-8000-00AA00389B71}") == L"ABCD",
+              L"codec: unknown printable FOURCC remains readable without guessing");
+        Check(preview::VideoCodecDisplayName(L"{34363248-1111-0010-8000-00AA00389B71}").empty() &&
+              preview::VideoCodecDisplayName(L"{00000001-0000-0010-8000-00AA00389B71}").empty() &&
+              preview::VideoCodecDisplayName(L"{34363248-broken}").empty(),
+              L"codec: unrelated GUIDs and malformed identifiers are not mislabeled");
+        Check(preview::VideoCodecDisplayName(L"Apple ProRes 422") == L"Apple ProRes 422" &&
+              preview::VideoCodecDisplayName(L" ").empty(),
+              L"codec: existing descriptive names and empty properties are preserved");
+        Check(RunThumbnailCacheTests(), L"thumbnail cache regressions");
+    }
+
     wchar_t temp[MAX_PATH]{};
     GetTempPathW(ARRAYSIZE(temp), temp);
     const std::wstring root = std::wstring(temp) + L"PulsePreviewTest-" +
@@ -276,29 +280,31 @@ int wmain(int argc, wchar_t** argv) {
     CreateDirectoryW(root.c_str(), nullptr);
     const auto path = [&](const wchar_t* name) { return root + L"\\" + name; };
 
-    std::vector<unsigned char> utf8 = {'h','e','l','l','o','\n'};
-    std::vector<unsigned char> le = {0xFF,0xFE,'A',0,0x2D,0x4E};
-    std::vector<unsigned char> be = {0xFE,0xFF,0, 'B',0x4E,0x2D};
-    std::vector<unsigned char> acp = {'A', 0xE9, 'B'};
-    std::vector<unsigned char> lpm = {'[', 'p', 'u', 'l', 's', 'e', ']', '\n'};
-    std::vector<unsigned char> binary(400, 0);
-    for (size_t i = 0; i < binary.size(); ++i) binary[i] = static_cast<unsigned char>(i);
-    std::vector<unsigned char> large(32 * 1024, 'x');
-    const std::vector<unsigned char> bmp = {
-        0x42,0x4D,70,0,0,0,0,0,0,0,54,0,0,0,40,0,0,0,
-        2,0,0,0,2,0,0,0,1,0,24,0,0,0,0,0,16,0,0,0,
-        0x13,0x0B,0,0,0x13,0x0B,0,0,0,0,0,0,0,0,0,0,
-        0,0,255,0,255,0,0,0,255,0,0,255,255,255,0,0
-    };
-    Check(WriteBytes(path(L"utf8.txt"), utf8), L"create UTF-8 fixture");
-    Check(WriteBytes(path(L"utf16le.txt"), le), L"create UTF-16 LE fixture");
-    Check(WriteBytes(path(L"utf16be.txt"), be), L"create UTF-16 BE fixture");
-    Check(WriteBytes(path(L"acp.txt"), acp), L"create ACP fallback fixture");
-    Check(WriteBytes(path(L"settings.lpm"), lpm), L"create LPM text fixture");
-    Check(WriteBytes(path(L"sample.bin"), binary), L"create binary fixture");
-    Check(WriteBytes(path(L"image.bmp"), bmp), L"create bitmap fixture");
-    Check(WriteBytes(path(L"sparse.txt"), large, 1024ull * 1024ull * 1024ull),
-          L"create 1 GB sparse text fixture");
+    if (!vector_only) {
+        std::vector<unsigned char> utf8 = {'h','e','l','l','o','\n'};
+        std::vector<unsigned char> le = {0xFF,0xFE,'A',0,0x2D,0x4E};
+        std::vector<unsigned char> be = {0xFE,0xFF,0, 'B',0x4E,0x2D};
+        std::vector<unsigned char> acp = {'A', 0xE9, 'B'};
+        std::vector<unsigned char> lpm = {'[', 'p', 'u', 'l', 's', 'e', ']', '\n'};
+        std::vector<unsigned char> binary(400, 0);
+        for (size_t i = 0; i < binary.size(); ++i) binary[i] = static_cast<unsigned char>(i);
+        std::vector<unsigned char> large(32 * 1024, 'x');
+        const std::vector<unsigned char> bmp = {
+            0x42,0x4D,70,0,0,0,0,0,0,0,54,0,0,0,40,0,0,0,
+            2,0,0,0,2,0,0,0,1,0,24,0,0,0,0,0,16,0,0,0,
+            0x13,0x0B,0,0,0x13,0x0B,0,0,0,0,0,0,0,0,0,0,
+            0,0,255,0,255,0,0,0,255,0,0,255,255,255,0,0
+        };
+        Check(WriteBytes(path(L"utf8.txt"), utf8), L"create UTF-8 fixture");
+        Check(WriteBytes(path(L"utf16le.txt"), le), L"create UTF-16 LE fixture");
+        Check(WriteBytes(path(L"utf16be.txt"), be), L"create UTF-16 BE fixture");
+        Check(WriteBytes(path(L"acp.txt"), acp), L"create ACP fallback fixture");
+        Check(WriteBytes(path(L"settings.lpm"), lpm), L"create LPM text fixture");
+        Check(WriteBytes(path(L"sample.bin"), binary), L"create binary fixture");
+        Check(WriteBytes(path(L"image.bmp"), bmp), L"create bitmap fixture");
+        Check(WriteBytes(path(L"sparse.txt"), large, 1024ull * 1024ull * 1024ull),
+              L"create 1 GB sparse text fixture");
+    }
 
     Host host;
     const auto host_begin = std::chrono::steady_clock::now();
@@ -311,116 +317,118 @@ int wmain(int argc, wchar_t** argv) {
     std::wprintf(L"[INFO] preview host start %.2f ms\n", host_start_ms);
     Check(host_started, L"start isolated preview host");
 
-    // PULSE_PREVIEW_BENCH=<file>: time a real document's first preview against
-    // its repeats. This is where shell providers (Office, PDF) show their
-    // one-time handler load, and it runs on the freshly started host on purpose.
-    wchar_t bench_path[32768]{};
-    if (GetEnvironmentVariableW(L"PULSE_PREVIEW_BENCH", bench_path, ARRAYSIZE(bench_path))) {
-        double bench_first = 0.0;
-        std::vector<double> bench_repeats;
-        for (int i = 0; i < 5; ++i) {
+    if (!vector_only) {
+        // PULSE_PREVIEW_BENCH=<file>: time a real document's first preview against
+        // its repeats. This is where shell providers (Office, PDF) show their
+        // one-time handler load, and it runs on the freshly started host on purpose.
+        wchar_t bench_path[32768]{};
+        if (GetEnvironmentVariableW(L"PULSE_PREVIEW_BENCH", bench_path, ARRAYSIZE(bench_path))) {
+            double bench_first = 0.0;
+            std::vector<double> bench_repeats;
+            for (int i = 0; i < 5; ++i) {
+                Result result;
+                const auto begin = std::chrono::steady_clock::now();
+                const bool ok = host.Request(bench_path, result, MAXDWORD,
+                                             ipc::kPreviewDefaultPixelSize);
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - begin).count();
+                if (i == 0) bench_first = ms;
+                else bench_repeats.push_back(ms);
+                std::wprintf(L"[INFO] bench[%d] %.2f ms ok=%d kind=%d status=%d error=%ls\n",
+                             i, ms, ok ? 1 : 0, static_cast<int>(result.response.kind),
+                             result.response.status, result.error.c_str());
+            }
+            std::sort(bench_repeats.begin(), bench_repeats.end());
+            std::wprintf(L"[INFO] bench first %.2f ms, repeats median %.2f ms\n",
+                         bench_first,
+                         bench_repeats.empty() ? 0.0 : bench_repeats[bench_repeats.size() / 2]);
+        }
+        // Optional real H.264 fixture exercises the Windows property provider too.
+        if (argc > 1) {
+            Result video;
+            const bool received = host.Request(argv[1], video, MAXDWORD,
+                ipc::kPreviewDefaultPixelSize, ipc::PreviewRequestKind::Properties);
+            bool h264 = false, raw_guid = false;
+            for (const auto& [label, value] : video.properties) {
+                h264 |= value == L"H.264 (AVC)";
+                raw_guid |= value.find(L"34363248-") != std::wstring::npos;
+            }
+            Check(received && h264 && !raw_guid,
+                  L"codec: actual H264 file returns friendly name through preview host protocol");
+        }
+        auto expectText = [&](const wchar_t* name, const wchar_t* contains) {
+            Result result;
+            const bool ok = host.Request(path(name), result);
+            Check(ok && result.response.status == 0 &&
+                  result.response.kind == ipc::PreviewContentKind::Text &&
+                  result.text.find(contains) != std::wstring::npos, name);
+            return result;
+        };
+        expectText(L"utf8.txt", L"hello");
+        expectText(L"utf16le.txt", L"A");
+        expectText(L"utf16be.txt", L"B");
+        expectText(L"acp.txt", L"A");
+        expectText(L"settings.lpm", L"pulse");
+
+        Result hex;
+        Check(host.Request(path(L"sample.bin"), hex) &&
+              hex.response.kind == ipc::PreviewContentKind::Hex &&
+              hex.response.bytes_read == 256 &&
+              (hex.response.flags & ipc::kPreviewFlagTruncated),
+              L"binary sniff returns 256-byte truncated hex");
+
+        Result sparse;
+        Check(host.Request(path(L"sparse.txt"), sparse) &&
+              sparse.response.kind == ipc::PreviewContentKind::Text &&
+              sparse.response.bytes_read <= 32 * 1024 &&
+              (sparse.response.flags & ipc::kPreviewFlagTruncated),
+              L"1 GB text reads at most 32 KiB and reports truncation");
+
+        std::vector<double> bitmapTimings;
+        for (int i = 0; i < 10; ++i) {
             Result result;
             const auto begin = std::chrono::steady_clock::now();
-            const bool ok = host.Request(bench_path, result, MAXDWORD,
-                                         ipc::kPreviewDefaultPixelSize);
-            const double ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - begin).count();
-            if (i == 0) bench_first = ms;
-            else bench_repeats.push_back(ms);
-            std::wprintf(L"[INFO] bench[%d] %.2f ms ok=%d kind=%d status=%d error=%ls\n",
-                         i, ms, ok ? 1 : 0, static_cast<int>(result.response.kind),
-                         result.response.status, result.error.c_str());
+            const bool ok = host.Request(path(L"image.bmp"), result);
+            const auto end = std::chrono::steady_clock::now();
+            if (ok && result.response.kind == ipc::PreviewContentKind::Bitmap &&
+                result.response.width > 0 && result.response.height > 0)
+                bitmapTimings.push_back(
+                    std::chrono::duration<double, std::milli>(end - begin).count());
         }
-        std::sort(bench_repeats.begin(), bench_repeats.end());
-        std::wprintf(L"[INFO] bench first %.2f ms, repeats median %.2f ms\n",
-                     bench_first,
-                     bench_repeats.empty() ? 0.0 : bench_repeats[bench_repeats.size() / 2]);
+        std::sort(bitmapTimings.begin(), bitmapTimings.end());
+        const double bitmapP95 = bitmapTimings.empty() ? 9999.0
+            : bitmapTimings[(bitmapTimings.size() * 95 - 1) / 100];
+        std::wprintf(L"[INFO] bitmap/WIC image decode P95 %.2f ms\n", bitmapP95);
+        Check(bitmapTimings.size() == 10 && bitmapP95 <= 500.0,
+              L"bitmap/WIC image decode P95 <= 500 ms");
+
+        Result tiny;
+        Check(host.Request(path(L"image.bmp"), tiny) &&
+              tiny.response.kind == ipc::PreviewContentKind::Bitmap &&
+              tiny.response.source_width == 2 && tiny.response.source_height == 2 &&
+              tiny.response.width == 2 && tiny.response.height == 2,
+              L"2x2 bitmap reports source and decoded size");
+
+        Check(WriteBmpRgb(path(L"large.bmp"), 1280, 720), L"create 1280x720 bitmap fixture");
+        Result scaled512;
+        Check(host.Request(path(L"large.bmp"), scaled512, MAXDWORD, 512) &&
+              scaled512.response.kind == ipc::PreviewContentKind::Bitmap &&
+              scaled512.response.source_width == 1280 && scaled512.response.source_height == 720 &&
+              (std::max)(scaled512.response.width, scaled512.response.height) <= 512,
+              L"request 512 keeps decoded longest edge <= 512 and reports source size");
+        Result scaled1024;
+        Check(host.Request(path(L"large.bmp"), scaled1024, MAXDWORD, 1024) &&
+              scaled1024.response.kind == ipc::PreviewContentKind::Bitmap &&
+              scaled1024.response.source_width == 1280 && scaled1024.response.source_height == 720 &&
+              (std::max)(scaled1024.response.width, scaled1024.response.height) <= 1024 &&
+              (std::max)(scaled1024.response.width, scaled1024.response.height) > 512,
+              L"request 1024 keeps decoded longest edge <= 1024");
+        Result clamped;
+        Check(host.Request(path(L"large.bmp"), clamped, MAXDWORD, 2048) &&
+              clamped.response.kind == ipc::PreviewContentKind::Bitmap &&
+              (std::max)(clamped.response.width, clamped.response.height) <= 1024,
+              L"host clamps pixel_size above 1024");
     }
-    // Optional real H.264 fixture exercises the Windows property provider too.
-    if (argc > 1) {
-        Result video;
-        const bool received = host.Request(argv[1], video, MAXDWORD,
-            ipc::kPreviewDefaultPixelSize, ipc::PreviewRequestKind::Properties);
-        bool h264 = false, raw_guid = false;
-        for (const auto& [label, value] : video.properties) {
-            h264 |= value == L"H.264 (AVC)";
-            raw_guid |= value.find(L"34363248-") != std::wstring::npos;
-        }
-        Check(received && h264 && !raw_guid,
-              L"codec: actual H264 file returns friendly name through preview host protocol");
-    }
-    auto expectText = [&](const wchar_t* name, const wchar_t* contains) {
-        Result result;
-        const bool ok = host.Request(path(name), result);
-        Check(ok && result.response.status == 0 &&
-              result.response.kind == ipc::PreviewContentKind::Text &&
-              result.text.find(contains) != std::wstring::npos, name);
-        return result;
-    };
-    expectText(L"utf8.txt", L"hello");
-    expectText(L"utf16le.txt", L"A");
-    expectText(L"utf16be.txt", L"B");
-    expectText(L"acp.txt", L"A");
-    expectText(L"settings.lpm", L"pulse");
-
-    Result hex;
-    Check(host.Request(path(L"sample.bin"), hex) &&
-          hex.response.kind == ipc::PreviewContentKind::Hex &&
-          hex.response.bytes_read == 256 &&
-          (hex.response.flags & ipc::kPreviewFlagTruncated),
-          L"binary sniff returns 256-byte truncated hex");
-
-    Result sparse;
-    Check(host.Request(path(L"sparse.txt"), sparse) &&
-          sparse.response.kind == ipc::PreviewContentKind::Text &&
-          sparse.response.bytes_read <= 32 * 1024 &&
-          (sparse.response.flags & ipc::kPreviewFlagTruncated),
-          L"1 GB text reads at most 32 KiB and reports truncation");
-
-    std::vector<double> bitmapTimings;
-    for (int i = 0; i < 10; ++i) {
-        Result result;
-        const auto begin = std::chrono::steady_clock::now();
-        const bool ok = host.Request(path(L"image.bmp"), result);
-        const auto end = std::chrono::steady_clock::now();
-        if (ok && result.response.kind == ipc::PreviewContentKind::Bitmap &&
-            result.response.width > 0 && result.response.height > 0)
-            bitmapTimings.push_back(
-                std::chrono::duration<double, std::milli>(end - begin).count());
-    }
-    std::sort(bitmapTimings.begin(), bitmapTimings.end());
-    const double bitmapP95 = bitmapTimings.empty() ? 9999.0
-        : bitmapTimings[(bitmapTimings.size() * 95 - 1) / 100];
-    std::wprintf(L"[INFO] bitmap/WIC image decode P95 %.2f ms\n", bitmapP95);
-    Check(bitmapTimings.size() == 10 && bitmapP95 <= 500.0,
-          L"bitmap/WIC image decode P95 <= 500 ms");
-
-    Result tiny;
-    Check(host.Request(path(L"image.bmp"), tiny) &&
-          tiny.response.kind == ipc::PreviewContentKind::Bitmap &&
-          tiny.response.source_width == 2 && tiny.response.source_height == 2 &&
-          tiny.response.width == 2 && tiny.response.height == 2,
-          L"2x2 bitmap reports source and decoded size");
-
-    Check(WriteBmpRgb(path(L"large.bmp"), 1280, 720), L"create 1280x720 bitmap fixture");
-    Result scaled512;
-    Check(host.Request(path(L"large.bmp"), scaled512, MAXDWORD, 512) &&
-          scaled512.response.kind == ipc::PreviewContentKind::Bitmap &&
-          scaled512.response.source_width == 1280 && scaled512.response.source_height == 720 &&
-          (std::max)(scaled512.response.width, scaled512.response.height) <= 512,
-          L"request 512 keeps decoded longest edge <= 512 and reports source size");
-    Result scaled1024;
-    Check(host.Request(path(L"large.bmp"), scaled1024, MAXDWORD, 1024) &&
-          scaled1024.response.kind == ipc::PreviewContentKind::Bitmap &&
-          scaled1024.response.source_width == 1280 && scaled1024.response.source_height == 720 &&
-          (std::max)(scaled1024.response.width, scaled1024.response.height) <= 1024 &&
-          (std::max)(scaled1024.response.width, scaled1024.response.height) > 512,
-          L"request 1024 keeps decoded longest edge <= 1024");
-    Result clamped;
-    Check(host.Request(path(L"large.bmp"), clamped, MAXDWORD, 2048) &&
-          clamped.response.kind == ipc::PreviewContentKind::Bitmap &&
-          (std::max)(clamped.response.width, clamped.response.height) <= 1024,
-          L"host clamps pixel_size above 1024");
 
     Check(preview::IsVectorExtension(L".svg") && !preview::IsImageExtension(L".svg") &&
           preview::IsNativeExtension(L".svg"),
@@ -513,52 +521,61 @@ int wmain(int argc, wchar_t** argv) {
           broken.text.find(L"not svg") != std::wstring::npos,
           L"an SVG that cannot be rendered falls back to its text preview");
 
-    Check(CreateDirectoryW(path(L"subdir").c_str(), nullptr), L"create directory fixture");
-    Result dirExtended;
-    Check(host.Request(L"\\\\?\\" + path(L"subdir"), dirExtended) &&
-          dirExtended.response.status == 0 &&
-          dirExtended.response.kind == ipc::PreviewContentKind::Bitmap &&
-          dirExtended.response.width > 0 && dirExtended.response.height > 0,
-          L"shell thumbnail accepts \\\\?\\ extended path");
+    if (!vector_only) {
+        Check(CreateDirectoryW(path(L"subdir").c_str(), nullptr), L"create directory fixture");
+        Result dirExtended;
+        Check(host.Request(L"\\\\?\\" + path(L"subdir"), dirExtended) &&
+              dirExtended.response.status == 0 &&
+              dirExtended.response.kind == ipc::PreviewContentKind::Bitmap &&
+              dirExtended.response.width > 0 && dirExtended.response.height > 0,
+              L"shell thumbnail accepts \\\\?\\ extended path");
 
-    Result offline;
-    Check(host.Request(path(L"utf8.txt"), offline, 0x00400000u) &&
-          offline.response.kind == ipc::PreviewContentKind::Unsupported &&
-          offline.response.bytes_read == 0 && offline.error == L"offline-placeholder",
-          L"offline placeholder is not read or hydrated");
-    Result recallOnOpen;
-    Check(host.Request(path(L"utf8.txt"), recallOnOpen, 0x00040000u) &&
-          recallOnOpen.response.kind == ipc::PreviewContentKind::Unsupported &&
-          recallOnOpen.response.bytes_read == 0 &&
-          recallOnOpen.error == L"offline-placeholder",
-          L"recall-on-open placeholder is not read or hydrated");
-    Result missing;
-    Check(host.Request(path(L"missing.txt"), missing) &&
-          missing.response.kind == ipc::PreviewContentKind::Unsupported &&
-          missing.error == L"path-unavailable",
-          L"disappeared path does not break preview host");
+        Result offline;
+        Check(host.Request(path(L"utf8.txt"), offline, 0x00400000u) &&
+              offline.response.kind == ipc::PreviewContentKind::Unsupported &&
+              offline.response.bytes_read == 0 && offline.error == L"offline-placeholder",
+              L"offline placeholder is not read or hydrated");
+        Result recallOnOpen;
+        Check(host.Request(path(L"utf8.txt"), recallOnOpen, 0x00040000u) &&
+              recallOnOpen.response.kind == ipc::PreviewContentKind::Unsupported &&
+              recallOnOpen.response.bytes_read == 0 &&
+              recallOnOpen.error == L"offline-placeholder",
+              L"recall-on-open placeholder is not read or hydrated");
+        Result missing;
+        Check(host.Request(path(L"missing.txt"), missing) &&
+              missing.response.kind == ipc::PreviewContentKind::Unsupported &&
+              missing.error == L"path-unavailable",
+              L"disappeared path does not break preview host");
 
-    std::vector<double> timings;
-    for (int i = 0; i < 25; ++i) {
-        Result result;
-        const auto begin = std::chrono::steady_clock::now();
-        const bool ok = host.Request(path(L"utf8.txt"), result);
-        const auto end = std::chrono::steady_clock::now();
-        if (ok) timings.push_back(std::chrono::duration<double, std::milli>(end - begin).count());
+        std::vector<double> timings;
+        for (int i = 0; i < 25; ++i) {
+            Result result;
+            const auto begin = std::chrono::steady_clock::now();
+            const bool ok = host.Request(path(L"utf8.txt"), result);
+            const auto end = std::chrono::steady_clock::now();
+            if (ok) timings.push_back(std::chrono::duration<double, std::milli>(end - begin).count());
+        }
+        std::sort(timings.begin(), timings.end());
+        const double p95 = timings.empty() ? 9999.0 : timings[(timings.size() * 95 - 1) / 100];
+        std::wprintf(L"[INFO] local text P95 %.2f ms\n", p95);
+        Check(timings.size() == 25 && p95 <= 150.0, L"local text protocol P95 <= 150 ms");
+
+        host.Stop();
+        Check(host.Start(), L"preview host restarts after termination");
+        Result restarted;
+        Check(host.Request(path(L"utf8.txt"), restarted) &&
+              restarted.response.kind == ipc::PreviewContentKind::Text,
+              L"restarted host serves requests");
+        host.Stop();
     }
-    std::sort(timings.begin(), timings.end());
-    const double p95 = timings.empty() ? 9999.0 : timings[(timings.size() * 95 - 1) / 100];
-    std::wprintf(L"[INFO] local text P95 %.2f ms\n", p95);
-    Check(timings.size() == 25 && p95 <= 150.0, L"local text protocol P95 <= 150 ms");
 
     host.Stop();
-    Check(host.Start(), L"preview host restarts after termination");
-    Result restarted;
-    Check(host.Request(path(L"utf8.txt"), restarted) &&
-          restarted.response.kind == ipc::PreviewContentKind::Text,
-          L"restarted host serves requests");
-    host.Stop();
-
+    DeleteFileW(path(L"shapes.svg").c_str());
+    DeleteFileW(path(L"oversized.svg").c_str());
+    DeleteFileW(path(L"shapes.emf").c_str());
+    DeleteFileW(path(L"clip.emf").c_str());
+    DeleteFileW(path(L"broken.svg").c_str());
+    DeleteFileW(path(L"settings.lpm").c_str());
     DeleteFileW(path(L"utf8.txt").c_str());
     DeleteFileW(path(L"utf16le.txt").c_str());
     DeleteFileW(path(L"utf16be.txt").c_str());

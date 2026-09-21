@@ -12,6 +12,7 @@ void ResetPreviewHandlerOpenAttemptsForTest();
 uint32_t PreviewHandlerOpenAttemptsForTest();
 bool PreviewHandlerCanActivateIsolatedForTest(const std::wstring& path);
 void ResetSlowPreviewProvidersForTest();
+bool PreviewProviderCoolingDownForTest(const std::wstring& path);
 void ResetOverlayPlaceCountsForTest();
 uint32_t OverlayPlaceCallsForTest();
 uint32_t OverlayPlaceDoneForTest();
@@ -33,9 +34,10 @@ int wmain(int argc, wchar_t** argv) {
     if (argc < 2 || ((wcscmp(argv[1], L"--selftest") == 0 ||
                       wcscmp(argv[1], L"--isolated-test") == 0) && argc < 3)) {
         wprintf(L"usage: pulse_preview_handler_probe.exe "
-                L"[--selftest|--isolated-test] <file>\n");
+                L"[--selftest|--isolated-test] <file> or --cooldown-test\n");
         return 1;
     }
+    const bool cooldown_test = wcscmp(argv[1], L"--cooldown-test") == 0;
     const bool self_test = argc >= 3 && wcscmp(argv[1], L"--selftest") == 0;
     const bool isolated_test = argc >= 3 && wcscmp(argv[1], L"--isolated-test") == 0;
     const std::wstring path = argv[(self_test || isolated_test) ? 2 : 1];
@@ -91,6 +93,69 @@ int wmain(int argc, wchar_t** argv) {
     const D2D1_RECT_F bounds = D2D1::RectF(16.0f, 16.0f, 380.0f, 640.0f);
     const D2D1_COLOR_F bg = D2D1::ColorF(0.12f, 0.12f, 0.12f);
     const D2D1_COLOR_F fg = D2D1::ColorF(0.92f, 0.92f, 0.92f);
+    if (cooldown_test) {
+        // Delay before provider activation, so this regression needs no installed
+        // Office/PDF handler or real files. B is queued while A is still opening.
+        const std::wstring first = L"pulse-cooldown-a.pulse-test-a";
+        const std::wstring second = L"pulse-cooldown-b.pulse-test-b";
+        SetEnvironmentVariableW(L"PULSE_PREVIEW_HANDLER_TEST_DELAY_MS", L"1200");
+        SetEnvironmentVariableW(L"PULSE_PREVIEW_HANDLER_OPEN_BUDGET_MS", L"200");
+        pulse::ui::ResetSlowPreviewProvidersForTest();
+        pulse::ui::ResetPreviewHandlerOpenAttemptsForTest();
+        bool started = false;
+        bool queued_before_timeout = false;
+        bool first_cooled = false;
+        bool second_cooled = false;
+        {
+            pulse::ui::PreviewHandlerHost host;
+            host.Sync(owner, bounds, first, FILE_ATTRIBUTE_NORMAL, 1, 0, 0,
+                      true, bg, fg, true, true);
+            const ULONGLONG start_deadline = GetTickCount64() + 1000;
+            while (GetTickCount64() < start_deadline) {
+                if (pulse::ui::PreviewHandlerOpenAttemptsForTest() > 0) {
+                    started = true;
+                    break;
+                }
+                Sleep(1);
+            }
+            if (started) {
+                host.Sync(owner, bounds, second, FILE_ATTRIBUTE_NORMAL, 2, 0, 0,
+                          true, bg, fg, true, true);
+                queued_before_timeout =
+                    !pulse::ui::PreviewProviderCoolingDownForTest(first) &&
+                    !pulse::ui::PreviewProviderCoolingDownForTest(second);
+                const ULONGLONG deadline = GetTickCount64() + 700;
+                while (GetTickCount64() < deadline) {
+                    host.Sync(owner, bounds, second, FILE_ATTRIBUTE_NORMAL, 2, 0, 0,
+                              true, bg, fg, true, true);
+                    first_cooled = pulse::ui::PreviewProviderCoolingDownForTest(first);
+                    second_cooled = pulse::ui::PreviewProviderCoolingDownForTest(second);
+                    if (first_cooled || second_cooled) break;
+                    Sleep(10);
+                }
+            }
+        }
+        SetEnvironmentVariableW(L"PULSE_PREVIEW_HANDLER_TEST_DELAY_MS", nullptr);
+        SetEnvironmentVariableW(L"PULSE_PREVIEW_HANDLER_OPEN_BUDGET_MS", nullptr);
+        const bool ok = started && queued_before_timeout && first_cooled && !second_cooled;
+        wprintf(L"[%s] switching A to B cools only the blocked A "
+                L"(started=%d, queued=%d, A=%d, B=%d)\n",
+                ok ? L"PASS" : L"FAIL", started, queued_before_timeout, first_cooled, second_cooled);
+        // Pump the owner while the retired worker finishes window cleanup.
+        const ULONGLONG cleanup_deadline = GetTickCount64() + 1400;
+        while (GetTickCount64() < cleanup_deadline) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            Sleep(10);
+        }
+        pulse::ui::ResetSlowPreviewProvidersForTest();
+        DestroyWindow(owner);
+        CoUninitialize();
+        return ok ? 0 : 6;
+    }
     if (self_test) {
         SetEnvironmentVariableW(L"PULSE_PREVIEW_HANDLER_TEST_DELAY_MS", L"1500");
         // This block only measures that the owner thread never waits on the
