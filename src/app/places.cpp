@@ -1174,8 +1174,11 @@ bool PlacesCatalog::ReorderQuickAccessPinned(const std::wstring& path, size_t po
     const auto found = std::find_if(quick_access_paths.begin(), quick_access_paths.end(),
         [&](const std::wstring& candidate) { return TagKey(candidate) == key; });
     if (found == quick_access_paths.end() || quick_access_paths.empty()) return false;
-    position = std::min(position, quick_access_paths.size() - 1);
+    position = std::min(position, quick_access_paths.size());
     const size_t current = static_cast<size_t>(found - quick_access_paths.begin());
+    // The indicator names a gap in the original list, which still includes the
+    // dragged row. Removing that row shifts every later gap back by one.
+    if (position > current) --position;
     if (current == position) return false;
     std::wstring moved = std::move(*found);
     quick_access_paths.erase(found);

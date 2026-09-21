@@ -2379,7 +2379,6 @@ void DumpContextVerbs() {
     const std::wstring extensions[] = { L".xlsx", L".txt", L".jpg", L".png" };
     for (const auto& ext : extensions) {
         const auto verbs = EnumerateStaticVerbs(ext);
-        wchar_t line[600]{};
         swprintf_s(line, L"[DUMP] %ls: %zu static verb(s)\n", ext.c_str(), verbs.size());
         LogLine(line);
         for (const auto& verb : verbs) {
@@ -3279,7 +3278,26 @@ void TestSplitLayout() {
           L"filter: view/source index mapping");
 }
 
+void TestQuickAccessPinReorder() {
+    PlacesCatalog pins;
+    pins.persist = false;
+    const std::vector<std::wstring> original{ L"C:\\a", L"C:\\b", L"C:\\c" };
+    pins.quick_access_paths = original;
+    Check(pins.ReorderQuickAccessPinned(L"C:\\a", 2) &&
+          pins.quick_access_paths == std::vector<std::wstring>{ L"C:\\b", L"C:\\a", L"C:\\c" },
+          L"quick access: downward drag lands at the indicated gap");
+    pins.quick_access_paths = original;
+    Check(!pins.ReorderQuickAccessPinned(L"C:\\a", 1) && pins.quick_access_paths == original,
+          L"quick access: dropping immediately after the source preserves order");
+    Check(pins.ReorderQuickAccessPinned(L"C:\\a", 3) &&
+          pins.quick_access_paths == std::vector<std::wstring>{ L"C:\\b", L"C:\\c", L"C:\\a" },
+          L"quick access: the final insertion gap appends the dragged pin");
+    Check(pins.ReorderQuickAccessPinned(L"C:\\a", 0) && pins.quick_access_paths == original,
+          L"quick access: upward drag still reaches the first gap");
+}
+
 void TestQuickAccess() {
+    TestQuickAccessPinReorder();
     PlacesCatalog cat;
     cat.persist = false;
     Check(cat.SetQuickAccessPinned({L"C:\\", L"C:\\Projects", L"c:/projects/",
@@ -3524,7 +3542,7 @@ void TestQuickAccess() {
     wchar_t previous[32768]{};
     GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
     const auto test_dir = kSandbox + L"\\quick_access_profile";
-    CreateDirectoryW(test_dir.c_str(), nullptr);
+    std::filesystem::create_directories(test_dir);
     SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", test_dir.c_str());
     {
         cat.persist = true;
@@ -5034,6 +5052,9 @@ int RunSelfTest1B2() {
         freopen_s(&f, "CONERR$", "w", stderr);
     }
     setvbuf(stdout, nullptr, _IONBF, 0);
+    std::error_code directory_error;
+    std::filesystem::create_directories(WorkspacePath(L"bench_data"), directory_error);
+    if (directory_error) return 1;
     FILE* g_log_local = nullptr;
     g_log = _wfopen_s(&g_log_local, kLogPath.c_str(), L"w, ccs=UTF-8") == 0
         ? g_log_local : nullptr;
@@ -5042,6 +5063,21 @@ int RunSelfTest1B2() {
     g_skip_visual = GetEnvironmentVariableW(L"PULSE_SELFTEST_NO_SCREENSHOTS", skip_visual, ARRAYSIZE(skip_visual)) > 0;
     if (g_skip_visual) LogLine(L"[SKIP] Screenshot capture disabled\n");
     wchar_t test_case[64]{};
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"pr-shell") == 0) {
+        TestMenuModel();
+        TestShellMenuMerge();
+        TestQuickAccess();
+        TestDetailsPreviewInteraction();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"pin-reorder") == 0) {
+        TestQuickAccessPinReorder();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
     if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
         wcscmp(test_case, L"context-verbs") == 0) {
         DumpContextVerbs();
