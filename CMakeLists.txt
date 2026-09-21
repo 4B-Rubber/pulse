@@ -315,11 +315,12 @@ if(PULSE_APP_SOURCES)
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/fluent/panel_right_24_color.svg"
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/fluent/panel_right_contract_24_color.svg"
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/fluent/add_circle_24_color.svg"
-        "${CMAKE_CURRENT_SOURCE_DIR}/assets/fluent/search_24_color.svg")
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/fluent/search_24_color.svg"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/fluent/pc_24_color.svg")
     target_link_options(pulse PRIVATE /MANIFEST:NO)
     target_link_libraries(pulse PRIVATE
         d3d11 d2d1 dwrite dxgi dcomp dwmapi shcore ole32 shell32 uuid comctl32 advapi32 shlwapi version windowscodecs gdi32 netapi32 mpr bcrypt pulse_crash_reporter)
-    target_link_libraries(pulse PRIVATE winhttp crypt32)
+    target_link_libraries(pulse PRIVATE winhttp crypt32 secur32)
     target_link_libraries(pulse PRIVATE pulse_localization)
     pulse_enable_lumatext(pulse)
     pulse_add_version_resource(pulse "Pulse file manager" "pulse" "pulse.exe")
@@ -375,16 +376,22 @@ target_link_libraries(pulse_shell PRIVATE ole32 shell32 uuid advapi32 shlwapi ve
 endif()
 
 # ---- Pulse.Preview.exe: thumbnail decoding / Shell provider isolation ----
-add_executable(pulse_preview WIN32 src/preview_host/main.cpp src/preview_host/video_codec.cpp)
+add_executable(pulse_preview WIN32 src/preview_host/main.cpp src/preview_host/video_codec.cpp
+    src/preview_host/svg_raster.cpp src/preview_host/metafile_raster.cpp)
 set_target_properties(pulse_preview PROPERTIES OUTPUT_NAME "Pulse.Preview")
-target_link_libraries(pulse_preview PRIVATE ole32 shell32 gdi32 uuid windowscodecs propsys advapi32)
+# gdiplus renders WMF/EMF, including the EMF+ records Office clip art uses.
+target_link_libraries(pulse_preview PRIVATE ole32 shell32 gdi32 uuid windowscodecs propsys advapi32 gdiplus)
+# SVG previews are rasterized with Direct2D, but d2d1/d3d11/dxgi are
+# deliberately not linked: implicit imports would load them at every preview
+# host start-up (the first preview of any file type) while only SVG needs them.
+# svg_raster.cpp resolves them on demand with LoadLibraryW instead.
 target_link_libraries(pulse_preview PRIVATE pulse_crash_reporter)
 pulse_add_version_resource(pulse_preview "Pulse preview host" "Pulse.Preview" "Pulse.Preview.exe")
 
 # Preview protocol self test (console; drives Pulse.Preview.exe over the pipe)
 add_executable(pulse_preview_test src/bench/preview_test_main.cpp
     src/bench/thumbnail_cache_test.cpp src/ui/thumbnail_cache.cpp src/preview_host/video_codec.cpp)
-target_link_libraries(pulse_preview_test PRIVATE ole32)
+target_link_libraries(pulse_preview_test PRIVATE ole32 gdi32 gdiplus)
 add_dependencies(pulse_preview_test pulse_preview)
 
 add_executable(pulse_shell_icons_test src/bench/shell_icons_test.cpp src/ui/shell_icons.cpp)
@@ -601,3 +608,18 @@ foreach(configuration_target IN LISTS configuration_targets)
         target_sources(${configuration_target} PRIVATE src/index/content_configuration.cpp)
     endif()
 endforeach()
+
+# Opt-in integration fixture: real view model/renderer, isolated preferences, no installer execution.
+option(PULSE_BUILD_PROGRESS_UI_TESTS "Build the content/update status-bar renderer fixture" OFF)
+if(PULSE_BUILD_PROGRESS_UI_TESTS)
+    get_target_property(progress_ui_sources pulse SOURCES)
+    get_target_property(progress_ui_libraries pulse LINK_LIBRARIES)
+    add_executable(pulse_content_progress_ui_test src/bench/content_progress_ui_test.cpp ${progress_ui_sources})
+    target_link_libraries(pulse_content_progress_ui_test PRIVATE ${progress_ui_libraries})
+    foreach(progress_property INCLUDE_DIRECTORIES COMPILE_DEFINITIONS LINK_OPTIONS)
+        get_target_property(progress_value pulse ${progress_property})
+        if(progress_value)
+            set_property(TARGET pulse_content_progress_ui_test PROPERTY ${progress_property} "${progress_value}")
+        endif()
+    endforeach()
+endif()

@@ -952,6 +952,7 @@ void MainRenderer::DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& r
     IDWriteTextFormat* small_fmt = compositor_->SmallFormat();
     const StatusBarMetrics sb = MakeStatusBarMetrics(
         vm, rect, scale_, status_height_, factory, small_fmt);
+    const bool centered_progress = vm.status.query_active || vm.status.task_is_update;
     float y = sb.bar.top;
     D2D1_COLOR_F statusBackground = theme.status_bg;
     if (vm.backdrop_enabled) statusBackground.a = vm.dark ? 0.76f : 0.82f;
@@ -960,7 +961,7 @@ void MainRenderer::DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& r
     FillRect(dc, brStrokeDivider_.get(), 0, y, rect.right, 1);
     MakeBrush(dc, theme.text_secondary, brTextSecondary_);
     const float gap = 16.0f * scale_;
-    const float statusLimit = vm.status.query_active ? std::min(rect.right * 0.30f, sb.task.left - gap) : rect.right * 0.30f;
+    const float statusLimit = centered_progress ? std::min(rect.right * 0.30f, sb.task.left - gap) : rect.right * 0.30f;
     const float statusWidth = std::min(std::max(0.0f, statusLimit - sb.pad),
         MeasureTextWidth(factory, small_fmt, vm.status.status_text));
     DrawTextEndEllipsis(dc, factory, small_fmt, brTextSecondary_.get(), vm.status.status_text,
@@ -977,7 +978,7 @@ void MainRenderer::DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& r
             IsHovered(vm, HitTestResult::StatusBarCancelSearch) ? theme.fill_hover : kTransparent,
             kIconCloseSmall, L"×", theme.text_secondary, true, true, 0.62f);
     }
-    if (!vm.status.query_active && !vm.status.performance_text.empty()) {
+    if (!centered_progress && !vm.status.performance_text.empty()) {
         const std::wstring& perfText = rect.right < 1100.0f * scale_
             ? vm.status.performance_compact_text : vm.status.performance_text;
         const float perfWidth = std::min(rect.right * 0.50f,
@@ -987,7 +988,7 @@ void MainRenderer::DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& r
         DrawTextRect(dc, small_fmt, brTextSecondary_.get(), perfText,
             rect.right - rightReserved, y, perfWidth, status_height_);
         small_fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-    } else if (!vm.status.query_active && !vm.status.hint_text.empty()) {
+    } else if (!centered_progress && !vm.status.hint_text.empty()) {
         const float cancelWidth = vm.status.query_cancellable ? sb.cancel_search.right - sb.cancel_search.left + 8.0f * scale_ : 0.0f;
         const float hintWidth = std::max(0.0f, rightReserved - sb.pad - cancelWidth);
         small_fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
@@ -996,24 +997,26 @@ void MainRenderer::DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& r
         small_fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 
-    // Query activity uses the same compact status area as operation summaries.
+    // Query/update activity shares the compact status area with operation summaries.
     const float taskX = sb.task.left;
     const float taskRight = sb.task.right;
-    if (vm.status.query_active) {
+    if (centered_progress) {
+        const auto& progress_text = vm.status.query_active ? vm.status.query_text : vm.status.task_text;
+        const float progress_value = vm.status.query_active ? vm.status.query_progress : vm.status.task_progress / 100.0f;
         const float taskWidth=std::max(0.0f,taskRight-taskX);
         const float trackWidth=std::min(100*scale_,taskWidth*0.30f);
         const float queryGap=std::min(8*scale_,taskWidth-trackWidth);
-        const float textWidth=std::min(MeasureTextWidth(factory,small_fmt,vm.status.query_text),
+        const float textWidth=std::min(MeasureTextWidth(factory,small_fmt,progress_text),
             std::max(0.0f,taskWidth-trackWidth-queryGap));
         const float trackX=taskRight-trackWidth;
         const float textX=std::max(taskX,trackX-queryGap-textWidth);
         MakeBrush(dc,theme.accent,brAccentText_);
-        DrawTextEndEllipsis(dc,factory,small_fmt,brAccentText_.get(),vm.status.query_text,
+        DrawTextEndEllipsis(dc,factory,small_fmt,brAccentText_.get(),progress_text,
             textX,y,textWidth,status_height_);
         fluent::ProgressSpec progress;
         progress.bounds=D2D1::RectF(trackX,y,std::min(taskRight,trackX+trackWidth),y+status_height_);
-        progress.value=std::clamp(vm.status.query_progress,0.0f,1.0f);
-        progress.indeterminate=vm.status.query_progress<0.0f;
+        progress.value=std::clamp(progress_value,0.0f,1.0f);
+        progress.indeterminate=progress_value<0.0f;
         progress.animation_progress=static_cast<float>(GetTickCount64()%1952)/1952.0f;
         painter_.DrawProgressBar(progress);
     } else if (!vm.status.task_text.empty() || vm.status.task_progress >= 0.0f) {

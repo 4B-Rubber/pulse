@@ -28,17 +28,8 @@ set "LIB=$toolset\lib\x64;%WindowsSdkDir%Lib\%WindowsSDKVersion%ucrt\x64;%Window
     $compilerArguments = "-DCMAKE_C_COMPILER=`"$toolset/bin/Hostx64/x64/cl.exe`" -DCMAKE_CXX_COMPILER=`"$toolset/bin/Hostx64/x64/cl.exe`" -DCMAKE_LINKER=`"$toolset/bin/Hostx64/x64/link.exe`""
 }
 $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
-$sdkRoot = Join-Path $repo '.release-sdk'
-$sdkArchive = Join-Path $repo '.release-sdk.zip'
-$sdk = Get-Content -Raw (Join-Path $repo 'cmake/lumatext-sdk.json') | ConvertFrom-Json
-if (-not (Test-Path $sdkArchive) -or (Get-FileHash $sdkArchive -Algorithm SHA256).Hash -ne $sdk.sha256) {
-    Invoke-WebRequest -Uri $sdk.url -OutFile $sdkArchive
-}
-if ((Get-FileHash $sdkArchive -Algorithm SHA256).Hash -ne $sdk.sha256) { throw 'LumaText SDK checksum mismatch' }
-Expand-Archive -LiteralPath $sdkArchive -DestinationPath $sdkRoot -Force
-# ZIP timestamps have no timezone; normalize extracted inputs before Ninja runs.
-$extractedAt = [DateTime]::UtcNow
-Get-ChildItem -LiteralPath $sdkRoot -Recurse -File | ForEach-Object { $_.LastWriteTimeUtc = $extractedAt }
+# The release tag pins the complete SDK; CI verifies it before configuring CMake.
+$sdkRoot = & (Join-Path $PSScriptRoot 'verify_lumatext_sdk.ps1')
 $candidate = if ($Channel -eq 'win81') { 'ON' } else { 'OFF' }
 $manifest = if ($Channel -eq 'win81') { 'update-manifest-win81.json' } else { 'update-manifest.json' }
 $publicKey = (Get-Content (Join-Path $repo 'cmake/update-public-key.txt') -Raw).Trim()
@@ -48,8 +39,10 @@ New-Item -ItemType Directory -Path $build -Force | Out-Null
 $testNames = @('pulse_rename_ops_test', 'pulse_child_edit_test', 'pulse_localization_test',
     'pulse_update_test', 'pulse_update_installer_test', 'pulse_app_controllers_test',
     'pulse_change_tracking_polling_test', 'pulse_change_tracking_test',
-    'pulse_change_tracking_memory_test', 'pulse_change_feed_memory_test', 'pulse_usn_packet_queue_test')
-$testTargets = (@('pulse', 'pulse_index_engine_test', 'pulse_index_host_stress') + $testNames) -join ' '
+    'pulse_change_tracking_memory_test', 'pulse_change_feed_memory_test', 'pulse_usn_packet_queue_test',
+    'pulse_content_progress_ui_test')
+$testTargets = (@('pulse', 'pulse_index_engine_test', 'pulse_index_host_stress',
+    'pulse_preview_test', 'pulse_preview_handler_probe') + $testNames) -join ' '
 $batch = Join-Path $build 'compile-release.bat'
 @"
 @echo off
@@ -58,7 +51,7 @@ if errorlevel 1 exit /b 1
 chcp 65001 >nul
 set "VSLANG=1033"
 $toolsetEnvironment
-cmake -S "$repo" -B "$build" -G Ninja $compilerArguments -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DPULSE_WIN81_CANDIDATE=$candidate -DPULSE_WITH_SELFTEST=ON -DPULSE_WITH_LUMATEXT=ON -DLUMATEXT_SOURCE_DIR= -DCMAKE_PREFIX_PATH="$sdkRoot" -DPULSE_UPDATE_MANIFEST_URL="https://github.com/jimmgreen/pulse/releases/latest/download/$manifest" -DPULSE_UPDATE_PUBLIC_KEY_HEX=$publicKey
+cmake -S "$repo" -B "$build" -G Ninja $compilerArguments -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DPULSE_WIN81_CANDIDATE=$candidate -DPULSE_WITH_SELFTEST=ON -DPULSE_BUILD_PROGRESS_UI_TESTS=ON -DPULSE_WITH_LUMATEXT=ON -DLUMATEXT_SOURCE_DIR= -DCMAKE_PREFIX_PATH="$sdkRoot" -DPULSE_UPDATE_MANIFEST_URL="https://github.com/jimmgreen/pulse/releases/latest/download/$manifest" -DPULSE_UPDATE_PUBLIC_KEY_HEX=$publicKey
 if errorlevel 1 exit /b 1
 cmake --build "$build" --parallel 4 --target $testTargets
 exit /b %errorlevel%
@@ -69,6 +62,10 @@ foreach ($testName in $testNames) {
     & (Join-Path $build "$testName.exe")
     if ($LASTEXITCODE -ne 0) { throw "$testName failed" }
 }
+& (Join-Path $build 'pulse_preview_test.exe') --vector-only
+if ($LASTEXITCODE -ne 0) { throw 'Vector preview regression failed' }
+& (Join-Path $build 'pulse_preview_handler_probe.exe') --cooldown-test
+if ($LASTEXITCODE -ne 0) { throw 'Preview provider cooldown regression failed' }
 foreach ($mode in @('--startup-stop', '--shell-roundtrip')) {
     & (Join-Path $build 'pulse_rename_ops_test.exe') $mode
     if ($LASTEXITCODE -ne 0) { throw "Rename lifecycle check $mode failed" }
@@ -88,7 +85,7 @@ foreach ($mode in @('--service-start-only', '--shutdown-only')) {
     if ($LASTEXITCODE -ne 0) { throw "Index lifecycle check $mode failed" }
 }
 $selftestCases = @('rename-editor', 'rename-editor-native', 'operation-toast',
-    'filter-controls', 'rename-outside', 'address-editor', 'address-editor-native', 'release-panels-hidden')
+    'filter-controls', 'rename-outside', 'address-editor', 'address-editor-native', 'release-panels-hidden', 'pr-shell', 'pin-reorder')
 $selftestLogs = @{
     'rename-editor' = 'bench_data/rename-editor/results.log'
     'rename-editor-native' = 'bench_data/rename-editor/results.log'

@@ -39,4 +39,4 @@ Release 正文自动提供上述系统说明与两个下载入口。不要重复
 
 签名私钥保存在仓库的 Actions Secret `PULSE_UPDATE_PRIVATE_KEY` 中，备份应保存在仓库之外，不进入 Git。后续发布沿用此密钥和公钥，避免已安装客户端无法验证新版。
 
-CI 使用 v143 和静态 VC 运行库，LumaText 使用校验过的固定 SDK，定义见 `cmake/lumatext-sdk.json`。这样构建不依赖本机路径或私有 LumaText 仓库。SDK 仅供构建使用；普通用户下载 Release 顶部对应系统的安装包。
+CI 使用 v143 和静态 VC 运行库，LumaText 使用仓库中 `third_party/lumatext` 的固定 SDK。`cmake/lumatext-sdk.json` 固定 `sdk-manifest.json` 的 SHA-256，`scripts/verify_lumatext_sdk.ps1` 在构建前逐一核对 DLL、导入库、头文件、CMake 导出和许可证，避免开发包与正式包混用。构建不依赖本机路径或私有 LumaText 仓库。SDK 仅供构建使用；普通用户下载 Release 顶部对应系统的安装包。

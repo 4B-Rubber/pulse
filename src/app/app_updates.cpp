@@ -32,6 +32,13 @@ void TickUpdates(AppState& state, unsigned long long now) {
         state.update_installer.Stop();
         InvalidateRect(state.hwnd, nullptr, FALSE);
     }
+    // Snapshot reads are cheap; repaint at most 10 Hz, only while work is active and visible.
+    // Bytes are never posted as individual window messages.
+    if (!state.shot.active && state.update_installer.Progress().active() &&
+        now >= state.next_update_progress_paint && IsWindowVisible(state.hwnd) && !IsIconic(state.hwnd)) {
+        state.next_update_progress_paint = now + 100;
+        InvalidateRect(state.hwnd, nullptr, FALSE);
+    }
     if (state.shot.active || !app::UpdateChecker::Enabled() || now < state.next_update_check) return;
     if (state.update_installer.downloading() || state.update_installer.installing() || state.update_checker.checking()) return;
     state.next_update_check = now + kCheckInterval;
@@ -71,7 +78,12 @@ void CompleteUpdateDownload(AppState& state) {
     DWORD error = ERROR_SUCCESS;
     if (!state.update_installer.TakeResult(error)) return;
     if (!error && (state.ops.Status().active || state.settings.migration_pending())) error = ERROR_BUSY;
-    if (!error) state.update_installer.Launch(state.hwnd, error);
+    if (!error) {
+        // Paint the verified/starting stage before ShellExecute can enter an elevation prompt.
+        InvalidateRect(state.hwnd, nullptr, FALSE);
+        UpdateWindow(state.hwnd);
+        state.update_installer.Launch(state.hwnd, error);
+    }
     state.update_install_error = error;
     if (error) {
         state.update_installer.Stop();

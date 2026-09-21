@@ -62,6 +62,11 @@ struct UpdateInstaller::State {
     std::atomic<bool> downloading{true};
     std::atomic<bool> installing{false};
     std::mutex mutex;
+    UpdateProgress progress{UpdatePhase::Connecting};
+    void SetPhase(UpdatePhase phase) {
+        std::lock_guard<std::mutex> lock(mutex);
+        progress.phase = phase;
+    }
     bool has_result = false;
     bool has_install_result = false;
     DWORD install_error = ERROR_SUCCESS;
@@ -98,6 +103,8 @@ struct UpdateInstaller::State {
             UpdateError category = UpdateError::None;
             if (!ReadUpdateWithFallback(update.download_page, kMaximumInstallerBytes, cancelled,
                     [&] {
+                        // A fallback truncates the file and resets its denominator/counter together.
+                        { std::lock_guard<std::mutex> lock(mutex); progress = {UpdatePhase::Connecting}; }
                         LARGE_INTEGER start{};
                         return SetFilePointerEx(output.value, start, nullptr, FILE_BEGIN) &&
                             SetEndOfFile(output.value);
@@ -105,7 +112,16 @@ struct UpdateInstaller::State {
                     [&](const void* data, DWORD size) {
                         DWORD written = 0;
                         return WriteFile(output.value, data, size, &written, nullptr) && written == size;
-                    }, category, failure)) return failure;
+                    }, category, failure,
+                    [&](std::wstring_view url, uint64_t maximum, const std::atomic<bool>& stop,
+                        const std::function<bool(const void*, DWORD)>& consume, UpdateError& kind, DWORD& error) {
+                        return ReadUpdateResponseWithProgress(url, maximum, stop, consume, kind, error,
+                            [&](uint64_t received, uint64_t total) {
+                                std::lock_guard<std::mutex> lock(mutex);
+                                progress = {UpdatePhase::Downloading, received, total};
+                            });
+                    })) return failure;
+            SetPhase(UpdatePhase::Verifying);
             if (!FlushFileBuffers(output.value)) return GetLastError();
         }
         if (cancelled) return ERROR_CANCELLED;
@@ -125,6 +141,12 @@ UpdateInstaller::~UpdateInstaller() { Stop(); }
 bool UpdateInstaller::downloading() const noexcept { return state_ && state_->downloading; }
 bool UpdateInstaller::installing() const noexcept { return state_ && state_->installing; }
 
+UpdateProgress UpdateInstaller::Progress() const {
+    if (!state_) return {};
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->progress;
+}
+
 bool UpdateInstaller::Start(const UpdateResult& update, HWND notify, UINT message) {
     if (downloading() || installing() || !notify || !message || update.error != UpdateError::None ||
         !update.update_available || !update.download_page.starts_with(L"https://") ||
@@ -138,10 +160,11 @@ bool UpdateInstaller::Start(const UpdateResult& update, HWND notify, UINT messag
             try { error = state->Download(update); } catch (...) {}
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
+                state->progress.phase = !error && !state->cancelled ? UpdatePhase::Ready : UpdatePhase::Idle;
                 state->error = error;
+                state->downloading = false;
                 state->has_result = true;
             }
-            state->downloading = false;
             if (!state->cancelled) PostMessageW(notify, message, 0, 0);
         }).detach();
     } catch (...) {
@@ -163,6 +186,7 @@ bool UpdateInstaller::TakeResult(DWORD& error) {
 bool UpdateInstaller::Launch(HWND owner, DWORD& error) {
     error = ERROR_INVALID_STATE;
     if (!state_ || state_->downloading || state_->installing || state_->error || state_->guard.value == INVALID_HANDLE_VALUE) return false;
+    state_->SetPhase(UpdatePhase::Launching);
     SHELLEXECUTEINFOW execute{sizeof(execute)};
     execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
     execute.hwnd = owner;
@@ -172,10 +196,15 @@ bool UpdateInstaller::Launch(HWND owner, DWORD& error) {
     execute.lpFile = state_->file.c_str();
     execute.lpParameters = L"/SP- /NORESTART /LOG";
     execute.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&execute)) { error = GetLastError(); return false; }
+    if (!ShellExecuteExW(&execute)) {
+        error = GetLastError();
+        state_->SetPhase(UpdatePhase::Idle);
+        return false;
+    }
     if (execute.hProcess) {
         auto state = state_;
         state->installing = true;
+        state->SetPhase(UpdatePhase::Installing);
         try {
             std::thread([state, process = execute.hProcess] {
                 DWORD exit_code = 0;
@@ -190,13 +219,18 @@ bool UpdateInstaller::Launch(HWND owner, DWORD& error) {
                 CloseHandle(process);
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
+                    state->progress.phase = UpdatePhase::Idle;
                     state->install_error = failure;
+                    state->installing = false;
                     state->has_install_result = true;
                 }
-                state->installing = false;
             }).detach();
-        } catch (...) { CloseHandle(execute.hProcess); state->installing = false; }
-    }
+        } catch (...) {
+            CloseHandle(execute.hProcess);
+            state->installing = false;
+            state->SetPhase(UpdatePhase::Idle);
+        }
+    } else state_->SetPhase(UpdatePhase::Idle);
     error = ERROR_SUCCESS;
     return true;
 }

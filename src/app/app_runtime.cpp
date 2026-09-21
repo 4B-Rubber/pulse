@@ -1,5 +1,6 @@
 // app_runtime.cpp — extracted from app_main.cpp.
 #include "app_internal.h"
+#include "update_status.h"
 #include "../ui/lumatext_renderer.h"
 #include "../ui/fluent_menu.h"
 #include "../ui/drag_drop.h"
@@ -141,6 +142,23 @@ void RefreshDuplicateGroupViews(AppState& s) {
 } // namespace
 
 namespace pulse {
+namespace {
+app::UpdateProgress UpdateProgressForView(const AppState& s) {
+    if (s.shot.active) {
+        using app::UpdatePhase;
+        const auto& phase = s.shot.update_state;
+        if (phase == L"connecting") return {UpdatePhase::Connecting};
+        if (phase == L"downloading") return {UpdatePhase::Downloading, 3 * 1024 * 1024, 8 * 1024 * 1024};
+        if (phase == L"downloading-unknown") return {UpdatePhase::Downloading, 3 * 1024 * 1024, 0};
+        if (phase == L"verifying") return {UpdatePhase::Verifying};
+        if (phase == L"launching") return {UpdatePhase::Launching};
+        if (phase == L"installing") return {UpdatePhase::Installing};
+        return {};
+    }
+    return s.update_installer.Progress();
+}
+}
+
 void PrefetchDetailsMeta(HWND hwnd, const std::wstring& path) {
     GetDetailsMetaWorker().Submit(hwnd, path);
 }
@@ -401,7 +419,8 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             vm.settings_update_installing = s.update_installer.installing();
             DWORD update_install_error = s.update_install_error;
             if (s.shot.active) {
-                vm.settings_update_downloading |= s.shot.update_state == L"downloading";
+                const auto progress = UpdateProgressForView(s);
+                vm.settings_update_downloading |= progress.active() && progress.phase != app::UpdatePhase::Installing;
                 vm.settings_update_installing |= s.shot.update_state == L"installing";
                 if (s.shot.update_state == L"cancelled") update_install_error = ERROR_CANCELLED;
                 if (s.shot.update_state == L"failed") update_install_error = ERROR_CRC;
@@ -414,7 +433,9 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             if (vm.settings_update_installing) {
                 vm.settings_update_status = l10n::Get(l10n::StringId::InstallingUpdate);
             } else if (vm.settings_update_downloading) {
-                vm.settings_update_status = l10n::Get(l10n::StringId::DownloadingUpdate);
+                vm.settings_update_status = app::UpdateProgressText(UpdateProgressForView(s));
+                if (vm.settings_update_status.empty())
+                    vm.settings_update_status = l10n::Get(l10n::StringId::DownloadingUpdate);
             } else if (update_install_error != ERROR_SUCCESS) {
                 const auto message = update_install_error == ERROR_CANCELLED ? l10n::StringId::UpdateCancelled :
                     update_install_error == ERROR_BUSY ? l10n::StringId::UpdateBusy : l10n::StringId::UpdateInstallFailed;
@@ -1127,10 +1148,19 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     });
     ui::WindowViewModel vm = app::BuildWindowViewModel(*s.pane, s.sidebar,
         s.pane->focused, s.maximized, s.darkMode, &s.places, s.sidebarCollapsedMask,
-        s.starredExpanded);
+        s.sidebarHiddenMask, s.starredExpanded, &s.sidebarOrder,
+        s.sidebarQuickAccessHiddenMask);
     app::FillWindowTabStrip(vm, s.window_tabs);
     vm.show_pinned_tab_names = s.appPrefs.show_pinned_tab_names;
     vm.sidebar_scroll = s.sidebarScroll;
+    if (s.groupDragActive) {
+        vm.sidebar_group_drag_id = s.groupDragId;
+        if (s.groupGapVisible) vm.sidebar_group_gap_line_y = s.groupGapLineY;
+    }
+    if (s.pinDragActive) {
+        vm.sidebar_pin_drag_index = s.pinDragRun;
+        if (s.pinGapVisible) vm.sidebar_pin_gap_line_y = s.pinGapLineY;
+    }
     ops::OpStatus st = s.ops.Status();
     if (st.active || !st.last_error.empty() || !st.summary.empty()) {
         vm.status.task_text = st.last_error.empty() ? st.summary
@@ -1138,6 +1168,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         vm.status.task_progress = st.active ? st.percent : -1.0f;
         if(s.contentSelectionAction) vm.status.selection_text=l10n::Get(l10n::StringId::OpPreparingList);
     }
+    app::ApplyUpdateStatus(vm.status, UpdateProgressForView(s), st.active);
     {
         std::wstring idx = s.index.Status();
         app::Tab* active = ActiveTab(s);
@@ -1356,6 +1387,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         ui::DetailsPanelView& dv = vm.details;
         dv.scroll_y = s.detailsScroll;
         dv.preview_only = s.detailsPreviewOnly;
+        dv.preview_enabled = s.detailsPreviewEnabled;
         dv.preview_expansion = s.detailsPreviewExpansion;
         dv.collapsed_mask = s.detailsCollapsedMask;
         app::Tab* tab = ActiveTab(s);
@@ -1515,6 +1547,24 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     return vm;
 }
 
+// True while the sidebar is collapsed to its icon rail: rows carry no text, so
+// every hover needs a name hint. EffectiveSidebarWidth returns pixels (the
+// upstream DIP-scaling fix), which is what the rail test expects.
+bool SidebarRailActive(const AppState& s) {
+    return ui::SidebarRailLayout(
+        s.renderer.EffectiveSidebarWidth(static_cast<float>(s.compositor.Width())), s.scale);
+}
+
+void ApplyHoverTarget(AppState& s, const ui::HitTestResult& hit) {
+    s.hoverRegion = static_cast<int>(hit.region);
+    s.hoverControlIndex = hit.index;
+    s.hoverSubIndex = hit.sub_index;
+    s.hoverPath = hit.path;
+    s.hoverLabel = hit.label;
+    s.hoverSince = GetTickCount64();
+    s.tooltipText.clear();
+}
+
 std::wstring TooltipForHover(AppState& s) {
     using R = ui::HitTestResult;
     using I = l10n::StringId;
@@ -1619,6 +1669,9 @@ std::wstring TooltipForHover(AppState& s) {
     case R::DetailsTagAdd: return text(I::AddTag);
     case R::DetailsResize: return text(I::ResizeDetails);
     case R::DetailsPreviewToggle: return text(s.detailsPreviewOnly ? I::PreviewExpandDetails : I::PreviewCollapseDetails);
+    // Names the action, matching the star and rename hints beside it.
+    case R::DetailsPreviewEnable:
+        return text(s.detailsPreviewEnabled ? I::PreviewHide : I::PreviewShow);
     case R::DetailsPreview: return L"";
     case R::StatusBarTask: return text(I::OpDetails);
     case R::StatusBarCancelSearch: return text(I::ContentCancelSearch);
@@ -1637,7 +1690,11 @@ std::wstring TooltipForHover(AppState& s) {
     case R::RowNewTab: return text(I::OpenNewTab);
     case R::RowMore: return text(I::MoreActions);
     case R::SidebarItemAction: return text(I::Unpin);
+    // On the icon rail there is no text to read, so every row (and every folded
+    // section's icon) names itself on hover.
+    case R::SidebarHeader: return SidebarRailActive(s) ? s.hoverLabel : L"";
     case R::SidebarItem: {
+        if (SidebarRailActive(s) && !s.hoverLabel.empty()) return s.hoverLabel;
         if (const app::StarredItem* starred = s.places.FindStarred(s.hoverPath);
             starred && !starred->badge.empty()) {
             return starred->badge;

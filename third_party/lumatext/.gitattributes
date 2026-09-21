@@ -1,0 +1,2 @@
+# Preserve pinned SDK bytes across Windows and CI checkouts.
+* -text

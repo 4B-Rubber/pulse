@@ -393,7 +393,7 @@ struct LumaTextRenderer::Impl {
         profile_desc.light.coverage_contrast = 1.00f;
         profile_desc.light.raster_filter = LT_RASTER_FILTER_MITCHELL;
         profile_desc.dark = profile_desc.light;
-        profile_desc.regular_optical_weight = 0.06f;
+        profile_desc.regular_optical_weight = 0.0f;
         profile_desc.bold_optical_weight = 0.0f;
 #if defined(PULSE_TEST_LUMATEXT_INIT_FAILURE)
         wchar_t fail_init[2]{};

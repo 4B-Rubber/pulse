@@ -75,6 +75,10 @@ Name: "startup"; Description: "开机自动启动 Pulse / Launch Pulse at sign-i
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "其他 / Other:"; Flags: unchecked
 
 [Files]
+#ifdef AppLocalRuntime
+; Local MD builds bundle the matching CRT; the static Win81 CI path is unchanged.
+Source: "{#BuildDir}\msvc-runtime\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+#endif
 Source: "{#BuildDir}\pulse.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\lumatext.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion
@@ -111,6 +115,75 @@ var
   IndexDirPage: TInputDirWizardPage;
   CleanupUserData: Boolean;
   UninstallIndexPath: String;
+  UpgradePrefsCaptured: Boolean;
+  UpgradeStartupPresent: Boolean;
+  UpgradeStartupCommand, UpgradePreviousExe: String;
+  UpgradeFolderCommands: array[0..1] of String;
+
+function FolderClass(Index: Integer): String;
+begin
+  if Index = 0 then Result := 'Directory' else Result := 'Drive';
+end;
+
+procedure CaptureUpgradePrefs(const PreviousExe: String);
+var
+  I: Integer;
+  Command, DefaultVerb: String;
+begin
+  if UpgradePrefsCaptured then Exit;
+  UpgradePreviousExe := PreviousExe;
+  UpgradeStartupPresent := RegQueryStringValue(HKCU,
+    'Software\Microsoft\Windows\CurrentVersion\Run', 'Pulse', UpgradeStartupCommand);
+  for I := 0 to 1 do
+  begin
+    Command := '';
+    DefaultVerb := '';
+    if RegQueryStringValue(HKCU, 'Software\Classes\' + FolderClass(I) +
+      '\shell\open\command', '', Command) and
+      (Pos(Lowercase(PreviousExe), Lowercase(Command)) > 0) and
+      RegQueryStringValue(HKCU, 'Software\Classes\' + FolderClass(I) +
+        '\shell', '', DefaultVerb) and (CompareText(DefaultVerb, 'open') = 0) then
+      UpgradeFolderCommands[I] := Command;
+  end;
+  UpgradePrefsCaptured := True;
+end;
+
+function UpgradeCommand(Command: String): String;
+var
+  P: Integer;
+begin
+  P := Pos(Lowercase(UpgradePreviousExe), Lowercase(Command));
+  if P > 0 then
+  begin
+    Delete(Command, P, Length(UpgradePreviousExe));
+    Insert(ExpandConstant('{app}\pulse.exe'), Command, P);
+  end;
+  Result := Command;
+end;
+
+procedure RestoreUpgradePrefs;
+var
+  I: Integer;
+  Key: String;
+begin
+  if not UpgradePrefsCaptured then Exit;
+  { Restore after file/registry installation, including when the old uninstaller
+    predates this code. Never restore associations to removed files on failure. }
+  if UpgradeStartupPresent then
+    RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run',
+      'Pulse', UpgradeCommand(UpgradeStartupCommand))
+  else
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'Pulse');
+  for I := 0 to 1 do
+    if UpgradeFolderCommands[I] <> '' then
+    begin
+      Key := 'Software\Classes\' + FolderClass(I) + '\shell';
+      RegWriteStringValue(HKCU, Key + '\open\command', '',
+        UpgradeCommand(UpgradeFolderCommands[I]));
+      RegWriteStringValue(HKCU, Key + '\open', 'DelegateExecute', '');
+      RegWriteStringValue(HKCU, Key, '', 'open');
+    end;
+end;
 
 function IsChinese: Boolean;
 begin
@@ -368,8 +441,8 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    { The app can create these values after installation, so remove them even
-      when the original installer task was not selected. }
+    { Silent removal must clean up too. The upgrading installer saves and
+      restores preferences only after the replacement files are installed. }
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'Pulse');
     DeleteFolderOpenOverride('Directory');
     DeleteFolderOpenOverride('Drive');
@@ -506,6 +579,7 @@ begin
 
   { Silent upgrades keep user data; an interactive uninstall still lets the
     user choose cleanup through the checkbox above. }
+  CaptureUpgradePrefs(AddBackslash(ExtractFileDir(FileName)) + 'pulse.exe');
   if not Exec(FileName,
     Trim(Params + ' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART'),
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
@@ -602,8 +676,9 @@ var
   Code: Integer;
   IndexExe, Path: String;
 begin
-  if (CurStep <> ssPostInstall) or not WizardIsTaskSelected('indexservice') then
-    Exit;
+  if CurStep <> ssPostInstall then Exit;
+  RestoreUpgradePrefs;
+  if not WizardIsTaskSelected('indexservice') then Exit;
   IndexExe := ExpandConstant('{app}\Pulse.Index.exe');
   Path := RemoveBackslashUnlessRoot(GetIndexPath(''));
   WizardForm.StatusLabel.Caption := '正在设置索引位置… / Configuring index location…';

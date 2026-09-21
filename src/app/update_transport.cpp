@@ -2,6 +2,7 @@
 #include "pulse_version.h"
 #include <winhttp.h>
 #include <array>
+#include <limits>
 
 namespace pulse::app {
 namespace {
@@ -11,10 +12,30 @@ struct HttpHandle {
 };
 }
 
+uint64_t ParseUpdateContentLength(std::wstring_view header) noexcept {
+    uint64_t value = 0;
+    if (header.empty()) return 0;
+    for (const auto c : header) {
+        if (c < L'0' || c > L'9') return 0;
+        const auto digit = static_cast<uint64_t>(c - L'0');
+        if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10) return 0;
+        value = value * 10 + digit;
+    }
+    return value;
+}
+
 bool ReadUpdateResponse(std::wstring_view url, uint64_t maximum_bytes,
                         const std::atomic<bool>& cancelled,
                         const std::function<bool(const void*, DWORD)>& consume,
                         UpdateError& category, DWORD& error) {
+    return ReadUpdateResponseWithProgress(url, maximum_bytes, cancelled, consume, category, error, {});
+}
+
+bool ReadUpdateResponseWithProgress(std::wstring_view url, uint64_t maximum_bytes,
+                        const std::atomic<bool>& cancelled,
+                        const std::function<bool(const void*, DWORD)>& consume,
+                        UpdateError& category, DWORD& error,
+                        const UpdateDownloadProgress& progress) {
     category = UpdateError::Network;
     error = ERROR_SUCCESS;
     URL_COMPONENTS parts{};
@@ -63,6 +84,18 @@ bool ReadUpdateResponse(std::wstring_view url, uint64_t maximum_bytes,
         error = status ? status : GetLastError();
         return false;
     }
+    wchar_t length_header[32]{};
+    DWORD length_size = sizeof(length_header);
+    uint64_t total = 0;
+    if (WinHttpQueryHeaders(request.value, WINHTTP_QUERY_CONTENT_LENGTH,
+            WINHTTP_HEADER_NAME_BY_INDEX, length_header, &length_size, WINHTTP_NO_HEADER_INDEX))
+        total = ParseUpdateContentLength(length_header);
+    if (total > maximum_bytes) {
+        category = UpdateError::ResponseTooLarge;
+        error = ERROR_FILE_TOO_LARGE;
+        return false;
+    }
+    if (progress) progress(0, total);
     uint64_t received = 0;
     std::array<char, 64 * 1024> buffer{};
     for (;;) {
@@ -79,13 +112,16 @@ bool ReadUpdateResponse(std::wstring_view url, uint64_t maximum_bytes,
             error = ERROR_FILE_TOO_LARGE;
             return false;
         }
-        received += read;
         if (!consume(buffer.data(), read)) {
             category = UpdateError::LocalIo;
             error = GetLastError();
             if (!error) error = ERROR_WRITE_FAULT;
             return false;
         }
+        received += read;
+        // A contradictory/missing length must never produce a fabricated percentage.
+        if (total && received > total) total = 0;
+        if (progress) progress(received, total);
     }
 }
 

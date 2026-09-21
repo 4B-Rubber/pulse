@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "architecture": "x64",
+  "configuration": "Release",
+  "runtime": "MT",
+  "toolset": "v143",
+  "snapshot_date": "2026-09-21",
+  "source_base_commit": "c21ea81f31293d51b066402730d7a4eb18ca2ce6",
+  "source_includes_uncommitted_changes": true,
+  "source_snapshot_sha256": "a8b74100d167deaa19e8b64844c00b011d893b55bd39e0af7f3815acb11b2520",
+  "build_note": "Approved LumaText source snapshot; isolated CMake runtime override, Windows 8.1 API baseline with runtime-queried newer DirectWrite interfaces.",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 69,
+      "sha256": "b1622a4ecbe84cf8828d5d1cff52298501ec1e5a48b073880d54fe019ce2a7a5"
+    },
+    {
+      "path": "bin/lumatext.dll",
+      "bytes": 1811968,
+      "sha256": "e2ea232486ccfe0e3bc382bb7fbc7bd498c99adcad9abd2b737601ba89ee7911"
+    },
+    {
+      "path": "include/lumatext/lumatext.h",
+      "bytes": 11210,
+      "sha256": "0ad38a3bf02667fc50a4c8f49d68adb7d39d9b928c35d6d54b6f6b2997ccf1b5"
+    },
+    {
+      "path": "include/lumatext/lumatext.hpp",
+      "bytes": 1444,
+      "sha256": "cc9be6d7a57ac68f3da5c02e7c4be04df1a5b4be2267cd922c06103e78b5b433"
+    },
+    {
+      "path": "lib/cmake/LumaText/LumaTextConfig.cmake",
+      "bytes": 1286,
+      "sha256": "f5eb05e70262fa9bcaf362ff612bc33d11c69e56a0a1b7045eee4421ffa76bb4"
+    },
+    {
+      "path": "lib/cmake/LumaText/LumaTextConfigVersion.cmake",
+      "bytes": 2762,
+      "sha256": "4440cdfab7c7e4e4fffcf0d81d698fcd80290c4f2a8d32c4f8242993b0af951d"
+    },
+    {
+      "path": "lib/cmake/LumaText/LumaTextTargets-release.cmake",
+      "bytes": 905,
+      "sha256": "7dec209675c603c7e87e4a68408ac76fe5c556e2a7aeec68f650e8607c7c36c1"
+    },
+    {
+      "path": "lib/cmake/LumaText/LumaTextTargets.cmake",
+      "bytes": 4924,
+      "sha256": "b9db402de6b8365414723df6e9de12559e1a2682e60572fd1de7e1db283bf64c"
+    },
+    {
+      "path": "lib/lumatext.lib",
+      "bytes": 7520,
+      "sha256": "706c989611e642d46b873b2550c35dbf8f1b2f943f5b3d8e38ee4d94ea0c5f80"
+    },
+    {
+      "path": "share/LumaText/licenses/FreeType.txt",
+      "bytes": 6743,
+      "sha256": "08c135755dd589039470f1fdbb400daaabaaa50d0b366d19cebff4d22986baa1"
+    },
+    {
+      "path": "share/LumaText/licenses/HarfBuzz.txt",
+      "bytes": 1570,
+      "sha256": "9818875fa596557bc1dcdb3b1e4c2840d4355758d86115ac519b3d26b550f6d2"
+    },
+    {
+      "path": "share/LumaText/licenses/LICENSE",
+      "bytes": 1079,
+      "sha256": "af235da00c8f63a2561893b4f23ae41a60b114cb121ed5bbae933f48549e3dbe"
+    },
+    {
+      "path": "share/LumaText/licenses/Unicode.txt",
+      "bytes": 1995,
+      "sha256": "027337b3a0bc5f3c958e1629d5a7650926c2b0698ab53bfc973f245ebc04b531"
+    }
+  ],
+  "text_line_endings": "LF"
+}
