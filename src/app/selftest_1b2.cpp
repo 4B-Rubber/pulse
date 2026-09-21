@@ -502,6 +502,10 @@ void TestShellNamespaceForward() {
           L"shell namespace: This PC and the rest report nothing to open");
     Check(ResolveIncomingPath(L"pulse:starred") == L"pulse:starred",
           L"shell namespace: virtual views still pass through");
+    // The reveal command reuses the search-results command; its id is the newest one, so
+    // it has to be inside the cached string range or Get() hands back an empty label.
+    Check(!l10n::Get(l10n::StringId::OpenItemLocation).empty(),
+          L"shell namespace: the reveal command has its label");
 
     wchar_t temp[MAX_PATH]{};
     if (GetTempPathW(MAX_PATH, temp)) {

@@ -752,6 +752,7 @@ enum class StringId : UINT {
     TagDeleteConfirmFormat = IDS_TAG_DELETE_CONFIRM_FORMAT,
     TagDeleteUsedFormat = IDS_TAG_DELETE_USED_FORMAT,
     OpenPath = IDS_OPEN_PATH,
+    OpenItemLocation = IDS_OPEN_ITEM_LOCATION,
     BadgeTextHint = IDS_BADGE_TEXT_HINT,
     RemoveRecent = IDS_REMOVE_RECENT,
     EditBadge = IDS_EDIT_BADGE,
