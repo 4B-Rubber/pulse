@@ -26,6 +26,9 @@ public:
     // Opens a new tab at the end of the group, carrying the last member's
     // folder. Shared by the group menu and the chip hover card.
     void NewTabInGroup(WindowTabs& tabs, int group_id);
+    // Tab menu: "new tab to the right" / "duplicate this tab". The new tab joins the group
+    // of the tab it was opened from, so it cannot cut that group's run in two.
+    void OpenTabBeside(WindowTabs& tabs, int tab_index, bool duplicate);
     void ShowGroupMenu(WindowTabs& tabs, int group_id, POINT screen_pt, ui::FluentMenu& menu);
     void ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt, ui::FluentMenu& menu);
 

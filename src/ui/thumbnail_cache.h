@@ -3,6 +3,7 @@
 #include "preview_viewport.h"
 #include "../ipc/preview_protocol.h"
 #include <atomic>
+#include <cstdint>
 #include <condition_variable>
 #include <deque>
 #include <list>
@@ -48,6 +49,13 @@ public:
                     std::vector<PreviewProperty>& properties);
     bool CachedProperties(const std::wstring& path, uint64_t modified, uint64_t size,
                           std::vector<PreviewProperty>& properties);
+    // Disk layer under the in-memory LRU: entries survive a restart, an index file keeps a
+    // byte budget with least-recently-used trimming, and the settings page can report and
+    // clear it.
+    uint64_t DiskCacheBytes() const;
+    void ClearDiskCache();
+    // Test hook: 0 restores the built-in 256 MB budget.
+    static void SetDiskBudgetForTest(uint64_t bytes);
 private:
     friend struct ThumbnailCacheTestAccess;
     struct Item {
@@ -83,6 +91,8 @@ private:
         std::wstring path, key, identity;
     };
     void Worker();
+    bool LoadDiskResult(const Request& request, Item& result);
+    void SaveDiskResult(const Request& request, const Item& result);
     bool StoreResult(const Request& request, Item result);
     void Touch(Item& item);
     bool Connect();

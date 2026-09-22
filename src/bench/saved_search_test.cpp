@@ -4,6 +4,12 @@
 #include <filesystem>
 #include <cstdio>
 
+namespace pulse::app {
+// The store asks the app for its data directory; this bench only uses the explicit-path
+// entry points, so the redirect never has to answer.
+std::wstring GetPulseDataDir() { return {}; }
+} // namespace pulse::app
+
 using namespace pulse::app;
 
 namespace {

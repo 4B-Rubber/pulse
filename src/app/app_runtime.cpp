@@ -293,6 +293,34 @@ std::wstring ShellNamespaceView(const std::wstring& raw) {
     }
     return {};
 }
+
+// Compact byte text for the settings page ("12.3 MB"): the units read the same in both
+// languages, so this needs no string-table entry.
+std::wstring FormatByteSize(uint64_t bytes) {
+    wchar_t text[64]{};
+    if (bytes >= 1024ull * 1024ull * 1024ull)
+        swprintf_s(text, L"%.2f GB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+    else if (bytes >= 1024ull * 1024ull)
+        swprintf_s(text, L"%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    else if (bytes >= 1024ull)
+        swprintf_s(text, L"%.0f KB", static_cast<double>(bytes) / 1024.0);
+    else
+        swprintf_s(text, L"%llu B", static_cast<unsigned long long>(bytes));
+    return text;
+}
+
+// The band hangs off the same content offsets as the rows, so the sub-pixel part of the scroll
+// the integer corners are still short of is drawn with it: the band glides with the rows instead
+// of stepping whole pixels. At rest the corners are the honest answer, which is what keeps the
+// band's 1px edges crisp.
+D2D1_RECT_F MarqueeBandRect(const AppState& s) {
+    const float glide = s.scrollAnimating ? s.marqueeShift : 0.0f;
+    return D2D1::RectF(
+        static_cast<float>(std::min(s.marqueeStart.x, s.marqueeCur.x)),
+        static_cast<float>(std::min(s.marqueeStart.y, s.marqueeCur.y)) - glide,
+        static_cast<float>(std::max(s.marqueeStart.x, s.marqueeCur.x)),
+        static_cast<float>(std::max(s.marqueeStart.y, s.marqueeCur.y)) - glide);
+}
 } // namespace
 
 std::wstring ResolveIncomingPath(const std::wstring& raw) {
@@ -439,6 +467,11 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             vm.settings_keep_running = s.appPrefs.keep_running_on_close;
             vm.settings_show_hidden_files = s.appPrefs.show_hidden_files;
             vm.settings_show_protected_os_files = s.appPrefs.show_protected_os_files;
+            vm.settings_show_tooltips = s.appPrefs.show_tooltips;
+            vm.settings_tooltip_delay = s.appPrefs.tooltip_delay_ms;
+            vm.settings_thumb_cache_text = FormatByteSize(s.renderer.ThumbCacheBytes());
+            vm.settings_file_hash_enabled = s.appPrefs.file_hash_enabled;
+            vm.settings_show_title_brand = s.appPrefs.show_title_brand;
             vm.settings_search_pinyin = s.appPrefs.search_pinyin;
             vm.settings_global_search_enabled = s.appPrefs.global_search_enabled;
             vm.settings_global_search_capturing = s.settings.global_search_hotkey_capturing();
@@ -772,11 +805,7 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
                 slot.pane.rename_index = s.renameIndex;
                 if (s.marqueeActive) {
                     slot.pane.marquee_active = true;
-                    slot.pane.marquee_rect = D2D1::RectF(
-                        static_cast<float>(std::min(s.marqueeStart.x, s.marqueeCur.x)),
-                        static_cast<float>(std::min(s.marqueeStart.y, s.marqueeCur.y)),
-                        static_cast<float>(std::max(s.marqueeStart.x, s.marqueeCur.x)),
-                        static_cast<float>(std::max(s.marqueeStart.y, s.marqueeCur.y)));
+                    slot.pane.marquee_rect = MarqueeBandRect(s);
                 }
             }
         }
@@ -1245,6 +1274,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         vm.tab_group_card.visible = !vm.tab_group_card.rows.empty();
     }
     vm.show_pinned_tab_names = s.appPrefs.show_pinned_tab_names;
+    vm.show_title_brand = s.appPrefs.show_title_brand;
     vm.sidebar_scroll = s.sidebarScroll;
     if (s.groupDragActive) {
         vm.sidebar_group_drag_id = s.groupDragId;
@@ -1336,11 +1366,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.details_resize_pressed = s.detailsPanelResizing;
     if (s.marqueeActive) {
         vm.pane.marquee_active = true;
-        vm.pane.marquee_rect = D2D1::RectF(
-            static_cast<float>(std::min(s.marqueeStart.x, s.marqueeCur.x)),
-            static_cast<float>(std::min(s.marqueeStart.y, s.marqueeCur.y)),
-            static_cast<float>(std::max(s.marqueeStart.x, s.marqueeCur.x)),
-            static_cast<float>(std::max(s.marqueeStart.y, s.marqueeCur.y)));
+        vm.pane.marquee_rect = MarqueeBandRect(s);
     }
     vm.breadcrumb_hover = s.breadcrumbHover;
     vm.breadcrumb_drop = s.dropBreadcrumb;

@@ -824,6 +824,23 @@ enum class StringId : UINT {
     TrayNewWindow = IDS_TRAY_NEW_WINDOW,
     JumpListPinned = IDS_JUMPLIST_PINNED,
     TabGroupEdit = IDS_TAB_GROUP_EDIT,
+    SettingsTooltips = IDS_SETTINGS_TOOLTIPS,
+    SettingsTooltipsDesc = IDS_SETTINGS_TOOLTIPS_DESC,
+    SettingsTooltipDelay = IDS_SETTINGS_TOOLTIP_DELAY,
+    SettingsTooltipDelayDesc = IDS_SETTINGS_TOOLTIP_DELAY_DESC,
+    TooltipDelayShort = IDS_TOOLTIP_DELAY_SHORT,
+    TooltipDelayStandard = IDS_TOOLTIP_DELAY_STANDARD,
+    TooltipDelayLong = IDS_TOOLTIP_DELAY_LONG,
+    UnblockFile = IDS_UNBLOCK_FILE,
+    HashFile = IDS_HASH_FILE,
+    HashCopied = IDS_HASH_COPIED,
+    UnblockDone = IDS_UNBLOCK_DONE,
+    SettingsThumbCache = IDS_SETTINGS_THUMB_CACHE,
+    SettingsFileHash = IDS_SETTINGS_FILE_HASH,
+    SettingsFileHashDesc = IDS_SETTINGS_FILE_HASH_DESC,
+    TooltipDelayCustom = IDS_TOOLTIP_DELAY_CUSTOM,
+    SettingsTitleBrand = IDS_SETTINGS_TITLE_BRAND,
+    SettingsTitleBrandDesc = IDS_SETTINGS_TITLE_BRAND_DESC,
 };
 
 bool IsLanguageId(std::wstring_view id) noexcept;

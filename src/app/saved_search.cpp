@@ -1,4 +1,5 @@
 #include "saved_search.h"
+#include "session.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
 
@@ -73,14 +74,12 @@ std::vector<std::wstring> ExtractObjects(const std::wstring& json) {
 } // namespace
 
 std::wstring SavedSearchStore::DefaultPath() {
-    PWSTR local = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE,
-                                    nullptr, &local)) || !local) return {};
-    const std::wstring root = std::wstring(local) + L"\\Pulse";
-    CoTaskMemFree(local);
-    if (!CreateDirectoryW(root.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
-        return {};
-    return root + L"\\saved_searches.json";
+    // The app data directory, like every other store: it is the one place that knows
+    // about the test redirect, so a self test can exercise this file at all (the path
+    // used to be assembled here by hand, which kept it out of reach).
+    const std::wstring dir = GetPulseDataDir();
+    if (dir.empty()) return {};
+    return dir + L"\\saved_searches.json";
 }
 
 bool SavedSearchStore::Load() {

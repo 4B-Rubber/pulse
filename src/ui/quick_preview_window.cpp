@@ -182,6 +182,18 @@ void QuickPreviewWindow::RecreateFormats() {
     }
 }
 
+void QuickPreviewWindow::SetAppearance(bool dark, WindowEffect effect) {
+    if (!hwnd_ || (dark_ == dark && effect_ == effect)) return;
+    dark_ = dark;
+    effect_ = effect;
+    ApplyWindowEffect(hwnd_, effect_, dark_);
+    if (find_edit_brush_) {
+        DeleteObject(find_edit_brush_);
+        find_edit_brush_ = nullptr;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 void QuickPreviewWindow::Show(const QuickPreviewItem& item, bool dark, WindowEffect effect,
                               bool safe_mode) {
     if (!hwnd_ || item.path.empty()) return;

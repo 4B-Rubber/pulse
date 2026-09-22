@@ -1,5 +1,6 @@
 #include "../ui/thumbnail_cache.h"
 #include <cstdio>
+#include <memory>
 
 namespace pulse::ui {
 struct ThumbnailCacheTestAccess {
@@ -71,6 +72,78 @@ struct ThumbnailCacheTestAccess {
         cache.Reset();
         check(cache.items_.empty() && cache.lru_.empty() && cache.cache_bytes_ == 0,
               "reset clears all cache state");
+
+        // Disk layer: entries survive "a restart" (a fresh cache object), the byte budget
+        // trims the oldest ones, and Clear() empties the directory.
+        {
+            wchar_t temp[MAX_PATH]{};
+            GetTempPathW(ARRAYSIZE(temp), temp);
+            const std::wstring dir = std::wstring(temp) + L"PulseThumbDisk-" +
+                                     std::to_wstring(GetCurrentProcessId());
+            CreateDirectoryW(dir.c_str(), nullptr);
+            SetEnvironmentVariableW(L"PULSE_TEST_THUMB_CACHE_DIR", dir.c_str());
+            ThumbnailCache::SetDiskBudgetForTest(8 * 1024);
+            const auto make_item = [](uint8_t fill, size_t pixel_bytes) {
+                ThumbnailCache::Item item;
+                item.w = static_cast<uint32_t>(pixel_bytes / 4);
+                item.h = 1;
+                item.stride = item.w * 4;
+                item.pixels.assign(pixel_bytes, fill);
+                item.kind = ipc::PreviewContentKind::Bitmap;
+                item.source_width = item.w;
+                item.source_height = item.h;
+                return item;
+            };
+            const auto make_request = [](const std::wstring& key) {
+                ThumbnailCache::Request req;
+                req.key = key;
+                req.kind = ipc::PreviewRequestKind::Content;
+                return req;
+            };
+            auto writer = std::make_unique<ThumbnailCache>();
+            const std::wstring key_a = writer->Key(L"C:\\disk\\a.png", 256, 1, 1);
+            const std::wstring key_b = writer->Key(L"C:\\disk\\b.png", 256, 1, 1);
+            const std::wstring key_c = writer->Key(L"C:\\disk\\c.png", 256, 1, 1);
+            writer->SaveDiskResult(make_request(key_a), make_item(0x11, 2048));
+            writer->SaveDiskResult(make_request(key_b), make_item(0x22, 2048));
+            check(writer->DiskCacheBytes() >= 4096, "disk cache keeps written entries");
+            writer.reset();
+
+            // A fresh cache object is what the next launch looks like.
+            ThumbnailCache reader;
+            ThumbnailCache::Item loaded;
+            check(reader.LoadDiskResult(make_request(key_a), loaded) && loaded.w == 512 &&
+                  loaded.h == 1 && loaded.pixels.size() == 2048 && loaded.pixels[0] == 0x11 &&
+                  loaded.kind == ipc::PreviewContentKind::Bitmap,
+                  "disk cache survives a restart");
+
+            // Budget: more pixels than the override allows push the oldest entries out.
+            reader.SaveDiskResult(make_request(key_a), make_item(0x11, 4096));
+            reader.SaveDiskResult(make_request(key_b), make_item(0x22, 4096));
+            reader.SaveDiskResult(make_request(key_c), make_item(0x33, 4096));
+            check(reader.DiskCacheBytes() <= 8 * 1024, "disk cache respects the byte budget");
+            ThumbnailCache::Item newest;
+            check(reader.LoadDiskResult(make_request(key_c), newest) &&
+                  newest.pixels.size() == 4096 && newest.pixels[0] == 0x33,
+                  "the newest entry survives the trim");
+
+            reader.ClearDiskCache();
+            check(reader.DiskCacheBytes() == 0, "clear drops the disk cache");
+            ThumbnailCache::Item cleared;
+            check(!reader.LoadDiskResult(make_request(key_a), cleared),
+                  "cleared entries do not come back");
+            ThumbnailCache::SetDiskBudgetForTest(0);
+            SetEnvironmentVariableW(L"PULSE_TEST_THUMB_CACHE_DIR", nullptr);
+            WIN32_FIND_DATAW found{};
+            HANDLE search = FindFirstFileW((dir + L"\\*.bin").c_str(), &found);
+            if (search != INVALID_HANDLE_VALUE) {
+                do {
+                    DeleteFileW((dir + L"\\" + found.cFileName).c_str());
+                } while (FindNextFileW(search, &found));
+                FindClose(search);
+            }
+            RemoveDirectoryW(dir.c_str());
+        }
 
         ComPtr<ID3D11Device> d3d;
         ComPtr<IDXGIDevice> dxgi;

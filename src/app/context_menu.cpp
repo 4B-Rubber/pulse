@@ -35,6 +35,8 @@ constexpr const wchar_t* kGlyphTag = L"\xE8EC";
 constexpr const wchar_t* kGlyphSettings = L"\xE713";
 constexpr const wchar_t* kGlyphRecycle = L"\xE75C";
 constexpr const wchar_t* kGlyphSelectAll = L"\xE8B3";
+constexpr const wchar_t* kGlyphUnblock = L"\xE72E";
+constexpr const wchar_t* kGlyphHash = L"\xE8A5";
 constexpr const wchar_t* kGlyphInvert = L"\xE7A1";
 constexpr const wchar_t* kGlyphWildcard = L"\xE71C";
 
@@ -61,7 +63,7 @@ ui::FluentMenuItem UndoItem(bool can_undo, const std::wstring& undo_label) {
 } // namespace
 
 std::vector<ui::FluentMenuItem> BuildItemMenu(bool can_undo, const std::wstring& undo_label,
-                                              bool folder) {
+                                              bool folder, bool can_unblock, bool show_hash) {
     std::vector<ui::FluentMenuItem> items;
     items.push_back(Item(CmdOpen, l10n::Get(l10n::StringId::Open).c_str(), kGlyphOpen));
 
@@ -85,7 +87,19 @@ std::vector<ui::FluentMenuItem> BuildItemMenu(bool can_undo, const std::wstring&
     items.push_back(Item(CmdCopyPath, l10n::Get(l10n::StringId::CopyPath).c_str(), kGlyphLink, L"Ctrl+Shift+C"));
     items.push_back(Item(CmdOpenTerminal, l10n::Get(l10n::StringId::OpenTerminalHere).c_str(), kGlyphTerminal));
     items.push_back(Item(CmdProperties, l10n::Get(l10n::StringId::Properties).c_str(), kGlyphProperties, L"Alt+Enter"));
-    items.back().separator_after = true;
+    // Mark-of-the-web and checksums sit next to Properties: they act on the same selection
+    // and neither needs a dialog of its own. Unblock stays disabled unless a stream is there.
+    items.push_back(Item(CmdUnblockFile, l10n::Get(l10n::StringId::UnblockFile).c_str(),
+                         kGlyphUnblock, nullptr, can_unblock));
+    // A folder has no contents to hash and a multi-selection has no single answer, so the
+    // submenu appears only when the caller vouches for one ordinary file.
+    if (show_hash && !folder) {
+        auto hash = Item(CmdNone, l10n::Get(l10n::StringId::HashFile).c_str(), kGlyphHash);
+        hash.children.push_back(Item(CmdHashSha256, L"SHA-256", L""));
+        hash.children.push_back(Item(CmdHashMd5, L"MD5", L""));
+        items.push_back(std::move(hash));
+        items.back().separator_after = true;
+    }
     items.push_back(Item(CmdPinWorkspace, l10n::Get(l10n::StringId::PinWorkspace).c_str(), kGlyphFolder));
     items.push_back(Item(CmdPinNetwork, l10n::Get(l10n::StringId::PinNetwork).c_str(), kGlyphLink));
     items.back().separator_after = true;
@@ -193,7 +207,8 @@ std::vector<ui::FluentMenuItem> BuildBreadcrumbMenu(bool filesystem) {
 void AppendBackgroundViewCommands(std::vector<ui::FluentMenuItem>& items,
                                   const BackgroundViewOptions& options) {
     auto view = Item(CmdNone, l10n::Get(l10n::StringId::View).c_str(), L"\xE8A9");
-    view.children = BuildViewMenu(options.view_mode, options.details_panel);
+    view.children = BuildViewMenu(options.view_mode, options.details_panel,
+                                  options.show_hidden, options.show_protected);
     auto sort = Item(CmdNone, l10n::Get(l10n::StringId::SortBy).c_str(), L"\xE8CB",
                      nullptr, options.can_sort);
     struct SortRow { int command; ui::SortColumn column; l10n::StringId label; };
@@ -269,7 +284,8 @@ std::vector<ui::FluentMenuItem> BuildSplitMenu(int current_preset) {
     return items;
 }
 
-std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode, bool details_panel) {
+std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode, bool details_panel,
+                                             bool show_hidden, bool show_protected) {
     static constexpr l10n::StringId labels[] = {
         l10n::StringId::ViewExtraLarge, l10n::StringId::ViewLarge,
         l10n::StringId::MediumIcons, l10n::StringId::ViewSmall,
@@ -293,7 +309,18 @@ std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode, bool de
     items.back().separator_after = true;
     auto panel = Item(CmdDetailsPanel, l10n::Get(l10n::StringId::DetailsPane).c_str(), L"\xE700");
     panel.checked = details_panel;
+    panel.separator_after = true;
     items.push_back(std::move(panel));
+    // The visibility switches live here too: reaching them through the settings page means
+    // leaving the folder the user is looking at.
+    auto hidden = Item(CmdToggleHiddenItems,
+        l10n::Get(l10n::StringId::SettingsShowHidden).c_str(), L"");
+    hidden.checked = show_hidden;
+    items.push_back(std::move(hidden));
+    auto protected_files = Item(CmdToggleProtectedItems,
+        l10n::Get(l10n::StringId::SettingsShowProtected).c_str(), L"", nullptr, show_hidden);
+    protected_files.checked = show_protected;
+    items.push_back(std::move(protected_files));
     return items;
 }
 

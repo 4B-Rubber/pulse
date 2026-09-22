@@ -114,6 +114,34 @@ void TabController::NewTabInGroup(WindowTabs& tabs, int group_id) {
     }
 }
 
+void TabController::OpenTabBeside(WindowTabs& tabs, int tab_index, bool duplicate) {
+    if (tab_index < 0 || tab_index >= static_cast<int>(tabs.items.size())) return;
+    LayoutTab& tab = *tabs.items[static_cast<size_t>(tab_index)];
+    const Tab* folder = tab.ActiveFolder();
+    const Tab* current = tabs.Active() ? tabs.Active()->ActiveFolder() : nullptr;
+    const std::wstring path = duplicate
+        ? (folder ? folder->current_path : L"C:\\")
+        : (current ? current->current_path : L"C:\\");
+    WillChangeLayout();
+    // A tab opened to the right of a grouped one joins that group: left ungrouped it would
+    // cut the group's run in two around the new tab. A folded group unfolds first, or the
+    // new tab would land on a strip that shows nothing.
+    const int group = tab.tab_group;
+    if (group != 0) {
+        if (TabGroup* owner = FindGroup(tabs, group); owner && owner->collapsed) {
+            owner->collapsed = false;
+            Changed();
+        }
+    }
+    tabs.NewTabAt(static_cast<size_t>(tab_index) + 1, path);
+    if (group != 0) tabs.Active()->tab_group = group;
+    LayoutChanged();
+    if (callbacks_.load_tab) {
+        if (Tab* created = tabs.Active()->ActiveFolder())
+            callbacks_.load_tab(*created);
+    }
+}
+
 uint32_t TabController::FirstUnusedColor(const WindowTabs& tabs) const {
     for (uint32_t color : kPalette) {
         const bool used = std::any_of(tabs.tab_groups.begin(), tabs.tab_groups.end(),
@@ -294,18 +322,7 @@ void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt
 
     const int command = menu.TrackPopup(screen_pt, std::move(items));
     if (command == CmdTabNewRight || command == CmdTabDuplicate) {
-        const Tab* folder = tab.ActiveFolder();
-        const Tab* current = tabs.Active() ? tabs.Active()->ActiveFolder() : nullptr;
-        const std::wstring path = command == CmdTabDuplicate
-            ? (folder ? folder->current_path : L"C:\\")
-            : (current ? current->current_path : L"C:\\");
-        WillChangeLayout();
-        tabs.NewTabAt(static_cast<size_t>(tab_index) + 1, path);
-        LayoutChanged();
-        if (callbacks_.load_tab) {
-            if (Tab* created = tabs.Active()->ActiveFolder())
-                callbacks_.load_tab(*created);
-        }
+        OpenTabBeside(tabs, tab_index, command == CmdTabDuplicate);
     } else if (command == CmdTabOpenInNewWindow) {
         // A second window for this folder. A virtual view ("最近使用", a search,
         // the settings page) travels as it is: the new window opens on it.

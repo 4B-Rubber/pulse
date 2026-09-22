@@ -468,7 +468,7 @@ void MainRenderer::Render(const WindowViewModel& vm, const D2D1_RECT_F& rect,
     if (vm.tab_group_card.visible && !vm.tab_group_card.rows.empty()) {
         D2D1_RECT_F chip_rc{};
         if (vm.tab_group_card.chip_index >= 0 &&
-            TabGroupChipRect(vm, rect.right, vm.tab_group_card.chip_index, &chip_rc)) {
+            TabGroupChipRectForHit(vm, rect.right, vm.tab_group_card.chip_index, &chip_rc)) {
             int visible = 0;
             const D2D1_RECT_F card =
                 TabGroupCardRect(vm.tab_group_card, chip_rc, rect, scale_, &visible);
@@ -580,36 +580,40 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
     const float right = rect.right;
     const bool compact = TitleBarCompact(rect.right, scale_, vm.tabs.size());
 
-    // Product mark: the packaged app icon; the monogram is the fallback.
+    // Product mark: the packaged app icon; the monogram is the fallback. The settings page can
+    // turn it off - the tab strip then starts at the window edge (see ComputeTabStrip), which is
+    // why the mark is skipped rather than drawn transparent.
     float x = 12.0f * scale_;
-    const float mark = 24.0f * scale_;
-    const float markY = (h - mark) * 0.5f;
-    if (ID2D1Bitmap* logo = LogoBitmap()) {
-        dc->DrawBitmap(logo, D2D1::RectF(x, markY, x + mark, markY + mark), 1.0f,
-                       D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
-    } else {
-        MakeBrush(dc, theme.accent, brAccent_);
-        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + mark * 0.5f, markY + mark * 0.5f),
-                                      mark * 0.5f, mark * 0.5f), brAccent_.get());
-        ComPtr<IDWriteTextFormat> markFmt;
-        typography::CreateTextFormat(compositor_->DwriteFactory(),
-            {typography::FontRole::Display, 11.0f * scale_, DWRITE_FONT_WEIGHT_SEMI_BOLD},
-            &markFmt);
-        if (markFmt.get()) {
-            markFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            markFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            MakeBrush(dc, theme.accent_text, brAccentText_);
-            DrawTextRect(dc, markFmt.get(), brAccentText_.get(), L"P", x, markY, mark, mark);
+    if (vm.show_title_brand) {
+        const float mark = 24.0f * scale_;
+        const float markY = (h - mark) * 0.5f;
+        if (ID2D1Bitmap* logo = LogoBitmap()) {
+            dc->DrawBitmap(logo, D2D1::RectF(x, markY, x + mark, markY + mark), 1.0f,
+                           D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
+        } else {
+            MakeBrush(dc, theme.accent, brAccent_);
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + mark * 0.5f, markY + mark * 0.5f),
+                                          mark * 0.5f, mark * 0.5f), brAccent_.get());
+            ComPtr<IDWriteTextFormat> markFmt;
+            typography::CreateTextFormat(compositor_->DwriteFactory(),
+                {typography::FontRole::Display, 11.0f * scale_, DWRITE_FONT_WEIGHT_SEMI_BOLD},
+                &markFmt);
+            if (markFmt.get()) {
+                markFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                markFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                MakeBrush(dc, theme.accent_text, brAccentText_);
+                DrawTextRect(dc, markFmt.get(), brAccentText_.get(), L"P", x, markY, mark, mark);
+            }
         }
-    }
-    x += mark + 8.0f * scale_;
-    if (!compact) {
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->HeaderFormat(), brTextSecondary_.get(), L"Pulse",
-            x, 0.0f, 64.0f * scale_, h);
-        x += 72.0f * scale_;
-    } else {
-        x += 4.0f * scale_;
+        x += mark + 8.0f * scale_;
+        if (!compact) {
+            MakeBrush(dc, theme.text_secondary, brTextSecondary_);
+            DrawTextRect(dc, compositor_->HeaderFormat(), brTextSecondary_.get(), L"Pulse",
+                x, 0.0f, 64.0f * scale_, h);
+            x += 72.0f * scale_;
+        } else {
+            x += 4.0f * scale_;
+        }
     }
 
     const float ctrlW = 46.0f * scale_;
@@ -1116,7 +1120,10 @@ MainRenderer::TabStripMetrics MainRenderer::ComputeTabStrip(
     TabStripMetrics m;
     const bool compact = TitleBarCompact(window_w, scale_, vm.tabs.size());
     const TitleChrome chrome = MakeTitleChrome(window_w, scale_, title_bar_height_);
-    m.x0 = compact ? 44.0f * scale_ : 112.0f * scale_;
+    // The strip starts where the product mark ends: 12 + 24 + 8 with the icon, plus the name
+    // when the title bar is wide enough for it. With the mark turned off the tabs take its place.
+    m.x0 = !vm.show_title_brand ? 12.0f * scale_
+        : (compact ? 44.0f * scale_ : 112.0f * scale_);
     const float tabsRight = chrome.settings_left - 8.0f * scale_;
 
     // Group chips: one at the start of each consecutive same-group run. Their

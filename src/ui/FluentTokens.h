@@ -270,7 +270,9 @@ inline Theme MakeTheme(bool dark, D2D1_COLOR_F accent) noexcept {
 
         t.fill_hover = WithAlpha(HexColor(0xFFFFFF), 0.08f);
         t.fill_pressed = WithAlpha(HexColor(0xFFFFFF), 0.06f);
-        t.fill_selected = WithAlpha(accent, 0.15f);
+        // Explorer weight: at 15% the accent wash sat too close to the hover fill to read as
+        // a selection, especially on a row that already carries a hover or a stripe.
+        t.fill_selected = WithAlpha(accent, 0.25f);
         t.fill_input = WithAlpha(HexColor(0xFFFFFF), 0.0605f);
         t.fill_input_hover = WithAlpha(HexColor(0xFFFFFF), 0.0837f);
         t.fill_input_focus = WithAlpha(HexColor(0x1E1E1E), 0.70f);
@@ -304,7 +306,8 @@ inline Theme MakeTheme(bool dark, D2D1_COLOR_F accent) noexcept {
 
         t.fill_hover = WithAlpha(HexColor(0x000000), 0.05f);
         t.fill_pressed = WithAlpha(HexColor(0x000000), 0.03f);
-        t.fill_selected = WithAlpha(accent, 0.12f);
+        // Explorer weight, as in the dark theme: 12% read as a hint, not as "this row".
+        t.fill_selected = WithAlpha(accent, 0.20f);
         t.fill_input = WithAlpha(HexColor(0xFFFFFF), 0.70f);
         t.fill_input_hover = WithAlpha(HexColor(0xF9F9F9), 0.50f);
         t.fill_input_focus = HexColor(0xFFFFFF);

@@ -1,5 +1,8 @@
 #include "thumbnail_cache.h"
+#include "../common/pulse_data_dir.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 
 namespace pulse::ui {
 namespace {
@@ -298,11 +301,395 @@ bool ThumbnailCache::StoreResult(const Request& req, Item result) {
     return true;
 }
 
+// ---- Disk layer ---------------------------------------------------------------
+// The in-memory LRU forgets everything on exit, so a folder of photos re-decodes from
+// scratch on every launch. Entries live in %LOCALAPPDATA%\Pulse\ThumbCache (the data
+// directory, so the self-test redirect covers them), keyed by the same identity the
+// memory cache uses - path + pixel size + mtime + size - and an index file keeps the
+// byte budget honest across runs.
+namespace {
+
+constexpr uint32_t kDiskEntryMagic = 0x31435450u;  // 'PTC1'
+constexpr uint32_t kDiskIndexMagic = 0x31495450u;  // 'PTI1'
+constexpr uint64_t kDiskBudgetBytes = 256ull * 1024ull * 1024ull;
+constexpr uint64_t kDiskEntryLimitBytes = 64ull * 1024ull * 1024ull;
+constexpr uint64_t kDiskIndexLimitBytes = 16ull * 1024ull * 1024ull;
+constexpr uint64_t kIndexSaveIntervalMs = 5000;
+constexpr uint32_t kMaxIndexEntries = 200000;
+
+std::atomic<uint64_t> g_disk_budget_override{0};
+
+uint64_t DiskBudgetBytes() {
+    const uint64_t override_bytes = g_disk_budget_override.load(std::memory_order_relaxed);
+    return override_bytes ? override_bytes : kDiskBudgetBytes;
+}
+
+uint64_t Fnv1a64(const std::wstring& text) {
+    uint64_t hash = 1469598103934665603ull;
+    for (wchar_t c : text) {
+        hash ^= static_cast<uint64_t>(c & 0xFF);
+        hash *= 1099511628211ull;
+        hash ^= static_cast<uint64_t>((c >> 8) & 0xFF);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+uint64_t FileTimeNow() {
+    FILETIME time{};
+    GetSystemTimeAsFileTime(&time);
+    return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+}
+
+std::wstring EnsureDir(const std::wstring& dir) {
+    if (dir.empty()) return {};
+    if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        !CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return {};
+    return dir;
+}
+
+std::wstring DiskCacheDir() {
+    // Test hook: the preview test links this file without the self-test data redirect.
+    wchar_t override_dir[32768]{};
+    const DWORD override_length =
+        GetEnvironmentVariableW(L"PULSE_TEST_THUMB_CACHE_DIR", override_dir,
+                                ARRAYSIZE(override_dir));
+    if (override_length > 0 && override_length < ARRAYSIZE(override_dir))
+        return EnsureDir(override_dir);
+    const std::wstring data_dir = pulse::PulseDataDir();
+    if (data_dir.empty()) return {};
+    return EnsureDir(data_dir + L"\\ThumbCache");
+}
+
+std::wstring DiskEntryPath(uint64_t hash) {
+    const std::wstring dir = DiskCacheDir();
+    if (dir.empty()) return {};
+    wchar_t name[40]{};
+    swprintf_s(name, L"%016llX.bin", static_cast<unsigned long long>(hash));
+    return dir + L"\\" + name;
+}
+
+struct DiskIndexEntry {
+    uint32_t size = 0;
+    uint64_t last_used = 0;
+};
+
+struct DiskIndex {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, DiskIndexEntry> entries;
+    uint64_t total = 0;
+    uint64_t saved_at = 0;
+    bool loaded = false;
+    bool dirty = false;
+};
+
+DiskIndex& DiskCacheIndex() {
+    static DiskIndex index;
+    return index;
+}
+
+void AppendPod(std::vector<uint8_t>& out, const void* data, size_t size) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    out.insert(out.end(), bytes, bytes + size);
+}
+
+template <typename T> void AppendValue(std::vector<uint8_t>& out, const T& value) {
+    AppendPod(out, &value, sizeof(T));
+}
+
+void AppendText(std::vector<uint8_t>& out, const std::wstring& text) {
+    AppendValue(out, static_cast<uint32_t>(text.size()));
+    AppendPod(out, text.data(), text.size() * sizeof(wchar_t));
+}
+
+template <typename T> bool ReadValue(const std::vector<uint8_t>& in, size_t& pos, T& value) {
+    if (pos + sizeof(T) > in.size()) return false;
+    memcpy(&value, in.data() + pos, sizeof(T));
+    pos += sizeof(T);
+    return true;
+}
+
+bool ReadText(const std::vector<uint8_t>& in, size_t& pos, std::wstring& text, uint32_t limit) {
+    uint32_t chars = 0;
+    if (!ReadValue(in, pos, chars) || chars > limit) return false;
+    const size_t bytes = static_cast<size_t>(chars) * sizeof(wchar_t);
+    if (pos + bytes > in.size()) return false;
+    text.assign(reinterpret_cast<const wchar_t*>(in.data() + pos), chars);
+    pos += bytes;
+    return true;
+}
+
+bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& bytes, uint64_t limit) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+        static_cast<uint64_t>(size.QuadPart) > limit) {
+        CloseHandle(file);
+        return false;
+    }
+    bytes.resize(static_cast<size_t>(size.QuadPart));
+    size_t done = 0;
+    while (done < bytes.size()) {
+        DWORD read = 0;
+        const DWORD chunk = static_cast<DWORD>(
+            (std::min)(bytes.size() - done, static_cast<size_t>(1u << 20)));
+        if (!ReadFile(file, bytes.data() + done, chunk, &read, nullptr) || read == 0) {
+            CloseHandle(file);
+            return false;
+        }
+        done += read;
+    }
+    CloseHandle(file);
+    return true;
+}
+
+bool WriteWholeFile(const std::wstring& path, const std::vector<uint8_t>& bytes) {
+    const std::wstring temp = path + L".tmp" + std::to_wstring(GetCurrentProcessId());
+    HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    size_t done = 0;
+    while (done < bytes.size()) {
+        DWORD written = 0;
+        const DWORD chunk = static_cast<DWORD>(
+            (std::min)(bytes.size() - done, static_cast<size_t>(1u << 20)));
+        if (!WriteFile(file, bytes.data() + done, chunk, &written, nullptr) || written == 0) {
+            CloseHandle(file);
+            DeleteFileW(temp.c_str());
+            return false;
+        }
+        done += written;
+    }
+    CloseHandle(file);
+    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(temp.c_str());
+        return false;
+    }
+    return true;
+}
+
+void SaveIndexLocked(DiskIndex& index);
+
+void LoadIndexLocked(DiskIndex& index) {
+    if (index.loaded) return;
+    index.loaded = true;
+    const std::wstring dir = DiskCacheDir();
+    if (dir.empty()) return;
+    std::vector<uint8_t> bytes;
+    if (!ReadWholeFile(dir + L"\\index.bin", bytes, kDiskIndexLimitBytes)) return;
+    size_t pos = 0;
+    uint32_t magic = 0;
+    uint32_t count = 0;
+    if (!ReadValue(bytes, pos, magic) || magic != kDiskIndexMagic) return;
+    if (!ReadValue(bytes, pos, count) || count > kMaxIndexEntries) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t hash = 0;
+        uint32_t reserved = 0;
+        DiskIndexEntry entry;
+        if (!ReadValue(bytes, pos, hash) || !ReadValue(bytes, pos, entry.size) ||
+            !ReadValue(bytes, pos, entry.last_used) || !ReadValue(bytes, pos, reserved))
+            break;
+        index.entries[hash] = entry;
+        index.total += entry.size;
+    }
+}
+
+void SaveIndexLocked(DiskIndex& index) {
+    const std::wstring dir = DiskCacheDir();
+    if (dir.empty()) return;
+    std::vector<uint8_t> bytes;
+    AppendValue(bytes, kDiskIndexMagic);
+    AppendValue(bytes, static_cast<uint32_t>(index.entries.size()));
+    for (const auto& [hash, entry] : index.entries) {
+        AppendValue(bytes, hash);
+        AppendValue(bytes, entry.size);
+        AppendValue(bytes, entry.last_used);
+        AppendValue(bytes, 0u);
+    }
+    if (WriteWholeFile(dir + L"\\index.bin", bytes)) {
+        index.dirty = false;
+        index.saved_at = GetTickCount64();
+    }
+}
+
+void TrimLocked(DiskIndex& index) {
+    const uint64_t budget = DiskBudgetBytes();
+    if (index.total <= budget) return;
+    std::vector<std::pair<uint64_t, uint64_t>> order;
+    order.reserve(index.entries.size());
+    for (const auto& [hash, entry] : index.entries) order.emplace_back(hash, entry.last_used);
+    std::sort(order.begin(), order.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+    for (const auto& [hash, last_used] : order) {
+        if (index.total <= budget) break;
+        DeleteFileW(DiskEntryPath(hash).c_str());
+        if (auto entry = index.entries.find(hash); entry != index.entries.end()) {
+            index.total -= entry->second.size;
+            index.entries.erase(entry);
+            index.dirty = true;
+        }
+    }
+}
+
+} // namespace
+
+bool ThumbnailCache::LoadDiskResult(const Request& request, Item& result) {
+    if (request.kind != ipc::PreviewRequestKind::Content) return false;
+    const uint64_t hash = Fnv1a64(request.key);
+    const std::wstring path = DiskEntryPath(hash);
+    if (path.empty()) return false;
+    std::vector<uint8_t> bytes;
+    if (!ReadWholeFile(path, bytes, kDiskEntryLimitBytes)) return false;
+    size_t pos = 0;
+    uint32_t magic = 0;
+    uint32_t kind = 0;
+    uint32_t flags = 0;
+    uint32_t pixel_bytes = 0;
+    if (!ReadValue(bytes, pos, magic) || magic != kDiskEntryMagic) return false;
+    if (!ReadValue(bytes, pos, kind) || !ReadValue(bytes, pos, flags)) return false;
+    if (!ReadValue(bytes, pos, result.w) || !ReadValue(bytes, pos, result.h) ||
+        !ReadValue(bytes, pos, result.stride)) return false;
+    if (!ReadValue(bytes, pos, result.bytes_read)) return false;
+    if (!ReadValue(bytes, pos, result.frame_count) ||
+        !ReadValue(bytes, pos, result.frame_delay_ms) ||
+        !ReadValue(bytes, pos, result.loop_count)) return false;
+    if (!ReadValue(bytes, pos, result.source_width) ||
+        !ReadValue(bytes, pos, result.source_height)) return false;
+    if (!ReadValue(bytes, pos, pixel_bytes) || pos + pixel_bytes > bytes.size()) return false;
+    if (pixel_bytes) {
+        result.pixels.assign(bytes.begin() + static_cast<std::ptrdiff_t>(pos),
+                             bytes.begin() + static_cast<std::ptrdiff_t>(pos + pixel_bytes));
+        pos += pixel_bytes;
+    }
+    if (!ReadText(bytes, pos, result.text, 1u << 20)) return false;
+    uint32_t property_count = 0;
+    if (!ReadValue(bytes, pos, property_count) || property_count > 16) return false;
+    for (uint32_t i = 0; i < property_count; ++i) {
+        PreviewProperty property;
+        if (!ReadText(bytes, pos, property.label, 128) ||
+            !ReadText(bytes, pos, property.value, 1024))
+            return false;
+        result.properties.push_back(std::move(property));
+    }
+    result.kind = static_cast<ipc::PreviewContentKind>(kind);
+    result.truncated = (flags & 1u) != 0;
+    result.frame_index = request.frame_index;
+    result.animation_identity = request.identity;
+    result.failed = false;
+    result.cost = result.text.size() * sizeof(wchar_t) +
+                  static_cast<size_t>(result.stride) * result.h;
+    for (const auto& property : result.properties)
+        result.cost += (property.label.size() + property.value.size()) * sizeof(wchar_t);
+    if (result.kind == ipc::PreviewContentKind::Bitmap && result.pixels.empty()) return false;
+    DiskIndex& index = DiskCacheIndex();
+    std::lock_guard lock(index.mutex);
+    LoadIndexLocked(index);
+    if (auto entry = index.entries.find(hash); entry != index.entries.end()) {
+        entry->second.last_used = FileTimeNow();
+        index.dirty = true;
+        if (GetTickCount64() - index.saved_at > kIndexSaveIntervalMs) SaveIndexLocked(index);
+    }
+    return true;
+}
+
+void ThumbnailCache::SaveDiskResult(const Request& request, const Item& result) {
+    if (result.failed) return;
+    if (result.kind == ipc::PreviewContentKind::None && result.properties.empty()) return;
+    const uint64_t hash = Fnv1a64(request.key);
+    const std::wstring path = DiskEntryPath(hash);
+    if (path.empty()) return;
+    std::vector<uint8_t> bytes;
+    bytes.reserve(result.pixels.size() + 256);
+    AppendValue(bytes, kDiskEntryMagic);
+    AppendValue(bytes, static_cast<uint32_t>(result.kind));
+    AppendValue(bytes, static_cast<uint32_t>(result.truncated ? 1u : 0u));
+    AppendValue(bytes, result.w);
+    AppendValue(bytes, result.h);
+    AppendValue(bytes, result.stride);
+    AppendValue(bytes, result.bytes_read);
+    AppendValue(bytes, result.frame_count);
+    AppendValue(bytes, result.frame_delay_ms);
+    AppendValue(bytes, result.loop_count);
+    AppendValue(bytes, result.source_width);
+    AppendValue(bytes, result.source_height);
+    AppendValue(bytes, static_cast<uint32_t>(result.pixels.size()));
+    AppendPod(bytes, result.pixels.data(), result.pixels.size());
+    AppendText(bytes, result.text);
+    AppendValue(bytes, static_cast<uint32_t>(result.properties.size()));
+    for (const auto& property : result.properties) {
+        AppendText(bytes, property.label);
+        AppendText(bytes, property.value);
+    }
+    if (bytes.size() > kDiskEntryLimitBytes) return;
+    if (!WriteWholeFile(path, bytes)) return;
+    DiskIndex& index = DiskCacheIndex();
+    std::lock_guard lock(index.mutex);
+    LoadIndexLocked(index);
+    if (auto entry = index.entries.find(hash); entry != index.entries.end()) {
+        index.total -= entry->second.size;
+        index.entries.erase(entry);
+    }
+    index.entries[hash] = DiskIndexEntry{static_cast<uint32_t>(bytes.size()), FileTimeNow()};
+    index.total += bytes.size();
+    TrimLocked(index);
+    index.dirty = true;
+    if (GetTickCount64() - index.saved_at > kIndexSaveIntervalMs) SaveIndexLocked(index);
+}
+
+void ThumbnailCache::SetDiskBudgetForTest(uint64_t bytes) {
+    g_disk_budget_override.store(bytes, std::memory_order_relaxed);
+}
+
+uint64_t ThumbnailCache::DiskCacheBytes() const {
+    DiskIndex& index = DiskCacheIndex();
+    std::lock_guard lock(index.mutex);
+    LoadIndexLocked(index);
+    return index.total;
+}
+
+void ThumbnailCache::ClearDiskCache() {
+    DiskIndex& index = DiskCacheIndex();
+    std::lock_guard lock(index.mutex);
+    LoadIndexLocked(index);
+    for (const auto& [hash, entry] : index.entries) {
+        (void)entry;
+        DeleteFileW(DiskEntryPath(hash).c_str());
+    }
+    index.entries.clear();
+    index.total = 0;
+    // Sweep the directory too: an index that was lost or damaged must not leak entries.
+    if (const std::wstring dir = DiskCacheDir(); !dir.empty()) {
+        WIN32_FIND_DATAW found{};
+        HANDLE search = FindFirstFileW((dir + L"\\*.bin").c_str(), &found);
+        if (search != INVALID_HANDLE_VALUE) {
+            do {
+                DeleteFileW((dir + L"\\" + found.cFileName).c_str());
+            } while (FindNextFileW(search, &found));
+            FindClose(search);
+        }
+    }
+    index.dirty = true;
+    SaveIndexLocked(index);
+}
+
 void ThumbnailCache::Worker() {
     while (running_) {
         Request req;
         { std::unique_lock lock(mutex_); cv_.wait(lock, [&]{return !running_ || !queue_.empty();});
           if (!running_) break; req = std::move(queue_.front()); queue_.pop_front(); }
+        // A result that survived a restart still counts: decode it here instead of paying
+        // for the preview host again.
+        Item cached;
+        if (LoadDiskResult(req, cached)) {
+            const bool stored = StoreResult(req, std::move(cached));
+            if (const HWND hwnd = hwnd_.load(); stored && hwnd)
+                InvalidateRect(hwnd, nullptr, FALSE);
+            continue;
+        }
         Item result; bool ok = Connect();
         ipc::PreviewRequest wire; wire.request_id=req.id; wire.generation=req.generation;
         wire.kind=req.kind; wire.pixel_size=req.pixels; wire.attrs=req.attrs;
@@ -393,6 +780,7 @@ void ThumbnailCache::Worker() {
         result.failed = !ok || response.status != 0 ||
             (req.kind == ipc::PreviewRequestKind::Content &&
              result.kind == ipc::PreviewContentKind::Bitmap && result.pixels.empty());
+        if (!result.failed) SaveDiskResult(req, result);
         const bool stored = StoreResult(req, std::move(result));
         if (const HWND hwnd = hwnd_.load(); stored && hwnd)
             InvalidateRect(hwnd, nullptr, FALSE);

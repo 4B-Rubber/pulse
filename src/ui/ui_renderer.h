@@ -536,7 +536,14 @@ struct WindowViewModel {
     bool settings_keep_running = false;
     bool settings_show_hidden_files = false;
     bool settings_show_protected_os_files = false;
+    bool settings_show_tooltips = true;
+    bool settings_file_hash_enabled = true;
+    int settings_tooltip_delay = 150; // ms (150 / 400 / 800)
+    std::wstring settings_thumb_cache_text; // e.g. "12.3 MB"
     bool show_pinned_tab_names = true;
+    // The title bar mark (app icon + name). The tab strip starts where it ends.
+    bool show_title_brand = true;
+    bool settings_show_title_brand = true;
     bool settings_open_folders = false;
     bool settings_blank_click_go_back = false;
     bool settings_change_tracking = false;
@@ -678,6 +685,8 @@ struct HitTestResult {
         SettingsToggle,
         SettingsGlobalSearchHotkey,
         SettingsChangeDays,
+        SettingsTooltipDelay,
+        SettingsThumbCache,
         SettingsRestore,
         SettingsAccent,
         SettingsEffect,
@@ -912,11 +921,22 @@ public:
     // Group chip rect (title-bar space); false when the group has no chip.
     bool TabGroupChipRect(const WindowViewModel& vm, float window_w, int group_index,
                           D2D1_RECT_F* out) const;
+    // The chip where it is actually drawn: the rest slot plus the 150 ms slide offset, so
+    // hit testing and the hover card follow the animation. Drag math keeps the rest rect.
+    bool TabGroupChipRectForHit(const WindowViewModel& vm, float window_w, int group_index,
+                                D2D1_RECT_F* out) const;
     // Uniform tab pitch (excludes group-chip offsets); used by drag math.
     float TabPitchPx(const WindowViewModel& vm, float window_w) const;
     float SettingsMaxScroll(const WindowViewModel& vm, float window_w, float window_h) const;
+    // Settings page: the preview cache on disk (bytes) and its clear button.
+    uint64_t ThumbCacheBytes() const { return thumbnail_cache_.DiskCacheBytes(); }
+    void ClearThumbCache() { thumbnail_cache_.ClearDiskCache(); }
     D2D1_RECT_F SettingsDropdownBounds(const WindowViewModel& vm, int index, float window_w, float window_h) const;
     float SettingsDestinationOffset(const WindowViewModel& vm, int setting_id, float window_w, float window_h) const;
+    // The on-screen rect of the tooltip-delay "custom" segment: the inline numeric editor
+    // places itself there. False when the row is scrolled out of view.
+    bool TooltipDelayCustomCell(const WindowViewModel& vm, float window_w, float window_h,
+                                D2D1_RECT_F* out) const;
     float SidebarMaxScroll(const WindowViewModel& vm, float window_w, float window_h) const;
     bool SidebarScrollbarGeometry(const WindowViewModel& vm, float window_w, float window_h,
                                   D2D1_RECT_F& track, D2D1_RECT_F& thumb, float& max_scroll) const;
@@ -1046,6 +1066,11 @@ private:
     mutable ComPtr<ID2D1SolidColorBrush> brDanger_;
     mutable ComPtr<ID2D1SolidColorBrush> brDangerHover_;
     mutable ComPtr<ID2D1SolidColorBrush> brScrollbar_;
+    // Fills whose color is decided at the call site: set immediately before use and never read
+    // as-is. Reusing a semantic brush for one of them leaked the tint into whatever drew next
+    // with that brush - a starred row painted the hover fill of every row below it in the
+    // accent wash of its own star pill.
+    mutable ComPtr<ID2D1SolidColorBrush> brScratch_;
     mutable ComPtr<ID2D1SolidColorBrush> brIconFolder_;
     mutable ComPtr<ID2D1SolidColorBrush> brIconFile_;
     mutable ComPtr<ID2D1StrokeStyle> dashStroke_;

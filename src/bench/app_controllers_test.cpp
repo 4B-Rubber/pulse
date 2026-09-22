@@ -5,6 +5,7 @@
 #include "../app/single_instance_coordinator.h"
 #include "../app/tray_controller.h"
 #include "../app/blank_pane_click.h"
+#include "../app/marquee_anchor.h"
 #include "../app/unc_probe_scheduler.h"
 #include "../common/localization.h"
 #include "../common/path_utils.h"
@@ -224,6 +225,32 @@ int wmain(int argc, wchar_t** argv) {
         changed = click;
         changed.pending = false;
         passed &= Report("cancelled or second double-click release never goes back", !accepts(changed));
+    }
+    {
+        // The band is anchored to the rows, so the pixels it moves have to add up to the
+        // distance the content travelled - including the fractions an integer corner cannot
+        // hold. Rounding each frame on its own dropped every one of them: the band stood still
+        // while the rows crept, then jumped a pixel, and the error piled up over a long glide.
+        float residual = 0.0f;
+        int steps = 0;
+        float travelled = 0.0f;
+        for (int frame = 0; frame < 240; ++frame) {
+            travelled += 0.4f;
+            steps += pulse::app::CarryMarqueeShift(residual, 0.4f);
+        }
+        passed &= Report("marquee band keeps the distance it cannot step",
+            std::fabs(static_cast<float>(steps) - travelled) <= 0.5f &&
+            std::fabs(residual) <= 0.5f);
+        float wobble_residual = 0.0f;
+        int wobble_steps = 0;
+        float wobble_travelled = 0.0f;
+        for (int frame = 0; frame < 600; ++frame) {
+            const float moved = 6.7f + 0.3f * static_cast<float>(frame % 5);
+            wobble_travelled += moved;
+            wobble_steps += pulse::app::CarryMarqueeShift(wobble_residual, moved);
+        }
+        passed &= Report("marquee band never drifts off the rows it picked",
+            std::fabs(static_cast<float>(wobble_steps) - wobble_travelled) <= 0.5f);
     }
     const std::wstring mutex_name = L"Local\\Pulse.ControllerTest." +
         std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(GetTickCount64());

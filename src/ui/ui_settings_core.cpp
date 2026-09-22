@@ -66,14 +66,14 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
             (vm.settings_expanded&(1u<<id)) ? L"\xE70D" : L"\xE76C",L"",theme.text_secondary,0.75f);
     };
     auto section=[&](int i,I title) { text(l10n::Get(title),lay.section[i]); };
-    auto segmented=[&](D2D1_RECT_F card,D2D1_RECT_F const* choices,const I* labels,const int* values,int current,H::Region hit,I title,I desc) {
+    auto segmented=[&](D2D1_RECT_F card,D2D1_RECT_F const* choices,const I* labels,const int* values,int current,H::Region hit,I title,I desc,int count=3,std::wstring desc_override={}) {
         const bool stacked=choices[0].left<card.left+100*scale_;
-        label(card,l10n::Get(title),l10n::Get(desc),L"\xE8A4",stacked ? card.right-16*scale_ : choices[0].left-12*scale_);
-        painter_.DrawSegmentedTrack(D2D1::RectF(choices[0].left,choices[0].top,choices[2].right,choices[2].bottom));
-        for(int i=0;i<3;++i) {
+        label(card,l10n::Get(title),desc_override.empty()?l10n::Get(desc):desc_override,L"\xE8A4",stacked ? card.right-16*scale_ : choices[0].left-12*scale_);
+        painter_.DrawSegmentedTrack(D2D1::RectF(choices[0].left,choices[0].top,choices[count-1].right,choices[count-1].bottom));
+        for(int i=0;i<count;++i) {
             fluent::SegmentedItemSpec item{};item.bounds=choices[i];item.text=l10n::Get(labels[i]);
             item.state.checked=current==values[i];item.state.hovered=IsHovered(vm,hit,i);
-            item.shared_track=true; item.position=i==0 ? fluent::SegmentPosition::First : i==2 ? fluent::SegmentPosition::Last : fluent::SegmentPosition::Middle;
+            item.shared_track=true; item.position=i==0 ? fluent::SegmentPosition::First : i==count-1 ? fluent::SegmentPosition::Last : fluent::SegmentPosition::Middle;
             painter_.DrawSegmentedItem(item);
         }
     };
@@ -165,6 +165,7 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
 
             const I sizes[]={I::SettingsTraySmall,I::SettingsTrayStandard,I::SettingsTrayLarge};const int icons[]={40,48,56};
             draw_card(lay.tray_icon_card);segmented(lay.tray_icon_card,lay.tray_icon_row,sizes,icons,vm.settings_tray_icon,H::SettingsTrayIcon,I::SettingsTrayIcon,I::SettingsTrayIconDesc);
+            draw_card(lay.title_brand_row);toggle(lay.title_brand_row,I::SettingsTitleBrand,I::SettingsTitleBrandDesc,L"\xE8A9",vm.settings_show_title_brand,19);
             draw_card(lay.startup_row[2]);toggle(lay.startup_row[2],I::SettingsOpenFolders,I::SettingsOpenFoldersDesc,L"\xE8B7",vm.settings_open_folders,3);
             draw_card(lay.hidden_files_row);toggle(lay.hidden_files_row,I::SettingsShowHidden,I::SettingsShowHiddenDesc,L"\xE890",vm.settings_show_hidden_files,5);
             // Hidden + system entries: File Explorer keeps these behind a second option.
@@ -174,6 +175,21 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
             draw_card(lay.change_tracking_row);toggle(lay.change_tracking_row,I::SettingsChangeTracking,I::SettingsChangeTrackingDesc,L"\xE823",vm.settings_change_tracking,8);
             const I days[]={I::ChangeToday,I::ChangeLast3Days,I::ChangeLast7Days};const int day_values[]={1,3,7};
             draw_card(lay.change_days_row);segmented(lay.change_days_row,lay.change_days,days,day_values,vm.settings_change_days,H::SettingsChangeDays,I::SettingsChangeDays,I::SettingsChangeTrackingDesc);
+            draw_card(lay.tooltip_row);toggle(lay.tooltip_row,I::SettingsTooltips,I::SettingsTooltipsDesc,L"\xE946",vm.settings_show_tooltips,17);
+            const I delays[]={I::TooltipDelayShort,I::TooltipDelayStandard,I::TooltipDelayLong,I::TooltipDelayCustom};
+            // The custom entry owns value 0; when the stored delay is not one of the three
+            // presets that segment is the checked one and the row spells the value out.
+            const int delay_values[]={150,400,800,0};
+            const int delay_ms=vm.settings_tooltip_delay;
+            const bool delay_preset=delay_ms==150||delay_ms==400||delay_ms==800;
+            const std::wstring delay_desc=delay_preset?std::wstring{}:
+                l10n::Get(I::SettingsTooltipDelayDesc)+L"  ·  "+std::to_wstring(delay_ms)+L" ms";
+            draw_card(lay.tooltip_delay_row);segmented(lay.tooltip_delay_row,lay.tooltip_delay,delays,delay_values,delay_preset?delay_ms:0,H::SettingsTooltipDelay,I::SettingsTooltipDelay,I::SettingsTooltipDelayDesc,4,delay_desc);
+            draw_card(lay.thumb_cache_row);
+            label(lay.thumb_cache_row,l10n::Get(I::SettingsThumbCache),vm.settings_thumb_cache_text,L"\xE8A5",
+                lay.thumb_cache_button.left-12*scale_);
+            button(lay.thumb_cache_button,l10n::Get(I::Clear),H::SettingsThumbCache,0);
+            draw_card(lay.file_hash_row);toggle(lay.file_hash_row,I::SettingsFileHash,I::SettingsFileHashDesc,L"\xE8A5",vm.settings_file_hash_enabled,18);
         }
         text(l10n::Get(I::SettingsImmediate),lay.footer,true);
     } else {

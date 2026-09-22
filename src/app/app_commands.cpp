@@ -22,6 +22,7 @@
 #include "batch_rename.h"
 #include "search_query.h"
 #include "link_resolve.h"
+#include "file_hash.h"
 #include "resource.h"
 #include "../ops/clipboard.h"
 #include "../ipc/ctx_menu_util.h"
@@ -466,6 +467,46 @@ void DispatchMenuCommand(AppState& s, int cmd) {
             !fs::IsVirtualPath(tab->current_path))
             s.ops.ShowProperties(ClipboardPath(tab->current_path));
         break;
+    case app::CmdUnblockFile: {
+        // The mark-of-the-web stream is what Explorer's "Unblock" checkbox drops.
+        const app::Tab* tab = ActiveTab(s);
+        if (!tab) break;
+        const auto paths = SelectedFullPaths(*tab);
+        int unblocked = 0;
+        std::wstring failure;
+        for (const auto& path : paths) {
+            if (path.empty() || fs::IsVirtualPath(path)) continue;
+            std::wstring error;
+            if (app::RemoveZoneIdentifier(path, error)) ++unblocked;
+            else failure = error;
+        }
+        if (!failure.empty()) {
+            s.notification_toast.ShowError(s.hwnd,
+                l10n::Get(l10n::StringId::UnblockFile), failure);
+        } else if (unblocked > 0) {
+            const std::wstring message = paths.size() == 1 && unblocked == 1 ? paths[0]
+                : std::to_wstring(unblocked) + L" / " + std::to_wstring(paths.size());
+            s.notification_toast.Show(s.hwnd, l10n::Get(l10n::StringId::UnblockDone),
+                                      message, false);
+        }
+        break;
+    }
+    case app::CmdHashSha256:
+    case app::CmdHashMd5: {
+        // Checksums run on a worker thread; the result comes back as WM_FILE_HASH_DONE.
+        if (!s.appPrefs.file_hash_enabled) break;
+        const app::Tab* tab = ActiveTab(s);
+        if (!tab) break;
+        const auto paths = SelectedFullPaths(*tab);
+        if (paths.size() != 1 || paths[0].empty() || fs::IsVirtualPath(paths[0])) break;
+        // A folder has nothing to stream through the hasher. The menu already leaves the
+        // command out; this keeps a stale menu or a shortcut from starting a doomed job.
+        const DWORD attrs = GetFileAttributesW(paths[0].c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) break;
+        app::StartFileHashJob(s.hwnd, WM_FILE_HASH_DONE, paths[0],
+            cmd == app::CmdHashMd5 ? app::HashAlgorithm::Md5 : app::HashAlgorithm::Sha256);
+        break;
+    }
     case app::CmdSortName:
     case app::CmdSortModified:
     case app::CmdSortType:
@@ -583,6 +624,19 @@ void DispatchMenuCommand(AppState& s, int cmd) {
         s.showDetailsPanel = !s.showDetailsPanel;
         s.renderer.SetDetailsPanelVisible(s.showDetailsPanel);
         break;
+    // The view menu carries these two so a folder full of dotfiles can be inspected
+    // without leaving it for the settings page. They write the same preference the page
+    // does, so both stay in step.
+    case app::CmdToggleHiddenItems:
+        s.appPrefs.show_hidden_files = !s.appPrefs.show_hidden_files;
+        s.appPrefs.Save();
+        ApplySettingsEffects(s, app::SettingsEffect::FileVisibility);
+        break;
+    case app::CmdToggleProtectedItems:
+        s.appPrefs.show_protected_os_files = !s.appPrefs.show_protected_os_files;
+        s.appPrefs.Save();
+        ApplySettingsEffects(s, app::SettingsEffect::FileVisibility);
+        break;
     case app::CmdLayoutSingle: ApplyLayoutPreset(s, app::LayoutPreset::Single); break;
     case app::CmdLayoutTwoVertical: ApplyLayoutPreset(s, app::LayoutPreset::TwoVertical); break;
     case app::CmdLayoutTwoHorizontal: ApplyLayoutPreset(s, app::LayoutPreset::TwoHorizontal); break;
@@ -681,13 +735,25 @@ std::vector<ui::FluentMenuItem> BuildFinderItemMenu(
             }
         }
     }
-    std::vector<ui::FluentMenuItem> items = app::BuildItemMenu(can_undo, undo_label, folder);
+    const std::vector<std::wstring> paths = ActiveTab(s)
+        ? SelectedFullPaths(*ActiveTab(s)) : std::vector<std::wstring>{};
+    bool can_unblock = false;
+    for (const auto& path : paths) {
+        if (!path.empty() && !fs::IsVirtualPath(path) && app::HasZoneIdentifier(path)) {
+            can_unblock = true;
+            break;
+        }
+    }
+    // Checksums answer for one ordinary file: not a folder, not a multi-selection, not a
+    // virtual view, and only while the preference has them enabled.
+    const bool show_hash = s.appPrefs.file_hash_enabled && paths.size() == 1 && !folder &&
+        !paths[0].empty() && !fs::IsVirtualPath(paths[0]);
+    std::vector<ui::FluentMenuItem> items =
+        app::BuildItemMenu(can_undo, undo_label, folder, can_unblock, show_hash);
     if (const auto* tab = ActiveTab(s))
         app::AppendRecentChangesCommand(items, app::RecentChangesMenuPath(*tab, false));
     ApplyWorkspacePinLabel(items, s);
     AppendQuickAccessCommand(s, items, QuickAccessTargets(ActiveTab(s), false));
-    const std::vector<std::wstring> paths = ActiveTab(s)
-        ? SelectedFullPaths(*ActiveTab(s)) : std::vector<std::wstring>{};
     const int quick_count = std::min(7, static_cast<int>(s.places.tags.size()));
     ui::FluentMenuItem quick_tags;
     quick_tags.command = app::CmdTags;
@@ -999,6 +1065,8 @@ void ShowBackgroundContextMenu(AppState& s, POINT screen_pt) {
     view_options.indexed_search = (kind == L"search" || kind == L"saved-search") && !tab->content_results;
     view_options.show_path = kind == L"search" || kind == L"saved-search" || kind == L"recycle";
     view_options.filesystem = !tab->current_path.empty() && !fs::IsVirtualPath(tab->current_path);
+    view_options.show_hidden = s.appPrefs.show_hidden_files;
+    view_options.show_protected = s.appPrefs.show_protected_os_files;
     if (IsRecycleTab(tab)) {
         const bool can_empty = tab->snapshot && tab->EntryCount() != 0;
         const std::wstring undoLabel = s.ops.UndoLabel();
@@ -1283,6 +1351,8 @@ void SetViewMode(AppState& s, ui::ViewMode mode) {
     s.scrollAnimating = false;
     if (tab->selected_index >= 0) EnsureRowVisible(s, *tab, tab->selected_index);
     ClampScroll(s);
+    // This folder now shows this view: remember it for the next visit.
+    RememberFolderView(s, *tab);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -1301,7 +1371,9 @@ void ShowViewDropdown(AppState& s, int pane_index) {
     const D2D1_RECT_F button = s.renderer.PaneViewButtonRect(paneRect, filterExpand);
     POINT anchor{ static_cast<LONG>(button.left), static_cast<LONG>(button.bottom) };
     ClientToScreen(s.hwnd, &anchor);
-    const int cmd = s.menu->TrackPopup(anchor, app::BuildViewMenu(tab->view_mode, s.showDetailsPanel));
+    const int cmd = s.menu->TrackPopup(anchor, app::BuildViewMenu(
+        tab->view_mode, s.showDetailsPanel,
+        s.appPrefs.show_hidden_files, s.appPrefs.show_protected_os_files));
     if (cmd != app::CmdNone) DispatchMenuCommand(s, cmd);
 }
 
@@ -1553,6 +1625,11 @@ void ApplyAppWindowChrome(AppState& s) {
     if (!s.hwnd) return;
     const auto effect = ui::WindowEffectFromId(s.appPrefs.window_effect);
     s.globalSearchWindow.SetAppearance(s.darkMode, effect, s.appPrefs.background_image, s.accentColor);
+    // The quick preview is an owned popup with its own compositor: it keeps the theme it was
+    // opened with unless the chrome pass, which already runs on every theme/material change,
+    // pushes the new one down.
+    if (s.quickPreview.visible())
+        s.quickPreview.SetAppearance(s.darkMode, effect);
     // Any selected image takes over the window base: sampled as material for
     // Mica/Acrylic, drawn as-is when the effect is None.
     const bool sample_image = !s.appPrefs.background_image.empty();
@@ -1722,6 +1799,8 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
             SendMessageW(s.hwndRenameEdit, WM_SETFONT, reinterpret_cast<WPARAM>(s.editFont), TRUE);
         if (s.hwndTagRenameEdit)
             SendMessageW(s.hwndTagRenameEdit, WM_SETFONT, reinterpret_cast<WPARAM>(s.editFont), TRUE);
+        if (s.hwndTooltipDelayEdit)
+            SendMessageW(s.hwndTooltipDelayEdit, WM_SETFONT, reinterpret_cast<WPARAM>(s.editFont), TRUE);
         if (s.pane) {
             ForEachPane(s, [&](app::Pane& pane) {
                 if (IsSettingsTab(pane.ActiveTab()))
@@ -1756,6 +1835,7 @@ void SetThemeMode(AppState& s, int mode) {
     if (s.hwndAddressEdit) InvalidateRect(s.hwndAddressEdit, nullptr, TRUE);
     if (s.hwndRenameEdit) InvalidateRect(s.hwndRenameEdit, nullptr, TRUE);
     if (s.hwndTagRenameEdit) InvalidateRect(s.hwndTagRenameEdit, nullptr, TRUE);
+    if (s.hwndTooltipDelayEdit) InvalidateRect(s.hwndTooltipDelayEdit, nullptr, TRUE);
     if (s.hwndFilterEdit) InvalidateRect(s.hwndFilterEdit, nullptr, TRUE);
     if (s.operationWindow) s.operationWindow->SetTheme(s.darkMode, s.accentColor);
     InvalidateRect(s.hwnd, nullptr, FALSE);

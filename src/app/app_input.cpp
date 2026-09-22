@@ -21,6 +21,7 @@
 #include "context_menu.h"
 #include "batch_rename.h"
 #include "blank_pane_click.h"
+#include "marquee_anchor.h"
 #include "link_resolve.h"
 #include "instance_launcher.h"
 #include "single_instance_coordinator.h"
@@ -486,6 +487,7 @@ void ResetMarquee(AppState& s) {
     s.marqueePending = false;
     s.marqueeActive = false;
     s.marqueeAdditive = false;
+    s.marqueeShift = 0.0f;
     s.marqueeBase.clear();
     s.blankClickPane = nullptr;
     s.blankClickTab = nullptr;
@@ -846,6 +848,7 @@ void UpdateSmoothScroll(AppState& s) {
         0.0, 50.0);
     s.scrollLastUpdateTime = now;
 
+    const float before = tab->scroll_y;
     const float remaining = s.scrollTargetY - tab->scroll_y;
     if (std::abs(remaining) <= 0.35f) {
         tab->scroll_y = s.scrollTargetY;
@@ -858,6 +861,20 @@ void UpdateSmoothScroll(AppState& s) {
         tab->scroll_y += remaining * response;
     }
     ClampScroll(s);
+    // A rubber band is anchored to the content, not to the glass. Scrolling while the left
+    // button is held used to leave the band where it was drawn, so it drifted over a
+    // different set of rows and the selection jumped on every pulse. Carry the whole band by
+    // the distance the content moved - both corners, so it stays over the rows it picked -
+    // and keep the fraction of a pixel the corners cannot hold for the drawing (see
+    // app::CarryMarqueeShift: rounding it away every frame is what made the band stutter).
+    const float moved = tab->scroll_y - before;
+    if (moved != 0.0f && (s.marqueePending || s.marqueeActive)) {
+        const int steps = app::CarryMarqueeShift(s.marqueeShift, moved);
+        if (steps != 0) {
+            s.marqueeStart.y -= steps;
+            s.marqueeCur.y -= steps;
+        }
+    }
 }
 
 LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -869,6 +886,13 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
         if (s->columnResizing) {
             if ((GetKeyState(VK_LBUTTON) & 0x8000) == 0) {
+                // The drag ended: keep the new edges for the folder it happened in. Virtual
+                // locations (search results among them) have no folder to remember and are
+                // skipped by the store itself.
+                if (app::Pane* resizePane = PaneAtSlot(*s, s->columnResizePane)) {
+                    if (app::Tab* resizeTab = resizePane->ActiveTab())
+                        app::RememberFolderView(*s, *resizeTab);
+                }
                 s->columnResizing = false;
                 s->columnResizeIndex = -1;
                 s->columnResizePane = -1;
@@ -2601,6 +2625,7 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 (GetKeyState(VK_MENU) & 0x8000) == 0 ? tab : nullptr;
             s->blankClickGeneration = tab ? tab->view_generation : 0;
             s->marqueeStart = s->marqueeCur = POINT{ mx, my };
+            s->marqueeShift = 0.0f;
             s->marqueeBase.clear();
             if (tab && ctrl) {
                 tab->MaterializeSelection();
@@ -3320,10 +3345,21 @@ LRESULT HandleMouseWheel(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
         app::Tab* wheelTab = ActiveTab(*s);
         if ((GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0) {
+            // Ctrl+wheel zooms the icons, the way Explorer does, and deliberately stays
+            // inside the four icon views. Stepping out of Details or List swapped the whole
+            // layout and reset the scroll position under a user who was only scrolling with
+            // Ctrl held down after a Ctrl-click selection.
             if (wheelTab) {
-                const int direction = delta > 0 ? -1 : 1;
-                const int next = std::clamp(ui::ViewModeIndex(wheelTab->view_mode) + direction, 0, 7);
-                SetViewMode(*s, ui::ViewModeFromIndex(next));
+                const ui::ViewMode mode = wheelTab->view_mode;
+                const bool zoomable = mode == ui::ViewMode::ExtraLargeIcons ||
+                    mode == ui::ViewMode::LargeIcons ||
+                    mode == ui::ViewMode::MediumIcons ||
+                    mode == ui::ViewMode::SmallIcons;
+                if (zoomable) {
+                    const int direction = delta > 0 ? -1 : 1;
+                    const int next = std::clamp(ui::ViewModeIndex(mode) + direction, 0, 3);
+                    SetViewMode(*s, ui::ViewModeFromIndex(next));
+                }
             }
             return 0;
         }

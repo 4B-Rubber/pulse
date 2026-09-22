@@ -510,6 +510,69 @@ void HideTagRenameOverlay(AppState& s, bool commit) {
 }
 
 
+bool TooltipDelayCustomCell(AppState& s, D2D1_RECT_F& cell) {
+    ui::WindowViewModel vm = BuildVm(s, false);
+    return s.renderer.TooltipDelayCustomCell(vm, static_cast<float>(s.compositor.Width()),
+                                             static_cast<float>(s.compositor.Height()), &cell);
+}
+
+void LayoutTooltipDelayEditor(AppState& s) {
+    if (!s.hwndTooltipDelayEdit || !s.tooltipDelayEditing || !s.hwnd) return;
+    D2D1_RECT_F cell{};
+    if (TooltipDelayCustomCell(s, cell))
+        PlaceHostedEdit(s.hwndTooltipDelayEdit, s.hwnd, cell, s.scale, 6, 6);
+}
+
+void ShowTooltipDelayEditor(AppState& s) {
+    if (s.renameIndex >= 0) HideRenameOverlay(s, false);
+    if (!s.tagRenameId.empty()) HideTagRenameOverlay(s, false);
+    if (s.addressEditing) HideAddressEditor(s, false);
+    if (s.filterEditing) HideFilterEditor(s, true);
+    s.tooltipDelayEditing = true;
+    if (!s.hwndTooltipDelayEdit)
+        s.hwndTooltipDelayEdit = CreateHostedEdit(s, TooltipDelayEditProc);
+    if (!s.hwndTooltipDelayEdit) {
+        s.tooltipDelayEditing = false;
+        return;
+    }
+    s.tooltipDelayIgnoreKillFocus = true;
+    const std::wstring current = std::to_wstring(s.appPrefs.tooltip_delay_ms);
+    SetWindowTextW(s.hwndTooltipDelayEdit, current.c_str());
+    LayoutTooltipDelayEditor(s);
+    ShowWindow(s.hwndTooltipDelayEdit, SW_SHOW);
+    SetForegroundWindow(GetAncestor(s.hwndTooltipDelayEdit, GA_ROOT));
+    SetFocus(s.hwndTooltipDelayEdit);
+    SendMessageW(s.hwndTooltipDelayEdit, EM_SETSEL, 0, -1);
+    s.tooltipDelayIgnoreKillFocus = false;
+    InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
+void HideTooltipDelayEditor(AppState& s, bool commit) {
+    // The flag is the row's state, so it is cleared even when there is no editor window to
+    // hide: a preset click has to be able to take the row out of "custom".
+    if (!s.tooltipDelayEditing) return;
+    if (commit && s.hwndTooltipDelayEdit) {
+        wchar_t text[32]{};
+        GetWindowTextW(s.hwndTooltipDelayEdit, text, ARRAYSIZE(text));
+        const int value = _wtoi(text);
+        if (value >= 50 && value <= 5000) {
+            if (s.appPrefs.tooltip_delay_ms != value) {
+                s.appPrefs.tooltip_delay_ms = value;
+                s.appPrefs.Save();
+            }
+        } else {
+            // Out of range, or not a number at all: keep what the row already had.
+            MessageBeep(MB_ICONWARNING);
+        }
+    }
+    s.tooltipDelayEditing = false;
+    s.tooltipDelayIgnoreKillFocus = true;
+    if (s.hwndTooltipDelayEdit) ShowWindow(s.hwndTooltipDelayEdit, SW_HIDE);
+    if (s.hwnd) SetFocus(s.hwnd);
+    s.tooltipDelayIgnoreKillFocus = false;
+    InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
 D2D1_COLOR_F HostedEditForeground(const AppState& s) {
     return s.darkMode ? D2D1::ColorF(1.0f, 1.0f, 1.0f)
                       : D2D1::ColorF(26.0f / 255.0f, 26.0f / 255.0f, 26.0f / 255.0f);
@@ -652,6 +715,32 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
     case WM_KILLFOCUS:
         if (!s->renameIgnoreKillFocus) HideRenameOverlay(*s, true);
+        break;
+    case WM_ERASEBKGND: {
+        return EraseHostedEditBackground(hwnd, wParam, s) ? 1 : 0;
+    }
+    }
+    return DefPresentedHostedEditProc(s, hwnd, msg, wParam, lParam);
+}
+
+LRESULT CALLBACK TooltipDelayEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                      UINT_PTR /*uIdSubclass*/, DWORD_PTR dwRefData) {
+    AppState* s = reinterpret_cast<AppState*>(dwRefData);
+    LRESULT handled = 0;
+    if (s && HandleHostedEditMessage(*s, hwnd, msg, wParam, lParam, handled)) return handled;
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (wParam == VK_RETURN) {
+            HideTooltipDelayEditor(*s, true);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            HideTooltipDelayEditor(*s, false);
+            return 0;
+        }
+        break;
+    case WM_KILLFOCUS:
+        if (!s->tooltipDelayIgnoreKillFocus) HideTooltipDelayEditor(*s, true);
         break;
     case WM_ERASEBKGND: {
         return EraseHostedEditBackground(hwnd, wParam, s) ? 1 : 0;

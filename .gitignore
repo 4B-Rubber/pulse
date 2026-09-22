@@ -81,3 +81,5 @@ CONERR$
 /.pnpm-store/
 /.summary.jsonl
 /.c2c.json
+
+.codebuddy/

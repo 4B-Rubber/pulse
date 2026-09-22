@@ -17,6 +17,7 @@
 #include "app_model.h"
 #include "content_results_ui.h"
 #include "app_worker.h"
+#include "folder_views.h"
 #include "places.h"
 #include "details_meta.h"
 #include "context_menu_prefs.h"
@@ -83,6 +84,8 @@ constexpr UINT WM_UPDATE_DOWNLOADED = WM_APP + 60;
 constexpr UINT WM_UPDATE_INSTALL = WM_APP + 61;
 constexpr UINT WM_SEARCH_HISTORY = WM_APP + 62;
 constexpr UINT WM_CHANGE_TRACKING = WM_APP + 63;
+// The checksum worker finished (wParam unused): the handler takes the result.
+constexpr UINT WM_FILE_HASH_DONE = WM_APP + 65;
 constexpr UINT kTimerUi = 1;
 
 enum class OmnibarMode { Path, Mixed, Command, Project };
@@ -174,6 +177,8 @@ struct AppState {
     float sidebarScroll = 0.0f;
     app::StagingTray tray;
     app::PlacesCatalog places;
+    // What each folder was last left in (view mode, sort, column edges).
+    app::FolderViewStore folderViews;
     app::ContextMenuPrefs ctxMenuPrefs;
     // Explorer COM/static menu session, caches, and delayed refresh state.
     app::ContextMenuController context_menu;
@@ -435,6 +440,10 @@ struct AppState {
     HWND hwndTagRenameEdit = nullptr;
     app::TagId tagRenameId;
     bool tagRenameIgnoreKillFocus = false;
+    // The tooltip-delay "custom" segment opens a small numeric editor on the row itself.
+    HWND hwndTooltipDelayEdit = nullptr;
+    bool tooltipDelayEditing = false;
+    bool tooltipDelayIgnoreKillFocus = false;
     HFONT editFont = nullptr;
     HBRUSH editBrush = nullptr;
 
@@ -621,6 +630,9 @@ struct AppState {
     bool blankDoublePending = false;
     POINT marqueeStart{};
     POINT marqueeCur{};
+    // The part of the scroll the corners above are still short of: the band is drawn with it,
+    // so it glides with the rows instead of stepping whole pixels (app::CarryMarqueeShift).
+    float marqueeShift = 0.0f;
     std::unordered_set<int> marqueeBase;
 
     // Cut state mirrored into list rows (ui.md §5.2 rule 6: 55% opacity).

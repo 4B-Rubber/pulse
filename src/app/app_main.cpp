@@ -96,6 +96,7 @@
 #pragma comment(lib, "psapi.lib")
 #include "app_internal.h"
 #include "duplicate_scan.h"
+#include "file_hash.h"
 #include <commctrl.h>
 #include <dbt.h> // WM_DEVICECHANGE / DEV_BROADCAST_HDR
 
@@ -206,6 +207,42 @@ void Render(AppState& s) {
     s.lastFrameTime = t1;
 }
 
+// The whole layout a killed process would otherwise lose: placement, tabs, groups, tray
+// deck, sidebar masks and the undo stack. The exit path and the autosave timer both go
+// through here, so the two can never drift apart.
+constexpr ULONGLONG kSessionAutosaveMs = 30000;
+static ULONGLONG session_autosave_tick = 0;
+
+static void SaveWindowSession(AppState& s, HWND hwnd) {
+    app::SessionSnapshot snap;
+    WINDOWPLACEMENT wp{ sizeof(wp) };
+    if (GetWindowPlacement(hwnd, &wp)) {
+        snap.window_rect = wp.rcNormalPosition;
+        snap.maximized = (wp.showCmd == SW_SHOWMAXIMIZED);
+    }
+    snap.dark = s.darkMode;
+    app::Tab* tab = ActiveTab(s);
+    if (tab) snap.active_path = tab->current_path;
+    RememberLayoutFocus(s);
+    snap.active_layout_tab = static_cast<int>(s.window_tabs.active);
+    for (const auto& group : s.window_tabs.tab_groups)
+        snap.tab_groups.push_back({ group.id, group.name, group.color_rgb, group.collapsed });
+    for (const auto& layout : s.window_tabs.items)
+        snap.layout_tabs.push_back(app::CaptureLayoutTab(*layout));
+    snap.tray = s.tray;
+    snap.undo_json = s.ops.UndoToJson();
+    snap.sidebar_collapsed = static_cast<int>(s.sidebarCollapsedMask);
+    snap.sidebar_hidden = static_cast<int>(s.sidebarHiddenMask);
+    snap.sidebar_order = app::NormalizeSidebarOrder(s.sidebarOrder);
+    snap.quick_access_hidden = static_cast<int>(s.sidebarQuickAccessHiddenMask);
+    snap.starred_expanded = s.starredExpanded;
+    snap.details_panel = s.showDetailsPanel;
+    snap.details_preview_only = s.detailsPreviewOnly;
+    snap.details_preview = s.detailsPreviewEnabled;
+    snap.details_panel_width = static_cast<int>(std::lround(s.detailsPanelWidth));
+    app::SaveSession(snap);
+}
+
 LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     AppState* s = GetAppState(hwnd);
     if (s && s->notification_toast.HandleMessage(hwnd, msg, wParam, lParam)) return 0;
@@ -272,10 +309,12 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s->isolatedTest) {
             s->places.persist = false;
             s->appPrefs.persist = false;
+            s->folderViews.persist = false;
         }
         s->savedSearches.Load();
         SyncSavedSearchSidebar(*s);
         s->places.Load();
+        s->folderViews.Load();
         ProbePinnedNetworks(*s);
         s->ctxMenuPrefs.Load();
         s->appPrefs.Load();
@@ -861,6 +900,12 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             DrainDirNotifies(*s);
             const ULONGLONG now = GetTickCount64();
             TickUpdates(*s, now);
+            // The layout is kept on a slow autosave while the window lives: the save on the
+            // way out is exactly the one a killed process never reaches.
+            if (now - session_autosave_tick >= kSessionAutosaveMs) {
+                session_autosave_tick = now;
+                if (!s->secondaryInstance && !s->mergedAway) SaveWindowSession(*s, s->hwnd);
+            }
             if (s->renderer.TickDetailsPreview(now)) dirty = true;
             if (s->detailsPreviewFoldStart) {
                 const float t = std::min(1.0f, static_cast<float>(now - s->detailsPreviewFoldStart) / 150.0f);
@@ -996,12 +1041,20 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->groupCardHoverRow = card_row;
                 dirty = true;
             }
-            // 150 ms: the icon rail relies on the hint to name each row, and the
-            // old 400 ms delay read as "no tooltip at all". The group hover card
-            // owns that spot while it is open.
-            if (s->groupCardGroupId == 0 && s->hoverRegion != 0 &&
+            // The pause before a hint is a setting (150 default; the icon rail relies on
+            // the hint to name each row, and 400 ms read as "no tooltip at all"). The
+            // switch in the settings page turns hints off; a hint already on screen goes
+            // away with the next tick. The group hover card owns that spot while open.
+            const ULONGLONG hint_delay = static_cast<ULONGLONG>(
+                std::clamp(s->appPrefs.tooltip_delay_ms, 50, 5000));
+            if (!s->appPrefs.show_tooltips) {
+                if (!s->tooltipText.empty()) {
+                    s->tooltipText.clear();
+                    dirty = true;
+                }
+            } else if (s->groupCardGroupId == 0 && s->hoverRegion != 0 &&
                 s->tooltipText.empty() && s->hoverSince != 0 &&
-                GetTickCount64() - s->hoverSince >= 150) {
+                GetTickCount64() - s->hoverSince >= hint_delay) {
                 s->tooltipText = TooltipForHover(*s);
                 dirty = !s->tooltipText.empty() || dirty;
             }
@@ -1501,6 +1554,25 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s) OpenSelected(*s);
         return 0;
 
+    case WM_FILE_HASH_DONE: {
+        std::wstring path, hex, error;
+        app::HashAlgorithm algorithm = app::HashAlgorithm::Sha256;
+        if (s && app::TakeFileHashResult(path, algorithm, hex, error)) {
+            if (!hex.empty()) {
+                ops::WriteClipboardText(hex);
+                std::wstring message = app::HashAlgorithmName(algorithm);
+                message += L" · ";
+                message += hex;
+                s->notification_toast.Show(s->hwnd, l10n::Get(l10n::StringId::HashFile),
+                                           message, false);
+            } else if (!error.empty()) {
+                s->notification_toast.ShowError(s->hwnd, l10n::Get(l10n::StringId::HashFile),
+                                                error);
+            }
+        }
+        return 0;
+    }
+
     case WM_NET_PROBE: {
         auto* result = reinterpret_cast<fs::UncProbeResult*>(lParam);
         if (s && result) {
@@ -1588,6 +1660,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->changes.client.Stop();
             s->index.Stop();
             s->worker.Stop();
+            // A detached hash worker would still be joinable when the process exits, which
+            // terminates the program instead of closing it.
+            app::CancelFileHashJob();
             ShutdownDetailsSizeWalk(*s);
 
             if (s->dropTarget) {
@@ -1627,36 +1702,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 !s->shot.active && !s->menushot && !s->isolatedTest;
             // A second window owns none of that: saving its own tabs, tray deck
             // and undo stack would replace the primary's.
-            if (persist_session && !s->secondaryInstance && !s->mergedAway) {
-                app::SessionSnapshot snap;
-                WINDOWPLACEMENT wp{ sizeof(wp) };
-                if (GetWindowPlacement(hwnd, &wp)) {
-                    snap.window_rect = wp.rcNormalPosition;
-                    snap.maximized = (wp.showCmd == SW_SHOWMAXIMIZED);
-                }
-                snap.dark = s->darkMode;
-                app::Tab* tab = ActiveTab(*s);
-                if (tab) snap.active_path = tab->current_path;
-                RememberLayoutFocus(*s);
-                snap.active_layout_tab = static_cast<int>(s->window_tabs.active);
-                for (const auto& group : s->window_tabs.tab_groups)
-                    snap.tab_groups.push_back(
-                        {group.id, group.name, group.color_rgb, group.collapsed});
-                for (const auto& layout : s->window_tabs.items)
-                    snap.layout_tabs.push_back(app::CaptureLayoutTab(*layout));
-                snap.tray = s->tray;
-                snap.undo_json = s->ops.UndoToJson();
-                snap.sidebar_collapsed = static_cast<int>(s->sidebarCollapsedMask);
-                snap.sidebar_hidden = static_cast<int>(s->sidebarHiddenMask);
-                snap.sidebar_order = app::NormalizeSidebarOrder(s->sidebarOrder);
-                snap.quick_access_hidden = static_cast<int>(s->sidebarQuickAccessHiddenMask);
-                snap.starred_expanded = s->starredExpanded;
-                snap.details_panel = s->showDetailsPanel;
-                snap.details_preview_only = s->detailsPreviewOnly;
-                snap.details_preview = s->detailsPreviewEnabled;
-                snap.details_panel_width = static_cast<int>(std::lround(s->detailsPanelWidth));
-                app::SaveSession(snap);
-            }
+            if (persist_session && !s->secondaryInstance && !s->mergedAway)
+                SaveWindowSession(*s, hwnd);
             if (persist_session) {
                 s->places.Save();
                 s->ctxMenuPrefs.Save();

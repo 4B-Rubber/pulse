@@ -24,6 +24,15 @@ struct AppPrefsValues {
     // Hidden + system attributes; File Explorer keeps these behind a separate option.
     bool show_protected_os_files = false;
     bool blank_click_go_back = false;
+    // Hover hints: the icon rail names every row through them, so they start on. The delay
+    // is how long the pointer rests before the hint appears (150 / 400 / 800 ms).
+    bool show_tooltips = true;
+    int tooltip_delay_ms = 150;
+    // Copy SHA-256 / MD5 from the item menu. Off hides the submenu for a single file.
+    bool file_hash_enabled = true;
+    // The title bar mark: the app icon and name left of the tabs. Off starts the tab strip
+    // at the window edge, which is what a user who wants a bare title bar is after.
+    bool show_title_brand = true;
     bool change_tracking_enabled = false;
     int change_tracking_days = 7;
     // system / zh-CN / en-US

@@ -160,13 +160,24 @@ bool SearchHistory::SaveToFile(const std::wstring& file) const {
 bool SearchHistory::Load() {
     if (!persist) return false;
     const auto dir = GetPulseDataDir();
-    return !dir.empty() && LoadFromFile(dir + L"\\search_history.json");
+    if (dir.empty()) return false;
+    const std::wstring path = dir + L"\\search_history.json";
+    if (LoadFromFile(path)) return true;
+    // There but unreadable (or empty): set it aside, so the next Save cannot replace the
+    // only copy of what the user searched for. A missing file is the normal first run.
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        QuarantineUnreadableFile(path);
+    return false;
 }
 
 bool SearchHistory::Save() const {
     if (!persist) return false;
     const auto dir = GetPulseDataDir();
-    return !dir.empty() && SaveToFile(dir + L"\\search_history.json");
+    if (dir.empty()) return false;
+    const std::wstring path = dir + L"\\search_history.json";
+    // One step back: the writer thread and every window share this one file.
+    KeepPreviousFileCopy(path);
+    return SaveToFile(path);
 }
 
 SearchHistoryWriter::SearchHistoryWriter(std::wstring file) : file_(std::move(file)),

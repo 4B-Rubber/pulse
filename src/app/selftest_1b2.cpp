@@ -62,6 +62,7 @@
 #include "../ops/clipboard.h"
 #include "../common/text_format.h"
 #include "../common/utf8_file.h"
+#include "file_hash.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -1166,6 +1167,25 @@ void TestBlankPaneClickNavigation() {
                   tab->current_path == L"C:\\",
                   L"blank pane: split click navigates only the clicked pane");
         }
+        // The band hangs off the content: while the list glides, the drawn rect carries the
+        // fraction of a pixel the integer corners cannot hold, so it travels with the rows
+        // instead of stepping whole pixels. At rest the corners are the truth again, which is
+        // what keeps the band's 1px edges crisp.
+        state->marqueeActive = true;
+        state->marqueeStart = POINT{ 100, 200 };
+        state->marqueeCur = POINT{ 300, 400 };
+        state->marqueeShift = 0.4f;
+        state->scrollAnimating = true;
+        const D2D1_RECT_F gliding = BuildVm(*state, false).pane.marquee_rect;
+        state->scrollAnimating = false;
+        const D2D1_RECT_F resting = BuildVm(*state, false).pane.marquee_rect;
+        Check(std::fabs(gliding.top - 199.6f) < 0.01f && std::fabs(gliding.bottom - 399.6f) < 0.01f &&
+              std::fabs(gliding.left - 100.0f) < 0.01f && std::fabs(gliding.right - 300.0f) < 0.01f &&
+              std::fabs(resting.top - 200.0f) < 0.01f && std::fabs(resting.bottom - 400.0f) < 0.01f,
+              L"marquee: the drawn band carries the scroll fraction and stays crisp at rest");
+        state->marqueeActive = false;
+        state->marqueeShift = 0.0f;
+
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         state->renderer.SetCompositor(nullptr);
         state->compositor.Shutdown();
@@ -1851,14 +1871,15 @@ void TestMenuModel() {
 
     // Item menu: 打开 + icon strip (cut/copy/delete/rename) + verbs + undo.
     auto items = BuildItemMenu(false, L"");
-    Check(items.size() == 9, L"menu: item menu is 打开+图标条+verbs+undo");
+    Check(items.size() == 11, L"menu: item menu is 打开+图标条+verbs+unblock/hash+undo");
     // Command-id ranges must not overlap: CmdTabJoinGroupBase once collided
     // with CmdTabCloseOthers and "join group" closed every other tab.
     static_assert(CmdTabJoinGroupBase > CmdTabCloseRight &&
                   CmdTabJoinGroupBase + 32 <= CmdRecentBase,
                   "join-group ids must sit between tab commands and recents");
     std::vector<int> want{ CmdOpen, CmdNone, CmdCopyPath, CmdOpenTerminal, CmdProperties,
-                           CmdPinWorkspace, CmdPinNetwork, CmdTags, CmdUndo };
+                           CmdUnblockFile, CmdNone, CmdPinWorkspace, CmdPinNetwork, CmdTags,
+                           CmdUndo };
     bool ids_ok = items.size() >= want.size();
     for (size_t i = 0; i < want.size() && i < items.size(); ++i)
         if (items[i].command != want[i]) ids_ok = false;
@@ -1872,8 +1893,27 @@ void TestMenuModel() {
           L"menu: icon strip carries 剪切/复制/删除/重命名");
     Check(items.size() > 2 && items[2].shortcut == L"Ctrl+Shift+C",
           L"menu: 复制路径 carries Ctrl+Shift+C");
+    Check(items[5].command == CmdUnblockFile && !items[5].enabled &&
+          items[6].children.size() == 2 && items[6].children[0].command == CmdHashSha256 &&
+          items[6].children[1].command == CmdHashMd5,
+          L"menu: unblock stays disabled without a mark-of-the-web stream");
+    auto unblockable = BuildItemMenu(false, L"", false, true);
+    Check(unblockable[5].command == CmdUnblockFile && unblockable[5].enabled,
+          L"menu: unblock enables when the selection carries the stream");
+    const auto menu_has_hash = [](const std::vector<ui::FluentMenuItem>& menu) {
+        for (const auto& item : menu)
+            for (const auto& child : item.children)
+                if (child.command == CmdHashSha256) return true;
+        return false;
+    };
     auto folder_items = BuildItemMenu(false, L"", true);
-    Check(folder_items.size() == 10, L"menu: folder item menu adds 在新标签打开");
+    Check(folder_items.size() == 11, L"menu: folder item menu adds 在新标签打开");
+    // A checksum answers for exactly one ordinary file, so the folder menu and a
+    // multi-selection both leave the submenu out.
+    Check(!menu_has_hash(folder_items), L"menu: a folder has no checksum submenu");
+    auto multi_items = BuildItemMenu(false, L"", false, false, false);
+    Check(multi_items.size() == 10 && !menu_has_hash(multi_items),
+          L"menu: a multi-selection has no checksum submenu");
     Check(folder_items.size() > 3 &&
           folder_items[2].command == CmdOpenInNewTab &&
           folder_items[2].text == L"在新标签打开" &&
@@ -2001,8 +2041,8 @@ void TestMenuModel() {
     options.sort_direction = ui::SortDirection::Desc;
     options.details_panel = true;
     AppendBackgroundViewCommands(bg, options);
-    Check(bg[0].children.size() == 9 && bg[0].children[1].radio &&
-          bg[0].children.back().checked, L"menu: background reflects view and details pane");
+    Check(bg[0].children.size() == 11 && bg[0].children[1].radio &&
+          bg[0].children[8].checked, L"menu: background reflects view and details pane");
     const auto& sort = bg[1].children;
     Check(sort.size() == 6 && sort[3].command == CmdSortSize && sort[3].radio &&
           !sort[4].radio && sort[5].radio,
@@ -3784,6 +3824,31 @@ void TestHiddenFiles() {
     Check(loaded.FromJson(prefs.ToJson()) && loaded.show_hidden_files &&
           loaded.show_protected_os_files,
           L"hidden: preference JSON roundtrip");
+    // Hover hints: on by default with the short delay, and both settings survive the file.
+    AppPrefs hints;
+    Check(hints.FromJson(L"{}") && hints.show_tooltips && hints.tooltip_delay_ms == 150,
+          L"hints: old preferences default to hints on at the fast delay");
+    hints.show_tooltips = false;
+    hints.tooltip_delay_ms = 800;
+    Check(hints.ToJson().find(L"\"tooltip_delay_ms\":800") != std::wstring::npos,
+          L"hints: the delay is written as a number");
+    AppPrefs hint_loaded;
+    Check(hint_loaded.FromJson(hints.ToJson()) && !hint_loaded.show_tooltips &&
+          hint_loaded.tooltip_delay_ms == 800,
+          L"hints: preference JSON roundtrip");
+    // Any delay inside the control's range is a valid custom value now; only out-of-range
+    // numbers clamp (the three presets live in the segmented control, not in the file).
+    AppPrefs custom_delay;
+    custom_delay.tooltip_delay_ms = 250;
+    AppPrefs custom_loaded;
+    Check(custom_loaded.FromJson(custom_delay.ToJson()) && custom_loaded.tooltip_delay_ms == 250,
+          L"hints: a custom delay survives the roundtrip");
+    AppPrefs clamped_delay;
+    Check(clamped_delay.FromJson(L"{\"tooltip_delay_ms\":99999}") &&
+          clamped_delay.tooltip_delay_ms == 5000 &&
+          clamped_delay.FromJson(L"{\"tooltip_delay_ms\":5}") &&
+          clamped_delay.tooltip_delay_ms == 50,
+          L"hints: out-of-range delays clamp to the control's bounds");
     Pane pane;
     auto& tab = pane.view;
     tab.current_path = L"\\\\server\\share";
@@ -4313,6 +4378,475 @@ void TestQuickAccess() {
     Check(!compat::ModernWindows() && compat::WindowDpi(GetDesktopWindow()) > 0 &&
           compat::SystemMetricsForDpi(SM_CXSIZEFRAME, 144) > 0, L"compat: legacy DPI path");
     SetEnvironmentVariableW(L"PULSE_COMPAT_81", previous_compat[0] ? previous_compat : nullptr);
+}
+
+// PULSE_SELFTEST_CASE=places-recovery: the two stores that could lose data on their own.
+// A tags file that is there but unreadable must be set aside instead of being replaced by
+// the default palette, and saved searches have to live in the app data directory (the path
+// used to be assembled by hand, which the test redirect cannot reach).
+void TestPlacesStoreRecovery() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulsePlacesRecovery-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring tags = dir + L"\\tags.json";
+    const std::wstring places = dir + L"\\places.json";
+    const std::wstring searches = dir + L"\\saved_searches.json";
+
+    wchar_t previous[32768]{};
+    const DWORD had_previous =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+    // Seed a profile the way a real launch leaves one, so the tag file below is the only
+    // thing that is broken.
+    {
+        PlacesCatalog seed;
+        seed.EnsureDefaults();
+        seed.RecordRecent(L"C:\\proj\\seed", PlaceItemKind::Folder);
+        Check(seed.Save() && GetFileAttributesW(places.c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"places recovery: a profile writes places.json");
+    }
+    {
+        HANDLE file = CreateFileW(tags.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        const char* garbage = "{\"version\":2,\"tags\":[{\"id\":\"broken\"";
+        DWORD written = 0;
+        if (file != INVALID_HANDLE_VALUE) {
+            WriteFile(file, garbage, static_cast<DWORD>(strlen(garbage)), &written, nullptr);
+            CloseHandle(file);
+        }
+    }
+    {
+        PlacesCatalog cat;
+        cat.Load();
+        Check(cat.tags.size() == 7, L"places recovery: the default palette comes back");
+        Check(GetFileAttributesW((tags + L".bad").c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"places recovery: the unreadable tag file is kept as .bad");
+    }
+    {
+        SavedSearchStore store;
+        SavedSearch search;
+        search.name = L"recovery";
+        search.root = L"C:\\proj";
+        search.query = L"needle";
+        Check(store.Add(search) && store.Save() &&
+              GetFileAttributesW(searches.c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"places recovery: saved searches land in the app data directory");
+        SavedSearchStore reloaded;
+        Check(reloaded.Load() && reloaded.items().size() == 1 &&
+              reloaded.items()[0].query == L"needle",
+              L"places recovery: saved searches round-trip through the redirect");
+    }
+
+    // Two windows, one file: the visit the other window collected must survive the save of
+    // the window that was already open when it happened - that is the rollback this merge
+    // is for. An entry this window dropped on purpose still stays dropped.
+    {
+        PlacesCatalog first;
+        Check(first.Load(), L"places recovery: an open window loads the profile");
+        first.RecordRecent(L"C:\\proj\\local", PlaceItemKind::Folder);
+        {
+            PlacesCatalog second;
+            second.Load();
+            second.RecordRecent(L"C:\\proj\\other", PlaceItemKind::Folder);
+            Check(second.Save(), L"places recovery: the second window saves its visit");
+        }
+        Check(first.Save(), L"places recovery: the first window saves on top");
+        PlacesCatalog check;
+        Check(check.Load() && check.FindRecent(L"C:\\proj\\other") != nullptr &&
+              check.FindRecent(L"C:\\proj\\local") != nullptr,
+              L"places recovery: the newer visit survives a stale save");
+    }
+
+    // The starred list follows the same two-window rule: the item the other window starred
+    // survives a stale save, the one unstarred here does not come back.
+    {
+        {
+            PlacesCatalog writer;
+            writer.Load();
+            Check(writer.ToggleStarred(L"C:\\proj\\kept", PlaceItemKind::Folder) && writer.Save(),
+                  L"places recovery: a starred item is on disk before the race");
+        }
+        PlacesCatalog first;
+        Check(first.Load() && first.IsStarred(L"C:\\proj\\kept"),
+              L"places recovery: a window loads the starred list");
+        first.ToggleStarred(L"C:\\proj\\kept");
+        Check(!first.IsStarred(L"C:\\proj\\kept"),
+              L"places recovery: and unstars it here");
+        {
+            PlacesCatalog second;
+            second.Load();
+            Check(second.ToggleStarred(L"C:\\proj\\other-star", PlaceItemKind::Folder) &&
+                  second.Save(),
+                  L"places recovery: the other window stars its own");
+        }
+        Check(first.Save(), L"places recovery: the first window saves on top");
+        PlacesCatalog check;
+        Check(check.Load() && check.FindStarred(L"C:\\proj\\other-star") != nullptr,
+              L"places recovery: the other window's star survives a stale save");
+        Check(check.FindStarred(L"C:\\proj\\kept") == nullptr,
+              L"places recovery: the item unstarred here stays unstarred");
+    }
+
+    // Pinned folders are user data like the starred list, so the save-time merge follows the
+    // same rule: the pin the other window made survives, the one unpinned here stays gone.
+    {
+        {
+            PlacesCatalog writer;
+            writer.Load();
+            writer.SetQuickAccessPinned({ L"C:\\proj\\pin-kept" }, true);
+        }
+        PlacesCatalog first;
+        Check(first.Load() && first.IsQuickAccessPinned(L"C:\\proj\\pin-kept"),
+              L"places recovery: a window loads the pinned folders");
+        Check(first.SetQuickAccessPinned({ L"C:\\proj\\pin-kept" }, false) &&
+              !first.IsQuickAccessPinned(L"C:\\proj\\pin-kept"),
+              L"places recovery: and unpins one here");
+        {
+            PlacesCatalog second;
+            second.Load();
+            second.SetQuickAccessPinned({ L"C:\\proj\\pin-other" }, true);
+        }
+        Check(first.Save(), L"places recovery: the first window saves on top");
+        PlacesCatalog check;
+        Check(check.Load() && check.IsQuickAccessPinned(L"C:\\proj\\pin-other"),
+              L"places recovery: the other window's pin survives a stale save");
+        Check(!check.IsQuickAccessPinned(L"C:\\proj\\pin-kept"),
+              L"places recovery: the folder unpinned here stays unpinned");
+    }
+
+    // Workspaces merge under the same rule, and the whole snapshot has to travel with the
+    // merged entry: name, layout, panes, views and the visit counts behind the "path\tcount"
+    // rows.
+    {
+        {
+            PlacesCatalog writer;
+            writer.Load();
+            writer.PinWorkspace(L"C:\\proj\\ws-kept", L"kept", 1, { L"C:\\proj\\ws-kept" });
+        }
+        PlacesCatalog first;
+        Check(first.Load() && first.FindWorkspace(L"C:\\proj\\ws-kept") >= 0,
+              L"places recovery: a window loads the pinned workspaces");
+        Check(first.UnpinWorkspace(L"C:\\proj\\ws-kept") &&
+              first.FindWorkspace(L"C:\\proj\\ws-kept") < 0,
+              L"places recovery: and unpins one here");
+        {
+            PlacesCatalog second;
+            second.Load();
+            Check(second.PinWorkspace(L"C:\\proj\\ws-other", L"other", 2,
+                                      { L"C:\\proj\\ws-other", L"C:\\proj\\ws-other\\sub" },
+                                      { ui::ViewMode::Details, ui::ViewMode::Tiles }) >= 0,
+                  L"places recovery: the other window pins a workspace");
+            second.RecordVisit(L"C:\\proj\\ws-other\\sub");
+            Check(second.Save(), L"places recovery: and saves its snapshot");
+        }
+        Check(first.Save(), L"places recovery: the first window saves on top");
+        PlacesCatalog check;
+        const int merged = check.Load() ? check.FindWorkspace(L"C:\\proj\\ws-other") : -1;
+        const Workspace* ws = merged >= 0 ? &check.workspaces[static_cast<size_t>(merged)] : nullptr;
+        Check(ws && ws->name == L"other" && ws->layout == 2 && ws->pane_paths.size() == 2 &&
+              ws->pane_views == std::vector<ui::ViewMode>{ ui::ViewMode::Details, ui::ViewMode::Tiles },
+              L"places recovery: another window's workspace survives with its snapshot");
+        const auto frequent = ws ? check.FrequentChildren(merged, 8) : std::vector<std::wstring>{};
+        // Visits are stored normalized, the same way RecordVisit keys them.
+        const std::wstring expected_visit = fs::NormalizePath(L"C:\\proj\\ws-other\\sub");
+        Check(frequent.size() == 1 &&
+              _wcsicmp(frequent[0].c_str(), expected_visit.c_str()) == 0,
+              L"places recovery: and its visit counts come back through the parse");
+        Check(check.FindWorkspace(L"C:\\proj\\ws-kept") < 0,
+              L"places recovery: the workspace unpinned here stays gone");
+    }
+
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous ? previous : nullptr);
+    DeleteFileW(tags.c_str());
+    DeleteFileW((tags + L".bad").c_str());
+    DeleteFileW((tags + L".bak").c_str());
+    DeleteFileW(places.c_str());
+    DeleteFileW((places + L".bak").c_str());
+    DeleteFileW(searches.c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
+// PULSE_SELFTEST_CASE=folder-views: the per-folder view memory. A folder has to come back
+// the way it was left, two windows must not undo each other, and the file stays bounded.
+void TestFolderViewMemory() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulseFolderViews-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring file = dir + L"\\folder-views.json";
+
+    wchar_t previous[32768]{};
+    const DWORD had_previous =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+    const std::wstring folder = fs::NormalizePath(L"C:\\proj\\alpha");
+    FolderView view;
+    view.view = ui::ViewMode::MediumIcons;
+    view.sort = ui::SortColumn::Mtime;
+    view.direction = ui::SortDirection::Desc;
+    view.dividers = { 0.25f, 0.5f, 0.75f };
+    {
+        FolderViewStore store;
+        store.Load();
+        store.Note(folder, view);
+        Check(GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"folder views: noting a folder writes the store");
+        const FolderView* found = store.Find(L"c:\\PROJ\\Alpha");
+        Check(found != nullptr,
+              L"folder views: a case-different path finds the entry");
+        Check(found && found->view == ui::ViewMode::MediumIcons &&
+              found->sort == ui::SortColumn::Mtime &&
+              found->direction == ui::SortDirection::Desc &&
+              std::fabs(found->dividers[1] - 0.5f) < 0.0001f,
+              L"folder views: the entry reads back");
+    }
+    {
+        FolderViewStore reloaded;
+        reloaded.Load();
+        const FolderView* found = reloaded.Find(folder);
+        Check(found && found->view == ui::ViewMode::MediumIcons &&
+              std::fabs(found->dividers[2] - 0.75f) < 0.0001f,
+              L"folder views: the memory survives a restart");
+    }
+
+    // A tab that navigates into the folder gets the remembered view back; one whose folder
+    // has no memory keeps what it was showing.
+    {
+        auto state = std::make_unique<AppState>();
+        state->folderViews.Load();
+        Tab tab;
+        tab.current_path = folder;
+        ApplyFolderView(*state, tab);
+        Check(tab.view_mode == ui::ViewMode::MediumIcons &&
+              tab.sort_column == ui::SortColumn::Mtime &&
+              tab.sort_direction == ui::SortDirection::Desc,
+              L"folder views: navigating back applies the remembered view");
+        Tab fresh;
+        fresh.current_path = fs::NormalizePath(L"C:\\proj\\never-seen");
+        fresh.view_mode = ui::ViewMode::Tiles;
+        ApplyFolderView(*state, fresh);
+        Check(fresh.view_mode == ui::ViewMode::Tiles,
+              L"folder views: a folder with no memory leaves the tab alone");
+    }
+
+    // Two windows, one file: the folder the other window visited while this one was open is
+    // kept, and the view changed here wins for its own folder.
+    {
+        const std::wstring own = fs::NormalizePath(L"C:\\proj\\own");
+        const std::wstring other = fs::NormalizePath(L"C:\\proj\\other");
+        FolderViewStore first;
+        first.Load();
+        FolderView list_view = view;
+        list_view.view = ui::ViewMode::List;
+        first.Note(own, list_view);
+        {
+            FolderViewStore second;
+            second.Load();
+            second.Note(other, view);
+        }
+        first.Save();
+        FolderViewStore check;
+        check.Load();
+        const FolderView* kept = check.Find(other);
+        Check(kept && kept->view == ui::ViewMode::MediumIcons,
+              L"folder views: the other window's folder survives a stale save");
+        const FolderView* mine = check.Find(own);
+        Check(mine && mine->view == ui::ViewMode::List,
+              L"folder views: this window's own change is on disk");
+    }
+
+    // The store is bounded: the least recently used folders are the ones that go.
+    {
+        FolderViewStore store;
+        store.Load();
+        for (size_t i = 0; i < FolderViewStore::kMaxEntries + 20; ++i) {
+            FolderView extra;
+            extra.used = 1000 + i;
+            store.Note(std::wstring(L"C:\\cap\\") + std::to_wstring(i), extra);
+        }
+        Check(store.size() == FolderViewStore::kMaxEntries,
+              L"folder views: the store stops at its cap");
+        FolderViewStore check;
+        check.Load();
+        const std::wstring newest =
+            std::wstring(L"C:\\cap\\") + std::to_wstring(FolderViewStore::kMaxEntries + 19);
+        const std::wstring oldest = fs::NormalizePath(L"C:\\cap\\0");
+        Check(check.size() == FolderViewStore::kMaxEntries,
+              L"folder views: the store stops at its cap on disk too");
+        Check(check.Find(newest) != nullptr,
+              L"folder views: the newest folder is kept");
+        Check(check.Find(oldest) == nullptr,
+              L"folder views: the oldest folder is trimmed");
+    }
+
+    // Virtual views are not folders.
+    {
+        FolderViewStore store;
+        store.Load();
+        const size_t before = store.size();
+        store.Note(L"pulse:recent", view);
+        Check(store.size() == before, L"folder views: a virtual view is not remembered");
+    }
+
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous ? previous : nullptr);
+    DeleteFileW(file.c_str());
+    DeleteFileW((file + L".bak").c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
+// PULSE_SELFTEST_CASE=tooltip-delay-editor: the custom delay segment has to own a rect and
+// hit-test as index 3, which is the index that opens the numeric editor.
+void TestTooltipDelayEditor() {
+    auto state = std::make_unique<AppState>();
+    AppState& s = *state;
+    ui::WindowViewModel vm = BuildVm(s, false);
+    vm.settings_open = true;
+    vm.settings_page = 0;
+    vm.settings_expanded |= 1u;
+    vm.settings_scroll = 0.0f;
+    const float w = 1280.0f * s.scale;
+    const float h = 1000.0f * s.scale;
+    const D2D1_RECT_F window = D2D1::RectF(0, 0, w, h);
+    // The row lives far down a long page: scroll until it is actually on screen, which is
+    // the only state a user can click it in.
+    D2D1_RECT_F cell{};
+    bool have_cell = false;
+    float scroll_used = 0.0f;
+    const float max_scroll = s.renderer.SettingsMaxScroll(vm, w, h);
+    for (float sc = 0.0f; sc <= max_scroll + 1.0f && !have_cell; sc += 40.0f * s.scale) {
+        vm.settings_scroll = sc;
+        D2D1_RECT_F candidate{};
+        if (s.renderer.TooltipDelayCustomCell(vm, w, h, &candidate) &&
+            candidate.top >= 120.0f && candidate.bottom <= h - 120.0f &&
+            candidate.right > candidate.left + 1.0f && candidate.bottom > candidate.top + 1.0f) {
+            cell = candidate;
+            scroll_used = sc;
+            have_cell = true;
+        }
+    }
+    vm.settings_scroll = scroll_used;
+    Check(have_cell, L"tooltip delay: the custom segment owns a rect once scrolled into view");
+    const ui::HitTestResult hit = s.renderer.HitTest(
+        vm, window, (cell.left + cell.right) * 0.5f, (cell.top + cell.bottom) * 0.5f);
+    Check(hit.region == ui::HitTestResult::SettingsTooltipDelay,
+          L"tooltip delay: the click lands on the delay row");
+    Check(hit.region == ui::HitTestResult::SettingsTooltipDelay && hit.index == 3,
+          L"tooltip delay: clicking the custom segment hits index 3");
+
+    // Regression: with the inline editor open, one of the three presets has to close it and
+    // land. Leaving the editor open kept the row reading as "custom", and because a click here
+    // never moved focus off the editor, its next commit wrote the editor's number back over the
+    // preset - so 短/标准/长 looked like they did nothing.
+    s.appPrefs.persist = false;
+    s.settings.BindUi(s.appPrefs, s.ctxMenuPrefs, s.index, s.networkIndex, {});
+    s.appPrefs.tooltip_delay_ms = 1000;
+    s.tooltipDelayEditing = true;
+    ui::HitTestResult preset{};
+    preset.region = ui::HitTestResult::SettingsTooltipDelay;
+    preset.index = 0;
+    HandleSettingsControl(s, preset);
+    Check(!s.tooltipDelayEditing && s.appPrefs.tooltip_delay_ms == 150,
+          L"tooltip delay: a preset closes the custom editor and applies");
+
+    // The reported flow with a real window and the real child editor: click 自定义, then click
+    // one of the presets on the row itself. The editor has to close and the preset has to land,
+    // which is what a click that never leaves the editor cannot do.
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = BlankPaneTestProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"PulseTooltipDelayClickSelftest";
+    RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, 1280, 1000,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    Check(hwnd != nullptr, L"tooltip delay: settings window created");
+    if (hwnd) {
+        s.hwnd = hwnd;
+        if (s.compositor.Init(hwnd)) {
+            s.scale = 1.0f;
+            s.compositor.RecreateTextFormats(1.0f);
+            s.renderer.SetCompositor(&s.compositor);
+            s.renderer.SetScale(1.0f);
+            s.window_tabs.NewTab(L"C:\\PulseTooltipDelayFixture");
+            s.pane = s.window_tabs.Active()->panes.front().get();
+            // The delay row lives in the advanced group of the general page.
+            s.settingsExpanded |= 1u;
+            ActiveTab(s)->current_path =
+                app::MakeSettingsPath(app::SettingsController::PageName(0));
+            s.settings.SelectPage(0);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&s));
+            const D2D1_RECT_F page_rect = D2D1::RectF(0, 0,
+                static_cast<float>(s.compositor.Width()),
+                static_cast<float>(s.compositor.Height()));
+            // Scroll the row up to where a user can click it.
+            const float page_max_scroll = s.renderer.SettingsMaxScroll(
+                BuildVm(s, false), page_rect.right, page_rect.bottom);
+            float row_scroll = 0.0f;
+            for (float sc = 0.0f; sc <= page_max_scroll; sc += 20.0f) {
+                s.settings.SetScroll(sc, page_max_scroll);
+                D2D1_RECT_F candidate{};
+                if (s.renderer.TooltipDelayCustomCell(BuildVm(s, false), page_rect.right,
+                                                      page_rect.bottom, &candidate) &&
+                    candidate.top >= 160.0f && candidate.bottom <= page_rect.bottom - 160.0f) {
+                    row_scroll = sc;
+                    break;
+                }
+            }
+            s.settings.SetScroll(row_scroll, page_max_scroll);
+            const ui::WindowViewModel vm_now = BuildVm(s, false);
+            D2D1_RECT_F custom{};
+            const bool have_row = vm_now.settings_open &&
+                s.renderer.TooltipDelayCustomCell(vm_now, page_rect.right, page_rect.bottom, &custom);
+            Check(have_row, L"tooltip delay: the delay row is on screen in a real window");
+            if (have_row) {
+                const float cell_w = custom.right - custom.left;
+                const float row_y = (custom.top + custom.bottom) * 0.5f;
+                const int custom_x = static_cast<int>((custom.left + custom.right) * 0.5f);
+                const int short_x = static_cast<int>(custom.left - 2.5f * cell_w);
+                const auto hit_custom = s.renderer.HitTest(
+                    vm_now, page_rect, static_cast<float>(custom_x), row_y);
+                const auto hit_preset = s.renderer.HitTest(
+                    vm_now, page_rect, static_cast<float>(short_x), row_y);
+                Check(hit_custom.region == ui::HitTestResult::SettingsTooltipDelay &&
+                      hit_custom.index == 3 &&
+                      hit_preset.region == ui::HitTestResult::SettingsTooltipDelay &&
+                      hit_preset.index == 0,
+                      L"tooltip delay: the custom cell and the presets keep separate hit targets");
+                s.appPrefs.tooltip_delay_ms = 1000;
+                const LPARAM custom_point = MAKELPARAM(custom_x, static_cast<int>(row_y));
+                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, custom_point);
+                SendMessageW(hwnd, WM_LBUTTONUP, 0, custom_point);
+                // The host window is never shown, so the editor's own WS_VISIBLE is what says
+                // whether the row handed its cell to the editor or hid it again.
+                const bool editor_shown = s.hwndTooltipDelayEdit &&
+                    (GetWindowLongPtrW(s.hwndTooltipDelayEdit, GWL_STYLE) & WS_VISIBLE) != 0;
+                Check(s.tooltipDelayEditing && s.hwndTooltipDelayEdit,
+                      L"tooltip delay: the custom cell opens the inline editor");
+                Check(editor_shown, L"tooltip delay: the inline editor is shown on the row");
+                const LPARAM preset_point = MAKELPARAM(short_x, static_cast<int>(row_y));
+                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, preset_point);
+                SendMessageW(hwnd, WM_LBUTTONUP, 0, preset_point);
+                Check(!s.tooltipDelayEditing && s.appPrefs.tooltip_delay_ms == 150,
+                      L"tooltip delay: a preset click on the row closes the editor and applies");
+                Check(s.hwndTooltipDelayEdit &&
+                      (GetWindowLongPtrW(s.hwndTooltipDelayEdit, GWL_STYLE) & WS_VISIBLE) == 0,
+                      L"tooltip delay: the editor is hidden once a preset takes over");
+            }
+            if (s.hwndTooltipDelayEdit) DestroyWindow(s.hwndTooltipDelayEdit);
+            s.hwndTooltipDelayEdit = nullptr;
+            s.renderer.SetCompositor(nullptr);
+            s.compositor.Shutdown();
+        } else Check(false, L"tooltip delay: settings graphics initialized");
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        DestroyWindow(hwnd);
+        s.hwnd = nullptr;
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    }
+    s.settings.ResetUi();
 }
 
 void TestPlacesAndIndex() {
@@ -5021,12 +5555,20 @@ void TestViewLayouts() {
     Check(list.MaxScrollX() > 0 && list.MaxScrollY() == 0,
           L"view: list is column-major with horizontal scrolling");
     auto menu = BuildViewMenu(ui::ViewMode::Details);
-    Check(menu.size() == 9 && menu[5].radio && !menu[0].radio &&
-          menu[8].command == CmdDetailsPanel,
-          L"view: menu has eight view choices plus details panel");
+    Check(menu.size() == 11 && menu[5].radio && !menu[0].radio &&
+          menu[8].command == CmdDetailsPanel &&
+          menu[9].command == CmdToggleHiddenItems &&
+          menu[10].command == CmdToggleProtectedItems,
+          L"view: menu has eight view choices plus panel and visibility switches");
     Check(menu[0].glyph_scale > menu[1].glyph_scale &&
           menu[1].glyph_scale > menu[2].glyph_scale,
           L"view: icon menu communicates extra-large, large, and medium scale");
+    auto hidden_menu = BuildViewMenu(ui::ViewMode::Details, false, true, false);
+    Check(hidden_menu[9].checked && !hidden_menu[10].checked && hidden_menu[10].enabled,
+          L"view: the hidden switch reflects the preference and frees the protected one");
+    auto quiet_menu = BuildViewMenu(ui::ViewMode::Details, false, false, false);
+    Check(!quiet_menu[9].checked && !quiet_menu[10].enabled,
+          L"view: protected files stay unreachable until hidden items show");
 
     ui::MainRenderer columns;
     columns.SetScale(1.0f);
@@ -6047,6 +6589,125 @@ void TestTabGroupCollapse() {
     }
     Check(history_ok && faint_rows == 1,
         L"tab-groups: only the remembered member carries the faint mark");
+
+    // "New tab to the right" inside a group keeps the run in one piece: the tab joins the
+    // group of the tab it was opened from instead of cutting that group in two.
+    {
+        WindowTabs right;
+        right.EnsureDefault();
+        right.NewTab(L"C:\\second");
+        right.NewTab(L"C:\\third");
+        TabGroup inside;
+        inside.id = 3;
+        inside.name = L"inside";
+        right.tab_groups.push_back(inside);
+        for (auto& item : right.items) item->tab_group = 3;
+        const size_t before = right.items.size();
+        controller.OpenTabBeside(right, 1, false);
+        const LayoutTab* born = right.Active();
+        bool run_ok = right.items.size() == before + 1 && born && born->tab_group == 3 &&
+                      right.items[1]->tab_group == 3 && right.items[2]->tab_group == 3 &&
+                      right.items[3]->tab_group == 3;
+        Check(run_ok, L"tab-groups: a tab opened to the right joins the group");
+    }
+    {
+        WindowTabs singly;
+        singly.EnsureDefault();
+        TabGroup inner;
+        inner.id = 4;
+        inner.name = L"inner";
+        inner.collapsed = true;
+        singly.tab_groups.push_back(inner);
+        singly.items[0]->tab_group = 4;
+        controller.OpenTabBeside(singly, 0, false);
+        Check(!singly.tab_groups[0].collapsed && singly.Active() &&
+              singly.Active()->tab_group == 4,
+              L"tab-groups: new-to-the-right unfolds a folded group");
+    }
+
+    // The chip slides for 150 ms after its group moves: hit testing and the hover card have
+    // to follow the drawn rect, while the drag math keeps reading the rest slot.
+    {
+        ui::MainRenderer chip_renderer;
+        chip_renderer.SetScale(1.0f);
+        ui::WindowViewModel chip_vm;
+        chip_vm.tabs.resize(2);
+        // TabView::group indexes tab_groups (FillWindowTabStrip resolves ids to slots).
+        chip_vm.tabs[0].group = 1;
+        chip_vm.tabs[1].group = 1;
+        chip_vm.tab_groups.resize(2);
+        chip_vm.tab_groups[1].id = 7;
+        D2D1_RECT_F rest{};
+        Check(chip_renderer.TabGroupChipRect(chip_vm, 1200.0f, 1, &rest),
+              L"tab-groups: a group chip has a rest rect");
+        chip_vm.tab_groups[1].x_offset = 24.0f;
+        D2D1_RECT_F sliding{};
+        D2D1_RECT_F still_rest{};
+        const bool have_sliding =
+            chip_renderer.TabGroupChipRectForHit(chip_vm, 1200.0f, 1, &sliding);
+        const bool have_rest = chip_renderer.TabGroupChipRect(chip_vm, 1200.0f, 1, &still_rest);
+        Check(have_sliding && have_rest &&
+              std::abs(sliding.left - rest.left - 24.0f) < 0.01f &&
+              std::abs(sliding.right - rest.right - 24.0f) < 0.01f &&
+              std::abs(still_rest.left - rest.left) < 0.01f,
+              L"tab-groups: the hit rect follows the slide and the rest rect stays put");
+    }
+}
+
+// PULSE_SELFTEST_CASE=file-hash: checksums (BCrypt) and the mark-of-the-web stream behind
+// Explorer's "Unblock" checkbox.
+void TestFileHashAndUnblock() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring path = std::wstring(temp) + L"PulseHashTest-" +
+                              std::to_wstring(GetCurrentProcessId()) + L".txt";
+    {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        const char* text = "hello world";
+        DWORD written = 0;
+        Check(file != INVALID_HANDLE_VALUE, L"hash: the fixture file is created");
+        if (file != INVALID_HANDLE_VALUE) {
+            WriteFile(file, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+            CloseHandle(file);
+        }
+    }
+    std::wstring hex, error;
+    Check(ComputeFileHash(path, HashAlgorithm::Sha256, hex, error) &&
+          hex == L"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+          L"hash: SHA-256 of a known file");
+    Check(ComputeFileHash(path, HashAlgorithm::Md5, hex, error) &&
+          hex == L"5eb63bbbe01eeed093cb22bb8f5acdc3",
+          L"hash: MD5 of a known file");
+    std::atomic<bool> cancel{true};
+    hex = L"stale";
+    Check(!ComputeFileHash(path, HashAlgorithm::Sha256, hex, error, &cancel) && hex.empty(),
+          L"hash: a cancelled run reports nothing");
+    hex.clear();
+    error.clear();
+    Check(!ComputeFileHash(path + L".missing", HashAlgorithm::Sha256, hex, error) &&
+          hex.empty() && !error.empty(),
+          L"hash: a missing file reports its error");
+
+    {
+        HANDLE stream = CreateFileW((path + L":Zone.Identifier").c_str(), GENERIC_WRITE, 0,
+                                    nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const char* zone = "[ZoneTransfer]\r\nZoneId=3\r\n";
+        DWORD written = 0;
+        if (stream != INVALID_HANDLE_VALUE) {
+            WriteFile(stream, zone, static_cast<DWORD>(strlen(zone)), &written, nullptr);
+            CloseHandle(stream);
+        }
+    }
+    Check(HasZoneIdentifier(path), L"hash: the mark-of-the-web stream is detected");
+    Check(RemoveZoneIdentifier(path, error) && !HasZoneIdentifier(path),
+          L"hash: unblock drops the stream");
+    Check(RemoveZoneIdentifier(path, error),
+          L"hash: unblocking an already clean file succeeds");
+    Check(ComputeFileHash(path, HashAlgorithm::Sha256, hex, error) &&
+          hex == L"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+          L"hash: the payload is untouched by unblocking");
+    DeleteFileW(path.c_str());
 }
 
 int RunSelfTest1B2() {
@@ -6200,11 +6861,39 @@ int RunSelfTest1B2() {
         if (g_log) { fclose(g_log); g_log = nullptr; }
         return g_fail ? 1 : 0;
     }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"places-recovery") == 0) {
+        TestPlacesStoreRecovery();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"folder-views") == 0) {
+        TestFolderViewMemory();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"tooltip-delay-editor") == 0) {
+        TestTooltipDelayEditor();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"file-hash") == 0) {
+        TestFileHashAndUnblock();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
 
     TestDetailsPreviewInteraction();
     TestBreadcrumb();
     TestThisPcEnumeration();
     TestShellNamespaceForward();
+    TestPlacesStoreRecovery();
+    TestFolderViewMemory();
+    TestTooltipDelayEditor();
+    TestFileHashAndUnblock();
     TestLoadingPresentation();
     TestNavigationReturnSelection();
     TestMouseHistoryNavigation();

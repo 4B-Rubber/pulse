@@ -796,6 +796,10 @@ void StartLoadingPath(AppState& s, app::Tab& tab, const std::wstring& path, Path
     tab.banner_message.clear();
     tab.net_readonly = false;
     tab.cache_unix = 0;
+    // The folder's own memory replaces the view the tab carried over from the last folder it
+    // showed; one with no memory keeps the carried view. Before the sort is handed to the
+    // worker, so the listing it returns is already in the remembered order.
+    app::ApplyFolderView(s, tab);
     if (tab.snapshot_path != normalized) {
         tab.SetSnapshot(nullptr);
         tab.applied_generation = 0;
@@ -1409,6 +1413,8 @@ void SetSort(AppState& s, ui::SortColumn col, ui::SortDirection direction) {
         // Apply the chosen order when the first result store arrives.
         tab->content_sort_override = true;
     } else RefreshActiveTab(s);
+    // The user chose this order for this folder: keep it, so the next visit starts here.
+    app::RememberFolderView(s, *tab);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 void OpenSelected(AppState& s) {

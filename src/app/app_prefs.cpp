@@ -77,7 +77,9 @@ constexpr const wchar_t* kStoredKeys[] = {
     L"verify_copies", L"show_status_performance", L"show_pinned_tab_names",
     L"show_hidden_files", L"show_protected_os_files", L"search_pinyin",
     L"global_search_enabled", L"global_search_modifiers", L"global_search_key",
-    L"blank_click_go_back", L"change_tracking_enabled", L"change_tracking_days",
+    L"blank_click_go_back", L"show_tooltips", L"tooltip_delay_ms", L"file_hash_enabled",
+    L"show_title_brand",
+    L"change_tracking_enabled", L"change_tracking_days",
     L"theme_mode", L"language", L"window_effect", L"background_image",
     L"row_height", L"sidebar_width", L"address_search_current",
     L"address_search_content", L"tray_icon_size", L"accent_rgb",
@@ -113,6 +115,10 @@ void AppPrefs::ResetToDefaults() {
     show_hidden_files = false;
     show_protected_os_files = false;
     blank_click_go_back = false;
+    show_tooltips = true;
+    tooltip_delay_ms = 150;
+    file_hash_enabled = true;
+    show_title_brand = true;
     change_tracking_enabled = false;
     change_tracking_days = 7;
     theme_mode = -1;
@@ -162,6 +168,13 @@ std::wstring AppPrefs::ToJson() const {
     out += L",\n  \"global_search_key\":" + std::to_wstring(global_search_key);
     out += L",\n  \"blank_click_go_back\":";
     out += blank_click_go_back ? L"true" : L"false";
+    out += L",\n  \"show_tooltips\":";
+    out += show_tooltips ? L"true" : L"false";
+    out += L",\n  \"tooltip_delay_ms\":" + std::to_wstring(tooltip_delay_ms);
+    out += L",\n  \"file_hash_enabled\":";
+    out += file_hash_enabled ? L"true" : L"false";
+    out += L",\n  \"show_title_brand\":";
+    out += show_title_brand ? L"true" : L"false";
     out += L",\n  \"change_tracking_enabled\":";
     out += change_tracking_enabled ? L"true" : L"false";
     out += L",\n  \"change_tracking_days\":";
@@ -232,6 +245,13 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     show_hidden_files = pulse::json::ExtractBool(json, L"show_hidden_files", false);
     show_protected_os_files = pulse::json::ExtractBool(json, L"show_protected_os_files", false);
     blank_click_go_back = pulse::json::ExtractBool(json, L"blank_click_go_back", false);
+    show_tooltips = pulse::json::ExtractBool(json, L"show_tooltips", true);
+    // Any value in range is valid: the settings page offers three presets plus a custom
+    // entry, and the stored number is what the hover timer uses.
+    tooltip_delay_ms =
+        (std::clamp)(pulse::json::ExtractInt(json, L"tooltip_delay_ms", 150), 50, 5000);
+    file_hash_enabled = pulse::json::ExtractBool(json, L"file_hash_enabled", true);
+    show_title_brand = pulse::json::ExtractBool(json, L"show_title_brand", true);
     change_tracking_enabled = pulse::json::ExtractBool(json, L"change_tracking_enabled", false);
     change_tracking_days = pulse::json::ExtractInt(json, L"change_tracking_days", 7);
     if (change_tracking_days != 1 && change_tracking_days != 3 && change_tracking_days != 7)
@@ -732,6 +752,14 @@ AppPrefsValues AppPrefs::MergedWithDisk(const AppPrefsValues& disk) const {
         merged.show_protected_os_files = disk.show_protected_os_files;
     if (mine.blank_click_go_back == baseline.blank_click_go_back)
         merged.blank_click_go_back = disk.blank_click_go_back;
+    if (mine.show_tooltips == baseline.show_tooltips)
+        merged.show_tooltips = disk.show_tooltips;
+    if (mine.tooltip_delay_ms == baseline.tooltip_delay_ms)
+        merged.tooltip_delay_ms = disk.tooltip_delay_ms;
+    if (mine.file_hash_enabled == baseline.file_hash_enabled)
+        merged.file_hash_enabled = disk.file_hash_enabled;
+    if (mine.show_title_brand == baseline.show_title_brand)
+        merged.show_title_brand = disk.show_title_brand;
     if (mine.change_tracking_enabled == baseline.change_tracking_enabled)
         merged.change_tracking_enabled = disk.change_tracking_enabled;
     if (mine.change_tracking_days == baseline.change_tracking_days)

@@ -1262,6 +1262,11 @@ struct SettingsLayout {
     D2D1_RECT_F hidden_files_row{};
     D2D1_RECT_F protected_files_row{};
     D2D1_RECT_F pinned_names_row{};
+    D2D1_RECT_F tooltip_row{};
+    D2D1_RECT_F tooltip_delay_row{}, tooltip_delay[4]{};
+    D2D1_RECT_F thumb_cache_row{}, thumb_cache_button{};
+    D2D1_RECT_F file_hash_row{};
+    D2D1_RECT_F title_brand_row{};
     D2D1_RECT_F blank_click_row{};
     D2D1_RECT_F change_tracking_row{}, change_days_row{}, change_days[3]{};
     D2D1_RECT_F search_pinyin_row{};
