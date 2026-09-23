@@ -33,6 +33,9 @@ struct AppPrefsValues {
     // The title bar mark: the app icon and name left of the tabs. Off starts the tab strip
     // at the window edge, which is what a user who wants a bare title bar is after.
     bool show_title_brand = true;
+    // Look for a signed update in the background. Off means no traffic to the release page and
+    // no install prompt - for anyone who would rather update by hand.
+    bool check_updates = true;
     bool change_tracking_enabled = false;
     int change_tracking_days = 7;
     // system / zh-CN / en-US

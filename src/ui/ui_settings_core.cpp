@@ -176,6 +176,7 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
             const I days[]={I::ChangeToday,I::ChangeLast3Days,I::ChangeLast7Days};const int day_values[]={1,3,7};
             draw_card(lay.change_days_row);segmented(lay.change_days_row,lay.change_days,days,day_values,vm.settings_change_days,H::SettingsChangeDays,I::SettingsChangeDays,I::SettingsChangeTrackingDesc);
             draw_card(lay.tooltip_row);toggle(lay.tooltip_row,I::SettingsTooltips,I::SettingsTooltipsDesc,L"\xE946",vm.settings_show_tooltips,17);
+            draw_card(lay.check_updates_row);toggle(lay.check_updates_row,I::SettingsAutoUpdate,I::SettingsAutoUpdateDesc,L"\xE895",vm.settings_check_updates,20);
             const I delays[]={I::TooltipDelayShort,I::TooltipDelayStandard,I::TooltipDelayLong,I::TooltipDelayCustom};
             // The custom entry owns value 0; when the stored delay is not one of the three
             // presets that segment is the checked one and the row spells the value out.

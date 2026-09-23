@@ -398,6 +398,11 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 19) {
         prefs_->show_title_brand = !prefs_->show_title_brand;
         SaveAndApply(SettingsEffect::None);
+    } else if (index == 20) {
+        prefs_->check_updates = !prefs_->check_updates;
+        // Nothing to apply here: the update tick reads the preference and stops the checker, a
+        // running download and the install prompt itself when it is off.
+        SaveAndApply(SettingsEffect::None);
     } else if (index == 6) {
         prefs_->show_pinned_tab_names = !prefs_->show_pinned_tab_names;
         SaveAndApply(SettingsEffect::None);

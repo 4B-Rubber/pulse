@@ -78,7 +78,7 @@ constexpr const wchar_t* kStoredKeys[] = {
     L"show_hidden_files", L"show_protected_os_files", L"search_pinyin",
     L"global_search_enabled", L"global_search_modifiers", L"global_search_key",
     L"blank_click_go_back", L"show_tooltips", L"tooltip_delay_ms", L"file_hash_enabled",
-    L"show_title_brand",
+    L"show_title_brand", L"check_updates",
     L"change_tracking_enabled", L"change_tracking_days",
     L"theme_mode", L"language", L"window_effect", L"background_image",
     L"row_height", L"sidebar_width", L"address_search_current",
@@ -119,6 +119,7 @@ void AppPrefs::ResetToDefaults() {
     tooltip_delay_ms = 150;
     file_hash_enabled = true;
     show_title_brand = true;
+    check_updates = true;
     change_tracking_enabled = false;
     change_tracking_days = 7;
     theme_mode = -1;
@@ -175,6 +176,8 @@ std::wstring AppPrefs::ToJson() const {
     out += file_hash_enabled ? L"true" : L"false";
     out += L",\n  \"show_title_brand\":";
     out += show_title_brand ? L"true" : L"false";
+    out += L",\n  \"check_updates\":";
+    out += check_updates ? L"true" : L"false";
     out += L",\n  \"change_tracking_enabled\":";
     out += change_tracking_enabled ? L"true" : L"false";
     out += L",\n  \"change_tracking_days\":";
@@ -246,6 +249,7 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     show_protected_os_files = pulse::json::ExtractBool(json, L"show_protected_os_files", false);
     blank_click_go_back = pulse::json::ExtractBool(json, L"blank_click_go_back", false);
     show_tooltips = pulse::json::ExtractBool(json, L"show_tooltips", true);
+    check_updates = pulse::json::ExtractBool(json, L"check_updates", true);
     // Any value in range is valid: the settings page offers three presets plus a custom
     // entry, and the stored number is what the hover timer uses.
     tooltip_delay_ms =
@@ -760,6 +764,8 @@ AppPrefsValues AppPrefs::MergedWithDisk(const AppPrefsValues& disk) const {
         merged.file_hash_enabled = disk.file_hash_enabled;
     if (mine.show_title_brand == baseline.show_title_brand)
         merged.show_title_brand = disk.show_title_brand;
+    if (mine.check_updates == baseline.check_updates)
+        merged.check_updates = disk.check_updates;
     if (mine.change_tracking_enabled == baseline.change_tracking_enabled)
         merged.change_tracking_enabled = disk.change_tracking_enabled;
     if (mine.change_tracking_days == baseline.change_tracking_days)

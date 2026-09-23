@@ -4,10 +4,12 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $version = (Get-Content version.txt -Raw).Trim()
 if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid release version' }
 $tag = "v$version"
-$repository = 'jimmgreen/pulse'
+$repository = '4B-Rubber/pulse'
 $base = "https://github.com/$repository/releases/download/$tag"
-$normal = "PulseSetup-$version.exe"
-$win81 = "PulseSetup-$version-win81.exe"
+# This repository publishes the -dev channel, so the installers carry the label while the version
+# (and the update manifest clients read) stays numeric.
+$normal = "PulseSetup-$version-dev.exe"
+$win81 = "PulseSetup-$version-dev-win81.exe"
 foreach ($file in @($normal, $win81)) {
     if (-not (Test-Path -LiteralPath "dist/$file")) { throw "Missing installer: $file" }
 }
@@ -27,7 +29,7 @@ $changesPath = "docs/releases/$version.md"
 $changes = if (Test-Path $changesPath) { Get-Content $changesPath -Raw } else { '修复问题并改进使用体验。' }
 $notesPath = 'dist/release-notes.md'
 @"
-# Pulse $version
+# Pulse $version (dev)
 
 ## 下载安装
 

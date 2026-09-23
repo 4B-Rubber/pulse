@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.25)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/version.txt" PULSE_VERSION LIMIT_COUNT 1)
 project(Pulse VERSION ${PULSE_VERSION} LANGUAGES C CXX)
 
+# What the UI and the installer call this build. A fork that ships its own builds passes a label
+# such as "1.0.34-dev" here; PROJECT_VERSION stays numeric, because the update checker parses the
+# numeric form and a suffix in it would make every check fail.
+set(PULSE_VERSION_LABEL "${PROJECT_VERSION}" CACHE STRING "Version label shown in the UI")
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -116,9 +121,9 @@ endif()
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
 configure_file(cmake/pulse_version.h.in generated/pulse_version.h @ONLY)
 
-set(PULSE_DEFAULT_UPDATE_MANIFEST "https://github.com/jimmgreen/pulse/releases/latest/download/update-manifest.json")
+set(PULSE_DEFAULT_UPDATE_MANIFEST "https://github.com/4B-Rubber/pulse/releases/latest/download/update-manifest.json")
 if(PULSE_WIN81_CANDIDATE)
-    set(PULSE_DEFAULT_UPDATE_MANIFEST "https://github.com/jimmgreen/pulse/releases/latest/download/update-manifest-win81.json")
+    set(PULSE_DEFAULT_UPDATE_MANIFEST "https://github.com/4B-Rubber/pulse/releases/latest/download/update-manifest-win81.json")
 endif()
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/update-public-key.txt" PULSE_DEFAULT_UPDATE_PUBLIC_KEY LIMIT_COUNT 1)
 set(PULSE_UPDATE_MANIFEST_URL "${PULSE_DEFAULT_UPDATE_MANIFEST}" CACHE STRING

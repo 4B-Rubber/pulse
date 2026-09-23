@@ -858,3 +858,6 @@
 #define IDS_TOOLTIP_DELAY_CUSTOM 2017
 #define IDS_SETTINGS_TITLE_BRAND 2018
 #define IDS_SETTINGS_TITLE_BRAND_DESC 2019
+// Settings: the background update check (and its install prompt) can be turned off.
+#define IDS_SETTINGS_AUTO_UPDATE 2020
+#define IDS_SETTINGS_AUTO_UPDATE_DESC 2021

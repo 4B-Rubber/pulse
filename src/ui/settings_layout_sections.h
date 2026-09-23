@@ -51,6 +51,7 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
         y+=8*scale; l.pinned_names_row=row(64);
         y+=8*scale; l.tooltip_row=row(64);
         l.tooltip_delay_row=row(narrow ? 98.0f : 64.0f); segments(l.tooltip_delay_row,l.tooltip_delay,4,282);
+        y+=8*scale; l.check_updates_row=row(96.0f);
         y+=8*scale; l.thumb_cache_row=row(64);
         {
             const float cache_bw=painter ? painter->MeasureButtonWidth(l10n::Get(l10n::StringId::Clear)) : 80*scale;

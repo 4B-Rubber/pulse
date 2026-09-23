@@ -826,6 +826,8 @@ enum class StringId : UINT {
     TabGroupEdit = IDS_TAB_GROUP_EDIT,
     SettingsTooltips = IDS_SETTINGS_TOOLTIPS,
     SettingsTooltipsDesc = IDS_SETTINGS_TOOLTIPS_DESC,
+    SettingsAutoUpdate = IDS_SETTINGS_AUTO_UPDATE,
+    SettingsAutoUpdateDesc = IDS_SETTINGS_AUTO_UPDATE_DESC,
     SettingsTooltipDelay = IDS_SETTINGS_TOOLTIP_DELAY,
     SettingsTooltipDelayDesc = IDS_SETTINGS_TOOLTIP_DELAY_DESC,
     TooltipDelayShort = IDS_TOOLTIP_DELAY_SHORT,

@@ -710,6 +710,7 @@ float MainRenderer::SettingsDestinationOffset(const WindowViewModel& vm, int set
     case I::PinnedNames: target=l.pinned_names_row;break;
     case I::SettingsTooltips: target=l.tooltip_row;break;
     case I::SettingsTooltipDelay: target=l.tooltip_delay_row;break;
+    case I::SettingsAutoUpdate: target=l.check_updates_row;break;
     case I::SettingsThumbCache: target=l.thumb_cache_row;break;
     case I::SettingsFileHash: target=l.file_hash_row;break;
     case I::SettingsBlankClickBack: target=l.blank_click_row;break;

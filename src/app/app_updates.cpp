@@ -15,6 +15,7 @@ void ShowInstallError(AppState& state) {
 }
 
 void CheckForUpdates(AppState& state) {
+    if (!state.appPrefs.check_updates) return;
     if (state.update_installer.downloading() || state.update_installer.installing()) return;
     if (state.update_checker.CheckAsync(state.hwnd, WM_UPDATE_RESULT)) {
         state.update_result_ready = false;
@@ -39,6 +40,15 @@ void TickUpdates(AppState& state, unsigned long long now) {
         state.next_update_progress_paint = now + 100;
         InvalidateRect(state.hwnd, nullptr, FALSE);
     }
+    // The setting has the last word: a user who turned the check off must not be left with a
+    // download still running or an install prompt that can still be clicked.
+    if (!state.appPrefs.check_updates) {
+        state.update_checker.Stop();
+        if (state.update_installer.downloading() || state.update_installer.installing())
+            state.update_installer.Stop();
+        state.notified_update_version.clear();
+        return;
+    }
     if (state.shot.active || !app::UpdateChecker::Enabled() || now < state.next_update_check) return;
     if (state.update_installer.downloading() || state.update_installer.installing() || state.update_checker.checking()) return;
     state.next_update_check = now + kCheckInterval;
@@ -46,6 +56,7 @@ void TickUpdates(AppState& state, unsigned long long now) {
 }
 
 void InstallUpdate(AppState& state) {
+    if (!state.appPrefs.check_updates) return;
     if (state.update_installer.installing()) return;
     if (state.update_installer.downloading()) {
         state.update_installer.Stop();
@@ -63,7 +74,8 @@ void CompleteUpdateCheck(AppState& state) {
     if (!state.update_checker.TakeResult(result)) return;
     state.update_result = std::move(result);
     state.update_result_ready = true;
-    if (state.update_result.update_available && state.notified_update_version != state.update_result.version) {
+    if (state.update_result.update_available && state.appPrefs.check_updates &&
+        state.notified_update_version != state.update_result.version) {
         state.notified_update_version = state.update_result.version;
         wchar_t title[160]{};
         swprintf_s(title, l10n::Get(l10n::StringId::UpdateAvailableFormat).c_str(),
@@ -77,6 +89,8 @@ void CompleteUpdateCheck(AppState& state) {
 void CompleteUpdateDownload(AppState& state) {
     DWORD error = ERROR_SUCCESS;
     if (!state.update_installer.TakeResult(error)) return;
+    // A download that finished after the user turned the check off is not installed.
+    if (!error && !state.appPrefs.check_updates) error = ERROR_CANCELLED;
     if (!error && (state.ops.Status().active || state.settings.migration_pending())) error = ERROR_BUSY;
     if (!error) {
         // Paint the verified/starting stage before ShellExecute can enter an elevation prompt.

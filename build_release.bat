@@ -15,7 +15,10 @@ if /i "%~1"=="/clean" (
 )
 set "PULSE_DEPS="
 set /p PULSE_UPDATE_KEY=<"%~dp0cmake\update-public-key.txt"
-set PULSE_UPDATE_CONFIG=-DPULSE_WITH_SELFTEST=OFF -DPULSE_UPDATE_MANIFEST_URL="https://github.com/jimmgreen/pulse/releases/latest/download/update-manifest.json" -DPULSE_UPDATE_PUBLIC_KEY_HEX=%PULSE_UPDATE_KEY%
+set /p PULSE_VERSION=<"%~dp0version.txt"
+rem Builds from this repository are the -dev channel: the label is what the UI shows, while the
+rem numeric version stays in version.txt for the update manifest.
+set PULSE_UPDATE_CONFIG=-DPULSE_WITH_SELFTEST=OFF -DPULSE_UPDATE_MANIFEST_URL="https://github.com/4B-Rubber/pulse/releases/latest/download/update-manifest.json" -DPULSE_UPDATE_PUBLIC_KEY_HEX=%PULSE_UPDATE_KEY% -DPULSE_VERSION_LABEL=%PULSE_VERSION%-dev
 if exist "%LUMATEXT_SOURCE_DIR%\build-vs18\_deps\harfbuzz-src\src\harfbuzz.cc" set PULSE_DEPS=-DFETCHCONTENT_SOURCE_DIR_HARFBUZZ="%LUMATEXT_SOURCE_DIR%\build-vs18\_deps\harfbuzz-src" -DFETCHCONTENT_SOURCE_DIR_FREETYPE="%LUMATEXT_SOURCE_DIR%\build-vs18\_deps\freetype-src"
 if defined LUMATEXT_SOURCE_DIR (
     cmake %PULSE_CMAKE_FRESH% -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLUMATEXT_SOURCE_DIR="%LUMATEXT_SOURCE_DIR%" -DPULSE_WITH_LUMATEXT=ON %PULSE_DEPS% %PULSE_UPDATE_CONFIG%

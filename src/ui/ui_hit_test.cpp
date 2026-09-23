@@ -303,6 +303,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 if (ContainsPt(lay.tooltip_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 17; return r;
                 }
+                if (ContainsPt(lay.check_updates_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 20; return r;
+                }
                 if (ContainsPt(lay.title_brand_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 19; return r;
                 }

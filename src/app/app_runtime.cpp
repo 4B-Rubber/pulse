@@ -516,14 +516,14 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
                 : s.appPrefs.language == L"en-US" ? 2 : 0;
             wchar_t version_text[128]{};
             swprintf_s(version_text,
-                l10n::Get(l10n::StringId::VersionFormat).c_str(), PULSE_VERSION_STRING);
+                l10n::Get(l10n::StringId::VersionFormat).c_str(), PULSE_VERSION_LABEL);
             vm.settings_version = version_text;
             wchar_t build_text[256]{};
             swprintf_s(build_text,
                 l10n::Get(l10n::StringId::BuildIdFormat).c_str(), PULSE_BUILD_ID);
             vm.settings_build_id = build_text;
-            vm.settings_update_enabled = app::UpdateChecker::Enabled() ||
-                s.shot.update_available;
+            vm.settings_update_enabled = (app::UpdateChecker::Enabled() &&
+                s.appPrefs.check_updates) || s.shot.update_available;
             vm.settings_update_checking = s.update_checker.checking();
             vm.settings_update_downloading = s.update_installer.downloading();
             vm.settings_update_installing = s.update_installer.installing();

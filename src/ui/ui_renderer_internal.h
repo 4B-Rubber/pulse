@@ -1264,6 +1264,7 @@ struct SettingsLayout {
     D2D1_RECT_F pinned_names_row{};
     D2D1_RECT_F tooltip_row{};
     D2D1_RECT_F tooltip_delay_row{}, tooltip_delay[4]{};
+    D2D1_RECT_F check_updates_row{};
     D2D1_RECT_F thumb_cache_row{}, thumb_cache_button{};
     D2D1_RECT_F file_hash_row{};
     D2D1_RECT_F title_brand_row{};

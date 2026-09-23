@@ -2786,15 +2786,18 @@ void TestPrefsPersistence() {
     // What the settings page writes comes back after a reload.
     {
         AppPrefs prefs;
+        Check(prefs.check_updates, L"prefs-persist: the update check starts on");
         prefs.keep_running_on_close = true;
         prefs.show_hidden_files = true;
         prefs.global_search_enabled = true;
+        prefs.check_updates = false;
         prefs.row_height = 40;
         prefs.language = L"en-US";
         Check(prefs.Save(), L"prefs-persist: save writes app.json");
         AppPrefs loaded;
         Check(loaded.Load() && loaded.loaded_from_file() && loaded.keep_running_on_close &&
               loaded.show_hidden_files && loaded.global_search_enabled &&
+              !loaded.check_updates &&
               loaded.row_height == 40 && loaded.language == L"en-US",
               L"prefs-persist: settings survive a reload");
     }

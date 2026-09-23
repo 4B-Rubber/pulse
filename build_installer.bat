@@ -8,6 +8,9 @@ if not defined PULSE_VERSION (
     echo Missing version in version.txt
     exit /b 1
 )
+rem This repository is the -dev channel: the installer and the version shown on the About card carry
+rem the suffix, while version.txt (and the update manifest) stay numeric.
+set "PULSE_VERSION_LABEL=%PULSE_VERSION%-dev"
 
 if /i "%~1"=="/skipbuild" goto after_release_build
 call "%~dp0build_release.bat" || exit /b 1
@@ -34,6 +37,6 @@ if not defined ISCC (
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\stage_installer_runtime.ps1" -BuildDir "%~dp0build" || exit /b 1
 
-"%ISCC%" /DAppVersion=%PULSE_VERSION% /DAppLocalRuntime installer\PulseSetup.iss || exit /b 1
+"%ISCC%" /DAppVersion=%PULSE_VERSION_LABEL% /DAppLocalRuntime installer\PulseSetup.iss || exit /b 1
 echo.
 echo Installer written to dist\

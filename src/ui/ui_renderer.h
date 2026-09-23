@@ -537,6 +537,7 @@ struct WindowViewModel {
     bool settings_show_hidden_files = false;
     bool settings_show_protected_os_files = false;
     bool settings_show_tooltips = true;
+    bool settings_check_updates = true;
     bool settings_file_hash_enabled = true;
     int settings_tooltip_delay = 150; // ms (150 / 400 / 800)
     std::wstring settings_thumb_cache_text; // e.g. "12.3 MB"

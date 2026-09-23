@@ -4,7 +4,7 @@
 
 多标签与多窗格、快速索引搜索、文件预览和可自定义外观，放在同一个工作空间里。
 
-[下载最新版](https://github.com/jimmgreen/pulse/releases/latest) · [查看更新记录](https://github.com/jimmgreen/pulse/releases) · [反馈问题](https://github.com/jimmgreen/pulse/issues)
+[下载最新版](https://github.com/4B-Rubber/pulse/releases/latest) · [查看更新记录](https://github.com/4B-Rubber/pulse/releases) · [反馈问题](https://github.com/4B-Rubber/pulse/issues)
 
 ## 下载与安装
 
@@ -12,8 +12,10 @@
 
 | 版本 | 适用系统 | 安装包 |
 | --- | --- | --- |
-| Windows 版（64位） | Windows 10 / Windows 11 | `PulseSetup-版本.exe` |
-| Windows 8.1 兼容版（64位） | Windows 8.1 | `PulseSetup-版本-win81.exe` |
+| Windows 版（64位） | Windows 10 / Windows 11 | `PulseSetup-版本-dev.exe` |
+| Windows 8.1 兼容版（64位） | Windows 8.1 | `PulseSetup-版本-dev-win81.exe` |
+
+本仓库发布的是 **dev 频道**：安装包名与界面显示的版本都带 `-dev` 后缀，更新源也指向本仓库。dev 包与稳定版共用同一套安装身份，安装它会覆盖稳定版并沿用现有设置。
 
 运行安装包，按向导完成安装。安装时可以启用 PulseIndex 服务，用于全盘索引搜索。
 
@@ -37,7 +39,7 @@
 
 ## 自动更新
 
-Pulse 会在启动后自动检查新版。有更新时，窗口内会出现提示；点击提示即可下载安装包，校验通过后打开安装向导。也可以在「设置 → 关于与诊断」中手动检查更新。
+Pulse 会在启动后自动检查新版。有更新时，窗口内会出现提示；点击提示即可下载安装包，校验通过后打开安装向导。也可以在「设置 → 关于与诊断」中手动检查更新。不想让它在后台联网检查，可在「设置 → 通用 → 自动检查更新」里关掉：关闭后不检查、不提示，正在进行的下载也会停止。本仓库的更新来自本仓库的发布页，用本仓库自己的签名密钥签发。
 
 下载可以取消，安装时按 Windows 提示确认管理员权限。普通版和 Windows 8.1 兼容版分别获取适用的更新。
 
@@ -67,4 +69,4 @@ pwsh ./scripts/build_release_ci.ps1 -Channel win81 -BuildDir build-ci-win81
 
 技术栈为 C++20、Win32、Direct2D 和 DirectComposition。文件系统、索引、预览与 Shell 任务分别放在对应模块，避免阻塞界面。
 
-更多说明：[自动更新与发布](docs/automatic-updates.md) · [Windows 兼容性](docs/windows-compatibility.md) · [索引存储与迁移](docs/index-migration.md)
+更多说明：[dev 频道](docs/dev-channel.md) · [自动更新与发布](docs/automatic-updates.md) · [Windows 兼容性](docs/windows-compatibility.md) · [索引存储与迁移](docs/index-migration.md)
