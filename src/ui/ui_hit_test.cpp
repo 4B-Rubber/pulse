@@ -226,8 +226,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             }
         }
         if (ContainsPt(lay.content, x, y)) {
-            for(int i=0;i<2;++i) if(ContainsPt(lay.disclosure[i],x,y)) {
-                r.region=HitTestResult::SettingsDisclosure;r.index=i;return r;
+            // Only the search page has a disclosure now; the general page lays every row out.
+            if(ContainsPt(lay.disclosure[1],x,y)) {
+                r.region=HitTestResult::SettingsDisclosure;r.index=1;return r;
             }
             for(int i=0;i<3;++i) if(ContainsPt(lay.theme_tile[i],x,y)) {
                 const int values[]={1,2,0};r.region=HitTestResult::SettingsTheme;r.index=values[i];return r;
@@ -263,20 +264,8 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                         return r;
                     }
                 }
-                for (int i = 0; i < 3; ++i) {
-                    if (ContainsPt(lay.language_segment[i], x, y)) {
-                        r.region = HitTestResult::SettingsLanguage;
-                        r.index = i;
-                        return r;
-                    }
-                }
-                for (int i = 0; i < kWindowEffectCount; ++i) {
-                    if (ContainsPt(lay.effect_row[i], x, y)) {
-                        r.region = HitTestResult::SettingsEffect;
-                        r.index = i;
-                        return r;
-                    }
-                }
+                // The language and the window effect are dropdowns (handled above); the segment
+                // loops that used to live here never had a laid-out rect to match.
                 if (ContainsPt(lay.wallpaper_choose, x, y)) {
                     r.region = HitTestResult::SettingsWallpaper;
                     r.index = 0;
@@ -302,9 +291,6 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 }
                 if (ContainsPt(lay.tooltip_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 17; return r;
-                }
-                if (ContainsPt(lay.check_updates_row, x, y)) {
-                    r.region = HitTestResult::SettingsToggle; r.index = 20; return r;
                 }
                 if (ContainsPt(lay.title_brand_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 19; return r;
@@ -346,9 +332,8 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 if (ContainsPt(lay.search_pinyin_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 9; return r;
                 }
-                if (ContainsPt(lay.content_index_row, x, y)) {
-                    r.region = HitTestResult::SettingsContentIndex; return r;
-                }
+                // No content_index_row target: that rect is never laid out, so the branch only
+                // pretended the row could be clicked (it cannot).
                 for (int i = 0; i < 3; ++i) {
                     if (ContainsPt(lay.index_action[i], x, y)) {
                         r.region = HitTestResult::SettingsIndexAction;
@@ -399,9 +384,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 }
                 if(ContainsPt(lay.context_restore,x,y)) {r.region=HitTestResult::SettingsRestore;return r;}
             } else if (vm.settings_page == 3) {
-                if (ContainsPt(lay.diagnostics_perf, x, y)) {
+                if (ContainsPt(lay.check_updates_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle;
-                    r.index = 4;
+                    r.index = 20;
                     return r;
                 }
                 for (int i = 0; i < 3; ++i) {

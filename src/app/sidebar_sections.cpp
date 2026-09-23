@@ -27,27 +27,19 @@ constexpr int kHideSection = 32302;
 
 constexpr int kSectionCount = app::kSidebarSectionCount;
 
-// Titles are listed in SidebarSectionId order; the cloud section shows the
-// product name, exactly as its sidebar row does.
-constexpr I kSectionTitles[] = {
-    I::SidebarWorkspaces,
-    I::SidebarQuickAccess,
-    I::SidebarSavedSearches,
-    I::SidebarDrives,
-    I::SidebarTags,
-    I::SidebarNetworkLocations,
-};
-// Cloud and Starred are named individually in SectionTitle().
-static_assert(std::size(kSectionTitles) ==
-                  static_cast<size_t>(app::SidebarSectionId::Cloud),
-              "kSectionTitles must cover every header section in id order");
-
+// Titles by section id. This is the one place that decides what the section menu can list; a
+// switch (rather than a table indexed by id) keeps it honest when the id space changes.
 std::wstring SectionTitle(int section) {
-    if (section == static_cast<int>(app::SidebarSectionId::Cloud)) return L"OneDrive";
-    if (section == static_cast<int>(app::SidebarSectionId::Starred))
-        return l10n::Get(I::StarredItems);
-    if (section < 0 || section >= static_cast<int>(std::size(kSectionTitles))) return {};
-    return l10n::Get(kSectionTitles[section]);
+    switch (static_cast<app::SidebarSectionId>(section)) {
+    case app::SidebarSectionId::Cloud: return L"OneDrive";
+    case app::SidebarSectionId::Starred: return l10n::Get(I::StarredItems);
+    case app::SidebarSectionId::Workspaces: return l10n::Get(I::SidebarWorkspaces);
+    case app::SidebarSectionId::QuickAccess: return l10n::Get(I::SidebarQuickAccess);
+    case app::SidebarSectionId::Drives: return l10n::Get(I::SidebarDrives);
+    case app::SidebarSectionId::Tags: return l10n::Get(I::SidebarTags);
+    case app::SidebarSectionId::Networks: return l10n::Get(I::SidebarNetworkLocations);
+    default: return {};
+    }
 }
 
 bool IsQuickAccessSection(int section) {
@@ -81,13 +73,14 @@ void ShowSidebarSectionsMenu(AppState& s, POINT screen_pt) {
         ui::FluentMenuItem item;
         item.command = kToggleBase + i;
         item.text = SectionTitle(i);
+        if (item.text.empty()) continue; // no title, no row
         item.checked = ((hidden >> i) & 1u) == 0;
         // TrackPopup only paints a checked row when the check arrives as a glyph,
         // which is what TrackDropdown does for its own checked entries.
         if (item.checked) item.glyph = kIconCheck;
         items.push_back(std::move(item));
     }
-    items.back().separator_after = true;
+    if (!items.empty()) items.back().separator_after = true;
     ui::FluentMenuItem expand;
     expand.command = kExpandAll;
     expand.text = l10n::Get(I::SidebarExpandAll);

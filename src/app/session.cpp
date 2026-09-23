@@ -21,7 +21,33 @@ namespace {
 // migrates (or discards) values written by older versions.
 //   6 -> 7: BuiltinQuickAccess lost its reserved "starred" bit, so the stored
 //           quick-access mask is dropped for files written before 7.
-constexpr int kSessionVersion = 7;
+//   7 -> 8: the sidebar's saved-search section is gone, so every section id above it moved
+//           down one; an older order and its collapse/hide masks are remapped on load.
+constexpr int kSessionVersion = 8;
+
+// The section id space changed in version 8; anything older is remapped once, on load.
+constexpr int kSectionIdVersion = 8;
+
+// That older space had eight ids, with the saved-search section at 2 pushing every later
+// section up by one. Both numbers are history: they must not follow today's enum.
+constexpr int kSidebarSectionCountV7 = 8;
+constexpr int kSavedSearchSectionV7 = 2;
+
+// -1 for the section version 8 removed; every later id moves down one.
+int SidebarIdFromV7(int old_id) {
+    if (old_id == kSavedSearchSectionV7) return -1;
+    return old_id < kSavedSearchSectionV7 ? old_id : old_id - 1;
+}
+
+int SidebarMaskFromV7(int mask) {
+    int out = 0;
+    for (int id = 0; id < kSidebarSectionCountV7; ++id) {
+        if (((mask >> id) & 1) == 0) continue;
+        const int mapped = SidebarIdFromV7(id);
+        if (mapped >= 0) out |= 1 << mapped;
+    }
+    return out;
+}
 
 // Column edges ("cols" / "searchCols") are the per-ten-thousand integers FormatScaled3/4 and
 // ParseScaled3/4 from ../common/scaled_edges.h handle, shared with the per-folder view store.
@@ -308,13 +334,24 @@ bool LoadSession(SessionSnapshot& snap) {
     snap.maximized = pulse::json::ExtractBool(json, L"maximized");
     snap.dark = pulse::json::ExtractBool(json, L"dark");
     snap.active_path = pulse::json::ExtractString(json, L"path");
+    const int session_version = pulse::json::ExtractInt(json, L"version");
     snap.sidebar_collapsed = pulse::json::ExtractInt(json, L"sidebarCollapsed");
     snap.sidebar_hidden = pulse::json::ExtractInt(json, L"sidebarHidden");
+    // A session from before version 8 indexed these masks against the old id space, which
+    // carried the saved-search section at 2; move them onto today's ids.
+    if (session_version < kSectionIdVersion) {
+        snap.sidebar_collapsed = SidebarMaskFromV7(snap.sidebar_collapsed);
+        snap.sidebar_hidden = SidebarMaskFromV7(snap.sidebar_hidden);
+    }
     // Section order travels as "0,1,2,6,3,4,5"; anything malformed falls back to
     // the default order (NormalizeSidebarOrder rebuilds a full permutation).
     snap.sidebar_order.clear();
     {
         const std::wstring order_text = pulse::json::ExtractString(json, L"sidebarOrder");
+        // Before version 8 the list was written in the old id space (a saved-search section at
+        // 2 pushed everything after it up); map it into today's ids before it is used.
+        const bool legacy_ids = session_version < kSectionIdVersion;
+        const int id_count = legacy_ids ? kSidebarSectionCountV7 : kSidebarSectionCount;
         size_t start = 0;
         while (start < order_text.size()) {
             size_t end = order_text.find(L',', start);
@@ -326,7 +363,10 @@ bool LoadSession(SessionSnapshot& snap) {
                 if (c < L'0' || c > L'9') { digits = false; break; }
                 value = value * 10 + static_cast<int>(c - L'0');
             }
-            if (digits && value < kSidebarSectionCount) snap.sidebar_order.push_back(value);
+            if (digits && value < id_count) {
+                const int mapped = legacy_ids ? SidebarIdFromV7(value) : value;
+                if (mapped >= 0) snap.sidebar_order.push_back(mapped);
+            }
             start = end + 1;
         }
         // Sessions written before the starred section existed lack its id; put it
@@ -343,9 +383,10 @@ bool LoadSession(SessionSnapshot& snap) {
         }
         snap.sidebar_order = NormalizeSidebarOrder(snap.sidebar_order);
     }
-    // Bit positions changed in version 7 (the reserved starred bit is gone), so
-    // anything older restarts with every built-in link visible.
-    snap.quick_access_hidden = pulse::json::ExtractInt(json, L"version") >= kSessionVersion
+    // Bit positions changed in version 7 (the reserved starred bit is gone), so anything older
+    // restarts with every built-in link visible. The section remap in 8 leaves this mask alone,
+    // which is why the threshold stays at 7 instead of following kSessionVersion.
+    snap.quick_access_hidden = session_version >= 7
         ? pulse::json::ExtractInt(json, L"quickAccessHidden") : 0;
     snap.starred_expanded = json.find(L"\"starredExpanded\"") == std::wstring::npos
         ? true : pulse::json::ExtractBool(json, L"starredExpanded");

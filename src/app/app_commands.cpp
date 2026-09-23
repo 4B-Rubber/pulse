@@ -1129,7 +1129,6 @@ void ShowSplitDropdown(AppState& s) {
 // ---------------------------------------------------------------------------
 void RefreshSidebarModel(AppState& s) {
     s.sidebar = app::BuildSidebarModel(&s.recycle_info);
-    SyncSavedSearchSidebar(s);
 }
 
 app::SidebarEntry* QuickAccessEntryForPath(AppState& s,

@@ -51,7 +51,7 @@
 - `context_menu.json`：右键菜单开关也是设置文件，**四条保证整套适用**（读改写合并、备份 `context_menu.json.bak`、读不到就改名为 `context_menu.json.bad` 再写、以及同一套**截断完整性闸门**——已知 6 个键里出现不到 3 个即判损坏、改读备份）。
 - **未覆盖，按风险排序**（都是"整份覆盖 + 读失败当默认"的老模式，值得下一批处理）：
   1. `places.json`（快速访问/星标/最近）与 `tags.json`（自定义标签色）——**风险最高**：用户数据、多窗口常驻，任一窗口一次保存就会回滚别人；`tags.json` 在文件不可读时会被默认颜色表覆盖。
-  2. `saved_searches.json`：整份覆盖，而且**不经过 `GetPulseDataDir()`**（自己拼 `%LOCALAPPDATA%\Pulse`，所以测试的数据目录重定向管不到它）。
+  2. `saved_searches.json`：整份覆盖。它已经走 `GetPulseDataDir()`（测试的数据目录重定向能管到它），但读写仍是"整份覆盖 + 读失败当默认"的老模式。
   3. `session.json`：读失败回默认、退出时整份写；只有主窗口写一次，被强杀会丢但不会被别的窗口覆盖。
   4. `search_history.json`：每个窗口都用同一个路径、各自整份写 → **最后写者胜**（历史可再生，多窗口会互相清掉条目）。
   5. `index-config.json`：机器级（`%ProgramData%`，管理员写），`index_host.cpp` 的安装路径在 `LoadMachineConfig` 失败后按默认回写，可能抹掉排除卷/排除路径。

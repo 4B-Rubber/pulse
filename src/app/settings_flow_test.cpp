@@ -204,7 +204,11 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
     prefs.FromJson(L"{\"theme_mode\":99}");check(prefs.theme_mode==-1,"invalid theme preference has legacy fallback");
     for(const auto* language:{L"zh-CN",L"en-US"}) {
         l10n::SetLanguage(language);bool complete=true;
-        for(int id=1900;id<=1929;++id) complete &= !l10n::Get(static_cast<I>(id)).empty();
+        // 1918 named the file-name index row, which the index status card made redundant.
+        for(int id=1900;id<=1929;++id) if(id!=1918) complete &= !l10n::Get(static_cast<I>(id)).empty();
+        // Older runs only covered 1900-1929, so the 2020-2025 batch could fall outside the
+        // string range and paint as blank text without failing anything.
+        for(int id=2020;id<=2025;++id) complete &= !l10n::Get(static_cast<I>(id)).empty();
         check(complete,"new settings labels exist in both languages");
         check(TestSettingsFilter(l10n::Get(I::SettingsWallpaper),I::SettingsWallpaper),"settings search finds hidden advanced settings");
         check(TestSettingsFilter(l10n::Get(I::SettingsSearchIndex),I::IndexLocation),"settings search finds page and subsettings");
@@ -213,11 +217,39 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
     l10n::SetLanguage(L"zh-CN");
     const float original_scale=s.scale;
     ui::fluent::Painter painter(&s.compositor);
+    {
+        // The automatic-check switch silences the background check and its reminder only: turning
+        // it off must leave the card's manual buttons live, or a user who wants no reminders can
+        // no longer update by hand.
+        const auto probe_window=D2D1::RectF(0,0,1100.0f*s.scale,900.0f*s.scale);
+        painter.SetScale(s.scale);
+        const bool saved_check_updates=s.appPrefs.check_updates;
+        s.appPrefs.check_updates=true;auto on_vm=BuildVm(s,false);on_vm.settings_page=3;
+        s.appPrefs.check_updates=false;auto off_vm=BuildVm(s,false);
+        off_vm.settings_open=true;off_vm.settings_page=3;off_vm.settings_scroll=0;
+        s.appPrefs.check_updates=saved_check_updates;
+        check(off_vm.settings_update_enabled==on_vm.settings_update_enabled,
+            "the automatic check switch does not disable the update buttons");
+        const auto off_layout=ui::MakeSettingsLayout(off_vm,probe_window,s.scale,
+            s.renderer.TitleBarHeight(),28*s.scale,&painter);
+        // A build may ship without an update service; the switch is what this checks, so pretend
+        // the service is there and look at what the switch does to the hit target.
+        off_vm.settings_update_enabled=true;
+        const auto check_hit=s.renderer.HitTest(off_vm,probe_window,
+            (off_layout.update_action[0].left+off_layout.update_action[0].right)*0.5f,
+            (off_layout.update_action[0].top+off_layout.update_action[0].bottom)*0.5f);
+        check(check_hit.region==H::SettingsUpdateAction && check_hit.index==0,
+            "manual check for updates stays clickable with the automatic check off");
+    }
     for(float scale:{1.0f,1.5f,2.0f}) {
         s.compositor.RecreateTextFormats(scale);s.renderer.SetScale(scale);painter.SetScale(scale);
         for(float width:{720.0f,820.0f,1280.0f,1920.0f}) {
             const auto window=D2D1::RectF(0,0,width*scale,1000*scale);
-            auto vm=BuildVm(s,false);vm.settings_open=true;vm.settings_scroll=0;
+            // The test tab is a folder, so settings_open is forced; the colour wheel has to be
+            // attached by hand for the same reason, or its hit target silently drops out and the
+            // wheel assertion below fails for the harness rather than for the layout.
+            auto vm=BuildVm(s,false);vm.settings_open=true;vm.settings_bloom=&s.bloom_accent;
+            vm.settings_scroll=0;
             vm.settings_content_folders={{LR"(C:\Projects\Very long project folder name)",L"Ready",false},{LR"(D:\Unavailable)",L"Unavailable (3)",true}};
             for(int page=0;page<5;++page) {
                 vm.settings_page=page;vm.settings_expanded=0;
@@ -233,7 +265,8 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
                     check(hit(layout.accent_picker).region==H::SettingsAccent,"original color wheel remains interactive");
                     check(hit(layout.effect_choice).region==H::SettingsDropdown && hit(layout.language_choice).index==1,"dropdown controls match layout");
                     check(hit(layout.density_row[2]).region==H::SettingsDensity,"density segments remain reachable");
-                    check(layout.wallpaper_card.bottom==0 && layout.startup_row[2].bottom==0,"collapsed advanced settings have no invisible hit targets");
+                    check(layout.wallpaper_card.bottom>layout.wallpaper_card.top && layout.startup_row[2].bottom>layout.startup_row[2].top,
+                        "the general page lays its appearance and behaviour rows out unconditionally");
                     for(const auto* locale:{L"zh-CN",L"en-US"}) {
                         l10n::SetLanguage(locale);bool fits=true;
                         const I labels[]={I::SettingsDensityCompact,I::SettingsDensityStandard,I::SettingsDensityRoomy,I::SettingsTraySmall,I::SettingsTrayStandard,I::SettingsTrayLarge};
@@ -284,7 +317,10 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
     const auto collapsed_max=s.renderer.SettingsMaxScroll(vm,window.right,window.bottom);
     H toggle;toggle.region=H::SettingsDisclosure;toggle.index=0;HandleSettingsControl(s,toggle);
     vm=BuildVm(s,false);const auto expanded_max=s.renderer.SettingsMaxScroll(vm,window.right,window.bottom);
-    check((s.settingsExpanded&1u) && expanded_max>collapsed_max,"expanding advanced settings updates scroll range");
+    // The general page no longer hides rows behind a disclosure: the appearance, behaviour and
+    // list rows are laid out either way, so the legacy expanded bit changes nothing.
+    check(expanded_max==collapsed_max,
+        "the general page scroll range no longer depends on a disclosure");
     {
         // The advanced group owns both the hidden-files switch and the protected
         // operating system files switch; both need a reachable row and fitting text.

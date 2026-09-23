@@ -1,6 +1,9 @@
 // Included inside ui_renderer_internal.h's anonymous namespace.
 float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float scale,
                             float y, const fluent::Painter* painter) {
+    // Every row on this page is laid out unconditionally now, so the view model (which used to
+    // decide the advanced disclosure) is no longer read here.
+    (void)vm;
     const float left = l.content.left + 20*scale, right = l.content.right - 20*scale;
     const bool narrow = right - left < 560*scale;
     auto row = [&](float h) { auto r = D2D1::RectF(left, y, right, y+h*scale); y=r.bottom; return r; };
@@ -25,44 +28,44 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
         right-16*scale,l.accent_card.top+(96*scale+picker)/2);
     l.effect_card=row(narrow ? 98.0f : 64.0f); l.effect_choice=choice(l.effect_card,176);
     l.language_card=row(narrow ? 98.0f : 64.0f); l.language_choice=choice(l.language_card,176);
+    // Card 1 - appearance. Everything that decides how Pulse looks: theme, colours, window effect,
+    // language, wallpaper, the tray icon size, the title-bar mark, the list row height and the
+    // status-bar readout. All of it is visible without a disclosure.
+    l.wallpaper_card=row(124);
+    l.wallpaper_preview=D2D1::RectF(left+16*scale,l.wallpaper_card.top+12*scale,left+112*scale,l.wallpaper_card.top+68*scale);
+    const float cw=painter ? painter->MeasureButtonWidth(l10n::Get(l10n::StringId::Clear)) : 80*scale;
+    const float bw=painter ? painter->MeasureButtonWidth(l10n::Get(l10n::StringId::ChooseImage)) : 120*scale;
+    l.wallpaper_clear=D2D1::RectF(right-16*scale-cw,l.wallpaper_card.bottom-44*scale,right-16*scale,l.wallpaper_card.bottom-12*scale);
+    l.wallpaper_choose=D2D1::RectF(l.wallpaper_clear.left-8*scale-bw,l.wallpaper_clear.top,l.wallpaper_clear.left-8*scale,l.wallpaper_clear.bottom);
+    y+=8*scale; l.tray_icon_card=row(narrow ? 98.0f : 64.0f); segments(l.tray_icon_card,l.tray_icon_row,3,282);
+    y+=8*scale; l.title_brand_row=row(64);
+    y+=8*scale; l.density_card=row(narrow ? 98.0f : 64.0f); segments(l.density_card,l.density_row,3,282);
+    y+=8*scale; l.performance_row=row(64);
     l.group[0]=D2D1::RectF(left,l.theme_row.top,right,y);
+    // Card 2 - behaviour: what Pulse does when you start it, close it, open a folder or click into
+    // empty space.
     section(1);
     l.startup_row[0]=row(64); l.startup_row[1]=row(64);
+    y+=8*scale; l.startup_row[2]=row(64);
+    y+=8*scale; l.blank_click_row=row(64);
     l.group[1]=D2D1::RectF(left,l.startup_row[0].top,right,y);
+    // Card 3 - the list itself and its hints, then the file tools that act on what is selected.
     section(2);
-    l.density_card=row(narrow ? 98.0f : 64.0f); segments(l.density_card,l.density_row,3,282);
-    l.performance_row=row(64);
-    l.group[2]=D2D1::RectF(left,l.density_card.top,right,y);
-    y+=18*scale;
-    l.disclosure[0]=row(64);
-    if(vm.settings_expanded & 1u) {
-        y+=10*scale;
-        l.wallpaper_card=row(124);
-        l.wallpaper_preview=D2D1::RectF(left+16*scale,l.wallpaper_card.top+12*scale,left+112*scale,l.wallpaper_card.top+68*scale);
-        const float cw=painter ? painter->MeasureButtonWidth(l10n::Get(l10n::StringId::Clear)) : 80*scale;
-        const float bw=painter ? painter->MeasureButtonWidth(l10n::Get(l10n::StringId::ChooseImage)) : 120*scale;
-        l.wallpaper_clear=D2D1::RectF(right-16*scale-cw,y-44*scale,right-16*scale,y-12*scale);
-        l.wallpaper_choose=D2D1::RectF(l.wallpaper_clear.left-8*scale-bw,y-44*scale,l.wallpaper_clear.left-8*scale,y-12*scale);
-        y+=8*scale; l.tray_icon_card=row(narrow ? 98.0f : 64.0f); segments(l.tray_icon_card,l.tray_icon_row,3,282);
-        y+=8*scale; l.title_brand_row=row(64);
-        y+=8*scale; l.startup_row[2]=row(64);
-        y+=8*scale; l.hidden_files_row=row(64);
-        y+=8*scale; l.protected_files_row=row(64);
-        y+=8*scale; l.pinned_names_row=row(64);
-        y+=8*scale; l.tooltip_row=row(64);
-        l.tooltip_delay_row=row(narrow ? 98.0f : 64.0f); segments(l.tooltip_delay_row,l.tooltip_delay,4,282);
-        y+=8*scale; l.check_updates_row=row(96.0f);
-        y+=8*scale; l.thumb_cache_row=row(64);
-        {
-            const float cache_bw=painter ? painter->MeasureButtonWidth(l10n::Get(l10n::StringId::Clear)) : 80*scale;
-            l.thumb_cache_button=D2D1::RectF(right-16*scale-cache_bw,l.thumb_cache_row.top+16*scale,
-                right-16*scale,l.thumb_cache_row.bottom-16*scale);
-        }
-        y+=8*scale; l.file_hash_row=row(64);
-        y+=8*scale; l.blank_click_row=row(64);
-        y+=8*scale; l.change_tracking_row=row(64);
-        l.change_days_row=row(narrow ? 98.0f : 64.0f); segments(l.change_days_row,l.change_days,3,282);
+    l.hidden_files_row=row(64);
+    y+=8*scale; l.protected_files_row=row(64);
+    y+=8*scale; l.pinned_names_row=row(64);
+    y+=8*scale; l.tooltip_row=row(64);
+    l.tooltip_delay_row=row(narrow ? 98.0f : 64.0f); segments(l.tooltip_delay_row,l.tooltip_delay,4,282);
+    y+=8*scale; l.thumb_cache_row=row(64);
+    {
+        const float cache_bw=painter ? painter->MeasureButtonWidth(l10n::Get(l10n::StringId::Clear)) : 80*scale;
+        l.thumb_cache_button=D2D1::RectF(right-16*scale-cache_bw,l.thumb_cache_row.top+16*scale,
+            right-16*scale,l.thumb_cache_row.bottom-16*scale);
     }
+    y+=8*scale; l.file_hash_row=row(64);
+    y+=8*scale; l.change_tracking_row=row(64);
+    l.change_days_row=row(narrow ? 98.0f : 64.0f); segments(l.change_days_row,l.change_days,3,282);
+    l.group[2]=D2D1::RectF(left,l.hidden_files_row.top,right,y);
     y+=12*scale; l.footer=row(28); y+=16*scale;
     return y;
 }

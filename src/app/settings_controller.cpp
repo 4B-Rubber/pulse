@@ -400,8 +400,9 @@ void SettingsController::ToggleUi(int index) {
         SaveAndApply(SettingsEffect::None);
     } else if (index == 20) {
         prefs_->check_updates = !prefs_->check_updates;
-        // Nothing to apply here: the update tick reads the preference and stops the checker, a
-        // running download and the install prompt itself when it is off.
+        // Nothing to apply here: the update tick reads the preference and stops the background
+        // check and the reminder itself. The card stays live, so checking by hand keeps working
+        // with the switch off.
         SaveAndApply(SettingsEffect::None);
     } else if (index == 6) {
         prefs_->show_pinned_tab_names = !prefs_->show_pinned_tab_names;

@@ -110,6 +110,13 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
             dc->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f * scale_, 8.0f * scale_),
                                      brStrokeCard_.get(), 1.0f);
         };
+        // The device and exclusion lists are rows on a card, not cards themselves: pad the
+        // card a little past the first and last row so the row hover fill stays inside it.
+        auto draw_list_card = [&](const std::vector<D2D1_RECT_F>& rows) {
+            if (rows.empty()) return;
+            draw_card(D2D1::RectF(rows.front().left, rows.front().top - 8.0f * scale_,
+                                  rows.back().right, rows.back().bottom + 8.0f * scale_));
+        };
         DrawSettingsCore(vm, rect, theme);
         if (vm.settings_expanded & 2u) {
         fluent::InfoBarSpec info;
@@ -178,6 +185,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
                      pulse::l10n::Get(pulse::l10n::StringId::LocalDrives),
                      lay.content.left + pad, header_y, 200.0f * scale_, 22.0f * scale_);
+        draw_list_card(lay.index_volume_rows);
         for (size_t i = 0; i < vm.settings_index_volumes.size() && i < lay.index_volume_rows.size(); ++i) {
             const auto& volume = vm.settings_index_volumes[i];
             const auto& row = lay.index_volume_rows[i];
@@ -227,7 +235,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         add_exclude.hovered = add_exclude.enabled &&
             IsHovered(vm, HitTestResult::SettingsIndexExcludeAction, 0);
         painter_.DrawButton({ lay.index_exclude_action,
-                              pulse::l10n::Get(pulse::l10n::StringId::AddFolder), {},
+                              pulse::l10n::Get(pulse::l10n::StringId::AddExcludeFolder), {},
                               fluent::ButtonKind::Primary, add_exclude });
         if (vm.settings_index_excluded_paths.empty() &&
             lay.index_exclude_empty.bottom > lay.index_exclude_empty.top) {
@@ -257,6 +265,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
                     fluent::HorizontalAlignment::Center);
             }
         }
+        draw_list_card(lay.index_exclude_rows);
         for (size_t i = 0; i < vm.settings_index_excluded_paths.size() &&
                            i < lay.index_exclude_rows.size() &&
                            i < lay.index_exclude_remove.size(); ++i) {
@@ -278,7 +287,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
             remove.hovered = remove.enabled &&
                 IsHovered(vm, HitTestResult::SettingsIndexExcludeRemove, static_cast<int>(i));
             painter_.DrawButton({ remove_rc,
-                                  pulse::l10n::Get(pulse::l10n::StringId::Remove), {},
+                                  pulse::l10n::Get(pulse::l10n::StringId::RemoveExcludeFolder), {},
                                   fluent::ButtonKind::Standard, remove });
         }
 
@@ -288,7 +297,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
                      pulse::l10n::Get(pulse::l10n::StringId::ServerFolders),
                      lay.content.left + pad, network_header_y, 160.0f * scale_, 22.0f * scale_);
         const std::wstring network_actions[] = {
-            pulse::l10n::Get(pulse::l10n::StringId::AddFolder),
+            pulse::l10n::Get(pulse::l10n::StringId::AddServerFolder),
             pulse::l10n::Get(pulse::l10n::StringId::Rescan),
         };
         for (int i = 0; i < 2; ++i) {
@@ -336,7 +345,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
             remove.hovered = remove.enabled &&
                 IsHovered(vm, HitTestResult::SettingsNetworkRemove, static_cast<int>(i));
             painter_.DrawButton({ lay.network_remove[i],
-                                  pulse::l10n::Get(pulse::l10n::StringId::Remove), {},
+                                  pulse::l10n::Get(pulse::l10n::StringId::RemoveServerFolder), {},
                                   fluent::ButtonKind::Standard, remove });
         }
         }
@@ -386,33 +395,6 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
                      lay.diagnostics_card.top + 40.0f * scale_,
                      lay.diagnostics_card.right - lay.diagnostics_card.left - 32.0f * scale_,
                      42.0f * scale_);
-        {
-            const D2D1_RECT_F& row = lay.diagnostics_perf;
-            if (IsHovered(vm, HitTestResult::SettingsToggle, 4)) {
-                MakeBrush(dc, theme.fill_hover, brFillHover_);
-                FillRoundedRect(dc, brFillHover_.get(), row.left + 4.0f * scale_, row.top,
-                                row.right - row.left - 8.0f * scale_, row.bottom - row.top,
-                                4.0f * scale_);
-            }
-            MakeBrush(dc, theme.text, brText_);
-            DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
-                         pulse::l10n::Get(pulse::l10n::StringId::SettingsShowPerformance),
-                         row.left + 16.0f * scale_, row.top + 8.0f * scale_,
-                         row.right - row.left - 80.0f * scale_, 22.0f * scale_);
-            MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-            DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                         pulse::l10n::Get(pulse::l10n::StringId::SettingsShowPerformanceDesc),
-                         row.left + 16.0f * scale_, row.top + 30.0f * scale_,
-                         row.right - row.left - 80.0f * scale_, 18.0f * scale_);
-            fluent::ControlState st{};
-            st.checked = vm.settings_show_performance;
-            st.hovered = IsHovered(vm, HitTestResult::SettingsToggle, 4);
-            painter_.DrawSwitch(D2D1::RectF(row.right - 16.0f * scale_ - switch_w,
-                                            row.top + (56.0f * scale_ - switch_h) * 0.5f,
-                                            row.right - 16.0f * scale_,
-                                            row.top + (56.0f * scale_ + switch_h) * 0.5f),
-                                L"", st);
-        }
         static constexpr pulse::l10n::StringId kDiagnosticsActions[] = {
             pulse::l10n::StringId::OpenDiagnostics,
             pulse::l10n::StringId::ClearDiagnostics,
@@ -429,6 +411,38 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         }
 
         draw_card(lay.update_card);
+        {
+            // Inside the card, after its fill: this switch decides whether the card does anything
+            // at all. Drawing it before the card was drawn left the label hidden behind the card
+            // background and only the bare switch visible.
+            const D2D1_RECT_F& row = lay.check_updates_row;
+            if (row.right > row.left) {
+                if (IsHovered(vm, HitTestResult::SettingsToggle, 20)) {
+                    MakeBrush(dc, theme.fill_hover, brFillHover_);
+                    FillRoundedRect(dc, brFillHover_.get(), row.left + 4.0f * scale_, row.top,
+                                    row.right - row.left - 8.0f * scale_, row.bottom - row.top,
+                                    4.0f * scale_);
+                }
+                MakeBrush(dc, theme.text, brText_);
+                DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
+                             pulse::l10n::Get(pulse::l10n::StringId::SettingsAutoUpdate),
+                             row.left + 16.0f * scale_, row.top + 8.0f * scale_,
+                             row.right - row.left - 80.0f * scale_, 22.0f * scale_);
+                MakeBrush(dc, theme.text_secondary, brTextSecondary_);
+                DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
+                             pulse::l10n::Get(pulse::l10n::StringId::SettingsAutoUpdateDesc),
+                             row.left + 16.0f * scale_, row.top + 30.0f * scale_,
+                             row.right - row.left - 80.0f * scale_, 18.0f * scale_);
+                fluent::ControlState st{};
+                st.checked = vm.settings_check_updates;
+                st.hovered = IsHovered(vm, HitTestResult::SettingsToggle, 20);
+                painter_.DrawSwitch(D2D1::RectF(row.right - 16.0f * scale_ - switch_w,
+                                                row.top + (56.0f * scale_ - switch_h) * 0.5f,
+                                                row.right - 16.0f * scale_,
+                                                row.top + (56.0f * scale_ + switch_h) * 0.5f),
+                                    L"", st);
+            }
+        }
         MakeBrush(dc, theme.text, brText_);
         DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
                      pulse::l10n::Get(pulse::l10n::StringId::Update),
@@ -436,14 +450,11 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
                      lay.update_card.right - lay.update_card.left - 32.0f * scale_,
                      22.0f * scale_);
         MakeBrush(dc, theme.text_secondary, brTextSecondary_);
-        DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
-                     vm.settings_version,
-                     lay.update_card.left + 16.0f * scale_, lay.update_card.top + 40.0f * scale_,
-                     lay.update_card.right - lay.update_card.left - 32.0f * scale_,
-                     22.0f * scale_);
+        // No version line here: the About card right above and the navigation rail already carry
+        // it, and repeating it only pushed the status line down.
         DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
                      vm.settings_update_status,
-                     lay.update_card.left + 16.0f * scale_, lay.update_card.top + 66.0f * scale_,
+                     lay.update_card.left + 16.0f * scale_, lay.update_card.top + 40.0f * scale_,
                      lay.update_card.right - lay.update_card.left - 32.0f * scale_,
                      38.0f * scale_);
         fluent::ControlState check{};
@@ -619,7 +630,6 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
                          card.left + 16.0f * scale_, card.top + 12.0f * scale_,
                          card.right - card.left - 32.0f * scale_, 24.0f * scale_);
             const float file_h = 32.0f * scale_;
-            const float inner = 16.0f * scale_;
             float fy = card.top + 48.0f * scale_;
             for (size_t f = 0; f < vm.dup_groups[g].files.size(); ++f) {
                 if (fy + file_h <= lay.content.top) {
@@ -627,27 +637,33 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
                     continue;
                 }
                 if (fy >= lay.content.bottom) break;
+                const int group_index = static_cast<int>(g);
+                const int file_index = static_cast<int>(f);
+                const D2D1_RECT_F* keep_rc = DupFileRect(lay.dup_keep, lay.dup_keep_group,
+                    lay.dup_keep_file, group_index, file_index);
+                const D2D1_RECT_F* open_rc = DupFileRect(lay.dup_open, lay.dup_open_group,
+                    lay.dup_open_file, group_index, file_index);
+                // Only the groups near the viewport get row rects laid out for them.
+                if (!keep_rc || !open_rc) {
+                    fy += file_h;
+                    continue;
+                }
                 const auto& file = vm.dup_groups[g].files[f];
-                const D2D1_RECT_F keep_rc = D2D1::RectF(card.left + inner, fy,
-                    card.left + inner + 88.0f * scale_, fy + file_h);
-                const D2D1_RECT_F open_rc = D2D1::RectF(card.left + inner + 92.0f * scale_, fy,
-                    card.right - inner, fy + file_h);
                 fluent::ControlState radio{};
                 radio.checked = file.keep;
                 radio.enabled = !vm.dup_scanning;
                 radio.hovered = radio.enabled &&
-                    IsHovered(vm, HitTestResult::SettingsDupKeep, static_cast<int>(g),
-                              static_cast<int>(f));
-                painter_.DrawRadioButton(keep_rc,
+                    IsHovered(vm, HitTestResult::SettingsDupKeep, group_index, file_index);
+                painter_.DrawRadioButton(*keep_rc,
                     pulse::l10n::Get(pulse::l10n::StringId::DupKeep), radio);
                 MakeBrush(dc, theme.text, brText_);
                 DrawTextRect(dc, compositor_->SmallFormat(), brText_.get(), file.name,
-                             open_rc.left, open_rc.top, open_rc.right - open_rc.left,
+                             open_rc->left, open_rc->top, open_rc->right - open_rc->left,
                              16.0f * scale_);
                 MakeBrush(dc, theme.text_secondary, brTextSecondary_);
                 DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(), file.detail,
-                             open_rc.left, open_rc.top + 14.0f * scale_,
-                             open_rc.right - open_rc.left, 14.0f * scale_);
+                             open_rc->left, open_rc->top + 14.0f * scale_,
+                             open_rc->right - open_rc->left, 14.0f * scale_);
                 fy += file_h;
             }
             if (g < lay.dup_group_delete.size() &&

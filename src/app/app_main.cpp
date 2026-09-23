@@ -312,7 +312,6 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->folderViews.persist = false;
         }
         s->savedSearches.Load();
-        SyncSavedSearchSidebar(*s);
         s->places.Load();
         s->folderViews.Load();
         ProbePinnedNetworks(*s);

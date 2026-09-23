@@ -58,7 +58,6 @@
 #define IDS_LOCAL_DISK                  1054
 #define IDS_SIDEBAR_WORKSPACES          1055
 #define IDS_SIDEBAR_QUICK_ACCESS        1056
-#define IDS_SIDEBAR_SAVED_SEARCHES      1057
 #define IDS_SIDEBAR_DRIVES              1058
 #define IDS_SIDEBAR_TAGS                1059
 #define IDS_SIDEBAR_NETWORK_LOCATIONS   1060
@@ -745,7 +744,6 @@
 #define IDS_SETTINGS_UI_1915 1915
 #define IDS_SETTINGS_UI_1916 1916
 #define IDS_SETTINGS_UI_1917 1917
-#define IDS_SETTINGS_UI_1918 1918
 #define IDS_SETTINGS_UI_1919 1919
 #define IDS_SETTINGS_UI_1920 1920
 
@@ -861,3 +859,10 @@
 // Settings: the background update check (and its install prompt) can be turned off.
 #define IDS_SETTINGS_AUTO_UPDATE 2020
 #define IDS_SETTINGS_AUTO_UPDATE_DESC 2021
+// Two buttons read "添加文件夹" in the same page; name what they add.
+#define IDS_ADD_EXCLUDE_FOLDER 2022
+#define IDS_ADD_SERVER_FOLDER 2023
+// The two "移除" buttons on that page get the same treatment: one drops a path from
+// the exclusion list, the other one a server folder.
+#define IDS_REMOVE_EXCLUDE_FOLDER 2024
+#define IDS_REMOVE_SERVER_FOLDER 2025

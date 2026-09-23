@@ -120,9 +120,9 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
         const I density[]={I::SettingsDensityCompact,I::SettingsDensityStandard,I::SettingsDensityRoomy};const int heights[]={28,34,40};
         segmented(lay.density_card,lay.density_row,density,heights,vm.settings_row_height,H::SettingsDensity,I::SettingsRowHeight,I::SettingsRowHeightDesc);divider(lay.density_card);
         toggle(lay.performance_row,I::SettingsShowPerformance,I::SettingsShowPerformanceDesc,L"\xE946",vm.settings_show_performance,4);
-        disclosure(lay.disclosure[0],I::SettingsAdvanced,I::SettingsAdvancedDesc,L"\xE713",0,true);
-        if(vm.settings_expanded & 1u) {
-        draw_card(lay.wallpaper_card);
+        // The general page is laid out as three visible cards now, so nothing hides behind a
+        // disclosure here any more.
+        {
         const auto& preview = lay.wallpaper_preview;
         MakeBrush(dc, theme.fill_hover, brFillHover_);
         FillRoundedRect(dc, brFillHover_.get(), preview.left, preview.top,
@@ -164,19 +164,18 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
 
 
             const I sizes[]={I::SettingsTraySmall,I::SettingsTrayStandard,I::SettingsTrayLarge};const int icons[]={40,48,56};
-            draw_card(lay.tray_icon_card);segmented(lay.tray_icon_card,lay.tray_icon_row,sizes,icons,vm.settings_tray_icon,H::SettingsTrayIcon,I::SettingsTrayIcon,I::SettingsTrayIconDesc);
-            draw_card(lay.title_brand_row);toggle(lay.title_brand_row,I::SettingsTitleBrand,I::SettingsTitleBrandDesc,L"\xE8A9",vm.settings_show_title_brand,19);
-            draw_card(lay.startup_row[2]);toggle(lay.startup_row[2],I::SettingsOpenFolders,I::SettingsOpenFoldersDesc,L"\xE8B7",vm.settings_open_folders,3);
-            draw_card(lay.hidden_files_row);toggle(lay.hidden_files_row,I::SettingsShowHidden,I::SettingsShowHiddenDesc,L"\xE890",vm.settings_show_hidden_files,5);
+            segmented(lay.tray_icon_card,lay.tray_icon_row,sizes,icons,vm.settings_tray_icon,H::SettingsTrayIcon,I::SettingsTrayIcon,I::SettingsTrayIconDesc);
+            toggle(lay.title_brand_row,I::SettingsTitleBrand,I::SettingsTitleBrandDesc,L"\xE8A9",vm.settings_show_title_brand,19);
+            toggle(lay.startup_row[2],I::SettingsOpenFolders,I::SettingsOpenFoldersDesc,L"\xE8B7",vm.settings_open_folders,3);
+            toggle(lay.hidden_files_row,I::SettingsShowHidden,I::SettingsShowHiddenDesc,L"\xE890",vm.settings_show_hidden_files,5);
             // Hidden + system entries: File Explorer keeps these behind a second option.
-            draw_card(lay.protected_files_row);toggle(lay.protected_files_row,I::SettingsShowProtected,I::SettingsShowProtectedDesc,L"\xE72E",vm.settings_show_protected_os_files,16);
-            draw_card(lay.pinned_names_row);toggle(lay.pinned_names_row,I::PinnedNames,I::PinnedNamesDesc,L"\xE718",vm.show_pinned_tab_names,6);
-            draw_card(lay.blank_click_row);toggle(lay.blank_click_row,I::SettingsBlankClickBack,I::SettingsBlankClickBackDesc,L"\xE72B",vm.settings_blank_click_go_back,7);
-            draw_card(lay.change_tracking_row);toggle(lay.change_tracking_row,I::SettingsChangeTracking,I::SettingsChangeTrackingDesc,L"\xE823",vm.settings_change_tracking,8);
+            toggle(lay.protected_files_row,I::SettingsShowProtected,I::SettingsShowProtectedDesc,L"\xE72E",vm.settings_show_protected_os_files,16);
+            toggle(lay.pinned_names_row,I::PinnedNames,I::PinnedNamesDesc,L"\xE718",vm.show_pinned_tab_names,6);
+            toggle(lay.blank_click_row,I::SettingsBlankClickBack,I::SettingsBlankClickBackDesc,L"\xE72B",vm.settings_blank_click_go_back,7);
+            toggle(lay.change_tracking_row,I::SettingsChangeTracking,I::SettingsChangeTrackingDesc,L"\xE823",vm.settings_change_tracking,8);
             const I days[]={I::ChangeToday,I::ChangeLast3Days,I::ChangeLast7Days};const int day_values[]={1,3,7};
-            draw_card(lay.change_days_row);segmented(lay.change_days_row,lay.change_days,days,day_values,vm.settings_change_days,H::SettingsChangeDays,I::SettingsChangeDays,I::SettingsChangeTrackingDesc);
-            draw_card(lay.tooltip_row);toggle(lay.tooltip_row,I::SettingsTooltips,I::SettingsTooltipsDesc,L"\xE946",vm.settings_show_tooltips,17);
-            draw_card(lay.check_updates_row);toggle(lay.check_updates_row,I::SettingsAutoUpdate,I::SettingsAutoUpdateDesc,L"\xE895",vm.settings_check_updates,20);
+            segmented(lay.change_days_row,lay.change_days,days,day_values,vm.settings_change_days,H::SettingsChangeDays,I::SettingsChangeDays,I::SettingsChangeTrackingDesc);
+            toggle(lay.tooltip_row,I::SettingsTooltips,I::SettingsTooltipsDesc,L"\xE946",vm.settings_show_tooltips,17);
             const I delays[]={I::TooltipDelayShort,I::TooltipDelayStandard,I::TooltipDelayLong,I::TooltipDelayCustom};
             // The custom entry owns value 0; when the stored delay is not one of the three
             // presets that segment is the checked one and the row spells the value out.
@@ -185,12 +184,11 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
             const bool delay_preset=delay_ms==150||delay_ms==400||delay_ms==800;
             const std::wstring delay_desc=delay_preset?std::wstring{}:
                 l10n::Get(I::SettingsTooltipDelayDesc)+L"  ·  "+std::to_wstring(delay_ms)+L" ms";
-            draw_card(lay.tooltip_delay_row);segmented(lay.tooltip_delay_row,lay.tooltip_delay,delays,delay_values,delay_preset?delay_ms:0,H::SettingsTooltipDelay,I::SettingsTooltipDelay,I::SettingsTooltipDelayDesc,4,delay_desc);
-            draw_card(lay.thumb_cache_row);
+            segmented(lay.tooltip_delay_row,lay.tooltip_delay,delays,delay_values,delay_preset?delay_ms:0,H::SettingsTooltipDelay,I::SettingsTooltipDelay,I::SettingsTooltipDelayDesc,4,delay_desc);
             label(lay.thumb_cache_row,l10n::Get(I::SettingsThumbCache),vm.settings_thumb_cache_text,L"\xE8A5",
                 lay.thumb_cache_button.left-12*scale_);
             button(lay.thumb_cache_button,l10n::Get(I::Clear),H::SettingsThumbCache,0);
-            draw_card(lay.file_hash_row);toggle(lay.file_hash_row,I::SettingsFileHash,I::SettingsFileHashDesc,L"\xE8A5",vm.settings_file_hash_enabled,18);
+            toggle(lay.file_hash_row,I::SettingsFileHash,I::SettingsFileHashDesc,L"\xE8A5",vm.settings_file_hash_enabled,18);
         }
         text(l10n::Get(I::SettingsImmediate),lay.footer,true);
     } else {
@@ -203,7 +201,6 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
         button(lay.global_search_hotkey_button,vm.settings_global_search_capturing ? l10n::Get(I::GlobalSearchRecording) : vm.settings_global_search_hotkey,H::SettingsGlobalSearchHotkey,0);
         divider(lay.global_search_hotkey_row);
         toggle(lay.search_pinyin_row,I::SearchPinyin,I::SearchPinyinDesc,L"\xE721",vm.settings_search_pinyin,9);divider(lay.search_pinyin_row);
-        label(lay.filename_status,l10n::Get(I::SettingsFilenameIndex),vm.settings_index_status,L"\xE8A5",lay.filename_status.right-16*scale_);divider(lay.filename_status);
         disclosure(lay.disclosure[1],I::SettingsMaintenance,I::SettingsMaintenanceDesc,L"\xE713",1,false);
         label(lay.content_header,l10n::Get(I::SettingsContentFolders),vm.settings_content_summary,L"\xE8B7",
             lay.content_header.right-16*scale_);

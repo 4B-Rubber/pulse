@@ -330,7 +330,6 @@ BEGIN
     IDS_LOCAL_DISK                  "本地磁盘"
     IDS_SIDEBAR_WORKSPACES          "工作区"
     IDS_SIDEBAR_QUICK_ACCESS        "快速访问"
-    IDS_SIDEBAR_SAVED_SEARCHES      "保存的搜索"
     IDS_SIDEBAR_DRIVES              "此电脑"
     IDS_SIDEBAR_TAGS                "标签"
     IDS_SIDEBAR_NETWORK_LOCATIONS   "网络位置"
@@ -585,7 +584,7 @@ BEGIN
     IDS_DIAGNOSTICS_EXPORT_LOCATION "选择一个空文件夹用于导出诊断"
     IDS_DIAGNOSTICS_EXPORT_FAILED   "无法导出诊断文件。"
     IDS_UPDATE                      "软件更新"
-    IDS_UPDATE_DESC                 "启动后自动检查更新，点击后下载并安装"
+    IDS_UPDATE_DESC                 "自动检查由上方开关控制；点按钮可随时检查、下载并安装"
     IDS_CHECK_FOR_UPDATES           "检查更新"
     IDS_CHECKING_UPDATES            "正在检查更新..."
     IDS_UPDATE_DISABLED             "当前构建未配置签名更新服务"
@@ -818,7 +817,11 @@ BEGIN
     IDS_SETTINGS_TOOLTIPS "显示悬停提示"
     IDS_SETTINGS_TOOLTIPS_DESC "鼠标停留时显示按钮和项目的名称"
     IDS_SETTINGS_AUTO_UPDATE "自动检查更新"
-    IDS_SETTINGS_AUTO_UPDATE_DESC "后台检查新版本并提示安装；关闭后不联网检查，也不会弹出安装提示"
+    IDS_SETTINGS_AUTO_UPDATE_DESC "后台检查新版本并提示安装；关闭后不再自动检查与提醒，仍可手动检查"
+    IDS_ADD_EXCLUDE_FOLDER "添加排除文件夹"
+    IDS_ADD_SERVER_FOLDER "添加服务器目录"
+    IDS_REMOVE_EXCLUDE_FOLDER "移除排除文件夹"
+    IDS_REMOVE_SERVER_FOLDER "移除服务器目录"
     IDS_SETTINGS_TOOLTIP_DELAY "提示延迟"
     IDS_SETTINGS_TOOLTIP_DELAY_DESC "鼠标停留多久后显示提示"
     IDS_TOOLTIP_DELAY_SHORT "短"
@@ -937,7 +940,6 @@ BEGIN
     IDS_LOCAL_DISK                  "Local Disk"
     IDS_SIDEBAR_WORKSPACES          "Workspaces"
     IDS_SIDEBAR_QUICK_ACCESS        "Quick access"
-    IDS_SIDEBAR_SAVED_SEARCHES      "Saved searches"
     IDS_SIDEBAR_DRIVES              "This PC"
     IDS_SIDEBAR_TAGS                "Tags"
     IDS_SIDEBAR_NETWORK_LOCATIONS   "Network locations"
@@ -1192,7 +1194,7 @@ BEGIN
     IDS_DIAGNOSTICS_EXPORT_LOCATION "Choose an empty folder for the diagnostics export"
     IDS_DIAGNOSTICS_EXPORT_FAILED   "Could not export diagnostics."
     IDS_UPDATE                      "Software update"
-    IDS_UPDATE_DESC                 "Checks automatically; downloads and installs when you click"
+    IDS_UPDATE_DESC                 "The switch above controls the automatic check; the button checks, downloads and installs"
     IDS_CHECK_FOR_UPDATES           "Check for updates"
     IDS_CHECKING_UPDATES            "Checking for updates..."
     IDS_UPDATE_DISABLED             "Signed update service is not configured in this build"
@@ -1425,7 +1427,11 @@ BEGIN
     IDS_SETTINGS_TOOLTIPS "Show hover hints"
     IDS_SETTINGS_TOOLTIPS_DESC "Name buttons and items while the pointer rests on them"
     IDS_SETTINGS_AUTO_UPDATE "Check for updates automatically"
-    IDS_SETTINGS_AUTO_UPDATE_DESC "Look for new versions in the background and offer to install them; off means no checks and no install prompt"
+    IDS_SETTINGS_AUTO_UPDATE_DESC "Background check and install prompt; off stops both, the button still checks and installs"
+    IDS_ADD_EXCLUDE_FOLDER "Add excluded folder"
+    IDS_ADD_SERVER_FOLDER "Add server folder"
+    IDS_REMOVE_EXCLUDE_FOLDER "Remove excluded folder"
+    IDS_REMOVE_SERVER_FOLDER "Remove server folder"
     IDS_SETTINGS_TOOLTIP_DELAY "Hint delay"
     IDS_SETTINGS_TOOLTIP_DELAY_DESC "How long the pointer rests before a hint appears"
     IDS_TOOLTIP_DELAY_SHORT "Short"
@@ -1805,17 +1811,6 @@ LANGUAGE 0x09, 0x01
 STRINGTABLE
 BEGIN
  IDS_SETTINGS_UI_1917 "Changes take effect immediately"
-END
-
-LANGUAGE 0x04, 0x02
-STRINGTABLE
-BEGIN
- IDS_SETTINGS_UI_1918 "文件名索引"
-END
-LANGUAGE 0x09, 0x01
-STRINGTABLE
-BEGIN
- IDS_SETTINGS_UI_1918 "File-name index"
 END
 
 LANGUAGE 0x04, 0x02

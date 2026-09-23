@@ -468,6 +468,7 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             vm.settings_show_hidden_files = s.appPrefs.show_hidden_files;
             vm.settings_show_protected_os_files = s.appPrefs.show_protected_os_files;
             vm.settings_show_tooltips = s.appPrefs.show_tooltips;
+            vm.settings_check_updates = s.appPrefs.check_updates;
             vm.settings_tooltip_delay = s.appPrefs.tooltip_delay_ms;
             vm.settings_thumb_cache_text = FormatByteSize(s.renderer.ThumbCacheBytes());
             vm.settings_file_hash_enabled = s.appPrefs.file_hash_enabled;
@@ -522,8 +523,10 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             swprintf_s(build_text,
                 l10n::Get(l10n::StringId::BuildIdFormat).c_str(), PULSE_BUILD_ID);
             vm.settings_build_id = build_text;
-            vm.settings_update_enabled = (app::UpdateChecker::Enabled() &&
-                s.appPrefs.check_updates) || s.shot.update_available;
+            // The card's buttons follow the build's update service, not the automatic-check switch:
+            // turning the background check off only stops the checks and the reminder, so the user
+            // can still update by hand.
+            vm.settings_update_enabled = app::UpdateChecker::Enabled() || s.shot.update_available;
             vm.settings_update_checking = s.update_checker.checking();
             vm.settings_update_downloading = s.update_installer.downloading();
             vm.settings_update_installing = s.update_installer.installing();
@@ -1990,26 +1993,6 @@ std::wstring SelectedFullPath(AppState& s) {
     app::Tab* tab = ActiveTab(s);
     if (!tab) return L"";
     return EntryFullPath(*tab, tab->selected_index);
-}
-
-void SyncSavedSearchSidebar(AppState& s) {
-    s.sidebar.saved_searches.clear();
-    const auto& searches = s.savedSearches.items();
-    s.sidebar.saved_searches.reserve(searches.size());
-    for (size_t i = 0; i < searches.size(); ++i) {
-        app::SidebarEntry entry;
-        entry.label = searches[i].name;
-        entry.detail = searches[i].root;
-        entry.glyph = searches[i].mode == app::SavedSearchMode::Duplicates
-            ? L"\xE8EF" : L"\xE721";
-        entry.fallback = searches[i].mode == app::SavedSearchMode::Duplicates
-            ? L"Dup" : L"Find";
-        entry.color = ui::HexColor(searches[i].mode == app::SavedSearchMode::Content
-            ? 0x0EA5E9 : searches[i].mode == app::SavedSearchMode::Duplicates
-                ? 0xF59E0B : 0x22C55E);
-        entry.path = L"pulse:saved-search:" + std::to_wstring(i);
-        s.sidebar.saved_searches.push_back(std::move(entry));
-    }
 }
 
 } // namespace pulse

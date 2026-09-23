@@ -15,7 +15,8 @@ void ShowInstallError(AppState& state) {
 }
 
 void CheckForUpdates(AppState& state) {
-    if (!state.appPrefs.check_updates) return;
+    // Deliberately ignores the automatic-check switch: this is the manual path, and a user who
+    // silenced the background check must still be able to look for an update by hand.
     if (state.update_installer.downloading() || state.update_installer.installing()) return;
     if (state.update_checker.CheckAsync(state.hwnd, WM_UPDATE_RESULT)) {
         state.update_result_ready = false;
@@ -40,12 +41,10 @@ void TickUpdates(AppState& state, unsigned long long now) {
         state.next_update_progress_paint = now + 100;
         InvalidateRect(state.hwnd, nullptr, FALSE);
     }
-    // The setting has the last word: a user who turned the check off must not be left with a
-    // download still running or an install prompt that can still be clicked.
+    // The switch silences the background check and the "update available" reminder. It must not
+    // cancel work the user started by hand: a manual check may still be in flight, and a download
+    // or install launched from the card is allowed to finish.
     if (!state.appPrefs.check_updates) {
-        state.update_checker.Stop();
-        if (state.update_installer.downloading() || state.update_installer.installing())
-            state.update_installer.Stop();
         state.notified_update_version.clear();
         return;
     }
@@ -56,7 +55,8 @@ void TickUpdates(AppState& state, unsigned long long now) {
 }
 
 void InstallUpdate(AppState& state) {
-    if (!state.appPrefs.check_updates) return;
+    // Same as the check above: downloading and installing is the manual path and stays available
+    // while the automatic-check switch is off.
     if (state.update_installer.installing()) return;
     if (state.update_installer.downloading()) {
         state.update_installer.Stop();
@@ -89,8 +89,8 @@ void CompleteUpdateCheck(AppState& state) {
 void CompleteUpdateDownload(AppState& state) {
     DWORD error = ERROR_SUCCESS;
     if (!state.update_installer.TakeResult(error)) return;
-    // A download that finished after the user turned the check off is not installed.
-    if (!error && !state.appPrefs.check_updates) error = ERROR_CANCELLED;
+    // Downloads only start from the card's buttons, so the automatic-check switch has nothing to
+    // say about finishing one: installing what the user asked for is exactly what they asked for.
     if (!error && (state.ops.Status().active || state.settings.migration_pending())) error = ERROR_BUSY;
     if (!error) {
         // Paint the verified/starting stage before ShellExecute can enter an elevation prompt.

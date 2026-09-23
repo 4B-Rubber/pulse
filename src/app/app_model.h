@@ -422,12 +422,12 @@ enum class BuiltinQuickAccess : int {
     Count,
 };
 
-// Sidebar sections. The ids are stable: the collapse/hide bitmasks stored in the
-// session are indexed by them, and the user may reorder the groups by dragging.
+// Sidebar sections. The ids are stable: the collapse/hide bitmasks stored in the session are
+// indexed by them, and the user may reorder the groups by dragging. Sessions written before
+// version 8 still list the dropped saved-search section; session.cpp remaps them on load.
 enum class SidebarSectionId : int {
     Workspaces = 0,
     QuickAccess,
-    SavedSearches,
     Drives,
     Tags,
     Networks,
@@ -455,7 +455,6 @@ int SidebarSectionIndex(const ui::WindowViewModel& vm, int section_id);
 
 struct SidebarModel {
     std::vector<SidebarEntry> quick_access;
-    std::vector<SidebarEntry> saved_searches;
     std::vector<SidebarEntry> drives;
     std::vector<SidebarEntry> cloud;   // OneDrive accounts (empty while signed out)
     std::vector<SidebarEntry> starred; // the "starred items" root row

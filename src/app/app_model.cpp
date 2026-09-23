@@ -1030,7 +1030,6 @@ std::vector<int> DefaultSidebarOrder() {
              static_cast<int>(SidebarSectionId::Starred),
              static_cast<int>(SidebarSectionId::QuickAccess),
              static_cast<int>(SidebarSectionId::Workspaces),
-             static_cast<int>(SidebarSectionId::SavedSearches),
              static_cast<int>(SidebarSectionId::Tags),
              static_cast<int>(SidebarSectionId::Drives),
              static_cast<int>(SidebarSectionId::Networks) };
@@ -1558,7 +1557,6 @@ ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
     }
     auto& workspaces = sections[static_cast<size_t>(SidebarSectionId::Workspaces)];
     auto& access = sections[static_cast<size_t>(SidebarSectionId::QuickAccess)];
-    auto& savedSearches = sections[static_cast<size_t>(SidebarSectionId::SavedSearches)];
     auto& cloud = sections[static_cast<size_t>(SidebarSectionId::Cloud)];
     auto& drives = sections[static_cast<size_t>(SidebarSectionId::Drives)];
     auto& tags = sections[static_cast<size_t>(SidebarSectionId::Tags)];
@@ -1675,8 +1673,6 @@ ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
             access.items.push_back(std::move(item));
         }
     }
-    savedSearches = ConvertGroup(l10n::Get(l10n::StringId::SidebarSavedSearches),
-                                 sidebar.saved_searches, false);
     // The title is only used by the section menus: the pane itself shows the
     // account rows without a header (see IsHeaderlessSection).
     cloud = ConvertGroup(L"OneDrive", sidebar.cloud, false);
@@ -1687,7 +1683,6 @@ ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
     // stand) keeps "This PC" apart from the monitor-only Desktop row.
     workspaces.icon_glyph = L"\xE8B7";    // folder
     access.icon_glyph = L"\xE8A9";        // app grid
-    savedSearches.icon_glyph = L"\xE721"; // search
     tags.icon_glyph = L"\xE8EC";          // tag
     drives.icon_glyph = L"\xE977";        // this PC
     nets.icon_glyph = L"\xE968";          // network

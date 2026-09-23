@@ -39,13 +39,16 @@ int Dropdown(AppState& s, int index, std::vector<ui::FluentMenuItem> items) {
 }
 struct SettingDestination { I title;int page;unsigned expanded; };
 constexpr SettingDestination destinations[]={
+    // The general page lays every row out, so none of these destinations needs the legacy
+    // expanded bit any more.
     {I::SettingsTheme,0,0},{I::SettingsThemeColor,0,0},{I::SettingsWindowEffect,0,0},{I::SettingsLanguage,0,0},
     {I::SettingsLaunch,0,0},{I::SettingsKeepRunning,0,0},{I::SettingsRowHeight,0,0},{I::SettingsShowPerformance,0,0},
-    {I::SettingsWallpaper,0,1},{I::SettingsTrayIcon,0,1},{I::SettingsShowHidden,0,1},{I::SettingsShowProtected,0,1},{I::PinnedNames,0,1},
-    {I::SettingsBlankClickBack,0,1},{I::SettingsChangeTracking,0,1},{I::SettingsOpenFolders,0,1},
-    {I::SettingsTooltips,0,1},{I::SettingsTooltipDelay,0,1},{I::SettingsAutoUpdate,0,1},{I::SettingsThumbCache,0,1},{I::SettingsFileHash,0,1},
+    {I::SettingsWallpaper,0,0},{I::SettingsTrayIcon,0,0},{I::SettingsShowHidden,0,0},{I::SettingsShowProtected,0,0},{I::PinnedNames,0,0},
+    {I::SettingsBlankClickBack,0,0},{I::SettingsChangeTracking,0,0},{I::SettingsOpenFolders,0,0},
+    {I::SettingsTooltips,0,0},{I::SettingsTooltipDelay,0,0},{I::SettingsThumbCache,0,0},{I::SettingsFileHash,0,0},
     {I::GlobalSearch,1,0},{I::GlobalSearchHotkey,1,0},{I::SearchPinyin,1,0},{I::ContentIndexManage,1,0},{I::IndexLocation,1,2},{I::LocalDrives,1,2},
     {I::Exclusions,1,2},{I::ServerFolders,1,2},{I::SettingsContextMenu,2,0},{I::SettingsDuplicates,4,0},{I::SettingsAboutDiagnostics,3,0},
+    {I::SettingsAutoUpdate,3,0},
 };
 std::vector<ui::FluentMenuItem> FilterSettings(const std::wstring& query) {
     std::wstring needle=query;std::transform(needle.begin(),needle.end(),needle.begin(),towlower);

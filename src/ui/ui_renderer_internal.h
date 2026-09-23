@@ -1238,7 +1238,7 @@ struct SettingsLayout {
     D2D1_RECT_F duplicate_options{};
     D2D1_RECT_F section[4]{}, group[3]{}, footer{};
     D2D1_RECT_F theme_row{}, theme_tile[3]{}, effect_choice{}, language_choice{};
-    D2D1_RECT_F performance_row{}, disclosure[2]{}, filename_status{};
+    D2D1_RECT_F performance_row{}, disclosure[2]{};
     D2D1_RECT_F content_header{}, content_types{}, content_pause{}, content_options{}, content_rebuild{}, content_empty{};
     D2D1_RECT_F body{};
     D2D1_RECT_F nav{};
@@ -1360,8 +1360,6 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         y += 108*scale;
         l.search_pinyin_row = D2D1::RectF(card_left, y, card_right, y + 68*scale);
         y += 68*scale;
-        l.filename_status = D2D1::RectF(card_left, y, card_right, y + 72*scale);
-        y += 72*scale;
         l.disclosure[1] = D2D1::RectF(card_left, y, card_right, y + 64*scale);
         y += 64*scale;
         l.group[0] = D2D1::RectF(card_left, l.global_search_row.top, card_right, y);
@@ -1408,18 +1406,21 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         }
         y += 44.0f * scale;
         const float section_btn_h = 32.0f * scale;
-        const float add_folder_w = label_btn_w(
-            pulse::l10n::Get(pulse::l10n::StringId::AddFolder));
-        l.index_exclude_action = D2D1::RectF(card_right - add_folder_w, y - 36.0f * scale,
+        // Measure each "add" button against the caption it draws: the two sit on this page together
+        // but name what they add, so one shared width clipped the longer label.
+        const float add_exclude_w = label_btn_w(
+            pulse::l10n::Get(pulse::l10n::StringId::AddExcludeFolder));
+        l.index_exclude_action = D2D1::RectF(card_right - add_exclude_w, y - 36.0f * scale,
                                              card_right, y - 36.0f * scale + section_btn_h);
-        const float remove_w = label_btn_w(pulse::l10n::Get(pulse::l10n::StringId::Remove));
+        const float remove_exclude_w = label_btn_w(
+            pulse::l10n::Get(pulse::l10n::StringId::RemoveExcludeFolder));
         l.index_exclude_rows.reserve(vm.settings_index_excluded_paths.size());
         l.index_exclude_remove.reserve(vm.settings_index_excluded_paths.size());
         for (size_t i = 0; i < vm.settings_index_excluded_paths.size(); ++i) {
             const D2D1_RECT_F row = D2D1::RectF(card_left, y, card_right, y + 56.0f * scale);
             l.index_exclude_rows.push_back(row);
             l.index_exclude_remove.push_back(D2D1::RectF(
-                row.right - 12.0f * scale - remove_w, row.top + 12.0f * scale,
+                row.right - 12.0f * scale - remove_exclude_w, row.top + 12.0f * scale,
                 row.right - 12.0f * scale, row.top + 44.0f * scale));
             y += 56.0f * scale;
         }
@@ -1430,7 +1431,11 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         }
         y += 44.0f * scale;
         const float rescan_w = label_btn_w(pulse::l10n::Get(pulse::l10n::StringId::Rescan));
-        l.network_action[0] = D2D1::RectF(card_right - add_folder_w, y - 36.0f * scale,
+        const float remove_server_w = label_btn_w(
+            pulse::l10n::Get(pulse::l10n::StringId::RemoveServerFolder));
+        const float add_server_w = label_btn_w(
+            pulse::l10n::Get(pulse::l10n::StringId::AddServerFolder));
+        l.network_action[0] = D2D1::RectF(card_right - add_server_w, y - 36.0f * scale,
                                           card_right, y - 36.0f * scale + section_btn_h);
         l.network_action[1] = D2D1::RectF(
             l.network_action[0].left - 8.0f * scale - rescan_w, y - 36.0f * scale,
@@ -1441,7 +1446,7 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
             const D2D1_RECT_F row = D2D1::RectF(card_left, y, card_right, y + 64.0f * scale);
             l.network_rows.push_back(row);
             l.network_remove.push_back(D2D1::RectF(
-                row.right - 12.0f * scale - remove_w, row.top + 16.0f * scale,
+                row.right - 12.0f * scale - remove_server_w, row.top + 16.0f * scale,
                 row.right - 12.0f * scale, row.top + 48.0f * scale));
             y += 64.0f * scale;
         }
@@ -1458,11 +1463,13 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
             l.context_toggle[g]=D2D1::RectF(l.content.right-pad-100*scale,y+20*scale,l.content.right-pad-56*scale,y+52*scale);
             y+=76*scale;
             if(vm.settings_expanded & (1u<<(g+8))) {
+                bool has_rows=false;
                 for(size_t i=0;i<vm.settings_items.size();++i) if(vm.settings_items[i].group==g) {
                     l.context_rows[i]=D2D1::RectF(l.content.left+pad+12*scale,y,l.content.right-pad-12*scale,y+40*scale);
                     y+=40*scale;
+                    has_rows=true;
                 }
-                if(y==l.context_header[g].bottom) {
+                if(!has_rows) {
                     l.context_empty[g]=D2D1::RectF(l.content.left+pad+16*scale,y,l.content.right-pad-16*scale,y+44*scale);
                     y+=44*scale;
                 }
@@ -1479,11 +1486,12 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         l.about_card = D2D1::RectF(card_left, y, card_right, y + 104.0f * scale);
         y += 116.0f * scale;
 
+        // The card holds a title, one line of description and the action row - the status-bar
+        // performance switch that used to sit in the middle is on the general page now, so the
+        // card is sized to its content instead of leaving a hole where that row was.
         const bool compact_diagnostics = card_right - card_left < 650.0f * scale;
-        const float diagnostics_h = (compact_diagnostics ? 288.0f : 208.0f) * scale;
+        const float diagnostics_h = (compact_diagnostics ? 224.0f : 152.0f) * scale;
         l.diagnostics_card = D2D1::RectF(card_left, y, card_right, y + diagnostics_h);
-        l.diagnostics_perf = D2D1::RectF(card_left + 8.0f * scale, y + 86.0f * scale,
-                                         card_right - 8.0f * scale, y + 142.0f * scale);
         const float gap = 8.0f * scale;
         const float action_left = card_left + 16.0f * scale;
         const float action_right = card_right - 16.0f * scale;
@@ -1497,7 +1505,7 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
             diag_w[i] = label_btn_w(pulse::l10n::Get(kDiagLabels[i]));
         if (compact_diagnostics) {
             for (int i = 0; i < 3; ++i) {
-                const float top = y + (152.0f + i * 40.0f) * scale;
+                const float top = y + (96.0f + i * 40.0f) * scale;
                 l.diagnostics_action[i] = D2D1::RectF(action_left, top, action_right,
                                                       top + 32.0f * scale);
             }
@@ -1508,7 +1516,7 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
             float left = action_left;
             for (int i = 0; i < 3; ++i) {
                 const float width = measured_total > available ? equal : diag_w[i];
-                const float top = y + 160.0f * scale;
+                const float top = y + 104.0f * scale;
                 l.diagnostics_action[i] = D2D1::RectF(left, top, left + width,
                                                       top + 32.0f * scale);
                 left += width + gap;
@@ -1522,9 +1530,13 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         const float download_w = std::min(available_width, label_btn_w(
             pulse::l10n::Get(pulse::l10n::StringId::DownloadUpdate)));
         const bool stack_updates = vm.settings_update_available && check_w + gap + download_w > available_width;
-        const float update_h = 174.0f * scale +
+        // One extra 64 dip row for the "check for updates automatically" switch between the status
+        // line and the buttons.
+        const float update_h = 174.0f * scale + 64.0f * scale +
             (stack_updates ? 40.0f * scale : 0.0f);
         l.update_card = D2D1::RectF(card_left, y, card_right, y + update_h);
+        l.check_updates_row = D2D1::RectF(card_left + 16.0f * scale, y + 104.0f * scale,
+                                          card_right - 16.0f * scale, y + 160.0f * scale);
         const float check_y = y + update_h - (stack_updates ? 88.0f : 48.0f) * scale;
         l.update_action[0] = D2D1::RectF(card_left + 16.0f * scale,
                                          check_y,
@@ -1636,6 +1648,17 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
     }
     l.content_h = y - l.content_origin + pad;
     return l;
+}
+
+// Duplicate-file rows exist only for the groups the layout kept near the viewport, so
+// painting looks the row up by group/file instead of recomputing it beside the layout.
+const D2D1_RECT_F* DupFileRect(const std::vector<D2D1_RECT_F>& rects,
+                               const std::vector<int>& groups, const std::vector<int>& files,
+                               int group, int file) {
+    for (size_t i = 0; i < rects.size(); ++i) {
+        if (groups[i] == group && files[i] == file) return &rects[i];
+    }
+    return nullptr;
 }
 
 bool ContainsPt(const D2D1_RECT_F& rc, float x, float y) {

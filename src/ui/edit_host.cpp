@@ -281,7 +281,9 @@ LRESULT DefPresentedChildEditProc(Compositor& compositor, IDWriteTextFormat* for
     // the caret at 0 behind the user's back and the next character landed in front of everything.
     // Keep the caret where the user was - the same selection for a redundant write, and just past
     // the changed span for a rewritten one, which is where the composition the IME wrote ends.
-    const bool read_before = msg == WM_SETTEXT && custom_paint;
+    // Independent of how the edit is painted: the native fallback resets the caret on WM_SETTEXT
+    // exactly the same way, and it is what users get when LumaText is unavailable.
+    const bool read_before = msg == WM_SETTEXT;
     std::wstring text_before;
     DWORD start_before = 0;
     DWORD end_before = 0;

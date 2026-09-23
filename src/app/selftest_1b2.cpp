@@ -4323,7 +4323,6 @@ void TestQuickAccess() {
             static_cast<int>(SidebarSectionId::Workspaces),
             static_cast<int>(SidebarSectionId::Starred),
             static_cast<int>(SidebarSectionId::QuickAccess),
-            static_cast<int>(SidebarSectionId::SavedSearches),
             static_cast<int>(SidebarSectionId::Tags),
             static_cast<int>(SidebarSectionId::Networks) };
         const auto reordered_vm = BuildWindowViewModel(pane, sidebar, true, false, false,
@@ -6367,7 +6366,16 @@ void TestDetailsPreviewInteraction() {
     saved.details_panel_width = 420;
     saved.sidebar_collapsed = 0x2;
     saved.sidebar_hidden = 0x4;
-    saved.sidebar_order = { 3, 6, 0, 7, 1, 2, 4, 5 };
+    // Every section exactly once, in a non-default order: a normalized order is a permutation
+    // of the ids the pane actually has.
+    saved.sidebar_order = {
+        static_cast<int>(SidebarSectionId::Drives),
+        static_cast<int>(SidebarSectionId::Cloud),
+        static_cast<int>(SidebarSectionId::Workspaces),
+        static_cast<int>(SidebarSectionId::Starred),
+        static_cast<int>(SidebarSectionId::QuickAccess),
+        static_cast<int>(SidebarSectionId::Tags),
+        static_cast<int>(SidebarSectionId::Networks) };
     saved.quick_access_hidden = (1 << 1) | (1 << 4);
     Check(SaveSession(saved) && LoadSession(loaded) && loaded.details_preview_only &&
         !loaded.details_preview && loaded.details_panel_width == 420,
@@ -6377,6 +6385,23 @@ void TestDetailsPreviewInteraction() {
     Check(loaded.sidebar_order == saved.sidebar_order &&
         loaded.quick_access_hidden == saved.quick_access_hidden,
         L"session: section order and hidden quick-access links survive reload");
+    {
+        // A version-7 session named the section ids it was written with, saved-search section
+        // included (id 2), and indexed its masks the same way. Loading it must drop that id and
+        // move every later section down one, instead of shifting what the user folded or hid.
+        WriteUtf8FileAtomic(data_dir + L"\\session.json",
+            L"{\"version\":7,\"sidebarOrder\":\"3,6,0,7,1,2,4,5\",\"sidebarHidden\":52}");
+        SessionSnapshot migrated;
+        LoadSession(migrated);
+        const int hidden_expected =
+            (1 << static_cast<int>(SidebarSectionId::Tags)) |
+            (1 << static_cast<int>(SidebarSectionId::Networks));
+        Check(migrated.sidebar_order.size() == static_cast<size_t>(kSidebarSectionCount) &&
+            migrated.sidebar_order[0] == static_cast<int>(SidebarSectionId::Drives) &&
+            migrated.sidebar_order[1] == static_cast<int>(SidebarSectionId::Cloud) &&
+            migrated.sidebar_hidden == hidden_expected,
+            L"session: a version-7 order and mask move to the new section ids");
+    }
     WriteUtf8FileAtomic(data_dir + L"\\session.json", L"{\"detailsPanel\":1,\"version\":4}");
     SessionSnapshot legacy;
     LoadSession(legacy);
