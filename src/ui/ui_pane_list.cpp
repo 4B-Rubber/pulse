@@ -775,8 +775,8 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
     const D2D1_RECT_F navForwardRc = PaneNavForwardRect(bounds, pane.filter_expand);
     const D2D1_RECT_F navUpRc = PaneNavUpRect(bounds, pane.filter_expand);
     if (pane.header_drop) {
-        MakeBrush(dc, WithAlpha(theme.accent, 0.18f), brFillHover_);
-        FillRoundedRect(dc, brFillHover_.get(), bounds.left + scale_, bounds.top + scale_,
+        MakeBrush(dc, WithAlpha(theme.accent, 0.18f), brScratch_);
+        FillRoundedRect(dc, brScratch_.get(), bounds.left + scale_, bounds.top + scale_,
             std::max(0.0f, w - 2.0f * scale_), pane_header_height_ - 2.0f * scale_,
             theme.radius_control * scale_);
     }
@@ -1033,6 +1033,8 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         }
         if (active_divider >= 0) {
             const float dividerX = columns.DividerX(active_divider);
+            // The accent brush holds whatever drew last; an ad-hoc read can land on a grey.
+            MakeBrush(dc, theme.accent, brAccent_);
             FillRect(dc, brAccent_.get(), dividerX - scale_, y + 4.0f * scale_,
                      2.0f * scale_, column_header_height_ - 8.0f * scale_);
         }
@@ -1050,7 +1052,7 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
     D2D1_COLOR_F frameColor = theme.stroke_card;
     if (focused) frameColor = WithAlpha(theme.accent, 0.28f);
     else if (target) frameColor = WithAlpha(theme.accent, 0.22f);
-    MakeBrush(dc, frameColor, brAccent_);
+    MakeBrush(dc, frameColor, brScratch_);
     const float strokeW = focused ? 1.5f * scale_ : 1.0f * scale_;
     D2D1_ROUNDED_RECT frame = D2D1::RoundedRect(
         D2D1::RectF(bounds.left + 0.5f * scale_, bounds.top + 0.5f * scale_,
@@ -1068,9 +1070,9 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
                 factory->Release();
             }
         }
-        dc->DrawRoundedRectangle(frame, brAccent_.get(), 1.5f * scale_, dashStroke_.get());
+        dc->DrawRoundedRectangle(frame, brScratch_.get(), 1.5f * scale_, dashStroke_.get());
     } else {
-        dc->DrawRoundedRectangle(frame, brAccent_.get(), strokeW);
+        dc->DrawRoundedRectangle(frame, brScratch_.get(), strokeW);
     }
 
     dc->PopAxisAlignedClip();
@@ -1235,6 +1237,9 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
         bool focused = (src == vm.selected_index);
         bool hover = (src == vm.hover_index);
         bool cut = e.record_only || vm.cut_names.contains(e.name);
+        // Hidden entries that the visibility setting lets through stay visually behind the
+        // real contents, the way Explorer dims them.
+        const bool dimmed = (e.attrs & FILE_ATTRIBUTE_HIDDEN) != 0;
 
         const float inset = 4.0f * scale_;
         if (hover) {
@@ -1296,7 +1301,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
         const bool drewThumbnail = !e.record_only && UsesThumbnails(vm.view_mode) &&
             thumbnail_cache_.Draw(dc, iconRect, e.path, e.attrs,
                 static_cast<uint32_t>(std::clamp(requestedPixels, 32l, 512l)),
-                vm.view_generation, e.modified_value, e.size_value)
+                vm.view_generation, e.modified_value, e.size_value, dimmed ? 0.7f : 1.0f)
                 == PreviewDrawResult::Bitmap;
         if (!drewThumbnail) DrawEntryIcon(e, iconX, iconY, renderedIconSize, theme);
 
@@ -1358,7 +1363,8 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             fieldState.focused = true;
             painter_.DrawTextFieldFrame(fieldRc, fieldState);
         } else {
-            D2D1_COLOR_F nameColor = cut ? WithAlpha(theme.text, 0.55f) : theme.text;
+            D2D1_COLOR_F nameColor = cut ? WithAlpha(theme.text, 0.55f)
+                : dimmed ? WithAlpha(theme.text, 0.72f) : theme.text;
             MakeBrush(dc, nameColor, brText_);
             if (iconGrid && tagDotCount == 0) {
                 DrawCenteredIconName(e.name, nameRc, nameColor, theme, name_matches);
@@ -1384,9 +1390,9 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 }
                 const float cx = trail.tag_x0 + trail.tag_r + static_cast<float>(d) * trail.tag_step;
                 const float cy = trail.tag_cy;
-                MakeBrush(dc, halo, brFillInput_);
+                MakeBrush(dc, halo, brScratch_);
                 dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
-                    trail.tag_r + 1.5f * scale_, trail.tag_r + 1.5f * scale_), brFillInput_.get());
+                    trail.tag_r + 1.5f * scale_, trail.tag_r + 1.5f * scale_), brScratch_.get());
                 // Dedicated brush: reusing brAccent_ leaked tag color into the
                 // next row's selection emphasis strip.
                 MakeBrush(dc, color, brTagDot_);
@@ -1405,7 +1411,9 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             }
         }
 
-        MakeBrush(dc, cut ? WithAlpha(theme.text_secondary, 0.55f) : theme.text_secondary, brTextSecondary_);
+        MakeBrush(dc, cut ? WithAlpha(theme.text_secondary, 0.55f)
+                : dimmed ? WithAlpha(theme.text_secondary, 0.72f) : theme.text_secondary,
+            brTextSecondary_);
         if (vm.view_mode == ViewMode::Details) {
             const auto draw_detail_text = [&](std::wstring_view text, float left, float width,
                                               DWRITE_TEXT_ALIGNMENT alignment) {
@@ -1474,8 +1482,8 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                                    const wchar_t* fallback, const D2D1_COLOR_F& color, float size) {
                 if (rc.right <= rc.left) return;
                 if (hot) {
-                    MakeBrush(dc, theme.fill_selected, brFillHover_);
-                    FillRoundedRect(dc, brFillHover_.get(), rc.left, rc.top,
+                    MakeBrush(dc, theme.fill_selected, brScratch_);
+                    FillRoundedRect(dc, brScratch_.get(), rc.left, rc.top,
                         rc.right - rc.left, rc.bottom - rc.top, 5.0f * scale_);
                 }
                 DrawIconText(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
@@ -1483,8 +1491,10 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             };
             if (trail.show_star) {
                 if (e.starred) {
-                    MakeBrush(dc, WithAlpha(theme.accent, starHot ? 0.28f : 0.18f), brFillHover_);
-                    FillRoundedRect(dc, brFillHover_.get(), trail.star.left, trail.star.top,
+                    // The star pill is its own tint: painting it through the hover brush made
+                    // every row drawn after it (the tile the pointer sits on) come out blue.
+                    MakeBrush(dc, WithAlpha(theme.accent, starHot ? 0.28f : 0.18f), brScratch_);
+                    FillRoundedRect(dc, brScratch_.get(), trail.star.left, trail.star.top,
                         trail.star.right - trail.star.left, trail.star.bottom - trail.star.top,
                         5.0f * scale_);
                 }

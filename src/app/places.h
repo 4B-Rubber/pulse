@@ -84,6 +84,19 @@ public:
     std::vector<std::wstring> quick_access_paths;
     std::vector<StarredItem> starred_items;
     std::vector<RecentItem> recent_items;
+    // The recent paths the file held when this process read it: the save-time merge keeps
+    // entries that appeared since (another window's visits) without resurrecting the ones
+    // the user removed here.
+    std::vector<std::wstring> recent_paths_at_load_;
+    // Same for the starred list: what the file held when this process read it, so a save
+    // can tell "the other window starred this" from "the user unstarred this here".
+    std::vector<std::wstring> starred_paths_at_load_;
+    // And for the pinned folders: a pin made in the other window must survive this one's
+    // save, an unpin made here must not be undone by it.
+    std::vector<std::wstring> quick_access_paths_at_load_;
+    // Workspaces are matched by root: what the file held at load tells the merge whether a
+    // workspace found on disk since was pinned elsewhere or was removed here.
+    std::vector<std::wstring> workspace_roots_at_load_;
     int active_workspace = -1;
     bool persist = true; // self-test can disable disk writes
 
@@ -174,6 +187,10 @@ private:
         std::vector<std::wstring> quick_access_paths;
         std::vector<StarredItem> starred_items;
         std::vector<RecentItem> recent_items;
+        std::vector<std::wstring> recent_paths_at_load;
+        std::vector<std::wstring> starred_paths_at_load;
+        std::vector<std::wstring> quick_access_paths_at_load;
+        std::vector<std::wstring> workspace_roots_at_load;
         int active_workspace = -1;
         bool persist = true;
     };

@@ -391,7 +391,7 @@ pulse_add_version_resource(pulse_preview "Pulse preview host" "Pulse.Preview" "P
 # Preview protocol self test (console; drives Pulse.Preview.exe over the pipe)
 add_executable(pulse_preview_test src/bench/preview_test_main.cpp
     src/bench/thumbnail_cache_test.cpp src/ui/thumbnail_cache.cpp src/preview_host/video_codec.cpp)
-target_link_libraries(pulse_preview_test PRIVATE ole32 gdi32 gdiplus)
+target_link_libraries(pulse_preview_test PRIVATE ole32 gdi32 gdiplus shell32)
 add_dependencies(pulse_preview_test pulse_preview)
 
 add_executable(pulse_shell_icons_test src/bench/shell_icons_test.cpp src/ui/shell_icons.cpp)

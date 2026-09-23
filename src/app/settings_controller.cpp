@@ -316,6 +316,14 @@ void SettingsController::ChangeTrackingDays(int days) {
     SaveAndApply(SettingsEffect::ChangeTracking);
 }
 
+void SettingsController::TooltipDelay(int index) {
+    static constexpr int kDelays[] = { 150, 400, 800 };
+    if (!prefs_ || index < 0 || index > 2) return;
+    if (prefs_->tooltip_delay_ms == kDelays[index]) return;
+    prefs_->tooltip_delay_ms = kDelays[index];
+    SaveAndApply(SettingsEffect::None);
+}
+
 bool SettingsController::CaptureGlobalSearchHotkey(uint32_t key, uint32_t modifiers) {
     if (!global_search_capturing_) return false;
     if (key == VK_ESCAPE) { CancelGlobalSearchHotkeyCapture(); return true; }
@@ -381,6 +389,15 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 16) {
         prefs_->show_protected_os_files = !prefs_->show_protected_os_files;
         SaveAndApply(SettingsEffect::FileVisibility);
+    } else if (index == 17) {
+        prefs_->show_tooltips = !prefs_->show_tooltips;
+        SaveAndApply(SettingsEffect::None);
+    } else if (index == 18) {
+        prefs_->file_hash_enabled = !prefs_->file_hash_enabled;
+        SaveAndApply(SettingsEffect::None);
+    } else if (index == 19) {
+        prefs_->show_title_brand = !prefs_->show_title_brand;
+        SaveAndApply(SettingsEffect::None);
     } else if (index == 6) {
         prefs_->show_pinned_tab_names = !prefs_->show_pinned_tab_names;
         SaveAndApply(SettingsEffect::None);

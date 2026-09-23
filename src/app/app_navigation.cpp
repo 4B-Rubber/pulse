@@ -796,6 +796,10 @@ void StartLoadingPath(AppState& s, app::Tab& tab, const std::wstring& path, Path
     tab.banner_message.clear();
     tab.net_readonly = false;
     tab.cache_unix = 0;
+    // The folder's own memory replaces the view the tab carried over from the last folder it
+    // showed; one with no memory keeps the carried view. Before the sort is handed to the
+    // worker, so the listing it returns is already in the remembered order.
+    app::ApplyFolderView(s, tab);
     if (tab.snapshot_path != normalized) {
         tab.SetSnapshot(nullptr);
         tab.applied_generation = 0;
@@ -1409,6 +1413,8 @@ void SetSort(AppState& s, ui::SortColumn col, ui::SortDirection direction) {
         // Apply the chosen order when the first result store arrives.
         tab->content_sort_override = true;
     } else RefreshActiveTab(s);
+    // The user chose this order for this folder: keep it, so the next visit starts here.
+    app::RememberFolderView(s, *tab);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 void OpenSelected(AppState& s) {
@@ -1513,8 +1519,31 @@ std::wstring NewTabPath(const AppState& s) {
     return tab->current_path;
 }
 
+void RememberGroupActivation(AppState& s, const app::LayoutTab* outgoing) {
+    if (!outgoing) return;
+    const int group_id = outgoing->tab_group;
+    if (group_id == 0) return;
+    s.lastActiveInGroup[group_id] = outgoing;
+}
+
+void PruneGroupActivations(AppState& s) {
+    auto& memory = s.lastActiveInGroup;
+    for (auto it = memory.begin(); it != memory.end();) {
+        bool still_member = false;
+        for (const auto& item : s.window_tabs.items) {
+            if (item.get() == it->second && item->tab_group == it->first) {
+                still_member = true;
+                break;
+            }
+        }
+        if (still_member) ++it;
+        else it = memory.erase(it);
+    }
+}
+
 void NewTab(AppState& s, const std::wstring& path) {
     RememberLayoutFocus(s);
+    RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.NewTab(path.empty() ? L"C:\\" : path);
     BindCurrentLayout(s);
     if (app::Tab* tab = ActiveTab(s)) {
@@ -1554,8 +1583,20 @@ void OpenSettingsTab(AppState& s, int page) {
 }
 void CloseLayoutTab(AppState& s, size_t idx) {
     if (idx >= s.window_tabs.items.size()) return;
+    // The window's last tab closes the window, the way Explorer does. WM_CLOSE
+    // owns the tray-or-exit decision, so this is the same as pressing the
+    // window's own close button.
+    if (s.window_tabs.ClosingLastTab(idx)) {
+        PostMessageW(s.hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
     RememberLayoutFocus(s);
+    RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.CloseTab(idx);
+    // The group that lost its last member has nothing left to show.
+    app::PruneEmptyGroups(s.window_tabs);
+    // The closed tab is gone; drop any memory that still points at it.
+    PruneGroupActivations(s);
     BindCurrentLayout(s);
     RevalidateVisibleFolders(s);
     InvalidateRect(s.hwnd, nullptr, FALSE);
@@ -1569,6 +1610,7 @@ void SwitchTab(AppState& s, size_t idx) {
     if (idx >= s.window_tabs.items.size()) return;
     if (s.addressSearching) HideAddressEditor(s, false);
     RememberLayoutFocus(s);
+    RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.SwitchTab(idx);
     BindCurrentLayout(s);
     RevalidateVisibleFolders(s);

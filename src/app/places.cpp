@@ -93,37 +93,8 @@ static bool PathIsOrDescendant(const std::wstring& path, const std::wstring& roo
     return root.ends_with(L"\\") || path[root.size()] == L'\\' || path[root.size()] == L'/';
 }
 
-static std::vector<std::wstring> ExtractObjectArray(const std::wstring& json,
-                                                     const wchar_t* key) {
-    std::vector<std::wstring> out;
-    size_t pos = pulse::json::ValuePosition(json, key);
-    if (pos == std::wstring::npos || pos >= json.size() || json[pos] != L'[') return out;
-    int array_depth = 0;
-    int object_depth = 0;
-    bool in_string = false;
-    size_t object_start = std::wstring::npos;
-    for (size_t i = pos; i < json.size(); ++i) {
-        const wchar_t c = json[i];
-        if (in_string) {
-            if (c == L'\\') ++i;
-            else if (c == L'"') in_string = false;
-            continue;
-        }
-        if (c == L'"') in_string = true;
-        else if (c == L'[') ++array_depth;
-        else if (c == L']') {
-            if (--array_depth == 0) break;
-        } else if (c == L'{') {
-            if (object_depth++ == 0) object_start = i;
-        } else if (c == L'}' && object_depth > 0) {
-            if (--object_depth == 0 && object_start != std::wstring::npos) {
-                out.push_back(json.substr(object_start, i - object_start + 1));
-                object_start = std::wstring::npos;
-            }
-        }
-    }
-    return out;
-}
+// The object arrays of places.json (recent, workspaces, starred) are read with
+// pulse::json::ExtractObjectArray from ../common/json_utils.h, shared with the folder view store.
 
 static const wchar_t* KindName(PlaceItemKind kind) {
     if (kind == PlaceItemKind::Folder) return L"folder";
@@ -150,6 +121,146 @@ static std::wstring TrimBadge(std::wstring value) {
 }
 
 } // namespace
+
+// The recent list is the one collection two windows really race over: every folder either
+// of them opens writes an entry, and the later save used to drop whatever the other had
+// collected since. The loader and the save-time merge read it through here.
+static std::vector<RecentItem> ParseRecentItemsJson(const std::wstring& json) {
+    std::vector<RecentItem> items;
+    for (const auto& block : pulse::json::ExtractObjectArray(json, L"recent_items")) {
+        RecentItem item;
+        item.path = Norm(pulse::json::ExtractString(block, L"path"));
+        item.kind = ParseKind(pulse::json::ExtractString(block, L"kind"));
+        const std::wstring opened = pulse::json::ExtractString(block, L"opened_at");
+        item.opened_at = opened.empty() ? 0 : _wcstoui64(opened.c_str(), nullptr, 10);
+        if (item.path.empty() || fs::IsVirtualPath(item.path) ||
+            fs::IsShellNamespacePath(item.path)) continue;
+        items.push_back(std::move(item));
+    }
+    return items;
+}
+
+// Workspaces are written back whole, so the loader and the save-time merge read them
+// through here. A workspace is identified by its root folder; the rest is its snapshot.
+static std::vector<Workspace> ParseWorkspacesJson(const std::wstring& json) {
+    std::vector<Workspace> workspaces;
+    for (const auto& block : pulse::json::ExtractObjectArray(json, L"workspaces")) {
+        Workspace w;
+        w.name = pulse::json::ExtractString(block, L"name");
+        w.root = pulse::json::ExtractString(block, L"root");
+        w.layout = pulse::json::ExtractInt(block, L"layout");
+        w.pane_paths = pulse::json::ExtractStringArray(block, L"panes");
+        for (const auto& value : pulse::json::ExtractStringArray(block, L"views"))
+            w.pane_views.push_back(ui::ParseViewMode(value));
+        while (w.pane_views.size() < w.pane_paths.size())
+            w.pane_views.push_back(ui::ViewMode::Details);
+        for (const auto& row : pulse::json::ExtractStringArray(block, L"freq")) {
+            auto tab = row.find(L'\t');
+            std::pair<std::wstring, int> hit;
+            if (tab == std::wstring::npos) {
+                hit.first = row;
+                hit.second = 1;
+            } else {
+                hit.first = row.substr(0, tab);
+                hit.second = _wtoi(row.c_str() + tab + 1);
+            }
+            if (!hit.first.empty()) w.frequent.push_back(std::move(hit));
+        }
+        if (!w.root.empty()) workspaces.push_back(std::move(w));
+    }
+    return workspaces;
+}
+
+// Keeps the visits another window collected after this one loaded. `recent` is the local
+// list and `loaded_paths` is what the file held back then: an entry that is on disk now,
+// missing locally and was not there back then is someone else's newer visit - while an
+// entry that was there and is gone locally stays gone (it was dropped on purpose).
+// The starred list is user data, so the same rule applies to it: an entry that is on disk
+// now, missing locally and was not there when this process loaded is another window's -
+// appended (and put through the same folders-first order the loader produces), while one
+// that was there and is gone locally was unstarred here and stays gone.
+// Pinned folders follow the same rule as the starred list: a folder pinned elsewhere while
+// this window was open is kept, a folder unpinned here stays unpinned.
+static void MergeQuickAccessFromDisk(const std::wstring& dir,
+                                     std::vector<std::wstring>& paths,
+                                     const std::vector<std::wstring>& loaded_paths) {
+    std::wstring json;
+    if (!ReadUtf8File(dir + L"\\places.json", json) || json.empty()) return;
+    for (const auto& path : pulse::json::ExtractStringArray(json, L"quick_access_paths")) {
+        const std::wstring normalized = Norm(path);
+        if (normalized.empty() || fs::IsVirtualPath(normalized)) continue;
+        const bool known = std::any_of(paths.begin(), paths.end(),
+            [&](const std::wstring& old) { return EqualI(old, normalized); });
+        if (known) continue;
+        const bool was_there = std::any_of(loaded_paths.begin(), loaded_paths.end(),
+            [&](const std::wstring& old) { return EqualI(old, normalized); });
+        if (!was_there) paths.push_back(normalized);
+    }
+}
+
+// A workspace pinned in another window while this one was open is kept: a root that is on
+// disk now, missing locally and was not there at load is appended in file order. A root the
+// file holds but this window already knows is this window's to write (local snapshot wins),
+// and one that was there at load but is gone locally was unpinned here, so it stays gone.
+static void MergeWorkspacesFromDisk(const std::wstring& dir, std::vector<Workspace>& workspaces,
+                                    const std::vector<std::wstring>& loaded_roots) {
+    std::wstring json;
+    if (!ReadUtf8File(dir + L"\\places.json", json) || json.empty()) return;
+    std::vector<Workspace> added;
+    for (auto& w : ParseWorkspacesJson(json)) {
+        const bool known = std::any_of(workspaces.begin(), workspaces.end(),
+            [&](const Workspace& old) { return EqualI(old.root, w.root); });
+        if (known) continue;
+        const bool was_there = std::any_of(loaded_roots.begin(), loaded_roots.end(),
+            [&](const std::wstring& root) { return EqualI(root, w.root); });
+        if (!was_there) added.push_back(std::move(w));
+    }
+    workspaces.insert(workspaces.end(), std::make_move_iterator(added.begin()),
+                      std::make_move_iterator(added.end()));
+}
+
+static void MergeStarredFromDisk(const std::wstring& dir, std::vector<StarredItem>& starred,
+                                 const std::vector<std::wstring>& loaded_paths) {
+    std::wstring json;
+    if (!ReadUtf8File(dir + L"\\places.json", json) || json.empty()) return;
+    std::vector<StarredItem> added;
+    for (const auto& block : pulse::json::ExtractObjectArray(json, L"starred_items")) {
+        StarredItem item;
+        item.path = Norm(pulse::json::ExtractString(block, L"path"));
+        item.kind = ParseKind(pulse::json::ExtractString(block, L"kind"));
+        item.badge = TrimBadge(pulse::json::ExtractString(block, L"badge"));
+        item.badge_rgb = ExtractRgb(block);
+        if (item.path.empty() || fs::IsVirtualPath(item.path)) continue;
+        const bool known = std::any_of(starred.begin(), starred.end(),
+            [&](const StarredItem& old) { return EqualI(old.path, item.path); });
+        if (known) continue;
+        const bool was_there = std::any_of(loaded_paths.begin(), loaded_paths.end(),
+            [&](const std::wstring& path) { return EqualI(path, item.path); });
+        if (!was_there) added.push_back(std::move(item));
+    }
+    if (added.empty()) return;
+    starred.insert(starred.end(), std::make_move_iterator(added.begin()),
+                   std::make_move_iterator(added.end()));
+    std::stable_partition(starred.begin(), starred.end(),
+        [](const StarredItem& item) { return item.kind == PlaceItemKind::Folder; });
+}
+
+static void MergeRecentFromDisk(const std::wstring& dir, std::vector<RecentItem>& recent,
+                                const std::vector<std::wstring>& loaded_paths) {
+    std::wstring json;
+    if (!ReadUtf8File(dir + L"\\places.json", json) || json.empty()) return;
+    for (auto& item : ParseRecentItemsJson(json)) {
+        const bool known = std::any_of(recent.begin(), recent.end(),
+            [&](const RecentItem& old) { return EqualI(old.path, item.path); });
+        if (known) continue;
+        const bool was_there = std::any_of(loaded_paths.begin(), loaded_paths.end(),
+            [&](const std::wstring& path) { return EqualI(path, item.path); });
+        if (!was_there) recent.push_back(std::move(item));
+    }
+    std::sort(recent.begin(), recent.end(),
+        [](const RecentItem& a, const RecentItem& b) { return a.opened_at > b.opened_at; });
+    if (recent.size() > 100) recent.resize(100);
+}
 
 PlacesCatalog::~PlacesCatalog() {
     StopPlacesWriter();
@@ -184,7 +295,11 @@ bool PlacesCatalog::SaveTagFile(const std::vector<ColorTag>& snapshot) {
         file << L"}" << (i + 1 < snapshot.size() ? L"," : L"") << L"\n";
     }
     file << L"  ]\n}\n";
-    return WriteUtf8FileAtomic(dir + L"\\tags.json", file.str());
+    // One step back, so a damaged write never leaves the palette with only a broken file
+    // to come back to.
+    const std::wstring path = dir + L"\\tags.json";
+    KeepPreviousFileCopy(path);
+    return WriteUtf8FileAtomic(path, file.str());
 }
 
 void PlacesCatalog::QueueTagSave() const {
@@ -268,46 +383,9 @@ bool PlacesCatalog::Load() {
     active_workspace = pulse::json::ExtractInt(json, L"active_workspace");
     if (json.find(L"\"active_workspace\"") == std::wstring::npos) active_workspace = -1;
 
-    size_t pos = json.find(L"\"workspaces\"");
-    if (pos != std::wstring::npos) {
-        pos = json.find(L'[', pos);
-        if (pos != std::wstring::npos) {
-            ++pos;
-            while (pos < json.size() && json[pos] != L']') {
-                size_t obj = json.find(L'{', pos);
-                if (obj == std::wstring::npos || obj > json.find(L']', pos)) break;
-                size_t end = json.find(L'}', obj);
-                if (end == std::wstring::npos) break;
-                std::wstring block = json.substr(obj, end - obj + 1);
-                Workspace w;
-                w.name = pulse::json::ExtractString(block, L"name");
-                w.root = pulse::json::ExtractString(block, L"root");
-                w.layout = pulse::json::ExtractInt(block, L"layout");
-                w.pane_paths = pulse::json::ExtractStringArray(block, L"panes");
-                for (const auto& value : pulse::json::ExtractStringArray(block, L"views"))
-                    w.pane_views.push_back(ui::ParseViewMode(value));
-                while (w.pane_views.size() < w.pane_paths.size())
-                    w.pane_views.push_back(ui::ViewMode::Details);
-                auto freq = pulse::json::ExtractStringArray(block, L"freq");
-                for (const auto& row : freq) {
-                    auto tab = row.find(L'\t');
-                    std::pair<std::wstring, int> hit;
-                    if (tab == std::wstring::npos) {
-                        hit.first = row;
-                        hit.second = 1;
-                    } else {
-                        hit.first = row.substr(0, tab);
-                        hit.second = _wtoi(row.c_str() + tab + 1);
-                    }
-                    if (!hit.first.empty()) w.frequent.push_back(std::move(hit));
-                }
-                if (!w.root.empty()) workspaces.push_back(std::move(w));
-                pos = end + 1;
-            }
-        }
-    }
+    workspaces = ParseWorkspacesJson(json);
 
-    pos = json.find(L"\"tags\"");
+    size_t pos = json.find(L"\"tags\"");
     if (pos != std::wstring::npos) {
         pos = json.find(L'[', pos);
         if (pos != std::wstring::npos) {
@@ -358,7 +436,7 @@ bool PlacesCatalog::Load() {
 
     const bool has_starred_items = pulse::json::ValuePosition(
         json, L"starred_items") != std::wstring::npos;
-    for (const auto& block : ExtractObjectArray(json, L"starred_items")) {
+    for (const auto& block : pulse::json::ExtractObjectArray(json, L"starred_items")) {
         StarredItem item;
         item.path = Norm(pulse::json::ExtractString(block, L"path"));
         item.kind = ParseKind(pulse::json::ExtractString(block, L"kind"));
@@ -378,19 +456,23 @@ bool PlacesCatalog::Load() {
                 starred_items.push_back({ normalized });
         }
     }
-    for (const auto& block : ExtractObjectArray(json, L"recent_items")) {
-        RecentItem item;
-        item.path = Norm(pulse::json::ExtractString(block, L"path"));
-        item.kind = ParseKind(pulse::json::ExtractString(block, L"kind"));
-        const std::wstring opened = pulse::json::ExtractString(block, L"opened_at");
-        item.opened_at = opened.empty() ? 0 : _wcstoui64(opened.c_str(), nullptr, 10);
-        if (!item.path.empty() && !fs::IsVirtualPath(item.path) &&
-            std::none_of(recent_items.begin(), recent_items.end(), [&](const RecentItem& old) {
-                return EqualI(old.path, item.path);
-            })) {
-            recent_items.push_back(std::move(item));
-        }
+    for (auto& item : ParseRecentItemsJson(json)) {
+        const bool duplicate = std::any_of(recent_items.begin(), recent_items.end(),
+            [&](const RecentItem& old) { return EqualI(old.path, item.path); });
+        if (!duplicate) recent_items.push_back(std::move(item));
     }
+    // Remember what the file held, so the next save can tell "another window added this"
+    // from "the user removed this here".
+    recent_paths_at_load_.clear();
+    recent_paths_at_load_.reserve(recent_items.size());
+    for (const auto& item : recent_items) recent_paths_at_load_.push_back(item.path);
+    starred_paths_at_load_.clear();
+    starred_paths_at_load_.reserve(starred_items.size());
+    for (const auto& item : starred_items) starred_paths_at_load_.push_back(item.path);
+    quick_access_paths_at_load_ = quick_access_paths;
+    workspace_roots_at_load_.clear();
+    workspace_roots_at_load_.reserve(workspaces.size());
+    for (const auto& workspace : workspaces) workspace_roots_at_load_.push_back(workspace.root);
     std::stable_sort(recent_items.begin(), recent_items.end(),
         [](const RecentItem& a, const RecentItem& b) { return a.opened_at > b.opened_at; });
     if (recent_items.size() > 100) recent_items.resize(100);
@@ -398,6 +480,9 @@ bool PlacesCatalog::Load() {
         [](const StarredItem& item) { return item.kind == PlaceItemKind::Folder; });
 
     bool tags_loaded = false;
+    // The file is there but nothing could be read out of it: the default palette must not
+    // take its place as the only copy of what the user had.
+    bool tags_unreadable = false;
     std::wstring tag_json;
     if (ReadUtf8File(dir + L"\\tags.json", tag_json) && !tag_json.empty()) {
         std::vector<ColorTag> loaded;
@@ -423,13 +508,22 @@ bool PlacesCatalog::Load() {
         if (!loaded.empty()) {
             tags = std::move(loaded);
             tags_loaded = true;
+        } else {
+            tags_unreadable = true;
         }
     }
 
     EnsureDefaults();
     RebuildTagIndex();
     RebuildStarIndex();
-    if (places_loaded && !tags_loaded) QueueTagSave();
+    if (places_loaded && !tags_loaded) {
+        // Set the unreadable file aside as .bad (it stays around for a manual recovery)
+        // and only then let the defaults be written to a fresh file. A file another
+        // process holds is left alone: replacing the only copy is worse than starting
+        // from the default palette.
+        if (!tags_unreadable || QuarantineUnreadableFile(dir + L"\\tags.json"))
+            QueueTagSave();
+    }
     return places_loaded || tags_loaded;
 }
 
@@ -456,6 +550,10 @@ PlacesCatalog::SaveSnapshot PlacesCatalog::CaptureSaveSnapshot() const {
     snapshot.quick_access_paths = quick_access_paths;
     snapshot.starred_items = starred_items;
     snapshot.recent_items = recent_items;
+    snapshot.recent_paths_at_load = recent_paths_at_load_;
+    snapshot.starred_paths_at_load = starred_paths_at_load_;
+    snapshot.quick_access_paths_at_load = quick_access_paths_at_load_;
+    snapshot.workspace_roots_at_load = workspace_roots_at_load_;
     snapshot.active_workspace = active_workspace;
     snapshot.persist = persist;
     return snapshot;
@@ -537,6 +635,16 @@ bool PlacesCatalog::Save() const {
 bool PlacesCatalog::SaveSnapshotFile(const SaveSnapshot& snapshot) {
     std::wstring dir = GetPulseDataDir();
     if (dir.empty()) return false;
+    // Another window may have collected recent entries since this snapshot was taken: its
+    // visits are not this save's to roll back.
+    std::vector<RecentItem> recent = snapshot.recent_items;
+    MergeRecentFromDisk(dir, recent, snapshot.recent_paths_at_load);
+    std::vector<StarredItem> starred = snapshot.starred_items;
+    MergeStarredFromDisk(dir, starred, snapshot.starred_paths_at_load);
+    std::vector<std::wstring> quick_access = snapshot.quick_access_paths;
+    MergeQuickAccessFromDisk(dir, quick_access, snapshot.quick_access_paths_at_load);
+    std::vector<Workspace> workspaces = snapshot.workspaces;
+    MergeWorkspacesFromDisk(dir, workspaces, snapshot.workspace_roots_at_load);
     std::wostringstream f;
     auto writeArr = [&](const std::vector<std::wstring>& arr) {
         f << L"[";
@@ -550,8 +658,8 @@ bool PlacesCatalog::SaveSnapshotFile(const SaveSnapshot& snapshot) {
     };
     f << L"{\n  \"places_version\":2,\n  \"tag_version\":2,\n  \"active_workspace\":" << snapshot.active_workspace
       << L",\n  \"workspaces\":[\n";
-    for (size_t i = 0; i < snapshot.workspaces.size(); ++i) {
-        const auto& w = snapshot.workspaces[i];
+    for (size_t i = 0; i < workspaces.size(); ++i) {
+        const auto& w = workspaces[i];
         std::wstring name, root;
         pulse::json::Escape(w.name, name);
         pulse::json::Escape(w.root, root);
@@ -570,7 +678,7 @@ bool PlacesCatalog::SaveSnapshotFile(const SaveSnapshot& snapshot) {
         f << L",\"freq\":";
         writeArr(freq);
         f << L"}";
-        if (i + 1 < snapshot.workspaces.size()) f << L",";
+        if (i + 1 < workspaces.size()) f << L",";
         f << L"\n";
     }
     f << L"  ],\n  \"tags\":[\n";
@@ -599,15 +707,15 @@ bool PlacesCatalog::SaveSnapshotFile(const SaveSnapshot& snapshot) {
         f << L"\n";
     }
     std::vector<std::wstring> legacy_starred;
-    legacy_starred.reserve(snapshot.starred_items.size());
-    for (const auto& item : snapshot.starred_items) legacy_starred.push_back(item.path);
+    legacy_starred.reserve(starred.size());
+    for (const auto& item : starred) legacy_starred.push_back(item.path);
     f << L"  ],\n  \"starred\":";
     writeArr(legacy_starred);
     f << L",\n  \"quick_access_paths\":";
-    writeArr(snapshot.quick_access_paths);
+    writeArr(quick_access);
     f << L",\n  \"starred_items\":[\n";
-    for (size_t i = 0; i < snapshot.starred_items.size(); ++i) {
-        const auto& item = snapshot.starred_items[i];
+    for (size_t i = 0; i < starred.size(); ++i) {
+        const auto& item = starred[i];
         std::wstring path, badge;
         pulse::json::Escape(item.path, path);
         pulse::json::Escape(item.badge, badge);
@@ -616,18 +724,18 @@ bool PlacesCatalog::SaveSnapshotFile(const SaveSnapshot& snapshot) {
         f << L"    {\"path\":\"" << path << L"\",\"kind\":\""
           << KindName(item.kind) << L"\",\"badge\":\"" << badge
           << L"\",\"rgb\":" << rgb << L"}";
-        if (i + 1 < snapshot.starred_items.size()) f << L",";
+        if (i + 1 < starred.size()) f << L",";
         f << L"\n";
     }
     f << L"  ],\n  \"recent_items\":[\n";
-    for (size_t i = 0; i < snapshot.recent_items.size(); ++i) {
-        const auto& item = snapshot.recent_items[i];
+    for (size_t i = 0; i < recent.size(); ++i) {
+        const auto& item = recent[i];
         std::wstring path;
         pulse::json::Escape(item.path, path);
         f << L"    {\"path\":\"" << path << L"\",\"kind\":\""
           << KindName(item.kind) << L"\",\"opened_at\":\""
           << item.opened_at << L"\"}";
-        if (i + 1 < snapshot.recent_items.size()) f << L",";
+        if (i + 1 < recent.size()) f << L",";
         f << L"\n";
     }
     f << L"  ]\n}\n";
@@ -995,7 +1103,11 @@ std::vector<std::wstring> PlacesCatalog::StarredFolderPaths() const {
 
 void PlacesCatalog::RecordRecent(const std::wstring& path, PlaceItemKind kind) {
     const std::wstring normalized = Norm(path);
-    if (normalized.empty() || fs::IsVirtualPath(normalized)) return;
+    // A namespace ("::{GUID}") used to arrive here as a folder path and stayed in the
+    // list as an entry that cannot be opened; nothing but a real location belongs here.
+    if (normalized.empty() || fs::IsVirtualPath(normalized) ||
+        fs::IsShellNamespacePath(normalized))
+        return;
     const std::wstring key = TagKey(normalized);
     RecentItem item{ normalized, kind, NowFileTime() };
     const auto found = std::find_if(recent_items.begin(), recent_items.end(),

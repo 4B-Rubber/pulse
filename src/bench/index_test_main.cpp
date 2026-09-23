@@ -156,6 +156,64 @@ int wmain(int argc, wchar_t** argv) {
               L"excluded path matches subtree boundaries");
     }
 
+    // The machine configuration is written by the settings UI, the installer and the service.
+    // A save whose snapshot never saw another writer's exclusions has to fold the file back
+    // in, and a file that cannot be read has to be set aside instead of being replaced by
+    // defaults (which used to erase the excluded volumes and folders).
+    {
+        wchar_t temp_dir[MAX_PATH]{};
+        GetTempPathW(ARRAYSIZE(temp_dir), temp_dir);
+        const std::wstring sandbox = std::wstring(temp_dir) + L"pulse-index-config-" +
+                                     std::to_wstring(GetCurrentProcessId());
+        CreateDirectoryW(sandbox.c_str(), nullptr);
+        wchar_t previous[32768]{};
+        const DWORD had_previous =
+            GetEnvironmentVariableW(L"PULSE_TEST_MACHINE_DIR", previous, ARRAYSIZE(previous));
+        SetEnvironmentVariableW(L"PULSE_TEST_MACHINE_DIR", sandbox.c_str());
+
+        const std::wstring config_path = sandbox + L"\\index-config.json";
+        const std::wstring volume_id{L"\\\\?\\VOLUME{11111111-2222-3333-4444-555555555555}\\"};
+        IndexConfig writer;
+        writer.index_path = sandbox + L"\\IndexData";
+        writer.excluded_volume_ids.insert(volume_id);
+        writer.excluded_paths = { L"C:\\NoIndexA" };
+        std::wstring error;
+        Check(SaveMachineConfig(writer, &error), L"machine config: a full profile saves");
+        {
+            // A second writer that only knows about its own exclusion must not drop the rest.
+            IndexConfig stale;
+            stale.index_path = writer.index_path;
+            stale.excluded_paths = { L"C:\\NoIndexB" };
+            Check(SaveMachineConfig(stale, &error), L"machine config: a stale snapshot saves");
+        }
+        IndexConfig loaded;
+        Check(LoadMachineConfig(loaded, &error) && loaded.excluded_paths.size() == 2 &&
+                  loaded.excluded_paths[0] == L"C:\\NoIndexA" &&
+                  loaded.excluded_paths[1] == L"C:\\NoIndexB",
+              L"machine config: exclusions from both writers survive");
+        Check(loaded.IsExcluded(volume_id),
+              L"machine config: the excluded volume survives a stale save");
+        Check(loaded.index_path == writer.index_path,
+              L"machine config: the writer's own index path wins");
+
+        DeleteFileW(config_path.c_str());
+        CreateDirectoryW(config_path.c_str(), nullptr);
+        IndexConfig fresh;
+        fresh.index_path = writer.index_path;
+        const bool wrote_over_unreadable = SaveMachineConfig(fresh, &error);
+        const DWORD written_attributes = GetFileAttributesW(config_path.c_str());
+        Check(wrote_over_unreadable && written_attributes != INVALID_FILE_ATTRIBUTES &&
+                  (written_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+                  GetFileAttributesW((config_path + L".bad").c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"machine config: an unreadable file is set aside before the write");
+
+        DeleteFileW(config_path.c_str());
+        DeleteFileW((config_path + L".bad").c_str());
+        DeleteFileW((config_path + L".bak").c_str());
+        RemoveDirectoryW(sandbox.c_str());
+        SetEnvironmentVariableW(L"PULSE_TEST_MACHINE_DIR", had_previous ? previous : nullptr);
+    }
+
     {
         wchar_t temp_dir[MAX_PATH]{};
         GetTempPathW(ARRAYSIZE(temp_dir), temp_dir);

@@ -193,6 +193,59 @@ std::wstring ConfigJson(const IndexConfig& config) {
     return out;
 }
 
+// The path LoadMachineConfig reads: the current file, or the in-Index copy older releases
+// wrote when the current one does not exist at all.
+std::wstring EffectiveConfigPath(const std::wstring& root) {
+    if (root.empty()) return {};
+    const std::wstring current = root + L"\\index-config.json";
+    if (GetFileAttributesW(current.c_str()) != INVALID_FILE_ATTRIBUTES) return current;
+    return GetLastError() == ERROR_FILE_NOT_FOUND ? root + L"\\Index\\config.json" : current;
+}
+
+void SortUniquePaths(std::vector<std::wstring>& paths) {
+    std::sort(paths.begin(), paths.end(), [](const auto& a, const auto& b) {
+        return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+    });
+    paths.erase(std::unique(paths.begin(), paths.end(), [](const auto& a, const auto& b) {
+        return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+    }), paths.end());
+}
+
+// The one parser behind LoadMachineConfig and the save-time merge, so the two can never
+// disagree about what the file says.
+void ParseMachineConfigJson(const std::wstring& json, const std::wstring& default_index_path,
+                            IndexConfig& config) {
+    config.version = static_cast<uint32_t>((std::max)(1, pulse::json::ExtractInt(json, L"version", 1)));
+    config.generation = static_cast<uint64_t>((std::max)(1, pulse::json::ExtractInt(json, L"generation", 1)));
+    config.include_fixed_ntfs = pulse::json::ExtractBool(json, L"include_fixed_ntfs", true);
+    config.include_removable_ntfs = pulse::json::ExtractBool(json, L"include_removable_ntfs", true);
+    config.index_path = pulse::json::ExtractString(json, L"index_path", default_index_path);
+    if (config.index_path.empty()) config.index_path = default_index_path;
+    config.excluded_volume_ids.clear();
+    for (auto& id : ExtractStringArray(json, L"excluded_volume_ids"))
+        config.excluded_volume_ids.insert(NormalizeVolumeId(std::move(id)));
+    config.excluded_paths.clear();
+    for (auto& path_value : ExtractStringArray(json, L"excluded_paths")) {
+        std::replace(path_value.begin(), path_value.end(), L'/', L'\\');
+        while (path_value.size() > 3 && path_value.back() == L'\\') path_value.pop_back();
+        if (!path_value.empty()) config.excluded_paths.push_back(std::move(path_value));
+    }
+    SortUniquePaths(config.excluded_paths);
+}
+
+// Exclusions are a union across writers: the settings UI, the installer and the service all
+// save this file, and a snapshot that never saw the other writer's list must not drop it.
+void MergeExclusionsFromJson(const std::wstring& json, const std::wstring& default_index_path,
+                             IndexConfig& config) {
+    IndexConfig disk;
+    ParseMachineConfigJson(json, default_index_path, disk);
+    config.generation = (std::max)(config.generation, disk.generation);
+    for (auto& id : disk.excluded_volume_ids)
+        config.excluded_volume_ids.insert(std::move(id));
+    for (auto& path : disk.excluded_paths) config.excluded_paths.push_back(std::move(path));
+    SortUniquePaths(config.excluded_paths);
+}
+
 bool IsNtfs(const std::wstring& fs) {
     return CompareStringOrdinal(fs.c_str(), -1, L"NTFS", -1, TRUE) == CSTR_EQUAL;
 }
@@ -225,6 +278,16 @@ std::wstring NormalizeVolumeId(std::wstring id) {
 }
 
 std::wstring MachineDataRoot() {
+    // Self-tests redirect this tree: the machine configuration is administrator-owned and a
+    // test run must never touch the real ProgramData copy.
+    wchar_t sandbox[32768]{};
+    const DWORD sandbox_length =
+        GetEnvironmentVariableW(L"PULSE_TEST_MACHINE_DIR", sandbox, ARRAYSIZE(sandbox));
+    if (sandbox_length > 0 && sandbox_length < ARRAYSIZE(sandbox)) {
+        std::wstring dir = sandbox;
+        while (dir.size() > 3 && dir.back() == L'\\') dir.pop_back();
+        return EnsureDirectory(dir) ? dir : std::wstring{};
+    }
     std::wstring root = KnownFolder(CSIDL_COMMON_APPDATA);
     if (root.empty()) return {};
     const std::wstring pulse = root + L"\\Pulse";
@@ -262,9 +325,11 @@ bool LoadMachineConfig(IndexConfig& config, std::wstring* error) {
         SetError(error, L"无法定位 ProgramData 索引目录");
         return false;
     }
-    // Older releases kept machine configuration inside the default data directory.
-    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND)
-        path = root + L"\\Index\\config.json";
+    path = EffectiveConfigPath(root);
+    if (path.empty()) {
+        SetError(error, L"无法定位 ProgramData 索引目录");
+        return false;
+    }
     std::wstring json;
     if (!pulse::ReadUtf8File(path, json)) {
         if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -278,41 +343,40 @@ bool LoadMachineConfig(IndexConfig& config, std::wstring* error) {
         SetError(error, L"索引配置为空或损坏");
         return false;
     }
-    config.version = static_cast<uint32_t>((std::max)(1, pulse::json::ExtractInt(json, L"version", 1)));
-    config.generation = static_cast<uint64_t>((std::max)(1, pulse::json::ExtractInt(json, L"generation", 1)));
-    config.include_fixed_ntfs = pulse::json::ExtractBool(json, L"include_fixed_ntfs", true);
-    config.include_removable_ntfs = pulse::json::ExtractBool(json, L"include_removable_ntfs", true);
-    config.index_path = pulse::json::ExtractString(json, L"index_path", root + L"\\Index");
-    if (config.index_path.empty()) config.index_path = root + L"\\Index";
-    for (auto& id : ExtractStringArray(json, L"excluded_volume_ids"))
-        config.excluded_volume_ids.insert(NormalizeVolumeId(std::move(id)));
-    for (auto& path_value : ExtractStringArray(json, L"excluded_paths")) {
-        std::replace(path_value.begin(), path_value.end(), L'/', L'\\');
-        while (path_value.size() > 3 && path_value.back() == L'\\') path_value.pop_back();
-        if (!path_value.empty()) config.excluded_paths.push_back(std::move(path_value));
-    }
-    std::sort(config.excluded_paths.begin(), config.excluded_paths.end(),
-              [](const auto& a, const auto& b) {
-                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_LESS_THAN;
-              });
-    config.excluded_paths.erase(std::unique(config.excluded_paths.begin(), config.excluded_paths.end(),
-              [](const auto& a, const auto& b) {
-                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
-              }), config.excluded_paths.end());
+    ParseMachineConfigJson(json, root + L"\\Index", config);
     return true;
 }
 
 bool SaveMachineConfig(const IndexConfig& config, std::wstring* error) {
+    const std::wstring root = MachineDataRoot();
     const std::wstring path = MachineConfigPath();
     if (path.empty()) {
         SetError(error, L"无法定位 ProgramData 索引目录");
         return false;
     }
-    if (!pulse::WriteUtf8FileAtomic(path, ConfigJson(config))) {
+    // Another writer may have changed the exclusions since this snapshot was taken (the
+    // settings page, the installer and the service all save this file): fold the file back
+    // in, so a stale save cannot erase an excluded volume or folder.
+    IndexConfig merged = config;
+    const std::wstring source = EffectiveConfigPath(root);
+    std::wstring existing;
+    if (!source.empty() && GetFileAttributesW(source.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (pulse::ReadUtf8File(source, existing) && !existing.empty() &&
+            existing.find(L'{') != std::wstring::npos) {
+            MergeExclusionsFromJson(existing, root + L"\\Index", merged);
+        } else if (!QuarantineUnreadableFile(source)) {
+            // The file can neither be read nor moved aside: writing would replace the only
+            // copy, so it is left alone.
+            SetError(error, L"索引配置无法读取，且无法隔离旧文件");
+            return false;
+        }
+    }
+    KeepPreviousFileCopy(path);
+    if (!pulse::WriteUtf8FileAtomic(path, ConfigJson(merged))) {
         SetError(error, Win32Error(L"保存索引配置失败"));
         return false;
     }
-    const std::wstring legacy_root = MachineDataRoot() + L"\\Index";
+    const std::wstring legacy_root = root + L"\\Index";
     const DWORD attributes = GetFileAttributesW(legacy_root.c_str());
     if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
         // The new configuration is durable before removing the legacy copy.

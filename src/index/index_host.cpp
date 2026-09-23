@@ -791,8 +791,10 @@ int InstallService() {
     (void)MachineDataRoot();
     (void)MachineIndexRoot();
     IndexConfig config;
-    LoadMachineConfig(config, nullptr);
-    SaveMachineConfig(config, nullptr);
+    // Write back only what was actually read: a failed load used to leave the defaults in
+    // `config` here, and saving them erased the machine's excluded volumes and folders.
+    if (LoadMachineConfig(config, nullptr))
+        SaveMachineConfig(config, nullptr);
     const std::wstring bin = L"\"" + SelfPath() + L"\" --service";
 
     DWORD last_err = ERROR_GEN_FAILURE;

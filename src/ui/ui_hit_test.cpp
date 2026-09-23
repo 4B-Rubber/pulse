@@ -46,6 +46,19 @@ bool MainRenderer::TabGroupChipRect(const WindowViewModel& vm, float window_w,
     return false;
 }
 
+bool MainRenderer::TabGroupChipRectForHit(const WindowViewModel& vm, float window_w,
+                                          int group_index, D2D1_RECT_F* out) const {
+    if (!out || !TabGroupChipRect(vm, window_w, group_index, out)) return false;
+    // Only hit testing and the hover card want this: the draw path and drag math use the
+    // rest slot above, so the animation offset is added here and not there.
+    if (group_index >= 0 && group_index < static_cast<int>(vm.tab_groups.size())) {
+        const float slide = vm.tab_groups[static_cast<size_t>(group_index)].x_offset;
+        out->left += slide;
+        out->right += slide;
+    }
+    return true;
+}
+
 float MainRenderer::TabPitchPx(const WindowViewModel& vm, float window_w) const {
     return ComputeTabStrip(vm, window_w).pitch;
 }
@@ -83,6 +96,31 @@ bool MainRenderer::SidebarRowRect(const WindowViewModel& vm, float w, float h, i
 HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F& rect, float x, float y) const {
     HitTestResult r;
     if (x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) return r;
+
+    // The group hover card floats over the strip and the content area, so it
+    // must win every hit before the title-bar/settings/pane branches.
+    if (vm.tab_group_card.visible && !vm.tab_group_card.rows.empty()) {
+        D2D1_RECT_F chip_rc{};
+        if (vm.tab_group_card.chip_index >= 0 &&
+            TabGroupChipRectForHit(vm, rect.right, vm.tab_group_card.chip_index, &chip_rc)) {
+            int visible = 0;
+            const D2D1_RECT_F card =
+                TabGroupCardRect(vm.tab_group_card, chip_rc, rect, scale_, &visible);
+            if (ContainsPt(card, x, y)) {
+                const int display = TabGroupCardRowAt(card, x, y, scale_);
+                if (display >= 0 && display < visible) {
+                    r.region = HitTestResult::TabGroupCardRow;
+                    // Rows are reported by their index in tab_group_card.rows,
+                    // not by the position they are drawn at: a capped card skips
+                    // the member rows it had to drop.
+                    r.index = TabGroupCardRowIndex(vm.tab_group_card, display, visible);
+                } else {
+                    r.region = HitTestResult::TabGroupCard;
+                }
+                return r;
+            }
+        }
+    }
 
     if (vm.change_popover.visible) {
         const auto popup = ChangePopoverRect(vm.change_popover, rect, scale_);
@@ -131,9 +169,14 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                  k < vm.tab_drag_index + dragN && k < static_cast<int>(vm.tabs.size()); ++k)
                 if (hitTab(k)) return r;
         }
-        // Group chips: strip slots between tabs, click opens the group popup.
+        // Group chips: strip slots between tabs, click opens the group popup. A chip that
+        // just moved slides for 150 ms, so the hit follows the drawn position.
         for (const auto& chip : strip.chips) {
-            if (x >= chip.left && x < chip.left + chip.width &&
+            const float slide = chip.group >= 0 &&
+                    chip.group < static_cast<int>(vm.tab_groups.size())
+                ? vm.tab_groups[static_cast<size_t>(chip.group)].x_offset : 0.0f;
+            const float chip_left = chip.left + slide;
+            if (x >= chip_left && x < chip_left + chip.width &&
                 y >= strip.y + 4.0f * scale_ && y < strip.y + strip.h - 4.0f * scale_) {
                 r.region = HitTestResult::TabGroup;
                 r.index = chip.group;
@@ -256,6 +299,21 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     r.region = HitTestResult::SettingsToggle;
                     r.index = 6;
                     return r;
+                }
+                if (ContainsPt(lay.tooltip_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 17; return r;
+                }
+                if (ContainsPt(lay.title_brand_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 19; return r;
+                }
+                for (int i = 0; i < 4; ++i) if (ContainsPt(lay.tooltip_delay[i], x, y)) {
+                    r.region = HitTestResult::SettingsTooltipDelay; r.index = i; return r;
+                }
+                if (ContainsPt(lay.thumb_cache_button, x, y)) {
+                    r.region = HitTestResult::SettingsThumbCache; return r;
+                }
+                if (ContainsPt(lay.file_hash_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 18; return r;
                 }
                 if (ContainsPt(lay.blank_click_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle;

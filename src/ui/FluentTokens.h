@@ -168,9 +168,23 @@ struct Theme {
 
 enum class ThemeMode { Auto, Light, Dark };
 
+// The immersive colour policy — and the undocumented export that reports it — is cached
+// per process: ShouldAppsUseDarkMode keeps answering with the value the process saw
+// first, so a theme switched while the app is running never reaches it (measured on this
+// machine: with AppsUseLightTheme flipped underneath, the export still returned the old
+// answer, and RefreshImmersiveColorPolicyState did not clear it either). The value
+// Settings itself writes is read fresh every time, so that one leads; the export stays as
+// the fallback for profiles that do not carry the value at all.
 inline bool ShouldUseDarkMode(ThemeMode overrideMode) noexcept {
     if (overrideMode == ThemeMode::Dark) return true;
     if (overrideMode == ThemeMode::Light) return false;
+    DWORD value = 1;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            L"AppsUseLightTheme",
+            RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS)
+        return value == 0;
     using Fn = bool (WINAPI*)();
     HMODULE uxtheme = LoadLibraryW(L"uxtheme.dll");
     bool dark = false;
@@ -180,12 +194,6 @@ inline bool ShouldUseDarkMode(ThemeMode overrideMode) noexcept {
         FreeLibrary(uxtheme);
         if (should) return dark;
     }
-    DWORD value = 1;
-    DWORD size = sizeof(value);
-    RegGetValueW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        L"AppsUseLightTheme",
-        RRF_RT_REG_DWORD, nullptr, &value, &size);
     return value == 0;
 }
 
@@ -262,7 +270,9 @@ inline Theme MakeTheme(bool dark, D2D1_COLOR_F accent) noexcept {
 
         t.fill_hover = WithAlpha(HexColor(0xFFFFFF), 0.08f);
         t.fill_pressed = WithAlpha(HexColor(0xFFFFFF), 0.06f);
-        t.fill_selected = WithAlpha(accent, 0.15f);
+        // Explorer weight: at 15% the accent wash sat too close to the hover fill to read as
+        // a selection, especially on a row that already carries a hover or a stripe.
+        t.fill_selected = WithAlpha(accent, 0.25f);
         t.fill_input = WithAlpha(HexColor(0xFFFFFF), 0.0605f);
         t.fill_input_hover = WithAlpha(HexColor(0xFFFFFF), 0.0837f);
         t.fill_input_focus = WithAlpha(HexColor(0x1E1E1E), 0.70f);
@@ -296,7 +306,8 @@ inline Theme MakeTheme(bool dark, D2D1_COLOR_F accent) noexcept {
 
         t.fill_hover = WithAlpha(HexColor(0x000000), 0.05f);
         t.fill_pressed = WithAlpha(HexColor(0x000000), 0.03f);
-        t.fill_selected = WithAlpha(accent, 0.12f);
+        // Explorer weight, as in the dark theme: 12% read as a hint, not as "this row".
+        t.fill_selected = WithAlpha(accent, 0.20f);
         t.fill_input = WithAlpha(HexColor(0xFFFFFF), 0.70f);
         t.fill_input_hover = WithAlpha(HexColor(0xF9F9F9), 0.50f);
         t.fill_input_focus = HexColor(0xFFFFFF);

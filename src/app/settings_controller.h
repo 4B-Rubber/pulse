@@ -143,6 +143,8 @@ public:
     void SetGlobalSearchError(std::wstring error) { global_search_error_ = std::move(error); }
     const std::wstring& global_search_error() const noexcept { return global_search_error_; }
     void ChangeTrackingDays(int days);
+    // 0/1/2 -> 150/400/800 ms before a hover hint appears.
+    void TooltipDelay(int index);
     void ToggleVolume(int index);
     void AddExclude();
     void RemoveExclude(int index);

@@ -106,4 +106,39 @@ inline std::vector<std::wstring> ExtractStringArray(const std::wstring& input,
     return output;
 }
 
+// One {...} per element of an object array, quote- and bracket-aware, so braces inside strings
+// and nested objects survive. Written once for the stores that keep a list of records
+// (quick access and starred items in places.json, the per-folder views).
+inline std::vector<std::wstring> ExtractObjectArray(const std::wstring& input,
+                                                    const std::wstring& key) {
+    std::vector<std::wstring> output;
+    size_t pos = ValuePosition(input, key);
+    if (pos == std::wstring::npos || pos >= input.size() || input[pos] != L'[') return output;
+    int array_depth = 0;
+    int object_depth = 0;
+    bool in_string = false;
+    size_t object_start = std::wstring::npos;
+    for (size_t i = pos; i < input.size(); ++i) {
+        const wchar_t c = input[i];
+        if (in_string) {
+            if (c == L'\\') ++i;
+            else if (c == L'"') in_string = false;
+            continue;
+        }
+        if (c == L'"') in_string = true;
+        else if (c == L'[') ++array_depth;
+        else if (c == L']') {
+            if (--array_depth == 0) break;
+        } else if (c == L'{') {
+            if (object_depth++ == 0) object_start = i;
+        } else if (c == L'}' && object_depth > 0) {
+            if (--object_depth == 0 && object_start != std::wstring::npos) {
+                output.push_back(input.substr(object_start, i - object_start + 1));
+                object_start = std::wstring::npos;
+            }
+        }
+    }
+    return output;
+}
+
 } // namespace pulse::json

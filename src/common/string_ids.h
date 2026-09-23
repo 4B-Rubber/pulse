@@ -828,3 +828,33 @@
 #define IDS_UPDATE_VERIFYING 1995
 #define IDS_UPDATE_LAUNCHING 1996
 #define IDS_UPDATE_INSTALLING_STATUS 1997
+
+// Second window: tab menu entry and tray menu entry. (Numbered past the shared update
+// progress strings above, which landed on main while this branch was in review.)
+#define IDS_TAB_OPEN_NEW_WINDOW 1998
+#define IDS_TRAY_NEW_WINDOW 1999
+#define IDS_JUMPLIST_PINNED 2000
+// Tab-group hover card.
+#define IDS_TAB_GROUP_EDIT 2001
+// Recent/starred item menu: reveal the row in its containing folder.
+#define IDS_OPEN_ITEM_LOCATION 2002
+// Settings: hover hints switch and delay.
+#define IDS_SETTINGS_TOOLTIPS 2003
+#define IDS_SETTINGS_TOOLTIPS_DESC 2004
+#define IDS_SETTINGS_TOOLTIP_DELAY 2005
+#define IDS_SETTINGS_TOOLTIP_DELAY_DESC 2006
+#define IDS_TOOLTIP_DELAY_SHORT 2007
+#define IDS_TOOLTIP_DELAY_STANDARD 2008
+#define IDS_TOOLTIP_DELAY_LONG 2009
+// Item menu: drop the mark-of-the-web stream and checksum a file.
+#define IDS_UNBLOCK_FILE 2010
+#define IDS_HASH_FILE 2011
+#define IDS_HASH_COPIED 2012
+#define IDS_UNBLOCK_DONE 2013
+// Settings: the on-disk preview cache and its clear button.
+#define IDS_SETTINGS_THUMB_CACHE 2014
+#define IDS_SETTINGS_FILE_HASH 2015
+#define IDS_SETTINGS_FILE_HASH_DESC 2016
+#define IDS_TOOLTIP_DELAY_CUSTOM 2017
+#define IDS_SETTINGS_TITLE_BRAND 2018
+#define IDS_SETTINGS_TITLE_BRAND_DESC 2019

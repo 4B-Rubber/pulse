@@ -69,6 +69,7 @@ enum MenuCmd : int {
     CmdDetailsShellMenu,    // details "更多": open the Explorer context menu
     CmdTabNewRight,         // tab menu: new tab to the right
     CmdTabDuplicate,        // tab menu: duplicate this tab
+    CmdTabOpenInNewWindow,  // tab menu: open this folder in its own window
     CmdTabPin,              // tab menu: pin/unpin toggle
     CmdTabClose,            // tab menu: close this tab
     CmdTabAddToNewGroup,    // tab menu: create a group with this tab
@@ -90,6 +91,11 @@ enum MenuCmd : int {
     CmdOpenRecycle,
     CmdPinQuickAccess,
     CmdUnpinQuickAccess,
+    CmdToggleHiddenItems = 185,   // view menu: show hidden files toggle
+    CmdToggleProtectedItems,      // view menu: show protected OS files toggle
+    CmdUnblockFile = 187,         // item menu: drop the Zone.Identifier stream
+    CmdHashSha256,                // item menu: copy the SHA-256 of the selected file
+    CmdHashMd5,                   // item menu: copy the MD5 of the selected file
     CmdViewRecentChanges = 180,
     CmdRecentBase = 200,
     CmdIndexBase = 1000,
@@ -117,8 +123,11 @@ struct ShellMenuEntry {
 // Context menu for a selected entry: 打开 + icon strip (cut/copy/delete/
 // rename) + built-in verbs + undo. Explorer rows are appended afterwards via
 // AppendShellSection (they grow the menu downward so open rows never move).
+// |show_hash| is about the selection, not the entry kind: a checksum answers for exactly one
+// ordinary file, so folders and multi-selections leave the submenu out.
 std::vector<ui::FluentMenuItem> BuildItemMenu(bool can_undo, const std::wstring& undo_label,
-                                              bool folder = false);
+                                              bool folder = false, bool can_unblock = false,
+                                              bool show_hash = true);
 
 struct Tab;
 // Uses snapshot metadata only; never probes the filesystem on the UI thread.
@@ -151,6 +160,8 @@ struct BackgroundViewOptions {
     bool indexed_search = false;
     bool show_path = false;
     bool filesystem = true;
+    bool show_hidden = false;
+    bool show_protected = false;
 };
 void AppendBackgroundViewCommands(std::vector<ui::FluentMenuItem>& items,
                                   const BackgroundViewOptions& options);
@@ -169,7 +180,9 @@ std::vector<ui::FluentMenuItem> BuildBreadcrumbMenu(bool filesystem);
 // Split-button layout presets.
 std::vector<ui::FluentMenuItem> BuildSplitMenu(int current_preset);
 std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode,
-                                              bool details_panel = false);
+                                             bool details_panel = false,
+                                             bool show_hidden = false,
+                                             bool show_protected = false);
 
 // Ctrl+K / address omnibar: verbs + index hits + recent folders at the end.
 struct OmnibarQuery {

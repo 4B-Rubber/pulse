@@ -1033,7 +1033,8 @@ struct LumaTextRenderer::Impl {
         }
         const bool presented = PresentEditBits(hwnd, hdc, dib_bits, w, h, background.a < 1.0f);
         blit_staging->Unmap();
-
+        // The bitmap draws its own caret, so the input method's composition and candidate windows
+        // are anchored to the position that caret is drawn at rather than the hidden native one.
         HIMC imc = ImmGetContext(hwnd);
         if (imc) {
             COMPOSITIONFORM form{};

@@ -11,6 +11,30 @@
 
 namespace pulse::app {
 namespace {
+// Helpers for the input method sequences below: they are long enough to read as scripts, and the
+// point of each one is the caret, not the plumbing.
+void SendChars(HWND edit, const wchar_t* chars) {
+    for (const wchar_t* p = chars; *p; ++p) SendMessageW(edit, WM_CHAR, *p, 1);
+}
+void SetEditText(HWND edit, const wchar_t* text) {
+    SendMessageW(edit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(text));
+}
+void ClickEditAt(HWND edit, int x) {
+    SendMessageW(edit, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, 12));
+    SendMessageW(edit, WM_LBUTTONUP, 0, MAKELPARAM(x, 12));
+}
+DWORD CaretOf(HWND edit, DWORD* start = nullptr) {
+    DWORD sel[2]{};
+    SendMessageW(edit, EM_GETSEL, reinterpret_cast<WPARAM>(&sel[0]),
+                 reinterpret_cast<LPARAM>(&sel[1]));
+    if (start) *start = sel[0];
+    return sel[1];
+}
+std::wstring TextOf(HWND edit) {
+    wchar_t text[64]{};
+    GetWindowTextW(edit, text, ARRAYSIZE(text));
+    return text;
+}
 LRESULT CALLBACK TestOwner(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto* state = reinterpret_cast<AppState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (state) {
@@ -318,6 +342,66 @@ bool RunRenameEditorTest() {
         if (log) fprintf(log, "editor rectangle: %ld,%ld - %ld,%ld\n", editor_rect.left, editor_rect.top, editor_rect.right, editor_rect.bottom);
         check(editor_rect.right > editor_rect.left && editor_rect.bottom > editor_rect.top,
             "rename editor has a nonempty visible text area");
+        {
+            // Every sequence below is about where the caret ends up. An EDIT puts it back to the
+            // front on every WM_SETTEXT, even when the text it is given is the one it already has,
+            // and the TSF bridge resets the selection after it commits a composition. Either one
+            // put the next character in front of everything typed: "demo" then "1" produced
+            // "1demo". A redundant write keeps the selection the user had.
+            SendMessageW(state->hwndRenameEdit, EM_SETSEL, 6, 6);
+            SetEditText(state->hwndRenameEdit, initial_name);
+            check(CaretOf(state->hwndRenameEdit) == 6,
+                "redundant WM_SETTEXT keeps the caret where the user was typing");
+            check(TextOf(state->hwndRenameEdit) == L"before.txt",
+                "redundant WM_SETTEXT keeps the text");
+
+            // A rewritten one keeps the caret just past the span the input method wrote.
+            SendMessageW(state->hwndRenameEdit, EM_SETSEL, 0, 6);
+            SetEditText(state->hwndRenameEdit, L"demo.txt");
+            check(CaretOf(state->hwndRenameEdit) == 4,
+                "a rewritten text keeps the caret past the composition");
+            SendChars(state->hwndRenameEdit, L"1");
+            check(TextOf(state->hwndRenameEdit) == L"demo1.txt",
+                "a character typed after the rewrite lands after the composition");
+
+            // A committed composition followed by the bridge's own caret reset keeps the order.
+            SetEditText(state->hwndRenameEdit, L"before.txt");
+            SendMessageW(state->hwndRenameEdit, EM_SETSEL, 0, 6);
+            SendMessageW(state->hwndRenameEdit, WM_IME_ENDCOMPOSITION, 0, 0);
+            SendChars(state->hwndRenameEdit, L"demo");
+            SendMessageW(state->hwndRenameEdit, EM_SETSEL, 0, 0);
+            SendChars(state->hwndRenameEdit, L"1");
+            check(TextOf(state->hwndRenameEdit) == L"demo1.txt",
+                "an input method's post-commit caret reset does not reorder the text");
+            // Once the user takes the caret back with the mouse, the request is the editor's own.
+            ClickEditAt(state->hwndRenameEdit, 20);
+            DWORD click_from = 0;
+            const DWORD click_to = CaretOf(state->hwndRenameEdit, &click_from);
+            check(click_from < 5 && click_from == click_to,
+                "a click after the commit still moves the caret");
+
+            // A fast typist gets the input method's keys handed through to the edit as ordinary
+            // key-downs (a real session's log shows WM_KEYDOWN for the digit that picked the
+            // candidate). Those must not count as the user taking the caret back, or the guard is
+            // gone exactly when the reset arrives.
+            SetEditText(state->hwndRenameEdit, L"before.txt");
+            SendMessageW(state->hwndRenameEdit, EM_SETSEL, 0, 6);
+            SendMessageW(state->hwndRenameEdit, WM_IME_ENDCOMPOSITION, 0, 0);
+            SendChars(state->hwndRenameEdit, L"demo");
+            SendMessageW(state->hwndRenameEdit, WM_KEYDOWN, L'1', 1);
+            SendMessageW(state->hwndRenameEdit, EM_SETSEL, 0, 0);
+            SendChars(state->hwndRenameEdit, L"1");
+            check(TextOf(state->hwndRenameEdit) == L"demo1.txt",
+                "a key passed through to the edit does not end the input method guard");
+            // A navigation key does hand the caret back to the user: the next request lands.
+            SendMessageW(state->hwndRenameEdit, WM_KEYDOWN, VK_LEFT, 1);
+            SendMessageW(state->hwndRenameEdit, EM_SETSEL, 0, 0);
+            check(CaretOf(state->hwndRenameEdit) == 0, "a navigation key ends the input method guard");
+
+            // Leave the editor in the state the rest of the test expects.
+            SetEditText(state->hwndRenameEdit, L"before.txt");
+            SendMessageW(state->hwndRenameEdit, EM_SETSEL, 0, 6);
+        }
         if (capture_editor) {
             Pump();
             EditorPixels sampled;

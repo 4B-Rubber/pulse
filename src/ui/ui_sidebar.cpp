@@ -89,8 +89,8 @@ void MainRenderer::DrawSidebar(const WindowViewModel& vm, const D2D1_RECT_F& rec
     if (compact) {
         for (const auto& slot : slots) {
             if (slot.kind == SidebarSlot::TrayPanel) {
-                MakeBrush(dc, vm.tray_drop ? theme.fill_selected : theme.surface_flyout, brFillHover_);
-                FillRoundedRect(dc, brFillHover_.get(), slot.rc.left, slot.rc.top,
+                MakeBrush(dc, vm.tray_drop ? theme.fill_selected : theme.surface_flyout, brScratch_);
+                FillRoundedRect(dc, brScratch_.get(), slot.rc.left, slot.rc.top,
                     slot.rc.right - slot.rc.left, slot.rc.bottom - slot.rc.top,
                     theme.radius_control * scale_);
                 DrawIconText(slot.rc.left, slot.rc.top, slot.rc.right - slot.rc.left,

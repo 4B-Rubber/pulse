@@ -6,6 +6,7 @@
 #include "../ui/ui_renderer.h"
 #include "../ui/fluent_menu.h"
 #include "../ui/drag_drop.h"
+#include "../ui/drag_ghost.h"
 #include "../ui/file_operation_dialog.h"
 #include "../ui/quick_preview_window.h"
 #include "../ui/bloom_accent_picker.h"
@@ -16,6 +17,7 @@
 #include "app_model.h"
 #include "content_results_ui.h"
 #include "app_worker.h"
+#include "folder_views.h"
 #include "places.h"
 #include "details_meta.h"
 #include "context_menu_prefs.h"
@@ -82,6 +84,8 @@ constexpr UINT WM_UPDATE_DOWNLOADED = WM_APP + 60;
 constexpr UINT WM_UPDATE_INSTALL = WM_APP + 61;
 constexpr UINT WM_SEARCH_HISTORY = WM_APP + 62;
 constexpr UINT WM_CHANGE_TRACKING = WM_APP + 63;
+// The checksum worker finished (wParam unused): the handler takes the result.
+constexpr UINT WM_FILE_HASH_DONE = WM_APP + 65;
 constexpr UINT kTimerUi = 1;
 
 enum class OmnibarMode { Path, Mixed, Command, Project };
@@ -173,6 +177,8 @@ struct AppState {
     float sidebarScroll = 0.0f;
     app::StagingTray tray;
     app::PlacesCatalog places;
+    // What each folder was last left in (view mode, sort, column edges).
+    app::FolderViewStore folderViews;
     app::ContextMenuPrefs ctxMenuPrefs;
     // Explorer COM/static menu session, caches, and delayed refresh state.
     app::ContextMenuController context_menu;
@@ -242,6 +248,19 @@ struct AppState {
     ui::ThemeMode themeOverride = ui::ThemeMode::Auto;
     bool safeMode = false;
     bool isolatedTest = false;
+    // This process was started as an extra window (`--new-window`): it skips the
+    // singleton, owns no tray icon and no global hotkey, and leaves the persisted
+    // session to the primary instance.
+    bool secondaryInstance = false;
+    // This window took the last tab of a sibling, which closed because of it:
+    // its own session snapshot must not be written any more, and closing it must
+    // not hide it in the tray (there is nothing left to hide).
+    bool mergedAway = false;
+    // Taking over the singleton resources (mutex, tray, hotkey, session) from a
+    // sibling that is closing. Retried from the UI tick until it succeeds.
+    bool adoptPending = false;
+    ULONGLONG adoptDeadline = 0;
+    ULONGLONG adoptLastTry = 0;
     bool contentIndexObserver = false;
     D2D1_COLOR_F accentColor;
     float scale = 1.0f;
@@ -299,6 +318,12 @@ struct AppState {
     int tabDragRunPos = 0;               // run start within tabOrder (group drags)
     int tabDragRunLen = 1;               // >1: the whole group run moves as a block
     bool tabDragFromChip = false;        // drag started on the group chip
+    bool tabDragExternal = false;        // cursor left the window: candidate for another window
+    int tabDragGrabDx = 0;               // where inside the tab the press landed (px)
+    int tabDragGrabDy = 0;
+    // The card that follows the cursor while the tab is over another window: this
+    // window cannot draw outside its own client area.
+    ui::TabDragGhost tabDragGhost;
     int tabDragGroupId = 0;              // chip drag: app::TabGroup::id
     float tabDragSlots = 1.0f;           // visual width of the drag block in slots
     float tabDragBlockW = 0.0f;          // >0: collapsed chip drag block (chip+gap, px)
@@ -415,6 +440,10 @@ struct AppState {
     HWND hwndTagRenameEdit = nullptr;
     app::TagId tagRenameId;
     bool tagRenameIgnoreKillFocus = false;
+    // The tooltip-delay "custom" segment opens a small numeric editor on the row itself.
+    HWND hwndTooltipDelayEdit = nullptr;
+    bool tooltipDelayEditing = false;
+    bool tooltipDelayIgnoreKillFocus = false;
     HFONT editFont = nullptr;
     HBRUSH editBrush = nullptr;
 
@@ -432,6 +461,17 @@ struct AppState {
     // Name of the hovered sidebar row or section: the collapsed rail shows icons
     // only, so its tooltips read this.
     std::wstring hoverLabel;
+    // Edge-style hover card for a tab-group chip. groupCardGroupId == 0 means
+    // hidden; chipIndex is the index into WindowTabs::tab_groups it belongs to.
+    int groupCardGroupId = 0;
+    int groupCardChipIndex = -1;
+    int groupCardHoverRow = -1;
+    ULONGLONG groupCardSince = 0;
+    // group id -> the member tab that was active the last time the window left
+    // that group, so its chip card can mark "the tab you last used here". The
+    // pointers are identity tokens only: they are compared, never dereferenced
+    // (see RememberGroupActivation / PruneGroupActivations).
+    std::unordered_map<int, const app::LayoutTab*> lastActiveInGroup;
 
     // Drag-over feedback state (rendered via WindowViewModel).
     int dropRow = -1;
@@ -590,6 +630,9 @@ struct AppState {
     bool blankDoublePending = false;
     POINT marqueeStart{};
     POINT marqueeCur{};
+    // The part of the scroll the corners above are still short of: the band is drawn with it,
+    // so it glides with the rows instead of stepping whole pixels (app::CarryMarqueeShift).
+    float marqueeShift = 0.0f;
     std::unordered_set<int> marqueeBase;
 
     // Cut state mirrored into list rows (ui.md §5.2 rule 6: 55% opacity).

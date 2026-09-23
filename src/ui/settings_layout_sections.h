@@ -44,10 +44,20 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
         l.wallpaper_clear=D2D1::RectF(right-16*scale-cw,y-44*scale,right-16*scale,y-12*scale);
         l.wallpaper_choose=D2D1::RectF(l.wallpaper_clear.left-8*scale-bw,y-44*scale,l.wallpaper_clear.left-8*scale,y-12*scale);
         y+=8*scale; l.tray_icon_card=row(narrow ? 98.0f : 64.0f); segments(l.tray_icon_card,l.tray_icon_row,3,282);
+        y+=8*scale; l.title_brand_row=row(64);
         y+=8*scale; l.startup_row[2]=row(64);
         y+=8*scale; l.hidden_files_row=row(64);
         y+=8*scale; l.protected_files_row=row(64);
         y+=8*scale; l.pinned_names_row=row(64);
+        y+=8*scale; l.tooltip_row=row(64);
+        l.tooltip_delay_row=row(narrow ? 98.0f : 64.0f); segments(l.tooltip_delay_row,l.tooltip_delay,4,282);
+        y+=8*scale; l.thumb_cache_row=row(64);
+        {
+            const float cache_bw=painter ? painter->MeasureButtonWidth(l10n::Get(l10n::StringId::Clear)) : 80*scale;
+            l.thumb_cache_button=D2D1::RectF(right-16*scale-cache_bw,l.thumb_cache_row.top+16*scale,
+                right-16*scale,l.thumb_cache_row.bottom-16*scale);
+        }
+        y+=8*scale; l.file_hash_row=row(64);
         y+=8*scale; l.blank_click_row=row(64);
         y+=8*scale; l.change_tracking_row=row(64);
         l.change_days_row=row(narrow ? 98.0f : 64.0f); segments(l.change_days_row,l.change_days,3,282);

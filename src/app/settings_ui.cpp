@@ -43,6 +43,7 @@ constexpr SettingDestination destinations[]={
     {I::SettingsLaunch,0,0},{I::SettingsKeepRunning,0,0},{I::SettingsRowHeight,0,0},{I::SettingsShowPerformance,0,0},
     {I::SettingsWallpaper,0,1},{I::SettingsTrayIcon,0,1},{I::SettingsShowHidden,0,1},{I::SettingsShowProtected,0,1},{I::PinnedNames,0,1},
     {I::SettingsBlankClickBack,0,1},{I::SettingsChangeTracking,0,1},{I::SettingsOpenFolders,0,1},
+    {I::SettingsTooltips,0,1},{I::SettingsTooltipDelay,0,1},{I::SettingsThumbCache,0,1},{I::SettingsFileHash,0,1},
     {I::GlobalSearch,1,0},{I::GlobalSearchHotkey,1,0},{I::SearchPinyin,1,0},{I::ContentIndexManage,1,0},{I::IndexLocation,1,2},{I::LocalDrives,1,2},
     {I::Exclusions,1,2},{I::ServerFolders,1,2},{I::SettingsContextMenu,2,0},{I::SettingsDuplicates,4,0},{I::SettingsAboutDiagnostics,3,0},
 };
@@ -114,6 +115,16 @@ bool HandleSettingsControl(AppState& s,const H& hit) {
         s.settings.SetScroll(s.settings.scroll(),maximum);break;
     }
     case H::SettingsGlobalSearchHotkey: SetFocus(s.hwnd);s.settings.BeginGlobalSearchHotkeyCapture();break;
+    case H::SettingsTooltipDelay:
+        // The fourth segment is the custom entry: it opens a numeric editor in place. Picking
+        // one of the three presets closes that editor first. Leaving it open kept the row
+        // reading as "custom" - and because the click never moved focus off the editor, its
+        // next commit (Enter, or any click outside the row) wrote the editor's number back
+        // over the preset, so 短/标准/长 looked like they did nothing.
+        if (hit.index == 3) ShowTooltipDelayEditor(s);
+        else { HideTooltipDelayEditor(s, false); s.settings.TooltipDelay(hit.index); }
+        break;
+    case H::SettingsThumbCache: s.renderer.ClearThumbCache();break;
     case H::SettingsTheme: SetThemeMode(s,hit.index);break;
     case H::SettingsDropdown: {
         std::vector<ui::FluentMenuItem> items;

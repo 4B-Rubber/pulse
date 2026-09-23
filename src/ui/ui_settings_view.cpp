@@ -708,6 +708,10 @@ float MainRenderer::SettingsDestinationOffset(const WindowViewModel& vm, int set
     case I::SettingsShowHidden: target=l.hidden_files_row;break;
     case I::SettingsShowProtected: target=l.protected_files_row;break;
     case I::PinnedNames: target=l.pinned_names_row;break;
+    case I::SettingsTooltips: target=l.tooltip_row;break;
+    case I::SettingsTooltipDelay: target=l.tooltip_delay_row;break;
+    case I::SettingsThumbCache: target=l.thumb_cache_row;break;
+    case I::SettingsFileHash: target=l.file_hash_row;break;
     case I::SettingsBlankClickBack: target=l.blank_click_row;break;
     case I::SettingsChangeTracking: target=l.change_tracking_row;break;
     case I::GlobalSearch: target=l.global_search_row;break;
@@ -721,6 +725,21 @@ float MainRenderer::SettingsDestinationOffset(const WindowViewModel& vm, int set
     default: return 0;
     }
     return (std::max)(0.0f,target.top-l.content_origin-20*scale_);
+}
+
+bool MainRenderer::TooltipDelayCustomCell(const WindowViewModel& vm, float window_w,
+                                          float window_h, D2D1_RECT_F* out) const {
+    if (!out) return false;
+    const auto l = MakeSettingsLayout(vm, D2D1::RectF(0, 0, window_w, window_h), scale_,
+                                      title_bar_height_, status_height_, &painter_);
+    // The layout already folds the scroll offset into its coordinates (content_origin), so
+    // the cell is used exactly as it comes out. Subtracting the scroll a second time put
+    // the editor a whole scroll above the row it belongs to, where it was never clicked.
+    D2D1_RECT_F cell = l.tooltip_delay[3];
+    if (cell.right <= cell.left || cell.bottom <= cell.top) return false;
+    if (cell.bottom <= 0.0f || cell.top >= window_h) return false;
+    *out = cell;
+    return true;
 }
 
 float MainRenderer::SettingsMaxScroll(const WindowViewModel& vm, float window_w, float window_h) const {

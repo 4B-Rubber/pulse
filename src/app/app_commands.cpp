@@ -22,6 +22,7 @@
 #include "batch_rename.h"
 #include "search_query.h"
 #include "link_resolve.h"
+#include "file_hash.h"
 #include "resource.h"
 #include "../ops/clipboard.h"
 #include "../ipc/ctx_menu_util.h"
@@ -430,6 +431,23 @@ void ShowTagSidebarMenu(AppState& s, const app::TagId& tag_id, POINT screen_pt) 
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
+// Reveal a path in the folder that holds it: the parent becomes the location and the
+// row itself is selected once the listing arrives. The pending selection has to be
+// armed after the load starts - StartLoadingPath clears it.
+void RevealInParent(AppState& s, const std::wstring& full) {
+    app::Tab* tab = ActiveTab(s);
+    if (!tab || full.empty()) return;
+    const std::wstring parent = fs::ParentPath(full);
+    const size_t slash = full.find_last_of(L"\\/");
+    const std::wstring leaf =
+        slash == std::wstring::npos ? full : full.substr(slash + 1);
+    if (parent.empty() || leaf.empty()) return;
+    NavigateTo(s, parent);
+    tab->pending_selected_name = leaf;
+    tab->pending_selected_names = { leaf };
+    tab->pending_ensure_selection_visible = true;
+}
+
 void DispatchMenuCommand(AppState& s, int cmd) {
     const bool needs_files=cmd==app::CmdProperties || cmd==app::CmdOpenPath || cmd==app::CmdOpenInNewTab || cmd==app::CmdRename;
     if(needs_files && DeferContentSelection(s,[cmd](AppState& v){DispatchMenuCommand(v,cmd);})) return;
@@ -449,6 +467,46 @@ void DispatchMenuCommand(AppState& s, int cmd) {
             !fs::IsVirtualPath(tab->current_path))
             s.ops.ShowProperties(ClipboardPath(tab->current_path));
         break;
+    case app::CmdUnblockFile: {
+        // The mark-of-the-web stream is what Explorer's "Unblock" checkbox drops.
+        const app::Tab* tab = ActiveTab(s);
+        if (!tab) break;
+        const auto paths = SelectedFullPaths(*tab);
+        int unblocked = 0;
+        std::wstring failure;
+        for (const auto& path : paths) {
+            if (path.empty() || fs::IsVirtualPath(path)) continue;
+            std::wstring error;
+            if (app::RemoveZoneIdentifier(path, error)) ++unblocked;
+            else failure = error;
+        }
+        if (!failure.empty()) {
+            s.notification_toast.ShowError(s.hwnd,
+                l10n::Get(l10n::StringId::UnblockFile), failure);
+        } else if (unblocked > 0) {
+            const std::wstring message = paths.size() == 1 && unblocked == 1 ? paths[0]
+                : std::to_wstring(unblocked) + L" / " + std::to_wstring(paths.size());
+            s.notification_toast.Show(s.hwnd, l10n::Get(l10n::StringId::UnblockDone),
+                                      message, false);
+        }
+        break;
+    }
+    case app::CmdHashSha256:
+    case app::CmdHashMd5: {
+        // Checksums run on a worker thread; the result comes back as WM_FILE_HASH_DONE.
+        if (!s.appPrefs.file_hash_enabled) break;
+        const app::Tab* tab = ActiveTab(s);
+        if (!tab) break;
+        const auto paths = SelectedFullPaths(*tab);
+        if (paths.size() != 1 || paths[0].empty() || fs::IsVirtualPath(paths[0])) break;
+        // A folder has nothing to stream through the hasher. The menu already leaves the
+        // command out; this keeps a stale menu or a shortcut from starting a doomed job.
+        const DWORD attrs = GetFileAttributesW(paths[0].c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) break;
+        app::StartFileHashJob(s.hwnd, WM_FILE_HASH_DONE, paths[0],
+            cmd == app::CmdHashMd5 ? app::HashAlgorithm::Md5 : app::HashAlgorithm::Sha256);
+        break;
+    }
     case app::CmdSortName:
     case app::CmdSortModified:
     case app::CmdSortType:
@@ -485,24 +543,10 @@ void DispatchMenuCommand(AppState& s, int cmd) {
         }
         break;
     }
-    case app::CmdOpenPath: {
-        // Reveal the hit in its containing folder (search results).
-        app::Tab* tab = ActiveTab(s);
-        const std::wstring full = tab ? SelectedFullPath(s) : L"";
-        if (!full.empty()) {
-            const std::wstring parent = fs::ParentPath(full);
-            const size_t slash = full.find_last_of(L"\\/");
-            const std::wstring leaf =
-                slash == std::wstring::npos ? full : full.substr(slash + 1);
-            if (!parent.empty() && !leaf.empty()) {
-                tab->pending_selected_name = leaf;
-                tab->pending_selected_names = { leaf };
-                tab->pending_ensure_selection_visible = true;
-                NavigateTo(s, parent);
-            }
-        }
+    case app::CmdOpenPath:
+        // Reveal the hit in its containing folder (search results, recent items).
+        RevealInParent(s, SelectedFullPath(s));
         break;
-    }
     case app::CmdCut: CollectToTray(s, true); break;
     case app::CmdCopy: CollectToTray(s, false); break;
     case app::CmdPaste: PasteIntoCurrent(s); break;
@@ -579,6 +623,19 @@ void DispatchMenuCommand(AppState& s, int cmd) {
     case app::CmdDetailsPanel:
         s.showDetailsPanel = !s.showDetailsPanel;
         s.renderer.SetDetailsPanelVisible(s.showDetailsPanel);
+        break;
+    // The view menu carries these two so a folder full of dotfiles can be inspected
+    // without leaving it for the settings page. They write the same preference the page
+    // does, so both stay in step.
+    case app::CmdToggleHiddenItems:
+        s.appPrefs.show_hidden_files = !s.appPrefs.show_hidden_files;
+        s.appPrefs.Save();
+        ApplySettingsEffects(s, app::SettingsEffect::FileVisibility);
+        break;
+    case app::CmdToggleProtectedItems:
+        s.appPrefs.show_protected_os_files = !s.appPrefs.show_protected_os_files;
+        s.appPrefs.Save();
+        ApplySettingsEffects(s, app::SettingsEffect::FileVisibility);
         break;
     case app::CmdLayoutSingle: ApplyLayoutPreset(s, app::LayoutPreset::Single); break;
     case app::CmdLayoutTwoVertical: ApplyLayoutPreset(s, app::LayoutPreset::TwoVertical); break;
@@ -678,13 +735,25 @@ std::vector<ui::FluentMenuItem> BuildFinderItemMenu(
             }
         }
     }
-    std::vector<ui::FluentMenuItem> items = app::BuildItemMenu(can_undo, undo_label, folder);
+    const std::vector<std::wstring> paths = ActiveTab(s)
+        ? SelectedFullPaths(*ActiveTab(s)) : std::vector<std::wstring>{};
+    bool can_unblock = false;
+    for (const auto& path : paths) {
+        if (!path.empty() && !fs::IsVirtualPath(path) && app::HasZoneIdentifier(path)) {
+            can_unblock = true;
+            break;
+        }
+    }
+    // Checksums answer for one ordinary file: not a folder, not a multi-selection, not a
+    // virtual view, and only while the preference has them enabled.
+    const bool show_hash = s.appPrefs.file_hash_enabled && paths.size() == 1 && !folder &&
+        !paths[0].empty() && !fs::IsVirtualPath(paths[0]);
+    std::vector<ui::FluentMenuItem> items =
+        app::BuildItemMenu(can_undo, undo_label, folder, can_unblock, show_hash);
     if (const auto* tab = ActiveTab(s))
         app::AppendRecentChangesCommand(items, app::RecentChangesMenuPath(*tab, false));
     ApplyWorkspacePinLabel(items, s);
     AppendQuickAccessCommand(s, items, QuickAccessTargets(ActiveTab(s), false));
-    const std::vector<std::wstring> paths = ActiveTab(s)
-        ? SelectedFullPaths(*ActiveTab(s)) : std::vector<std::wstring>{};
     const int quick_count = std::min(7, static_cast<int>(s.places.tags.size()));
     ui::FluentMenuItem quick_tags;
     quick_tags.command = app::CmdTags;
@@ -996,6 +1065,8 @@ void ShowBackgroundContextMenu(AppState& s, POINT screen_pt) {
     view_options.indexed_search = (kind == L"search" || kind == L"saved-search") && !tab->content_results;
     view_options.show_path = kind == L"search" || kind == L"saved-search" || kind == L"recycle";
     view_options.filesystem = !tab->current_path.empty() && !fs::IsVirtualPath(tab->current_path);
+    view_options.show_hidden = s.appPrefs.show_hidden_files;
+    view_options.show_protected = s.appPrefs.show_protected_os_files;
     if (IsRecycleTab(tab)) {
         const bool can_empty = tab->snapshot && tab->EntryCount() != 0;
         const std::wstring undoLabel = s.ops.UndoLabel();
@@ -1156,6 +1227,17 @@ void ShowCuratedItemMenu(AppState& s, const std::wstring& path,
     open.text = l10n::Get(l10n::StringId::Open);
     open.glyph = L"\xE8A0";
     items.push_back(std::move(open));
+    // Only a row whose target is still there can be revealed; a stale one (a recent item
+    // that moved away, a pinned folder that is gone) keeps just the commands that act on
+    // the list it lives in. Starred and pinned rows get this too: the same gesture means
+    // the same thing wherever the row is shown.
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        ui::FluentMenuItem location;
+        location.command = app::CmdOpenPath;
+        location.text = l10n::Get(l10n::StringId::OpenItemLocation);
+        location.glyph = L"\xE8B7";
+        items.push_back(std::move(location));
+    }
     if (recent) {
         ui::FluentMenuItem remove;
         remove.command = app::CmdRemoveRecent;
@@ -1250,6 +1332,8 @@ void ShowCuratedItemMenu(AppState& s, const std::wstring& path,
         if (s.places.IsStarred(path)) ToggleStarred(s, path);
     } else if (cmd == app::CmdRemoveRecent) {
         if (s.places.RemoveRecent(path)) RefreshRecentViews(s);
+    } else if (cmd == app::CmdOpenPath) {
+        RevealInParent(s, path);
     }
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
@@ -1267,6 +1351,8 @@ void SetViewMode(AppState& s, ui::ViewMode mode) {
     s.scrollAnimating = false;
     if (tab->selected_index >= 0) EnsureRowVisible(s, *tab, tab->selected_index);
     ClampScroll(s);
+    // This folder now shows this view: remember it for the next visit.
+    RememberFolderView(s, *tab);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -1285,7 +1371,9 @@ void ShowViewDropdown(AppState& s, int pane_index) {
     const D2D1_RECT_F button = s.renderer.PaneViewButtonRect(paneRect, filterExpand);
     POINT anchor{ static_cast<LONG>(button.left), static_cast<LONG>(button.bottom) };
     ClientToScreen(s.hwnd, &anchor);
-    const int cmd = s.menu->TrackPopup(anchor, app::BuildViewMenu(tab->view_mode, s.showDetailsPanel));
+    const int cmd = s.menu->TrackPopup(anchor, app::BuildViewMenu(
+        tab->view_mode, s.showDetailsPanel,
+        s.appPrefs.show_hidden_files, s.appPrefs.show_protected_os_files));
     if (cmd != app::CmdNone) DispatchMenuCommand(s, cmd);
 }
 
@@ -1537,6 +1625,11 @@ void ApplyAppWindowChrome(AppState& s) {
     if (!s.hwnd) return;
     const auto effect = ui::WindowEffectFromId(s.appPrefs.window_effect);
     s.globalSearchWindow.SetAppearance(s.darkMode, effect, s.appPrefs.background_image, s.accentColor);
+    // The quick preview is an owned popup with its own compositor: it keeps the theme it was
+    // opened with unless the chrome pass, which already runs on every theme/material change,
+    // pushes the new one down.
+    if (s.quickPreview.visible())
+        s.quickPreview.SetAppearance(s.darkMode, effect);
     // Any selected image takes over the window base: sampled as material for
     // Mica/Acrylic, drawn as-is when the effect is None.
     const bool sample_image = !s.appPrefs.background_image.empty();
@@ -1682,7 +1775,9 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
     if (app::HasEffect(effects, app::SettingsEffect::TrayDeckIcon))
         s.renderer.SetTrayIconDip(static_cast<float>(s.appPrefs.tray_icon_size));
     if (app::HasEffect(effects, app::SettingsEffect::TrayVisibility))
-        s.tray_controller.SetVisible(s.appPrefs.keep_running_on_close || s.appPrefs.global_search_enabled);
+        // A second window owns no tray icon: the primary keeps the only one.
+    s.tray_controller.SetVisible(!s.secondaryInstance &&
+        (s.appPrefs.keep_running_on_close || s.appPrefs.global_search_enabled));
     if (app::HasEffect(effects, app::SettingsEffect::GlobalSearch))
         ApplyGlobalSearchSettings(s);
     if (app::HasEffect(effects, app::SettingsEffect::StatusBarPerformance))
@@ -1704,6 +1799,8 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
             SendMessageW(s.hwndRenameEdit, WM_SETFONT, reinterpret_cast<WPARAM>(s.editFont), TRUE);
         if (s.hwndTagRenameEdit)
             SendMessageW(s.hwndTagRenameEdit, WM_SETFONT, reinterpret_cast<WPARAM>(s.editFont), TRUE);
+        if (s.hwndTooltipDelayEdit)
+            SendMessageW(s.hwndTooltipDelayEdit, WM_SETFONT, reinterpret_cast<WPARAM>(s.editFont), TRUE);
         if (s.pane) {
             ForEachPane(s, [&](app::Pane& pane) {
                 if (IsSettingsTab(pane.ActiveTab()))
@@ -1738,6 +1835,7 @@ void SetThemeMode(AppState& s, int mode) {
     if (s.hwndAddressEdit) InvalidateRect(s.hwndAddressEdit, nullptr, TRUE);
     if (s.hwndRenameEdit) InvalidateRect(s.hwndRenameEdit, nullptr, TRUE);
     if (s.hwndTagRenameEdit) InvalidateRect(s.hwndTagRenameEdit, nullptr, TRUE);
+    if (s.hwndTooltipDelayEdit) InvalidateRect(s.hwndTooltipDelayEdit, nullptr, TRUE);
     if (s.hwndFilterEdit) InvalidateRect(s.hwndFilterEdit, nullptr, TRUE);
     if (s.operationWindow) s.operationWindow->SetTheme(s.darkMode, s.accentColor);
     InvalidateRect(s.hwnd, nullptr, FALSE);

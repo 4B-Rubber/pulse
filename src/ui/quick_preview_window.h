@@ -29,6 +29,9 @@ public:
     bool Initialize(HWND owner, UINT navigate_message, UINT open_message);
     void Show(const QuickPreviewItem& item, bool dark, WindowEffect effect, bool safe_mode);
     void Update(const QuickPreviewItem& item);
+    // A theme switched while the panel is open: the host passes its own answer down, so the
+    // panel follows instead of keeping the colours it was opened with.
+    void SetAppearance(bool dark, WindowEffect effect);
     void Close();
     bool visible() const noexcept;
     HWND hwnd() const noexcept { return hwnd_; }

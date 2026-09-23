@@ -20,6 +20,9 @@
 #include "app_hosted_edit.h"
 #include "app_navigation.h"
 #include "app_runtime.h"
+#include "tab_controller.h"
+#include "instance_launcher.h"
+#include "single_instance_coordinator.h"
 #include "../ui/address_search_layout.h"
 #include "search_query.h"
 #include "../common/localization.h"
@@ -52,12 +55,14 @@
 #include "../ui/color_picker.h"
 #include "../ui/bloom_accent_picker.h"
 #include "../ui/drag_drop.h"
+#include "../ui/drag_ghost.h"
 #include "../ui/ui_renderer.h"
 #include "../ui/preview_footer_layout.h"
 #include "../ops/ops_manager.h"
 #include "../ops/clipboard.h"
 #include "../common/text_format.h"
 #include "../common/utf8_file.h"
+#include "file_hash.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -471,6 +476,85 @@ void TestThisPcEnumeration() {
     }
     Check(all_dirs, L"thispc: all entries are directories");
     Check(has_c, L"thispc: contains the C: drive");
+}
+
+void TestShellNamespaceForward() {
+    // The folder takeover owns Folder\shell\open, so pinned items that resolve their
+    // open verb through the Folder class (the taskbar's Explorer button, the desktop's
+    // This PC and Recycle Bin icons) reach Pulse as a namespace, never as a path.
+    Check(fs::IsShellNamespacePath(L"::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}") &&
+          fs::IsShellNamespacePath(L"shell:RecycleBinFolder") &&
+          fs::IsShellNamespacePath(L"\\\\?\\::{20D04FE0-3AEA-1069-A2D8-08002B30309D}") &&
+          !fs::IsShellNamespacePath(L"C:\\") &&
+          !fs::IsShellNamespacePath(L"pulse:recent"),
+          L"shell namespace: ::{GUID} and shell: are namespaces, paths and views are not");
+
+    // Home (Windows 11) and Quick access are what "open the file manager" means when
+    // nothing in particular is aimed at; Recent is already this app's own answer to that.
+    Check(ResolveIncomingPath(L"::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}") == L"pulse:recent" &&
+          ResolveIncomingPath(L"::{679f85cb-0220-4080-b29b-5540cc05aab6}") == L"pulse:recent",
+          L"shell namespace: Home and Quick access open the recent view");
+    Check(ResolveIncomingPath(L"::{645FF040-5081-101B-9F08-00AA002F954E}") == L"pulse:recycle",
+          L"shell namespace: the Recycle Bin opens the recycle view");
+    // Nothing to open: not a tab named after the CLSID, and no fallback to anywhere else.
+    Check(ResolveIncomingPath(L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}").empty() &&
+          ResolveIncomingPath(L"shell:AppsFolder").empty() &&
+          ResolveIncomingPath(L"::{").empty(),
+          L"shell namespace: This PC and the rest report nothing to open");
+    Check(ResolveIncomingPath(L"pulse:starred") == L"pulse:starred",
+          L"shell namespace: virtual views still pass through");
+    // The reveal command reuses the search-results command; its id is the newest one, so
+    // it has to be inside the cached string range or Get() hands back an empty label.
+    Check(!l10n::Get(l10n::StringId::OpenItemLocation).empty(),
+          L"shell namespace: the reveal command has its label");
+
+    wchar_t temp[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, temp)) {
+        const std::wstring folder =
+            fs::NormalizePath(std::wstring(temp) + L"pulse-shell-namespace-test");
+        CreateDirectoryW(folder.c_str(), nullptr);
+        Check(ResolveIncomingPath(folder) == folder &&
+              ResolveIncomingPath(L"\"" + folder + L"\"") == folder,
+              L"shell namespace: a real folder still resolves to itself, quotes and all");
+        RemoveDirectoryW(folder.c_str());
+    }
+
+    // The recent list only holds places someone can come back to: a namespace that
+    // reached it while the takeover opened CLSIDs as folders is dropped on load.
+    {
+        wchar_t previous[MAX_PATH * 2]{};
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+        const std::wstring dir = WorkspacePath(L"bench_data\\shell-namespace");
+        CreateDirectoryW(WorkspacePath(L"bench_data").c_str(), nullptr);
+        CreateDirectoryW(dir.c_str(), nullptr);
+        SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+        PlacesCatalog cat;
+        cat.persist = false;
+        cat.RecordRecent(L"::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}", PlaceItemKind::Folder);
+        cat.RecordRecent(L"pulse:recent", PlaceItemKind::Folder);
+        cat.RecordRecent(L"C:\\", PlaceItemKind::Folder);
+        Check(cat.recent_items.size() == 1,
+              L"shell namespace: opening a namespace is not a recent entry");
+
+        PlacesCatalog writer;
+        writer.persist = true;
+        // The form an affected profile carries: the namespace with the path normalizer's
+        // prefix, next to a real folder stored the way the loader writes it.
+        writer.recent_items.push_back(
+            { L"\\\\?\\::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", PlaceItemKind::Folder, 1 });
+        writer.recent_items.push_back({ L"\\\\?\\C:\\", PlaceItemKind::Folder, 2 });
+        Check(writer.Save(), L"shell namespace: seed a profile carrying a namespace entry");
+        PlacesCatalog loaded;
+        const bool loaded_ok = loaded.Load();
+        Check(loaded_ok && loaded.recent_items.size() == 1,
+              L"shell namespace: the loaded profile drops the namespace entry");
+        Check(loaded_ok && !loaded.recent_items.empty() &&
+              loaded.recent_items[0].path == fs::NormalizePath(L"C:\\"),
+              L"shell namespace: the real entry survives the load");
+
+        SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous[0] ? previous : nullptr);
+    }
 }
 
 void TestLoadingPresentation() {
@@ -1083,6 +1167,25 @@ void TestBlankPaneClickNavigation() {
                   tab->current_path == L"C:\\",
                   L"blank pane: split click navigates only the clicked pane");
         }
+        // The band hangs off the content: while the list glides, the drawn rect carries the
+        // fraction of a pixel the integer corners cannot hold, so it travels with the rows
+        // instead of stepping whole pixels. At rest the corners are the truth again, which is
+        // what keeps the band's 1px edges crisp.
+        state->marqueeActive = true;
+        state->marqueeStart = POINT{ 100, 200 };
+        state->marqueeCur = POINT{ 300, 400 };
+        state->marqueeShift = 0.4f;
+        state->scrollAnimating = true;
+        const D2D1_RECT_F gliding = BuildVm(*state, false).pane.marquee_rect;
+        state->scrollAnimating = false;
+        const D2D1_RECT_F resting = BuildVm(*state, false).pane.marquee_rect;
+        Check(std::fabs(gliding.top - 199.6f) < 0.01f && std::fabs(gliding.bottom - 399.6f) < 0.01f &&
+              std::fabs(gliding.left - 100.0f) < 0.01f && std::fabs(gliding.right - 300.0f) < 0.01f &&
+              std::fabs(resting.top - 200.0f) < 0.01f && std::fabs(resting.bottom - 400.0f) < 0.01f,
+              L"marquee: the drawn band carries the scroll fraction and stays crisp at rest");
+        state->marqueeActive = false;
+        state->marqueeShift = 0.0f;
+
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         state->renderer.SetCompositor(nullptr);
         state->compositor.Shutdown();
@@ -1768,14 +1871,15 @@ void TestMenuModel() {
 
     // Item menu: 打开 + icon strip (cut/copy/delete/rename) + verbs + undo.
     auto items = BuildItemMenu(false, L"");
-    Check(items.size() == 9, L"menu: item menu is 打开+图标条+verbs+undo");
+    Check(items.size() == 11, L"menu: item menu is 打开+图标条+verbs+unblock/hash+undo");
     // Command-id ranges must not overlap: CmdTabJoinGroupBase once collided
     // with CmdTabCloseOthers and "join group" closed every other tab.
     static_assert(CmdTabJoinGroupBase > CmdTabCloseRight &&
                   CmdTabJoinGroupBase + 32 <= CmdRecentBase,
                   "join-group ids must sit between tab commands and recents");
     std::vector<int> want{ CmdOpen, CmdNone, CmdCopyPath, CmdOpenTerminal, CmdProperties,
-                           CmdPinWorkspace, CmdPinNetwork, CmdTags, CmdUndo };
+                           CmdUnblockFile, CmdNone, CmdPinWorkspace, CmdPinNetwork, CmdTags,
+                           CmdUndo };
     bool ids_ok = items.size() >= want.size();
     for (size_t i = 0; i < want.size() && i < items.size(); ++i)
         if (items[i].command != want[i]) ids_ok = false;
@@ -1789,8 +1893,27 @@ void TestMenuModel() {
           L"menu: icon strip carries 剪切/复制/删除/重命名");
     Check(items.size() > 2 && items[2].shortcut == L"Ctrl+Shift+C",
           L"menu: 复制路径 carries Ctrl+Shift+C");
+    Check(items[5].command == CmdUnblockFile && !items[5].enabled &&
+          items[6].children.size() == 2 && items[6].children[0].command == CmdHashSha256 &&
+          items[6].children[1].command == CmdHashMd5,
+          L"menu: unblock stays disabled without a mark-of-the-web stream");
+    auto unblockable = BuildItemMenu(false, L"", false, true);
+    Check(unblockable[5].command == CmdUnblockFile && unblockable[5].enabled,
+          L"menu: unblock enables when the selection carries the stream");
+    const auto menu_has_hash = [](const std::vector<ui::FluentMenuItem>& menu) {
+        for (const auto& item : menu)
+            for (const auto& child : item.children)
+                if (child.command == CmdHashSha256) return true;
+        return false;
+    };
     auto folder_items = BuildItemMenu(false, L"", true);
-    Check(folder_items.size() == 10, L"menu: folder item menu adds 在新标签打开");
+    Check(folder_items.size() == 11, L"menu: folder item menu adds 在新标签打开");
+    // A checksum answers for exactly one ordinary file, so the folder menu and a
+    // multi-selection both leave the submenu out.
+    Check(!menu_has_hash(folder_items), L"menu: a folder has no checksum submenu");
+    auto multi_items = BuildItemMenu(false, L"", false, false, false);
+    Check(multi_items.size() == 10 && !menu_has_hash(multi_items),
+          L"menu: a multi-selection has no checksum submenu");
     Check(folder_items.size() > 3 &&
           folder_items[2].command == CmdOpenInNewTab &&
           folder_items[2].text == L"在新标签打开" &&
@@ -1918,8 +2041,8 @@ void TestMenuModel() {
     options.sort_direction = ui::SortDirection::Desc;
     options.details_panel = true;
     AppendBackgroundViewCommands(bg, options);
-    Check(bg[0].children.size() == 9 && bg[0].children[1].radio &&
-          bg[0].children.back().checked, L"menu: background reflects view and details pane");
+    Check(bg[0].children.size() == 11 && bg[0].children[1].radio &&
+          bg[0].children[8].checked, L"menu: background reflects view and details pane");
     const auto& sort = bg[1].children;
     Check(sort.size() == 6 && sort[3].command == CmdSortSize && sort[3].radio &&
           !sort[4].radio && sort[5].radio,
@@ -2517,6 +2640,674 @@ void TestAppPrefsAndSettingsPath() {
           L"appprefs: invalid accent_rgb falls back to follow");
 }
 
+// The folder-open overrides live in HKCU and AppPrefs::Load() repairs them, so a
+// self-test must leave them alone. Read-only: a missing value and an empty one both
+// read as "" and compare equal, which is what "the user never enabled this" is.
+struct FolderOpenRegistrySnapshot {
+    std::wstring directory_command;
+    std::wstring directory_verb;
+    std::wstring drive_command;
+    std::wstring drive_verb;
+    std::wstring folder_command;
+    std::wstring folder_command_delegate;
+    std::wstring folder_explore_command;
+    std::wstring folder_explore_delegate;
+
+    bool operator==(const FolderOpenRegistrySnapshot& other) const {
+        return directory_command == other.directory_command &&
+               directory_verb == other.directory_verb &&
+               drive_command == other.drive_command && drive_verb == other.drive_verb &&
+               folder_command == other.folder_command &&
+               folder_command_delegate == other.folder_command_delegate &&
+               folder_explore_command == other.folder_explore_command &&
+               folder_explore_delegate == other.folder_explore_delegate;
+    }
+};
+
+// Reads one string value; |name| null means the key's default value.
+std::wstring ReadRegString(const std::wstring& key, const wchar_t* name = nullptr) {
+    HKEY h = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &h) != ERROR_SUCCESS)
+        return {};
+    wchar_t value[1024]{};
+    DWORD bytes = sizeof(value);
+    DWORD type = 0;
+    const LONG st = RegQueryValueExW(h, name, nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(value), &bytes);
+    RegCloseKey(h);
+    if (st != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) return {};
+    return value;
+}
+
+// Presence checks: an absent value and an empty one both read as "", which is not
+// enough to tell "Pulse shadowed the handler" apart from "nothing was there".
+bool RegValuePresent(const std::wstring& key, const wchar_t* name) {
+    HKEY h = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &h) != ERROR_SUCCESS)
+        return false;
+    const LONG st = RegQueryValueExW(h, name, nullptr, nullptr, nullptr, nullptr);
+    RegCloseKey(h);
+    return st == ERROR_SUCCESS;
+}
+
+bool RegKeyPresent(const std::wstring& key) {
+    HKEY h = nullptr;
+    const LONG st = RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &h);
+    if (h) RegCloseKey(h);
+    return st == ERROR_SUCCESS;
+}
+
+FolderOpenRegistrySnapshot ReadFolderOpenRegistry() {
+    FolderOpenRegistrySnapshot snapshot;
+    snapshot.directory_command =
+        ReadRegString(L"Software\\Classes\\Directory\\shell\\open\\command");
+    snapshot.directory_verb = ReadRegString(L"Software\\Classes\\Directory\\shell");
+    snapshot.drive_command = ReadRegString(L"Software\\Classes\\Drive\\shell\\open\\command");
+    snapshot.drive_verb = ReadRegString(L"Software\\Classes\\Drive\\shell");
+    snapshot.folder_command = ReadRegString(L"Software\\Classes\\Folder\\shell\\open\\command");
+    snapshot.folder_command_delegate =
+        ReadRegString(L"Software\\Classes\\Folder\\shell\\open\\command", L"DelegateExecute");
+    snapshot.folder_explore_command =
+        ReadRegString(L"Software\\Classes\\Folder\\shell\\explore\\command");
+    snapshot.folder_explore_delegate =
+        ReadRegString(L"Software\\Classes\\Folder\\shell\\explore\\command", L"DelegateExecute");
+    return snapshot;
+}
+
+// A file nobody can read is the only copy of those bytes: a window that could not load
+// it has no business replacing it with its own defaults. Both settings files share the
+// same Save() policy, so they share this check too; |label| keeps each case's
+// assertions byte-identical to the ones the two hand-written copies used to emit.
+template <class Prefs, class Seed, class Touch>
+void CheckLockedFileSaveRefused(const wchar_t* label, const std::wstring& file,
+                                const std::wstring& backup, const std::wstring& quarantine,
+                                Seed seed, Touch touch) {
+    const std::wstring prefix = std::wstring(label) + L": ";
+    const size_t slash = file.find_last_of(L"\\/");
+    const std::wstring name = slash == std::wstring::npos ? file : file.substr(slash + 1);
+    {
+        Prefs writer;
+        seed(writer);
+        Check(writer.Save(), (prefix + L"seed the file the lock test uses").c_str());
+    }
+    // That save kept a backup of the previous file; drop it so the locked file is the
+    // only copy left and "nothing could be read" is actually the case here.
+    DeleteFileW(backup.c_str());
+    std::wstring before;
+    Check(ReadUtf8File(file, before) && !before.empty(),
+          (prefix + L"read the file before locking it").c_str());
+    HANDLE held = CreateFileW(file.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (held == INVALID_HANDLE_VALUE) {
+        Check(false, (prefix + L"the test could lock " + name).c_str());
+    } else {
+        Prefs blocked;
+        blocked.Load();
+        touch(blocked);
+        Check(!blocked.loaded_from_file(), (prefix + L"a locked file is not read").c_str());
+        Check(!blocked.Save(), (prefix + L"save refuses to replace it").c_str());
+        CloseHandle(held);
+        std::wstring after;
+        Check(ReadUtf8File(file, after) && after == before,
+              (prefix + L"the locked file is byte-identical").c_str());
+        Check(!Exists(quarantine), (prefix + L"a failed quarantine leaves no residue").c_str());
+    }
+}
+
+// PULSE_SELFTEST_CASE=prefs-persist: app.json has to round-trip, survive a second
+// window that still holds the values from before, and never be replaced by defaults
+// when it cannot be read. Everything runs in a temp profile, so the real
+// %LOCALAPPDATA%\Pulse is untouched.
+void TestPrefsPersistence() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulsePrefsPersist-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring file = dir + L"\\app.json";
+    const std::wstring backup = file + L".bak";
+    const std::wstring quarantine = file + L".bad";
+
+    // GetPulseDataDir() honours PULSE_TEST_DATA_DIR in a selftest build. The caller's
+    // value is put back below so the rest of the suite keeps its own profile.
+    wchar_t previous[32768]{};
+    const DWORD had_previous =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+    // Every Load() below runs with persistence enabled; the redirected profile is what
+    // keeps them off the real HKCU, so the case ends by proving the keys are untouched.
+    const FolderOpenRegistrySnapshot registry_before = ReadFolderOpenRegistry();
+
+    DeleteFileW(file.c_str());
+    DeleteFileW(backup.c_str());
+    DeleteFileW(quarantine.c_str());
+
+    // What the settings page writes comes back after a reload.
+    {
+        AppPrefs prefs;
+        prefs.keep_running_on_close = true;
+        prefs.show_hidden_files = true;
+        prefs.global_search_enabled = true;
+        prefs.row_height = 40;
+        prefs.language = L"en-US";
+        Check(prefs.Save(), L"prefs-persist: save writes app.json");
+        AppPrefs loaded;
+        Check(loaded.Load() && loaded.loaded_from_file() && loaded.keep_running_on_close &&
+              loaded.show_hidden_files && loaded.global_search_enabled &&
+              loaded.row_height == 40 && loaded.language == L"en-US",
+              L"prefs-persist: settings survive a reload");
+    }
+
+    // The regression this covers: a window that loaded app.json before another
+    // window wrote it must not roll that write back when it saves its own setting.
+    {
+        AppPrefs first;
+        Check(first.Load() && first.show_hidden_files && first.global_search_enabled,
+              L"prefs-persist: an open window loads the current file");
+        AppPrefs second;
+        Check(second.Load() && second.show_hidden_files,
+              L"prefs-persist: the second window loads the same file");
+        second.show_hidden_files = false;
+        Check(second.Save(), L"prefs-persist: the second window saves its setting");
+        first.global_search_enabled = false;
+        Check(first.Save(), L"prefs-persist: the stale window saves afterwards");
+        AppPrefs merged;
+        Check(merged.Load() && !merged.show_hidden_files && !merged.global_search_enabled &&
+              merged.keep_running_on_close && merged.language == L"en-US",
+              L"prefs-persist: the stale save keeps the other window's change");
+        // Saving again from the same stale window must not resurrect its value: the
+        // baseline is what it holds, not what the previous save wrote.
+        Check(first.Save(), L"prefs-persist: the stale window saves a second time");
+        AppPrefs stable;
+        Check(stable.Load() && !stable.show_hidden_files && !stable.global_search_enabled,
+              L"prefs-persist: a second save does not resurrect the stale value");
+    }
+
+    // A file nobody can read is the only copy of those bytes: a window that could not
+    // load it has no business replacing it with its own defaults.
+    CheckLockedFileSaveRefused<AppPrefs>(
+        L"prefs-persist", file, backup, quarantine,
+        [](AppPrefs& p) {
+            p.keep_running_on_close = true;
+            p.search_pinyin = false;
+        },
+        [](AppPrefs& p) { p.show_hidden_files = true; });
+
+    // A truncated main file next to a complete backup: the backup wins, and the next
+    // save repairs the main file from it.
+    {
+        DeleteFileW(file.c_str());
+        DeleteFileW(backup.c_str());
+        DeleteFileW(quarantine.c_str());
+        AppPrefs good;
+        good.keep_running_on_close = true;
+        good.show_hidden_files = true;
+        good.row_height = 40;
+        good.language = L"en-US";
+        const std::wstring complete = good.ToJson();
+        Check(WriteUtf8FileAtomic(backup, complete),
+              L"prefs-persist: the backup holds a complete file");
+        Check(WriteUtf8FileAtomic(file, complete.substr(0, complete.size() / 3)),
+              L"prefs-persist: the main file is truncated");
+        AppPrefs healed;
+        Check(healed.Load() && healed.loaded_from_file() && healed.keep_running_on_close &&
+              healed.show_hidden_files && healed.row_height == 40 &&
+              healed.language == L"en-US",
+              L"prefs-persist: a truncated app.json falls back to the backup");
+        healed.show_hidden_files = false;
+        Check(healed.Save(), L"prefs-persist: a save repairs the truncated file");
+        AppPrefs repaired;
+        Check(repaired.Load() && repaired.loaded_from_file() && !repaired.show_hidden_files &&
+              repaired.keep_running_on_close && repaired.language == L"en-US",
+              L"prefs-persist: the repaired file holds the merged values");
+    }
+
+    Check(ReadFolderOpenRegistry() == registry_before,
+          L"prefs-persist: the test left the folder-open registry untouched");
+
+    DeleteFileW(file.c_str());
+    DeleteFileW(backup.c_str());
+    DeleteFileW(quarantine.c_str());
+    RemoveDirectoryW(dir.c_str());
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous ? previous : nullptr);
+}
+
+namespace {
+
+std::wstring SelfExePath() {
+    wchar_t path[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+    return n ? std::wstring(path, n) : std::wstring();
+}
+
+// Creates the key so a value can be written into an empty sandbox.
+bool CreateRegKey(const std::wstring& key) {
+    HKEY h = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                        nullptr, &h, nullptr) != ERROR_SUCCESS)
+        return false;
+    RegCloseKey(h);
+    return true;
+}
+
+bool SetRegNamedString(const std::wstring& key, const wchar_t* name,
+                       const std::wstring& value) {
+    HKEY h = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                        nullptr, &h, nullptr) != ERROR_SUCCESS)
+        return false;
+    const LONG st = RegSetValueExW(h, name, 0, REG_SZ,
+                                   reinterpret_cast<const BYTE*>(value.c_str()),
+                                   static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(h);
+    return st == ERROR_SUCCESS;
+}
+
+bool SetRegDefaultString(const std::wstring& key, const std::wstring& value) {
+    return SetRegNamedString(key, nullptr, value);
+}
+
+void DeleteRegTree(const std::wstring& key) {
+    RegDeleteTreeW(HKEY_CURRENT_USER, key.c_str());
+}
+
+} // namespace
+
+// PULSE_SELFTEST_CASE=prefs-registry: app.json holds the intent and the registry is a
+// projection of it, so an install that moved (or a key an uninstaller deleted) has to
+// be repaired at startup instead of reading "missing" as "off" and freezing that into
+// the file. PULSE_TEST_REGISTRY_BASE sends every registry path into a sandbox key, so
+// the machine's own Run value and folder-open verbs are never involved.
+void TestPrefsRegistryReconcile() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulsePrefsRegistry-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring file = dir + L"\\app.json";
+    const std::wstring backup = file + L".bak";
+    const std::wstring quarantine = file + L".bad";
+
+    wchar_t previous_data[32768]{};
+    const DWORD had_previous_data =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous_data, ARRAYSIZE(previous_data));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+    const std::wstring base = L"Software\\Pulse\\SelftestSandbox";
+    SetEnvironmentVariableW(L"PULSE_TEST_REGISTRY_BASE", base.c_str());
+
+    // The real keys, read before and after: the sandbox is only working if these are
+    // identical when the case ends.
+    const FolderOpenRegistrySnapshot registry_before = ReadFolderOpenRegistry();
+    const std::wstring run_before =
+        ReadRegString(L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Pulse");
+
+    const std::wstring exe = SelfExePath();
+    const std::wstring start_command = L"\"" + exe + L"\"";
+    const std::wstring folder_command = L"\"" + exe + L"\" \"%1\"";
+    const std::wstring run_key = base + L"\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    auto folder_open = [&](const wchar_t* cls) {
+        return base + L"\\Software\\Classes\\" + cls + L"\\shell\\open\\command";
+    };
+    auto folder_explore = [&](const wchar_t* cls) {
+        return base + L"\\Software\\Classes\\" + cls + L"\\shell\\explore\\command";
+    };
+    auto folder_verb = [&](const wchar_t* cls, const wchar_t* verb) {
+        return base + L"\\Software\\Classes\\" + cls + L"\\shell\\" + verb;
+    };
+    auto folder_shell = [&](const wchar_t* cls) {
+        return base + L"\\Software\\Classes\\" + cls + L"\\shell";
+    };
+    auto reset = [&]() {
+        DeleteRegTree(base);
+        DeleteFileW(file.c_str());
+        DeleteFileW(backup.c_str());
+        DeleteFileW(quarantine.c_str());
+    };
+    auto seed_file = [&](bool startup, bool folder_open_on) {
+        AppPrefs seed;
+        seed.launch_on_startup = startup;
+        seed.open_folders_in_pulse = folder_open_on;
+        return seed.Save();
+    };
+    auto file_says = [&](const wchar_t* key, bool expected) {
+        std::wstring json;
+        if (!ReadUtf8File(file, json)) return false;
+        return json.find(std::wstring(L"\"") + key + L"\":") != std::wstring::npos &&
+               json.find(std::wstring(L"\"") + key + L"\":" + (expected ? L"true" : L"false")) !=
+                   std::wstring::npos;
+    };
+
+    // The setting is on and the keys are gone: startup repairs them.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        Check(CreateRegKey(run_key), L"prefs-registry: create the sandboxed Run key");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(run_key, L"Pulse") == start_command,
+              L"prefs-registry: a missing Run value is written back");
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == folder_command,
+              L"prefs-registry: a missing folder-open command is written back");
+        Check(ReadRegString(folder_shell(L"Directory").c_str()) == L"open",
+              L"prefs-registry: the class default verb is set to open");
+        Check(ReadRegString(folder_open(L"Folder").c_str()) == folder_command &&
+                  ReadRegString(folder_explore(L"Folder").c_str()) == folder_command,
+              L"prefs-registry: the Folder class open and explore verbs are written back");
+        Check(RegValuePresent(folder_open(L"Folder"), L"DelegateExecute") &&
+                  ReadRegString(folder_open(L"Folder"), L"DelegateExecute").empty(),
+              L"prefs-registry: the Folder verb carries a blank delegated handler");
+    }
+
+    // The keys hold another program: Pulse stays out of it.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        const std::wstring other =
+            L"\"C:\\Program Files\\Files\\Files.App.Launcher.exe\" \"%1\"";
+        Check(SetRegNamedString(run_key, L"Pulse", L"\"C:\\Windows\\notepad.exe\"") &&
+              SetRegDefaultString(folder_open(L"Directory"), other) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open"),
+              L"prefs-registry: seed keys another program owns");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(run_key, L"Pulse") == L"\"C:\\Windows\\notepad.exe\"",
+              L"prefs-registry: someone else's Run value is left alone");
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == other,
+              L"prefs-registry: someone else's folder-open verb is left alone");
+        Check(prefs.launch_on_startup && prefs.open_folders_in_pulse,
+              L"prefs-registry: the file still says on after a verb was left alone");
+    }
+
+    // The keys name a Pulse that is no longer this executable: repoint them.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        const std::wstring stale = L"\"D:\\old install\\pulse.exe\" \"%1\"";
+        Check(SetRegNamedString(run_key, L"Pulse", L"\"D:\\old install\\pulse.exe\"") &&
+              SetRegDefaultString(folder_open(L"Directory"), stale) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open"),
+              L"prefs-registry: seed keys left by an install that moved");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(run_key, L"Pulse") == start_command,
+              L"prefs-registry: a stale Run value is repointed at this executable");
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == folder_command,
+              L"prefs-registry: a stale folder-open command is repointed");
+    }
+
+    // The file says off and what is left in the registry is ours — the loose sense
+    // counts a path an install left behind: clear it, or the setting can never be
+    // switched off and double-click keeps calling an executable that is gone.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        Check(SetRegDefaultString(folder_open(L"Directory"),
+                                  L"\"D:\\old install\\pulse.exe\" \"%1\"") &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open") &&
+              SetRegDefaultString(folder_shell(L"Drive"), L"open"),
+              L"prefs-registry: seed residue from an install that moved");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Directory").c_str()).empty(),
+              L"prefs-registry: a stale pulse.exe command is cleared when the file says off");
+        Check(ReadRegString(folder_shell(L"Directory").c_str()).empty(),
+              L"prefs-registry: its class default verb is cleared with it");
+        Check(ReadRegString(folder_shell(L"Drive").c_str()).empty(),
+              L"prefs-registry: a leftover class default verb alone is cleared too");
+        Check(!prefs.open_folders_in_pulse,
+              L"prefs-registry: the file stays off after the cleanup");
+    }
+
+    // The file says off and the verb belongs to another program: not one byte moves.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        const std::wstring foreign =
+            L"\"C:\\Program Files\\Files\\Files.App.Launcher.exe\" \"%1\"";
+        Check(SetRegDefaultString(folder_open(L"Directory"), foreign) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open") &&
+              SetRegDefaultString(folder_open(L"Drive"), foreign),
+              L"prefs-registry: seed a verb another program owns");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == foreign,
+              L"prefs-registry: another program's command survives a file that says off");
+        Check(ReadRegString(folder_shell(L"Directory").c_str()) == L"open",
+              L"prefs-registry: another program's class default verb survives too");
+        Check(ReadRegString(folder_open(L"Drive").c_str()) == foreign,
+              L"prefs-registry: the second class is left alone as well");
+    }
+
+    // The file says off but the registry is ours and working: the file lost the value,
+    // so it is adopted back and written instead of switching the setting off.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        Check(CreateRegKey(run_key) &&
+              SetRegNamedString(run_key, L"Pulse", start_command) &&
+              SetRegDefaultString(folder_open(L"Directory"), folder_command) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open"),
+              L"prefs-registry: seed working keys the file disagrees with");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(prefs.launch_on_startup && prefs.open_folders_in_pulse,
+              L"prefs-registry: a working registry value is adopted, not discarded");
+        Check(file_says(L"launch_on_startup", true) &&
+              file_says(L"open_folders_in_pulse", true),
+              L"prefs-registry: the adopted value is written back into app.json");
+    }
+
+    // The machine's own Folder copy names explorer.exe and hands the verb to the shell
+    // handler; the file says on, so both are replaced — the empty DelegateExecute is
+    // what stops the inherited handler from answering instead of Pulse.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        const std::wstring shell_default = L"%SystemRoot%\\Explorer.exe";
+        const std::wstring shell_handler = L"{11dbb47c-a525-400b-9e80-a54615a090c0}";
+        Check(SetRegDefaultString(folder_open(L"Folder"), shell_default) &&
+              SetRegNamedString(folder_open(L"Folder"), L"DelegateExecute", shell_handler) &&
+              SetRegDefaultString(folder_explore(L"Folder"), shell_default),
+              L"prefs-registry: seed the shell's own Folder default");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Folder").c_str()) == folder_command,
+              L"prefs-registry: the shell's own default is replaced by Pulse");
+        Check(RegValuePresent(folder_open(L"Folder"), L"DelegateExecute") &&
+                  ReadRegString(folder_open(L"Folder"), L"DelegateExecute").empty(),
+              L"prefs-registry: Explorer's delegated handler is shadowed, not inherited");
+        Check(ReadRegString(folder_explore(L"Folder").c_str()) == folder_command,
+              L"prefs-registry: the explore verb is taken over as well");
+    }
+
+    // A handler another program installed on the Folder class blocks the whole class —
+    // no open, no explore — while the classes it does not touch are still written.
+    {
+        reset();
+        Check(seed_file(true, true), L"prefs-registry: seed an app.json that asks for both");
+        const std::wstring other = L"\"C:\\Tools\\Files\\Files.App.Launcher.exe\" \"%1\"";
+        Check(SetRegDefaultString(folder_open(L"Folder"), other),
+              L"prefs-registry: seed a Folder handler another program owns");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Folder").c_str()) == other,
+              L"prefs-registry: another program's Folder verb is left alone");
+        Check(!RegKeyPresent(folder_verb(L"Folder", L"explore")),
+              L"prefs-registry: its explore verb is not created either");
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == folder_command,
+              L"prefs-registry: a blocked Folder class does not block Directory");
+    }
+
+    // The file says off and the Folder residue is ours: both verbs go, so double-click
+    // cannot keep calling an executable that is not there any more.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        const std::wstring stale = L"\"D:\\old install\\pulse.exe\" \"%1\"";
+        Check(SetRegDefaultString(folder_open(L"Folder"), stale) &&
+              SetRegDefaultString(folder_explore(L"Folder"), stale),
+              L"prefs-registry: seed Folder residue from an install that moved");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(!RegKeyPresent(folder_verb(L"Folder", L"open")) &&
+                  !RegKeyPresent(folder_verb(L"Folder", L"explore")),
+              L"prefs-registry: both Folder verbs of a stale install are cleared");
+    }
+
+    // A mixed class: Pulse owns open, another program owns explore, the file says off.
+    // Only our verb goes.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        const std::wstring other = L"\"C:\\Tools\\manager.exe\" \"%1\"";
+        Check(SetRegDefaultString(folder_open(L"Folder"),
+                                  L"\"D:\\old install\\pulse.exe\" \"%1\"") &&
+              SetRegDefaultString(folder_explore(L"Folder"), other),
+              L"prefs-registry: seed a Folder class split between two owners");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(!RegKeyPresent(folder_verb(L"Folder", L"open")),
+              L"prefs-registry: Pulse's own verb is cleared in a split class");
+        Check(ReadRegString(folder_explore(L"Folder").c_str()) == other,
+              L"prefs-registry: the other program's verb survives the cleanup");
+    }
+
+    // A command naming explorer.exe is the shell's own default: it is replaced when the
+    // file says on, but it is not Pulse residue either, so a file that says off leaves
+    // it — and the default verb that belongs to it — in place.
+    {
+        reset();
+        Check(seed_file(false, false), L"prefs-registry: seed an app.json that asks for neither");
+        const std::wstring shell_default = L"%SystemRoot%\\Explorer.exe";
+        Check(SetRegDefaultString(folder_open(L"Directory"), shell_default) &&
+              SetRegDefaultString(folder_shell(L"Directory"), L"open"),
+              L"prefs-registry: seed the shell's own default while the file says off");
+        AppPrefs prefs;
+        prefs.Load();
+        Check(ReadRegString(folder_open(L"Directory").c_str()) == shell_default &&
+                  ReadRegString(folder_shell(L"Directory").c_str()) == L"open",
+              L"prefs-registry: the shell's own default is not residue to clean");
+    }
+
+    Check(ReadFolderOpenRegistry() == registry_before,
+          L"prefs-registry: the sandbox left the real folder-open keys untouched");
+    Check(ReadRegString(L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Pulse") ==
+              run_before,
+          L"prefs-registry: the sandbox left the real Run value untouched");
+
+    DeleteRegTree(base);
+    DeleteFileW(file.c_str());
+    DeleteFileW(backup.c_str());
+    DeleteFileW(quarantine.c_str());
+    RemoveDirectoryW(dir.c_str());
+    SetEnvironmentVariableW(L"PULSE_TEST_REGISTRY_BASE", nullptr);
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous_data ? previous_data : nullptr);
+}
+
+// PULSE_SELFTEST_CASE=ctxmenu-persist: context_menu.json is a setting like app.json, so
+// it gets the same guarantees — round-trip, a window holding older values does not roll
+// another one back, and a file nobody can read is never replaced.
+void TestContextMenuPersistence() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulseCtxMenuPrefs-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring file = dir + L"\\context_menu.json";
+    const std::wstring backup = file + L".bak";
+    const std::wstring quarantine = file + L".bad";
+
+    wchar_t previous[32768]{};
+    const DWORD had_previous =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+    auto reset = [&]() {
+        DeleteFileW(file.c_str());
+        DeleteFileW(backup.c_str());
+        DeleteFileW(quarantine.c_str());
+    };
+
+    // What the settings page and the catalog write comes back after a reload.
+    {
+        reset();
+        ContextMenuPrefs prefs;
+        prefs.share = true;
+        prefs.explorer_cap = 12;
+        prefs.SetItemEnabled(L":folder", false);
+        prefs.RecordSeen(L"v:copy", L"复制", false, ipc::CtxMenuCategory::Software, true);
+        Check(prefs.Save(), L"ctxmenu-persist: save writes context_menu.json");
+        ContextMenuPrefs loaded;
+        Check(loaded.Load() && loaded.loaded_from_file() && loaded.share &&
+                  loaded.explorer_cap == 12 && loaded.seen.size() == 1 &&
+                  !loaded.ItemEnabled(L":folder", ipc::CtxMenuCategory::Software, false),
+              L"ctxmenu-persist: the prefs survive a reload");
+    }
+
+    // A window that loaded before another one wrote must not roll that write back.
+    {
+        reset();
+        // Start from the defaults so each save below is a change of exactly one field.
+        ContextMenuPrefs seed;
+        Check(seed.Save(), L"ctxmenu-persist: seed the file the merge test uses");
+        ContextMenuPrefs first;
+        Check(first.Load(), L"ctxmenu-persist: an open window loads the file");
+        ContextMenuPrefs second;
+        Check(second.Load(), L"ctxmenu-persist: the second window loads the same file");
+        second.share = true;
+        Check(second.Save(), L"ctxmenu-persist: the second window saves its setting");
+        first.print = false;
+        Check(first.Save(), L"ctxmenu-persist: the stale window saves afterwards");
+        ContextMenuPrefs merged;
+        Check(merged.Load() && merged.share && !merged.print,
+              L"ctxmenu-persist: the stale save keeps the other window's change");
+        Check(first.Save(), L"ctxmenu-persist: the stale window saves a second time");
+        ContextMenuPrefs stable;
+        Check(stable.Load() && stable.share && !stable.print,
+              L"ctxmenu-persist: a second save does not resurrect the stale value");
+    }
+
+    // A file nobody can read is the only copy of those bytes.
+    reset();
+    CheckLockedFileSaveRefused<ContextMenuPrefs>(
+        L"ctxmenu-persist", file, backup, quarantine,
+        [](ContextMenuPrefs& p) { p.share = true; },
+        [](ContextMenuPrefs& p) { p.rotate = true; });
+
+    // A file truncated mid-write still parses into a couple of keys, so the key count
+    // has to send Load() to the backup instead of reading the fragment as the config.
+    {
+        reset();
+        ContextMenuPrefs good;
+        good.share = true;
+        good.explorer_cap = 12;
+        good.RecordSeen(L"v:copy", L"复制", false, ipc::CtxMenuCategory::Software, true);
+        const std::wstring complete = good.ToJson();
+        const size_t cut = complete.find(L"\"categories\"");
+        Check(WriteUtf8FileAtomic(backup, complete),
+              L"ctxmenu-persist: the backup holds a complete file");
+        Check(cut != std::wstring::npos && WriteUtf8FileAtomic(file, complete.substr(0, cut)),
+              L"ctxmenu-persist: the main file is truncated to a couple of keys");
+        ContextMenuPrefs healed;
+        Check(healed.Load() && healed.loaded_from_file() && healed.share &&
+                  healed.explorer_cap == 12 && healed.seen.size() == 1,
+              L"ctxmenu-persist: a truncated context_menu.json falls back to the backup");
+        healed.rotate = true;
+        Check(healed.Save(), L"ctxmenu-persist: a save repairs the truncated file");
+        ContextMenuPrefs repaired;
+        Check(repaired.Load() && repaired.share && repaired.rotate &&
+                  repaired.explorer_cap == 12 && repaired.seen.size() == 1,
+              L"ctxmenu-persist: the repaired file holds the merged values");
+    }
+
+    DeleteFileW(file.c_str());
+    DeleteFileW(backup.c_str());
+    DeleteFileW(quarantine.c_str());
+    RemoveDirectoryW(dir.c_str());
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous ? previous : nullptr);
+}
+
 void TestBloomAccentGeometry() {
     Check(ui::kBloomDotCount == 19, L"bloom: 19 dots");
     Check(std::fabs(ui::BloomDotHue(1, 0, 6) - 90.0f) < 0.01f,
@@ -3021,7 +3812,6 @@ void TestMultiSelect() {
     tab.InvertIndices({0, 1, 2, 3});
     Check(tab.SelectedCount() == 0, L"select: invert of all_selected clears");
 }
-
 void TestHiddenFiles() {
     AppPrefs prefs;
     Check(prefs.FromJson(L"{}") && !prefs.show_hidden_files,
@@ -3034,6 +3824,31 @@ void TestHiddenFiles() {
     Check(loaded.FromJson(prefs.ToJson()) && loaded.show_hidden_files &&
           loaded.show_protected_os_files,
           L"hidden: preference JSON roundtrip");
+    // Hover hints: on by default with the short delay, and both settings survive the file.
+    AppPrefs hints;
+    Check(hints.FromJson(L"{}") && hints.show_tooltips && hints.tooltip_delay_ms == 150,
+          L"hints: old preferences default to hints on at the fast delay");
+    hints.show_tooltips = false;
+    hints.tooltip_delay_ms = 800;
+    Check(hints.ToJson().find(L"\"tooltip_delay_ms\":800") != std::wstring::npos,
+          L"hints: the delay is written as a number");
+    AppPrefs hint_loaded;
+    Check(hint_loaded.FromJson(hints.ToJson()) && !hint_loaded.show_tooltips &&
+          hint_loaded.tooltip_delay_ms == 800,
+          L"hints: preference JSON roundtrip");
+    // Any delay inside the control's range is a valid custom value now; only out-of-range
+    // numbers clamp (the three presets live in the segmented control, not in the file).
+    AppPrefs custom_delay;
+    custom_delay.tooltip_delay_ms = 250;
+    AppPrefs custom_loaded;
+    Check(custom_loaded.FromJson(custom_delay.ToJson()) && custom_loaded.tooltip_delay_ms == 250,
+          L"hints: a custom delay survives the roundtrip");
+    AppPrefs clamped_delay;
+    Check(clamped_delay.FromJson(L"{\"tooltip_delay_ms\":99999}") &&
+          clamped_delay.tooltip_delay_ms == 5000 &&
+          clamped_delay.FromJson(L"{\"tooltip_delay_ms\":5}") &&
+          clamped_delay.tooltip_delay_ms == 50,
+          L"hints: out-of-range delays clamp to the control's bounds");
     Pane pane;
     auto& tab = pane.view;
     tab.current_path = L"\\\\server\\share";
@@ -3563,6 +4378,475 @@ void TestQuickAccess() {
     Check(!compat::ModernWindows() && compat::WindowDpi(GetDesktopWindow()) > 0 &&
           compat::SystemMetricsForDpi(SM_CXSIZEFRAME, 144) > 0, L"compat: legacy DPI path");
     SetEnvironmentVariableW(L"PULSE_COMPAT_81", previous_compat[0] ? previous_compat : nullptr);
+}
+
+// PULSE_SELFTEST_CASE=places-recovery: the two stores that could lose data on their own.
+// A tags file that is there but unreadable must be set aside instead of being replaced by
+// the default palette, and saved searches have to live in the app data directory (the path
+// used to be assembled by hand, which the test redirect cannot reach).
+void TestPlacesStoreRecovery() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulsePlacesRecovery-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring tags = dir + L"\\tags.json";
+    const std::wstring places = dir + L"\\places.json";
+    const std::wstring searches = dir + L"\\saved_searches.json";
+
+    wchar_t previous[32768]{};
+    const DWORD had_previous =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+    // Seed a profile the way a real launch leaves one, so the tag file below is the only
+    // thing that is broken.
+    {
+        PlacesCatalog seed;
+        seed.EnsureDefaults();
+        seed.RecordRecent(L"C:\\proj\\seed", PlaceItemKind::Folder);
+        Check(seed.Save() && GetFileAttributesW(places.c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"places recovery: a profile writes places.json");
+    }
+    {
+        HANDLE file = CreateFileW(tags.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        const char* garbage = "{\"version\":2,\"tags\":[{\"id\":\"broken\"";
+        DWORD written = 0;
+        if (file != INVALID_HANDLE_VALUE) {
+            WriteFile(file, garbage, static_cast<DWORD>(strlen(garbage)), &written, nullptr);
+            CloseHandle(file);
+        }
+    }
+    {
+        PlacesCatalog cat;
+        cat.Load();
+        Check(cat.tags.size() == 7, L"places recovery: the default palette comes back");
+        Check(GetFileAttributesW((tags + L".bad").c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"places recovery: the unreadable tag file is kept as .bad");
+    }
+    {
+        SavedSearchStore store;
+        SavedSearch search;
+        search.name = L"recovery";
+        search.root = L"C:\\proj";
+        search.query = L"needle";
+        Check(store.Add(search) && store.Save() &&
+              GetFileAttributesW(searches.c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"places recovery: saved searches land in the app data directory");
+        SavedSearchStore reloaded;
+        Check(reloaded.Load() && reloaded.items().size() == 1 &&
+              reloaded.items()[0].query == L"needle",
+              L"places recovery: saved searches round-trip through the redirect");
+    }
+
+    // Two windows, one file: the visit the other window collected must survive the save of
+    // the window that was already open when it happened - that is the rollback this merge
+    // is for. An entry this window dropped on purpose still stays dropped.
+    {
+        PlacesCatalog first;
+        Check(first.Load(), L"places recovery: an open window loads the profile");
+        first.RecordRecent(L"C:\\proj\\local", PlaceItemKind::Folder);
+        {
+            PlacesCatalog second;
+            second.Load();
+            second.RecordRecent(L"C:\\proj\\other", PlaceItemKind::Folder);
+            Check(second.Save(), L"places recovery: the second window saves its visit");
+        }
+        Check(first.Save(), L"places recovery: the first window saves on top");
+        PlacesCatalog check;
+        Check(check.Load() && check.FindRecent(L"C:\\proj\\other") != nullptr &&
+              check.FindRecent(L"C:\\proj\\local") != nullptr,
+              L"places recovery: the newer visit survives a stale save");
+    }
+
+    // The starred list follows the same two-window rule: the item the other window starred
+    // survives a stale save, the one unstarred here does not come back.
+    {
+        {
+            PlacesCatalog writer;
+            writer.Load();
+            Check(writer.ToggleStarred(L"C:\\proj\\kept", PlaceItemKind::Folder) && writer.Save(),
+                  L"places recovery: a starred item is on disk before the race");
+        }
+        PlacesCatalog first;
+        Check(first.Load() && first.IsStarred(L"C:\\proj\\kept"),
+              L"places recovery: a window loads the starred list");
+        first.ToggleStarred(L"C:\\proj\\kept");
+        Check(!first.IsStarred(L"C:\\proj\\kept"),
+              L"places recovery: and unstars it here");
+        {
+            PlacesCatalog second;
+            second.Load();
+            Check(second.ToggleStarred(L"C:\\proj\\other-star", PlaceItemKind::Folder) &&
+                  second.Save(),
+                  L"places recovery: the other window stars its own");
+        }
+        Check(first.Save(), L"places recovery: the first window saves on top");
+        PlacesCatalog check;
+        Check(check.Load() && check.FindStarred(L"C:\\proj\\other-star") != nullptr,
+              L"places recovery: the other window's star survives a stale save");
+        Check(check.FindStarred(L"C:\\proj\\kept") == nullptr,
+              L"places recovery: the item unstarred here stays unstarred");
+    }
+
+    // Pinned folders are user data like the starred list, so the save-time merge follows the
+    // same rule: the pin the other window made survives, the one unpinned here stays gone.
+    {
+        {
+            PlacesCatalog writer;
+            writer.Load();
+            writer.SetQuickAccessPinned({ L"C:\\proj\\pin-kept" }, true);
+        }
+        PlacesCatalog first;
+        Check(first.Load() && first.IsQuickAccessPinned(L"C:\\proj\\pin-kept"),
+              L"places recovery: a window loads the pinned folders");
+        Check(first.SetQuickAccessPinned({ L"C:\\proj\\pin-kept" }, false) &&
+              !first.IsQuickAccessPinned(L"C:\\proj\\pin-kept"),
+              L"places recovery: and unpins one here");
+        {
+            PlacesCatalog second;
+            second.Load();
+            second.SetQuickAccessPinned({ L"C:\\proj\\pin-other" }, true);
+        }
+        Check(first.Save(), L"places recovery: the first window saves on top");
+        PlacesCatalog check;
+        Check(check.Load() && check.IsQuickAccessPinned(L"C:\\proj\\pin-other"),
+              L"places recovery: the other window's pin survives a stale save");
+        Check(!check.IsQuickAccessPinned(L"C:\\proj\\pin-kept"),
+              L"places recovery: the folder unpinned here stays unpinned");
+    }
+
+    // Workspaces merge under the same rule, and the whole snapshot has to travel with the
+    // merged entry: name, layout, panes, views and the visit counts behind the "path\tcount"
+    // rows.
+    {
+        {
+            PlacesCatalog writer;
+            writer.Load();
+            writer.PinWorkspace(L"C:\\proj\\ws-kept", L"kept", 1, { L"C:\\proj\\ws-kept" });
+        }
+        PlacesCatalog first;
+        Check(first.Load() && first.FindWorkspace(L"C:\\proj\\ws-kept") >= 0,
+              L"places recovery: a window loads the pinned workspaces");
+        Check(first.UnpinWorkspace(L"C:\\proj\\ws-kept") &&
+              first.FindWorkspace(L"C:\\proj\\ws-kept") < 0,
+              L"places recovery: and unpins one here");
+        {
+            PlacesCatalog second;
+            second.Load();
+            Check(second.PinWorkspace(L"C:\\proj\\ws-other", L"other", 2,
+                                      { L"C:\\proj\\ws-other", L"C:\\proj\\ws-other\\sub" },
+                                      { ui::ViewMode::Details, ui::ViewMode::Tiles }) >= 0,
+                  L"places recovery: the other window pins a workspace");
+            second.RecordVisit(L"C:\\proj\\ws-other\\sub");
+            Check(second.Save(), L"places recovery: and saves its snapshot");
+        }
+        Check(first.Save(), L"places recovery: the first window saves on top");
+        PlacesCatalog check;
+        const int merged = check.Load() ? check.FindWorkspace(L"C:\\proj\\ws-other") : -1;
+        const Workspace* ws = merged >= 0 ? &check.workspaces[static_cast<size_t>(merged)] : nullptr;
+        Check(ws && ws->name == L"other" && ws->layout == 2 && ws->pane_paths.size() == 2 &&
+              ws->pane_views == std::vector<ui::ViewMode>{ ui::ViewMode::Details, ui::ViewMode::Tiles },
+              L"places recovery: another window's workspace survives with its snapshot");
+        const auto frequent = ws ? check.FrequentChildren(merged, 8) : std::vector<std::wstring>{};
+        // Visits are stored normalized, the same way RecordVisit keys them.
+        const std::wstring expected_visit = fs::NormalizePath(L"C:\\proj\\ws-other\\sub");
+        Check(frequent.size() == 1 &&
+              _wcsicmp(frequent[0].c_str(), expected_visit.c_str()) == 0,
+              L"places recovery: and its visit counts come back through the parse");
+        Check(check.FindWorkspace(L"C:\\proj\\ws-kept") < 0,
+              L"places recovery: the workspace unpinned here stays gone");
+    }
+
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous ? previous : nullptr);
+    DeleteFileW(tags.c_str());
+    DeleteFileW((tags + L".bad").c_str());
+    DeleteFileW((tags + L".bak").c_str());
+    DeleteFileW(places.c_str());
+    DeleteFileW((places + L".bak").c_str());
+    DeleteFileW(searches.c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
+// PULSE_SELFTEST_CASE=folder-views: the per-folder view memory. A folder has to come back
+// the way it was left, two windows must not undo each other, and the file stays bounded.
+void TestFolderViewMemory() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulseFolderViews-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring file = dir + L"\\folder-views.json";
+
+    wchar_t previous[32768]{};
+    const DWORD had_previous =
+        GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", dir.c_str());
+
+    const std::wstring folder = fs::NormalizePath(L"C:\\proj\\alpha");
+    FolderView view;
+    view.view = ui::ViewMode::MediumIcons;
+    view.sort = ui::SortColumn::Mtime;
+    view.direction = ui::SortDirection::Desc;
+    view.dividers = { 0.25f, 0.5f, 0.75f };
+    {
+        FolderViewStore store;
+        store.Load();
+        store.Note(folder, view);
+        Check(GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"folder views: noting a folder writes the store");
+        const FolderView* found = store.Find(L"c:\\PROJ\\Alpha");
+        Check(found != nullptr,
+              L"folder views: a case-different path finds the entry");
+        Check(found && found->view == ui::ViewMode::MediumIcons &&
+              found->sort == ui::SortColumn::Mtime &&
+              found->direction == ui::SortDirection::Desc &&
+              std::fabs(found->dividers[1] - 0.5f) < 0.0001f,
+              L"folder views: the entry reads back");
+    }
+    {
+        FolderViewStore reloaded;
+        reloaded.Load();
+        const FolderView* found = reloaded.Find(folder);
+        Check(found && found->view == ui::ViewMode::MediumIcons &&
+              std::fabs(found->dividers[2] - 0.75f) < 0.0001f,
+              L"folder views: the memory survives a restart");
+    }
+
+    // A tab that navigates into the folder gets the remembered view back; one whose folder
+    // has no memory keeps what it was showing.
+    {
+        auto state = std::make_unique<AppState>();
+        state->folderViews.Load();
+        Tab tab;
+        tab.current_path = folder;
+        ApplyFolderView(*state, tab);
+        Check(tab.view_mode == ui::ViewMode::MediumIcons &&
+              tab.sort_column == ui::SortColumn::Mtime &&
+              tab.sort_direction == ui::SortDirection::Desc,
+              L"folder views: navigating back applies the remembered view");
+        Tab fresh;
+        fresh.current_path = fs::NormalizePath(L"C:\\proj\\never-seen");
+        fresh.view_mode = ui::ViewMode::Tiles;
+        ApplyFolderView(*state, fresh);
+        Check(fresh.view_mode == ui::ViewMode::Tiles,
+              L"folder views: a folder with no memory leaves the tab alone");
+    }
+
+    // Two windows, one file: the folder the other window visited while this one was open is
+    // kept, and the view changed here wins for its own folder.
+    {
+        const std::wstring own = fs::NormalizePath(L"C:\\proj\\own");
+        const std::wstring other = fs::NormalizePath(L"C:\\proj\\other");
+        FolderViewStore first;
+        first.Load();
+        FolderView list_view = view;
+        list_view.view = ui::ViewMode::List;
+        first.Note(own, list_view);
+        {
+            FolderViewStore second;
+            second.Load();
+            second.Note(other, view);
+        }
+        first.Save();
+        FolderViewStore check;
+        check.Load();
+        const FolderView* kept = check.Find(other);
+        Check(kept && kept->view == ui::ViewMode::MediumIcons,
+              L"folder views: the other window's folder survives a stale save");
+        const FolderView* mine = check.Find(own);
+        Check(mine && mine->view == ui::ViewMode::List,
+              L"folder views: this window's own change is on disk");
+    }
+
+    // The store is bounded: the least recently used folders are the ones that go.
+    {
+        FolderViewStore store;
+        store.Load();
+        for (size_t i = 0; i < FolderViewStore::kMaxEntries + 20; ++i) {
+            FolderView extra;
+            extra.used = 1000 + i;
+            store.Note(std::wstring(L"C:\\cap\\") + std::to_wstring(i), extra);
+        }
+        Check(store.size() == FolderViewStore::kMaxEntries,
+              L"folder views: the store stops at its cap");
+        FolderViewStore check;
+        check.Load();
+        const std::wstring newest =
+            std::wstring(L"C:\\cap\\") + std::to_wstring(FolderViewStore::kMaxEntries + 19);
+        const std::wstring oldest = fs::NormalizePath(L"C:\\cap\\0");
+        Check(check.size() == FolderViewStore::kMaxEntries,
+              L"folder views: the store stops at its cap on disk too");
+        Check(check.Find(newest) != nullptr,
+              L"folder views: the newest folder is kept");
+        Check(check.Find(oldest) == nullptr,
+              L"folder views: the oldest folder is trimmed");
+    }
+
+    // Virtual views are not folders.
+    {
+        FolderViewStore store;
+        store.Load();
+        const size_t before = store.size();
+        store.Note(L"pulse:recent", view);
+        Check(store.size() == before, L"folder views: a virtual view is not remembered");
+    }
+
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", had_previous ? previous : nullptr);
+    DeleteFileW(file.c_str());
+    DeleteFileW((file + L".bak").c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
+// PULSE_SELFTEST_CASE=tooltip-delay-editor: the custom delay segment has to own a rect and
+// hit-test as index 3, which is the index that opens the numeric editor.
+void TestTooltipDelayEditor() {
+    auto state = std::make_unique<AppState>();
+    AppState& s = *state;
+    ui::WindowViewModel vm = BuildVm(s, false);
+    vm.settings_open = true;
+    vm.settings_page = 0;
+    vm.settings_expanded |= 1u;
+    vm.settings_scroll = 0.0f;
+    const float w = 1280.0f * s.scale;
+    const float h = 1000.0f * s.scale;
+    const D2D1_RECT_F window = D2D1::RectF(0, 0, w, h);
+    // The row lives far down a long page: scroll until it is actually on screen, which is
+    // the only state a user can click it in.
+    D2D1_RECT_F cell{};
+    bool have_cell = false;
+    float scroll_used = 0.0f;
+    const float max_scroll = s.renderer.SettingsMaxScroll(vm, w, h);
+    for (float sc = 0.0f; sc <= max_scroll + 1.0f && !have_cell; sc += 40.0f * s.scale) {
+        vm.settings_scroll = sc;
+        D2D1_RECT_F candidate{};
+        if (s.renderer.TooltipDelayCustomCell(vm, w, h, &candidate) &&
+            candidate.top >= 120.0f && candidate.bottom <= h - 120.0f &&
+            candidate.right > candidate.left + 1.0f && candidate.bottom > candidate.top + 1.0f) {
+            cell = candidate;
+            scroll_used = sc;
+            have_cell = true;
+        }
+    }
+    vm.settings_scroll = scroll_used;
+    Check(have_cell, L"tooltip delay: the custom segment owns a rect once scrolled into view");
+    const ui::HitTestResult hit = s.renderer.HitTest(
+        vm, window, (cell.left + cell.right) * 0.5f, (cell.top + cell.bottom) * 0.5f);
+    Check(hit.region == ui::HitTestResult::SettingsTooltipDelay,
+          L"tooltip delay: the click lands on the delay row");
+    Check(hit.region == ui::HitTestResult::SettingsTooltipDelay && hit.index == 3,
+          L"tooltip delay: clicking the custom segment hits index 3");
+
+    // Regression: with the inline editor open, one of the three presets has to close it and
+    // land. Leaving the editor open kept the row reading as "custom", and because a click here
+    // never moved focus off the editor, its next commit wrote the editor's number back over the
+    // preset - so 短/标准/长 looked like they did nothing.
+    s.appPrefs.persist = false;
+    s.settings.BindUi(s.appPrefs, s.ctxMenuPrefs, s.index, s.networkIndex, {});
+    s.appPrefs.tooltip_delay_ms = 1000;
+    s.tooltipDelayEditing = true;
+    ui::HitTestResult preset{};
+    preset.region = ui::HitTestResult::SettingsTooltipDelay;
+    preset.index = 0;
+    HandleSettingsControl(s, preset);
+    Check(!s.tooltipDelayEditing && s.appPrefs.tooltip_delay_ms == 150,
+          L"tooltip delay: a preset closes the custom editor and applies");
+
+    // The reported flow with a real window and the real child editor: click 自定义, then click
+    // one of the presets on the row itself. The editor has to close and the preset has to land,
+    // which is what a click that never leaves the editor cannot do.
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = BlankPaneTestProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"PulseTooltipDelayClickSelftest";
+    RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, 1280, 1000,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    Check(hwnd != nullptr, L"tooltip delay: settings window created");
+    if (hwnd) {
+        s.hwnd = hwnd;
+        if (s.compositor.Init(hwnd)) {
+            s.scale = 1.0f;
+            s.compositor.RecreateTextFormats(1.0f);
+            s.renderer.SetCompositor(&s.compositor);
+            s.renderer.SetScale(1.0f);
+            s.window_tabs.NewTab(L"C:\\PulseTooltipDelayFixture");
+            s.pane = s.window_tabs.Active()->panes.front().get();
+            // The delay row lives in the advanced group of the general page.
+            s.settingsExpanded |= 1u;
+            ActiveTab(s)->current_path =
+                app::MakeSettingsPath(app::SettingsController::PageName(0));
+            s.settings.SelectPage(0);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&s));
+            const D2D1_RECT_F page_rect = D2D1::RectF(0, 0,
+                static_cast<float>(s.compositor.Width()),
+                static_cast<float>(s.compositor.Height()));
+            // Scroll the row up to where a user can click it.
+            const float page_max_scroll = s.renderer.SettingsMaxScroll(
+                BuildVm(s, false), page_rect.right, page_rect.bottom);
+            float row_scroll = 0.0f;
+            for (float sc = 0.0f; sc <= page_max_scroll; sc += 20.0f) {
+                s.settings.SetScroll(sc, page_max_scroll);
+                D2D1_RECT_F candidate{};
+                if (s.renderer.TooltipDelayCustomCell(BuildVm(s, false), page_rect.right,
+                                                      page_rect.bottom, &candidate) &&
+                    candidate.top >= 160.0f && candidate.bottom <= page_rect.bottom - 160.0f) {
+                    row_scroll = sc;
+                    break;
+                }
+            }
+            s.settings.SetScroll(row_scroll, page_max_scroll);
+            const ui::WindowViewModel vm_now = BuildVm(s, false);
+            D2D1_RECT_F custom{};
+            const bool have_row = vm_now.settings_open &&
+                s.renderer.TooltipDelayCustomCell(vm_now, page_rect.right, page_rect.bottom, &custom);
+            Check(have_row, L"tooltip delay: the delay row is on screen in a real window");
+            if (have_row) {
+                const float cell_w = custom.right - custom.left;
+                const float row_y = (custom.top + custom.bottom) * 0.5f;
+                const int custom_x = static_cast<int>((custom.left + custom.right) * 0.5f);
+                const int short_x = static_cast<int>(custom.left - 2.5f * cell_w);
+                const auto hit_custom = s.renderer.HitTest(
+                    vm_now, page_rect, static_cast<float>(custom_x), row_y);
+                const auto hit_preset = s.renderer.HitTest(
+                    vm_now, page_rect, static_cast<float>(short_x), row_y);
+                Check(hit_custom.region == ui::HitTestResult::SettingsTooltipDelay &&
+                      hit_custom.index == 3 &&
+                      hit_preset.region == ui::HitTestResult::SettingsTooltipDelay &&
+                      hit_preset.index == 0,
+                      L"tooltip delay: the custom cell and the presets keep separate hit targets");
+                s.appPrefs.tooltip_delay_ms = 1000;
+                const LPARAM custom_point = MAKELPARAM(custom_x, static_cast<int>(row_y));
+                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, custom_point);
+                SendMessageW(hwnd, WM_LBUTTONUP, 0, custom_point);
+                // The host window is never shown, so the editor's own WS_VISIBLE is what says
+                // whether the row handed its cell to the editor or hid it again.
+                const bool editor_shown = s.hwndTooltipDelayEdit &&
+                    (GetWindowLongPtrW(s.hwndTooltipDelayEdit, GWL_STYLE) & WS_VISIBLE) != 0;
+                Check(s.tooltipDelayEditing && s.hwndTooltipDelayEdit,
+                      L"tooltip delay: the custom cell opens the inline editor");
+                Check(editor_shown, L"tooltip delay: the inline editor is shown on the row");
+                const LPARAM preset_point = MAKELPARAM(short_x, static_cast<int>(row_y));
+                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, preset_point);
+                SendMessageW(hwnd, WM_LBUTTONUP, 0, preset_point);
+                Check(!s.tooltipDelayEditing && s.appPrefs.tooltip_delay_ms == 150,
+                      L"tooltip delay: a preset click on the row closes the editor and applies");
+                Check(s.hwndTooltipDelayEdit &&
+                      (GetWindowLongPtrW(s.hwndTooltipDelayEdit, GWL_STYLE) & WS_VISIBLE) == 0,
+                      L"tooltip delay: the editor is hidden once a preset takes over");
+            }
+            if (s.hwndTooltipDelayEdit) DestroyWindow(s.hwndTooltipDelayEdit);
+            s.hwndTooltipDelayEdit = nullptr;
+            s.renderer.SetCompositor(nullptr);
+            s.compositor.Shutdown();
+        } else Check(false, L"tooltip delay: settings graphics initialized");
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        DestroyWindow(hwnd);
+        s.hwnd = nullptr;
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    }
+    s.settings.ResetUi();
 }
 
 void TestPlacesAndIndex() {
@@ -4271,12 +5555,20 @@ void TestViewLayouts() {
     Check(list.MaxScrollX() > 0 && list.MaxScrollY() == 0,
           L"view: list is column-major with horizontal scrolling");
     auto menu = BuildViewMenu(ui::ViewMode::Details);
-    Check(menu.size() == 9 && menu[5].radio && !menu[0].radio &&
-          menu[8].command == CmdDetailsPanel,
-          L"view: menu has eight view choices plus details panel");
+    Check(menu.size() == 11 && menu[5].radio && !menu[0].radio &&
+          menu[8].command == CmdDetailsPanel &&
+          menu[9].command == CmdToggleHiddenItems &&
+          menu[10].command == CmdToggleProtectedItems,
+          L"view: menu has eight view choices plus panel and visibility switches");
     Check(menu[0].glyph_scale > menu[1].glyph_scale &&
           menu[1].glyph_scale > menu[2].glyph_scale,
           L"view: icon menu communicates extra-large, large, and medium scale");
+    auto hidden_menu = BuildViewMenu(ui::ViewMode::Details, false, true, false);
+    Check(hidden_menu[9].checked && !hidden_menu[10].checked && hidden_menu[10].enabled,
+          L"view: the hidden switch reflects the preference and frees the protected one");
+    auto quiet_menu = BuildViewMenu(ui::ViewMode::Details, false, false, false);
+    Check(!quiet_menu[9].checked && !quiet_menu[10].enabled,
+          L"view: protected files stay unreachable until hidden items show");
 
     ui::MainRenderer columns;
     columns.SetScale(1.0f);
@@ -4767,6 +6059,50 @@ void TestLayoutOwnedTabs() {
           restored.items[1]->panes.size() == 1 &&
           restored.items[1]->panes[0]->view.current_path.find(L"raw") != std::wstring::npos,
           L"layouttabs: session restore keeps the second tab's single folder");
+
+    // A window's last tab is not just removed: closing it closes the window.
+    // The model reports that and refuses to empty the strip on its own, so its
+    // callers (the strip's x, the tab menu, Ctrl+W) can post WM_CLOSE instead.
+    WindowTabs single;
+    single.EnsureDefault();
+    Check(single.items.size() == 1 && single.ClosingLastTab(0) && !single.ClosingLastTab(1),
+          L"layouttabs: the only tab asks its window to close");
+    single.CloseTab(0);
+    Check(single.items.size() == 1 && single.active == 0,
+          L"layouttabs: the model never empties the strip by itself");
+    single.items[0]->pinned = true;
+    Check(!single.ClosingLastTab(0),
+          L"layouttabs: a pinned single tab never closes its window");
+    single.items[0]->pinned = false;
+    single.NewTab(L"C:\\second");
+    Check(single.items.size() == 2 && !single.ClosingLastTab(0) && !single.ClosingLastTab(1),
+          L"layouttabs: a tab with a sibling closes as a tab");
+    single.CloseTab(0);
+    Check(single.items.size() == 1 && single.active == 0,
+          L"layouttabs: closing one of two tabs keeps the other");
+
+    // A group that lost its last member is worth nothing: nothing left to show,
+    // nothing left to ungroup. The prune has to cover every close path, so it
+    // only touches the group list and never the tabs.
+    WindowTabs grouped;
+    grouped.NewTab(L"C:\\group-one");
+    grouped.NewTab(L"C:\\group-two");
+    const int group_id = grouped.next_tab_group_id++;
+    TabGroup group;
+    group.id = group_id;
+    grouped.tab_groups.push_back(group);
+    grouped.items[0]->tab_group = group_id;
+    PruneEmptyGroups(grouped);
+    Check(grouped.tab_groups.size() == 1 && grouped.tab_groups[0].id == group_id,
+          L"layouttabs: a group with a member tab survives the prune");
+    Check(grouped.items[0]->tab_group == group_id && grouped.items[1]->tab_group == 0,
+          L"layouttabs: pruning groups leaves tab membership alone");
+    grouped.CloseTab(0);
+    PruneEmptyGroups(grouped);
+    Check(grouped.tab_groups.empty() && grouped.next_tab_group_id == group_id + 1,
+          L"layouttabs: a group that lost its last member is dropped");
+    Check(grouped.items.size() == 1 && grouped.items[0]->tab_group == 0,
+          L"layouttabs: pruning groups keeps the surviving tabs");
 }
 
 void TestUtf8PersistFile() {
@@ -4796,7 +6132,7 @@ void TestUtf8PersistFile() {
     }
     Check(utf8, L"utf8file: on-disk bytes are UTF-8");
     DeleteFileW(path.c_str());
-    DeleteFileW((path + L".tmp").c_str());
+    DeleteFileW((path + L".tmp." + std::to_wstring(GetCurrentProcessId())).c_str());
 }
 
 void TestColorPickerModel() {
@@ -5045,6 +6381,337 @@ void TestDetailsPreviewInteraction() {
     SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous[0] ? previous : nullptr);
 }
 
+// A tab dragged out of its strip is dropped on whichever Pulse window is under
+// the cursor, and the floating card that follows the pointer must never count as
+// one: the card is a topmost window of its own, so a card left visible would
+// swallow the very drop it belongs to. This pins down the two halves a window
+// drag depends on - where the drop lands, and where the card hangs - because
+// both are pure window-manager behavior that no model test can reach.
+void TestTabHandoff() {
+    const wchar_t* main_class = SingleInstanceCoordinator::WindowClassName();
+    const wchar_t* card_class = L"PulseTabDragGhost";
+    // The card first: looking it up by class name below must not pick up one of
+    // the probe windows that carry the same name.
+    {
+        ui::TabDragGhost card;
+        card.Show(1.0f, L"文档", false, 40, 12);
+        card.Follow(POINT{300, 300});
+        RECT card_rect{};
+        const HWND card_hwnd = FindWindowW(card_class, nullptr);
+        Check(card.visible() && card_hwnd != nullptr && GetWindowRect(card_hwnd, &card_rect) &&
+            card_rect.left == 300 - 40 && card_rect.top == 300 - 12,
+            L"tab-handoff: the drag card hangs by the grab offset");
+        card.Hide();
+        Check(!card.visible(), L"tab-handoff: the drag card is hidden before the hand-off");
+    }
+
+    // The classes may already exist - the card registers its own on the first
+    // Show - and a probe window only needs the name, not a class of its own.
+    auto ensure_class = [](const wchar_t* name) -> int {
+        WNDCLASSW desc{};
+        desc.lpfnWndProc = DefWindowProcW;
+        desc.hInstance = GetModuleHandleW(nullptr);
+        desc.lpszClassName = name;
+        if (RegisterClassW(&desc)) return 1;
+        return GetLastError() == ERROR_CLASS_ALREADY_EXISTS ? 0 : -1;
+    };
+    const int main_state = ensure_class(main_class);
+    const int card_state = ensure_class(card_class);
+    if (main_state < 0 || card_state < 0) {
+        LogLine(L"[SKIP] tab-handoff: the probe window classes are unavailable\n");
+        return;
+    }
+    auto make_probe = [](const wchar_t* cls, int x) {
+        HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, cls, L"", WS_POPUP,
+                                    x, 0, 80, 80, nullptr, nullptr,
+                                    GetModuleHandleW(nullptr), nullptr);
+        if (hwnd) {
+            // Topmost so the probe wins the hit test over whatever else is on
+            // screen, never activated so running the self-test does not steal
+            // the keyboard from the window the user is working in.
+            SetWindowPos(hwnd, HWND_TOPMOST, x, 0, 80, 80, SWP_NOACTIVATE);
+            ShowWindow(hwnd, SW_SHOWNA);
+            UpdateWindow(hwnd);
+        }
+        return hwnd;
+    };
+    HWND first = make_probe(main_class, 0);
+    HWND second = make_probe(main_class, 100);
+    HWND card_window = make_probe(card_class, 200);
+    Check(first && second && card_window, L"tab-handoff: the probe windows open");
+    if (first && second && card_window) {
+        MSG pending{};
+        while (PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&pending);
+            DispatchMessageW(&pending);
+        }
+        // WindowFromPoint answers who is physically on top, so a later topmost
+        // window - a notification, an IME candidate or another always-on-top
+        // app - can sit over a probe and make the hit test "fail" for reasons
+        // Pulse does not own. Skip rather than report it: a flaky red here would
+        // hide a real regression, and the drop logic is still exercised whenever
+        // the desktop happens to be clear.
+        auto probe_on_top = [](POINT point, HWND probe) {
+            const HWND top = WindowFromPoint(point);
+            return top != nullptr && GetAncestor(top, GA_ROOT) == probe;
+        };
+        if (!probe_on_top(POINT{40, 40}, first) || !probe_on_top(POINT{140, 40}, second) ||
+            !probe_on_top(POINT{240, 40}, card_window)) {
+            LogLine(L"[SKIP] tab-handoff: the probe windows are covered\n");
+        } else {
+            Check(PulseWindowUnderPoint(POINT{40, 40}, nullptr) == first,
+                L"tab-handoff: the window under the cursor takes the tab");
+            Check(PulseWindowUnderPoint(POINT{140, 40}, nullptr) == second,
+                L"tab-handoff: the other window takes it when the cursor moves on");
+            Check(PulseWindowUnderPoint(POINT{40, 40}, first) == nullptr,
+                L"tab-handoff: the window that owns the tab is never its own target");
+            Check(PulseWindowUnderPoint(POINT{240, 40}, nullptr) == nullptr,
+                L"tab-handoff: a window carrying the drag card's class is never a target");
+        }
+    }
+    if (card_window) DestroyWindow(card_window);
+    if (second) DestroyWindow(second);
+    if (first) DestroyWindow(first);
+    if (card_state == 1) UnregisterClassW(card_class, GetModuleHandleW(nullptr));
+    if (main_state == 1) UnregisterClassW(main_class, GetModuleHandleW(nullptr));
+}
+
+// A group chip is a control, not a label: clicking it folds the group's tabs out
+// of the strip, clicking it again brings them back, and the folded flag is what
+// the session stores. The chip press used to bail out before arming, which left
+// ToggleGroupCollapse unreachable from the window.
+void TestTabGroupCollapse() {
+    WindowTabs tabs;
+    tabs.EnsureDefault();
+    tabs.NewTab(L"C:\\work");
+    tabs.NewTab(L"D:\\media");
+    TabGroup group;
+    group.id = 1;
+    group.name = L"group";
+    group.color_rgb = 0x0078D4;
+    tabs.tab_groups.push_back(group);
+    for (auto& item : tabs.items) item->tab_group = 1;
+
+    ui::WindowViewModel expanded;
+    FillWindowTabStrip(expanded, tabs);
+    Check(expanded.tabs.size() == tabs.items.size() && !expanded.tabs[0].hidden &&
+        !expanded.tabs[1].hidden,
+        L"tab-groups: an expanded group shows its members");
+    const auto expanded_rows = TabGroupCardRows(tabs, 1);
+    Check(expanded_rows.size() == 2 && expanded_rows[0].new_tab &&
+        expanded_rows[1].edit && expanded_rows[0].tab_index < 0,
+        L"tab-groups: an expanded chip card offers only the two actions");
+
+    TabController controller;
+    controller.ToggleGroupCollapse(tabs, 1);
+    Check(tabs.tab_groups[0].collapsed, L"tab-groups: the chip folds the group");
+    ui::WindowViewModel folded;
+    FillWindowTabStrip(folded, tabs);
+    Check(folded.tabs.size() > 1 && folded.tabs[0].hidden && folded.tabs[1].hidden,
+        L"tab-groups: folded members leave the strip");
+    Check(folded.tab_groups.size() == 1 && folded.tab_groups[0].has_active,
+        L"tab-groups: the folded chip marks the group holding the active tab");
+    const auto folded_rows = TabGroupCardRows(tabs, 1);
+    const size_t members = tabs.items.size();
+    Check(folded_rows.size() == members + 2 &&
+        folded_rows[0].tab_index == 0 &&
+        folded_rows[members - 1].separator_after &&
+        folded_rows[members].new_tab && folded_rows[members + 1].edit,
+        L"tab-groups: a folded chip card lists its members above the actions");
+    bool card_active_ok = true;
+    for (const auto& row : folded_rows) {
+        const bool expected = row.tab_index == static_cast<int>(tabs.active);
+        if (row.active != expected) card_active_ok = false;
+    }
+    Check(card_active_ok, L"tab-groups: the card marks exactly the active member row");
+    controller.ToggleGroupCollapse(tabs, 1);
+    Check(!tabs.tab_groups[0].collapsed, L"tab-groups: the chip unfolds it again");
+
+    // The marker tracks the active tab: moving it outside the group clears it.
+    tabs.items[0]->tab_group = 0;
+    tabs.active = 0;
+    ui::WindowViewModel unmarked;
+    FillWindowTabStrip(unmarked, tabs);
+    Check(unmarked.tab_groups.size() == 1 && !unmarked.tab_groups[0].has_active,
+        L"tab-groups: a chip without the active tab is not marked");
+
+    // The card belongs to the group it was opened for: an unknown id has none,
+    // and a second group never lends it members.
+    Check(TabGroupCardRows(tabs, 99).empty(),
+        L"tab-groups: an unknown group has no card");
+    TabGroup other;
+    other.id = 2;
+    other.name = L"other";
+    other.collapsed = true;
+    tabs.tab_groups.push_back(other);
+    tabs.tab_groups[0].collapsed = true;
+    tabs.items[1]->tab_group = 2;
+    const auto own_rows = TabGroupCardRows(tabs, 1);
+    const auto other_rows = TabGroupCardRows(tabs, 2);
+    Check(own_rows.size() == 3 && other_rows.size() == 3 &&
+        own_rows[0].tab_index == 2 && other_rows[0].tab_index == 1 &&
+        own_rows[1].new_tab && own_rows[2].edit &&
+        other_rows[1].new_tab && other_rows[2].edit,
+        L"tab-groups: a card lists only the members of its own group");
+
+    // A tab added to a folded group unfolds it: the new tab is the active one,
+    // and an active tab hidden inside a fold would leave the strip unchanged.
+    controller.NewTabInGroup(tabs, 1);
+    const LayoutTab* created = tabs.Active();
+    Check(!tabs.tab_groups[0].collapsed && created && created->tab_group == 1,
+        L"tab-groups: a tab added to a folded group unfolds it");
+
+    // Group 1 now holds items[2] and the tab NewTabInGroup just created, with
+    // the new tab active. The card tells "you are here" apart from "you were
+    // here": while the group owns the active tab the memory is ignored, and a
+    // group the window has left marks the remembered member with a faint check.
+    const LayoutTab* remembered = tabs.items[2].get();
+    tabs.tab_groups[0].collapsed = true;
+    const auto owns_active_rows = TabGroupCardRows(tabs, 1, remembered);
+    int active_rows = 0;
+    bool memory_suppressed = true;
+    for (const auto& row : owns_active_rows) {
+        if (row.active) ++active_rows;
+        memory_suppressed &= !row.was_active;
+    }
+    Check(owns_active_rows.size() == 4 && active_rows == 1 && memory_suppressed,
+        L"tab-groups: the active row wins over the remembered tab");
+
+    tabs.active = 0; // the active tab now sits outside group 1
+    const auto history_rows = TabGroupCardRows(tabs, 1, remembered);
+    bool history_ok = history_rows.size() == 4; // two members plus the actions
+    int faint_rows = 0;
+    for (const auto& row : history_rows) {
+        if (row.was_active) {
+            ++faint_rows;
+            history_ok &= !row.active && row.tab_index == 2;
+        } else {
+            history_ok &= !row.active;
+        }
+    }
+    Check(history_ok && faint_rows == 1,
+        L"tab-groups: only the remembered member carries the faint mark");
+
+    // "New tab to the right" inside a group keeps the run in one piece: the tab joins the
+    // group of the tab it was opened from instead of cutting that group in two.
+    {
+        WindowTabs right;
+        right.EnsureDefault();
+        right.NewTab(L"C:\\second");
+        right.NewTab(L"C:\\third");
+        TabGroup inside;
+        inside.id = 3;
+        inside.name = L"inside";
+        right.tab_groups.push_back(inside);
+        for (auto& item : right.items) item->tab_group = 3;
+        const size_t before = right.items.size();
+        controller.OpenTabBeside(right, 1, false);
+        const LayoutTab* born = right.Active();
+        bool run_ok = right.items.size() == before + 1 && born && born->tab_group == 3 &&
+                      right.items[1]->tab_group == 3 && right.items[2]->tab_group == 3 &&
+                      right.items[3]->tab_group == 3;
+        Check(run_ok, L"tab-groups: a tab opened to the right joins the group");
+    }
+    {
+        WindowTabs singly;
+        singly.EnsureDefault();
+        TabGroup inner;
+        inner.id = 4;
+        inner.name = L"inner";
+        inner.collapsed = true;
+        singly.tab_groups.push_back(inner);
+        singly.items[0]->tab_group = 4;
+        controller.OpenTabBeside(singly, 0, false);
+        Check(!singly.tab_groups[0].collapsed && singly.Active() &&
+              singly.Active()->tab_group == 4,
+              L"tab-groups: new-to-the-right unfolds a folded group");
+    }
+
+    // The chip slides for 150 ms after its group moves: hit testing and the hover card have
+    // to follow the drawn rect, while the drag math keeps reading the rest slot.
+    {
+        ui::MainRenderer chip_renderer;
+        chip_renderer.SetScale(1.0f);
+        ui::WindowViewModel chip_vm;
+        chip_vm.tabs.resize(2);
+        // TabView::group indexes tab_groups (FillWindowTabStrip resolves ids to slots).
+        chip_vm.tabs[0].group = 1;
+        chip_vm.tabs[1].group = 1;
+        chip_vm.tab_groups.resize(2);
+        chip_vm.tab_groups[1].id = 7;
+        D2D1_RECT_F rest{};
+        Check(chip_renderer.TabGroupChipRect(chip_vm, 1200.0f, 1, &rest),
+              L"tab-groups: a group chip has a rest rect");
+        chip_vm.tab_groups[1].x_offset = 24.0f;
+        D2D1_RECT_F sliding{};
+        D2D1_RECT_F still_rest{};
+        const bool have_sliding =
+            chip_renderer.TabGroupChipRectForHit(chip_vm, 1200.0f, 1, &sliding);
+        const bool have_rest = chip_renderer.TabGroupChipRect(chip_vm, 1200.0f, 1, &still_rest);
+        Check(have_sliding && have_rest &&
+              std::abs(sliding.left - rest.left - 24.0f) < 0.01f &&
+              std::abs(sliding.right - rest.right - 24.0f) < 0.01f &&
+              std::abs(still_rest.left - rest.left) < 0.01f,
+              L"tab-groups: the hit rect follows the slide and the rest rect stays put");
+    }
+}
+
+// PULSE_SELFTEST_CASE=file-hash: checksums (BCrypt) and the mark-of-the-web stream behind
+// Explorer's "Unblock" checkbox.
+void TestFileHashAndUnblock() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring path = std::wstring(temp) + L"PulseHashTest-" +
+                              std::to_wstring(GetCurrentProcessId()) + L".txt";
+    {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        const char* text = "hello world";
+        DWORD written = 0;
+        Check(file != INVALID_HANDLE_VALUE, L"hash: the fixture file is created");
+        if (file != INVALID_HANDLE_VALUE) {
+            WriteFile(file, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+            CloseHandle(file);
+        }
+    }
+    std::wstring hex, error;
+    Check(ComputeFileHash(path, HashAlgorithm::Sha256, hex, error) &&
+          hex == L"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+          L"hash: SHA-256 of a known file");
+    Check(ComputeFileHash(path, HashAlgorithm::Md5, hex, error) &&
+          hex == L"5eb63bbbe01eeed093cb22bb8f5acdc3",
+          L"hash: MD5 of a known file");
+    std::atomic<bool> cancel{true};
+    hex = L"stale";
+    Check(!ComputeFileHash(path, HashAlgorithm::Sha256, hex, error, &cancel) && hex.empty(),
+          L"hash: a cancelled run reports nothing");
+    hex.clear();
+    error.clear();
+    Check(!ComputeFileHash(path + L".missing", HashAlgorithm::Sha256, hex, error) &&
+          hex.empty() && !error.empty(),
+          L"hash: a missing file reports its error");
+
+    {
+        HANDLE stream = CreateFileW((path + L":Zone.Identifier").c_str(), GENERIC_WRITE, 0,
+                                    nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const char* zone = "[ZoneTransfer]\r\nZoneId=3\r\n";
+        DWORD written = 0;
+        if (stream != INVALID_HANDLE_VALUE) {
+            WriteFile(stream, zone, static_cast<DWORD>(strlen(zone)), &written, nullptr);
+            CloseHandle(stream);
+        }
+    }
+    Check(HasZoneIdentifier(path), L"hash: the mark-of-the-web stream is detected");
+    Check(RemoveZoneIdentifier(path, error) && !HasZoneIdentifier(path),
+          L"hash: unblock drops the stream");
+    Check(RemoveZoneIdentifier(path, error),
+          L"hash: unblocking an already clean file succeeds");
+    Check(ComputeFileHash(path, HashAlgorithm::Sha256, hex, error) &&
+          hex == L"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+          L"hash: the payload is untouched by unblocking");
+    DeleteFileW(path.c_str());
+}
+
 int RunSelfTest1B2() {
     // These model assertions use the Chinese resource strings explicitly.
     l10n::Initialize(GetModuleHandleW(nullptr), L"zh-CN");
@@ -5160,10 +6827,75 @@ int RunSelfTest1B2() {
         if (g_log) { fclose(g_log); g_log = nullptr; }
         return g_fail ? 1 : 0;
     }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"tab-handoff") == 0) {
+        TestTabHandoff();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"tab-groups") == 0) {
+        TestTabGroupCollapse();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"prefs-persist") == 0) {
+        TestPrefsPersistence();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"prefs-registry") == 0) {
+        TestPrefsRegistryReconcile();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"ctxmenu-persist") == 0) {
+        TestContextMenuPersistence();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"shell-namespace") == 0) {
+        TestShellNamespaceForward();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"places-recovery") == 0) {
+        TestPlacesStoreRecovery();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"folder-views") == 0) {
+        TestFolderViewMemory();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"tooltip-delay-editor") == 0) {
+        TestTooltipDelayEditor();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"file-hash") == 0) {
+        TestFileHashAndUnblock();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
 
     TestDetailsPreviewInteraction();
     TestBreadcrumb();
     TestThisPcEnumeration();
+    TestShellNamespaceForward();
+    TestPlacesStoreRecovery();
+    TestFolderViewMemory();
+    TestTooltipDelayEditor();
+    TestFileHashAndUnblock();
     TestLoadingPresentation();
     TestNavigationReturnSelection();
     TestMouseHistoryNavigation();
@@ -5173,6 +6905,9 @@ int RunSelfTest1B2() {
     TestShellMenuMerge();
     TestContextMenuPrefs();
     TestAppPrefsAndSettingsPath();
+    TestPrefsPersistence();
+    TestPrefsRegistryReconcile();
+    TestContextMenuPersistence();
     TestDragDropPure();
     TestAddressSearch();
     TestAddressSearchHistoryInteraction();
@@ -5206,6 +6941,8 @@ int RunSelfTest1B2() {
     TestTabShortcuts();
     TestStagingTrayDeletion();
     TestLayoutOwnedTabs();
+    TestTabHandoff();
+    TestTabGroupCollapse();
     TestUtf8PersistFile();
     TestColorPickerModel();
     TestBloomAccentGeometry();

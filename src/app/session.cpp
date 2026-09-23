@@ -2,6 +2,8 @@
 #include "session.h"
 #include "../ui/panel_metrics.h"
 #include "../common/json_utils.h"
+#include "../common/pulse_data_dir.h"
+#include "../common/scaled_edges.h"
 #include "../common/utf8_file.h"
 #include <commctrl.h>
 #include <prsht.h>
@@ -21,45 +23,8 @@ namespace {
 //           quick-access mask is dropped for files written before 7.
 constexpr int kSessionVersion = 7;
 
-std::wstring FormatScaled3(const std::array<float, 3>& edges) {
-    return std::to_wstring(static_cast<int>(std::lround(edges[0] * 10000.0f))) + L","
-         + std::to_wstring(static_cast<int>(std::lround(edges[1] * 10000.0f))) + L","
-         + std::to_wstring(static_cast<int>(std::lround(edges[2] * 10000.0f)));
-}
-
-std::array<float, 3> ParseScaled3(const std::wstring& value) {
-    std::array<int, 3> edges{};
-    std::array<float, 3> ratios{};
-    if (swscanf_s(value.c_str(), L"%d,%d,%d",
-                  &edges[0], &edges[1], &edges[2]) == 3 &&
-        edges[0] > 0 && edges[0] < edges[1] &&
-        edges[1] < edges[2] && edges[2] < 10000) {
-        for (size_t i = 0; i < ratios.size(); ++i)
-            ratios[i] = static_cast<float>(edges[i]) / 10000.0f;
-    }
-    return ratios;
-}
-
-std::wstring FormatScaled4(const std::array<float, 4>& edges) {
-    return std::to_wstring(static_cast<int>(std::lround(edges[0] * 10000.0f))) + L","
-         + std::to_wstring(static_cast<int>(std::lround(edges[1] * 10000.0f))) + L","
-         + std::to_wstring(static_cast<int>(std::lround(edges[2] * 10000.0f))) + L","
-         + std::to_wstring(static_cast<int>(std::lround(edges[3] * 10000.0f)));
-}
-
-std::array<float, 4> ParseScaled4(const std::wstring& value) {
-    std::array<int, 4> edges{};
-    std::array<float, 4> ratios{};
-    if (swscanf_s(value.c_str(), L"%d,%d,%d,%d",
-                  &edges[0], &edges[1], &edges[2], &edges[3]) == 4 &&
-        edges[0] > 0 && edges[0] < edges[1] &&
-        edges[1] < edges[2] && edges[2] < edges[3] &&
-        edges[3] < 10000) {
-        for (size_t i = 0; i < ratios.size(); ++i)
-            ratios[i] = static_cast<float>(edges[i]) / 10000.0f;
-    }
-    return ratios;
-}
+// Column edges ("cols" / "searchCols") are the per-ten-thousand integers FormatScaled3/4 and
+// ParseScaled3/4 from ../common/scaled_edges.h handle, shared with the per-folder view store.
 
 std::wstring FormatScaledList(const std::vector<float>& values) {
     std::wstring out;
@@ -270,21 +235,7 @@ bool ParseLayoutTabs(const std::wstring& array_json,
 }
 
 std::wstring GetPulseDataDir() {
-#ifdef PULSE_WITH_SELFTEST
-    wchar_t test_dir[32768]{};
-    const DWORD length = GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", test_dir, ARRAYSIZE(test_dir));
-    if (length > 0 && length < ARRAYSIZE(test_dir)) {
-        CreateDirectoryW(test_dir, nullptr);
-        return test_dir;
-    }
-#endif
-    wchar_t path[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, path))) {
-        std::wstring dir = std::wstring(path) + L"\\Pulse";
-        CreateDirectoryW(dir.c_str(), nullptr);
-        return dir;
-    }
-    return L"";
+    return pulse::PulseDataDir();
 }
 
 bool SaveSession(const SessionSnapshot& snap) {
@@ -330,14 +281,25 @@ bool SaveSession(const SessionSnapshot& snap) {
     f << L"  \"tabGroups\":" << TabGroupsToJson(snap.tab_groups) << L",\n";
     f << L"  \"layoutTabs\":" << LayoutTabsToJson(snap.layout_tabs) << L"\n";
     f << L"}\n";
-    return WriteUtf8FileAtomic(dir + L"\\session.json", f.str());
+    // One step back, like the other stores: the exit-time save is the only write this file
+    // gets, so a damaged one must not be all the next launch has to read.
+    const std::wstring path = dir + L"\\session.json";
+    KeepPreviousFileCopy(path);
+    return WriteUtf8FileAtomic(path, f.str());
 }
 
 bool LoadSession(SessionSnapshot& snap) {
     std::wstring dir = GetPulseDataDir();
     if (dir.empty()) return false;
+    const std::wstring path = dir + L"\\session.json";
     std::wstring json;
-    if (!ReadUtf8File(dir + L"\\session.json", json) || json.empty()) return false;
+    if (!ReadUtf8File(path, json) || json.empty()) {
+        // Present but unreadable (or an empty leftover of a killed write): set it aside so
+        // the save on the way out cannot replace the only copy of the layout the user had.
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+            QuarantineUnreadableFile(path);
+        return false;
+    }
 
     snap.window_rect.left = pulse::json::ExtractInt(json, L"left");
     snap.window_rect.top = pulse::json::ExtractInt(json, L"top");
