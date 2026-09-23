@@ -128,7 +128,10 @@ $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\I
     "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $iscc) { throw 'Inno Setup 6 is required' }
 $version = (Get-Content version.txt -Raw).Trim()
-$arguments = @("/DAppVersion=$version", "/DBuildDir=$build")
+# This repository publishes the -dev channel: the installer (and the version it shows) carries the
+# suffix, while version.txt and the update manifest stay numeric. publish_release.ps1 looks for
+# this exact file name; keeping them in step is what lets the release step find the installer.
+$arguments = @("/DAppVersion=$version-dev", "/DBuildDir=$build")
 if ($Channel -eq 'win81') { $arguments += '/DWin81Candidate=1' }
 & $iscc @arguments installer/PulseSetup.iss
 if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }

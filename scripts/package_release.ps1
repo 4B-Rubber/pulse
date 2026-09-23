@@ -37,7 +37,7 @@ foreach ($name in $binaries) {
 
 & (Join-Path $repo "build_installer.bat") /skipbuild
 if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
-$installer = Join-Path $repo "dist\PulseSetup-$version.exe"
+$installer = Join-Path $repo "dist\PulseSetup-$version-dev.exe"
 & $signTool sign /sha1 $CodeSigningThumbprint /fd SHA256 /tr $TimestampUrl.AbsoluteUri /td SHA256 $installer
 if ($LASTEXITCODE -ne 0) { throw "Installer signing failed" }
 
@@ -71,4 +71,4 @@ $hashManifest = [ordered]@{
     (Join-Path $repo "dist\hashes.json"), $hashManifest + "`n",
     [System.Text.UTF8Encoding]::new($false))
 
-Write-Host "Release package complete: dist\PulseSetup-$version.exe"
+Write-Host "Release package complete: dist\PulseSetup-$version-dev.exe"
