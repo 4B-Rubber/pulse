@@ -213,6 +213,22 @@ void Render(AppState& s) {
 constexpr ULONGLONG kSessionAutosaveMs = 30000;
 static ULONGLONG session_autosave_tick = 0;
 
+// The per-user network agent is only worth a process when the user has server
+// folders to index: creating it paints the shell's "starting" cursor over a
+// launching Pulse. The roots live in the network index config, so the answer is
+// re-read slowly while the window lives - a config another window wrote still
+// reaches this one. A failed read keeps the previous answer rather than turning
+// the agent off, and the settings page can always start it on demand.
+constexpr ULONGLONG kNetworkRootsCheckMs = 30000;
+static ULONGLONG network_roots_check_tick = 0;
+
+static void RefreshNetworkAgentNeed(AppState& s) {
+    network_roots_check_tick = GetTickCount64();
+    std::vector<std::wstring> roots;
+    if (!index::LoadNetworkRoots(roots)) return;
+    s.networkIndex.SetServerFoldersConfigured(!roots.empty());
+}
+
 static void SaveWindowSession(AppState& s, HWND hwnd) {
     app::SessionSnapshot snap;
     WINDOWPLACEMENT wp{ sizeof(wp) };
@@ -370,6 +386,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         ApplyAppWindowChrome(*s);
         s->index.Start(hwnd, WM_INDEX_NOTIFY, WM_INDEX_SEARCH);
         StartChangeTracking(*s);
+        RefreshNetworkAgentNeed(*s);
         s->networkIndex.Start(hwnd, WM_NETWORK_INDEX_NOTIFY, WM_NETWORK_INDEX_SEARCH);
         s->contentSearch.Start(hwnd, WM_CONTENT_SEARCH, s->contentIndexObserver ? index::ContentAgentMode::Observer : index::ContentAgentMode::Instant);
         s->duplicateSearch.Start(hwnd, WM_DUPLICATE_SCAN, false);
@@ -899,6 +916,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             DrainDirNotifies(*s);
             const ULONGLONG now = GetTickCount64();
             TickUpdates(*s, now);
+            if (now - network_roots_check_tick >= kNetworkRootsCheckMs) RefreshNetworkAgentNeed(*s);
             // The layout is kept on a slow autosave while the window lives: the save on the
             // way out is exactly the one a killed process never reaches.
             if (now - session_autosave_tick >= kSessionAutosaveMs) {

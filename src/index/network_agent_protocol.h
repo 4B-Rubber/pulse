@@ -7,6 +7,10 @@ namespace pulse::index::agent {
 inline constexpr uint32_t kMagic = 0x544E5050; // 'PPNT'
 inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\PulseNetworkIndex";
 inline constexpr size_t kMaxPayload = 16 * 1024 * 1024;
+// One agent per user session serves every Pulse window. Both sides must agree on
+// the name: the client uses it to tell "someone already serves the pipe" from
+// "nobody does, so starting an agent is worth a process".
+inline constexpr wchar_t kAgentSingletonName[] = L"Local\\Pulse.Index.NetworkAgent.Singleton";
 
 enum Message : uint32_t {
     REQ_STATUS = 1,

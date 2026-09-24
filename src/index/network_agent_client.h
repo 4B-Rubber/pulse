@@ -31,11 +31,23 @@ public:
     bool RemoveRoot(const std::wstring& path, std::wstring* error = nullptr);
     void Rebuild(const std::wstring& path = {});
 
+    // The agent is only started when the user actually has server folders to index:
+    // creating it is what paints the shell's "starting" cursor over a launching
+    // Pulse. The app sets this from the persisted roots before Start(); a session
+    // that adds its first root turns it on for the rest of the run.
+    void SetServerFoldersConfigured(bool configured) noexcept {
+        server_folders_configured_ = configured;
+    }
+
 private:
-    bool EnsureAgent();
+    // |force| starts an agent even when no server folder is configured yet; the
+    // settings page needs that to answer the first AddRoot.
+    bool EnsureAgent(bool force = false);
+    bool EnsureAgentJob();
     bool OpenPipe(HANDLE& pipe);
     bool Request(uint32_t type, uint32_t id, const std::vector<uint8_t>& payload,
-                 uint32_t& response_type, std::vector<uint8_t>& response);
+                 uint32_t& response_type, std::vector<uint8_t>& response,
+                 bool force_agent = false);
     void SearchRequest(Query query, uint32_t id);
     void SearchLoop();
     void RefreshRoots();
@@ -65,7 +77,11 @@ private:
     std::map<uint64_t,std::pair<uint32_t,Query>> pending_searches_;
     std::map<uint64_t,uint32_t> session_requests_;
     std::thread search_thread_;
+    std::atomic<bool> server_folders_configured_{false};
     HANDLE agent_process_ = nullptr;
+    // Owns only the agent this client started; closing it ends that agent.
+    HANDLE agent_job_ = nullptr;
+    ULONGLONG last_spawn_try_ = 0;
 };
 
 } // namespace pulse::index

@@ -617,6 +617,9 @@
 #define IDS_OP_CURRENT_SPEED 1666
 #define IDS_OP_SPEED_HISTORY 1667
 #define IDS_OP_PEAK 1668
+// Values are allocated, not grouped by neighbourhood: the item-speed unit arrived long
+// after the rest of the operation labels.
+#define IDS_OP_ITEMS_PER_SECOND 2026
 #define IDS_SETTINGS_ABORTED 1669
 #define IDS_SETTINGS_SERVICE_START_ERROR 1670
 #define IDS_SETTINGS_SERVICE_ERROR 1671

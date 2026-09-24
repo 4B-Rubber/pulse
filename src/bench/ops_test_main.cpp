@@ -391,6 +391,70 @@ int wmain() {
               L"Shell delete reports monotonic completed item counts");
     }
 
+    // --- 6b. Delete reports an item speed -----------------------------------
+    {
+        Check(ops::SpeedBasisFor(ops::OpType::Copy) == ops::OpSpeedBasis::Bytes &&
+              ops::SpeedBasisFor(ops::OpType::Move) == ops::OpSpeedBasis::Bytes &&
+              ops::SpeedBasisFor(ops::OpType::EmptyRecycle) == ops::OpSpeedBasis::Bytes &&
+              ops::SpeedBasisFor(ops::OpType::RecycleDelete) == ops::OpSpeedBasis::Items &&
+              ops::SpeedBasisFor(ops::OpType::RealDelete) == ops::OpSpeedBasis::Items &&
+              ops::SpeedBasisFor(ops::OpType::RestoreRecycle) == ops::OpSpeedBasis::Items &&
+              ops::SpeedBasisFor(ops::OpType::Rename) == ops::OpSpeedBasis::None,
+              L"speed basis: byte transfers, item operations, and neither");
+
+        // The dialog feeds the speed graph from item counts for delete, so a delete that
+        // runs past the estimator's warm-up has to report a live item speed.
+        const std::wstring speed_dir = srcDir + L"\\speed-delete";
+        MakeDir(speed_dir);
+        std::vector<std::wstring> victims;
+        for (int i = 0; i < 400; ++i) {
+            wchar_t name[64];
+            swprintf_s(name, L"s%04d.tmp", i);
+            const std::wstring path = speed_dir + L"\\" + name;
+            char buf[512] = {};
+            MakeFile(path, buf, sizeof(buf));
+            victims.push_back(path);
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_status_mutex);
+            g_status_history.clear();
+        }
+        ops::OpRequest request = SimpleOp(ops::OpType::RealDelete, {});
+        for (const auto& victim : victims) request.sources.push_back(victim);
+        const uint64_t previous = g_ops.Status().completed_ops;
+        const uint64_t task_id = g_ops.Submit(std::move(request));
+        const auto started_at = std::chrono::steady_clock::now();
+        Check(WaitOpDone(previous), L"bulk realdelete completes");
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started_at).count();
+
+        bool saw_item_basis = false;
+        bool saw_live_speed = false;
+        bool saw_eta = false;
+        bool peak_consistent = true;
+        {
+            std::lock_guard<std::mutex> lock(g_status_mutex);
+            for (const auto& status : g_status_history) {
+                if (status.task_id != task_id || !status.active) continue;
+                saw_item_basis = saw_item_basis || status.speed_basis == ops::OpSpeedBasis::Items;
+                saw_live_speed = saw_live_speed || status.items_per_second > 0.0;
+                saw_eta = saw_eta || status.eta_seconds > 0;
+                peak_consistent = peak_consistent &&
+                    status.peak_items_per_second + 1e-9 >= status.items_per_second;
+            }
+        }
+        Check(saw_item_basis, L"delete task reports its speed in items");
+        Check(peak_consistent, L"delete peak never drops below the live item speed");
+        Check(saw_live_speed || elapsed_ms < 1200,
+              L"delete reports a live item speed once it runs past the warm-up");
+        // Item rates sit below the 1/s floor byte transfers use, so a slow delete has to
+        // show a countdown instead of "estimating" forever.
+        Check(saw_eta || elapsed_ms < 1200,
+              L"delete reports a remaining-time estimate once it runs past the warm-up");
+        wprintf(L"[INFO] bulk realdelete: %lld ms, live_speed=%d\n",
+                static_cast<long long>(elapsed_ms), saw_live_speed ? 1 : 0);
+    }
+
     // --- 7. Progress + cancel (bulk dir copy, cancel on first progress) -----
     {
         std::wstring bulk = srcDir + L"\\bulk";

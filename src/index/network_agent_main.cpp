@@ -239,7 +239,7 @@ void ClientLoop(HANDLE pipe) {
 }
 
 int RunAgent() {
-    HANDLE singleton = CreateMutexW(nullptr, TRUE, L"Local\\Pulse.Index.NetworkAgent.Singleton");
+    HANDLE singleton = CreateMutexW(nullptr, TRUE, agent::kAgentSingletonName);
     if (!singleton || GetLastError() == ERROR_ALREADY_EXISTS) {
         if (singleton) CloseHandle(singleton);
         return 0;

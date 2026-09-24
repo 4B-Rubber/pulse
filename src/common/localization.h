@@ -689,6 +689,7 @@ enum class StringId : UINT {
     OpCurrentSpeed = IDS_OP_CURRENT_SPEED,
     OpSpeedHistory = IDS_OP_SPEED_HISTORY,
     OpPeak = IDS_OP_PEAK,
+    OpItemsPerSecond = IDS_OP_ITEMS_PER_SECOND,
     SettingsAborted = IDS_SETTINGS_ABORTED,
     SettingsServiceStartError = IDS_SETTINGS_SERVICE_START_ERROR,
     SettingsServiceError = IDS_SETTINGS_SERVICE_ERROR,

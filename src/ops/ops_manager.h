@@ -34,6 +34,10 @@ enum class CollisionPolicy { System, Replace, KeepBoth };
 enum class OpPhase { Queued, Scanning, WaitingForConflict, Running, Paused,
                      Verifying, Cancelling, Completed, Failed };
 enum class ConflictChoice { Cancel, Replace, Skip, KeepBoth };
+// What the speed fields track for a task. Byte transfers and empty-recycle report bytes;
+// shell item operations (delete, restore) report item counts, because the shell never
+// sends byte progress for them.
+enum class OpSpeedBasis { None, Bytes, Items };
 
 struct ConflictItemInfo {
     uint64_t token = 0;
@@ -85,9 +89,27 @@ struct OpStatus {
     uint64_t completed_items = 0;
     double bytes_per_second = 0.0;
     double peak_bytes_per_second = 0.0;
+    double items_per_second = 0.0;
+    double peak_items_per_second = 0.0;
+    OpSpeedBasis speed_basis = OpSpeedBasis::None;
     uint64_t eta_seconds = 0;
     uint64_t completed_ops = 0; // bumped on every finished op (UI edge detect)
 };
+
+// Every task reports speed in exactly one unit; the transfer dialog labels the history
+// graph, the current speed and the peak from it. Empty-recycle counts as bytes because
+// its poller really does track recycled bytes.
+inline OpSpeedBasis SpeedBasisFor(OpType type) {
+    switch (type) {
+    case OpType::Copy:
+    case OpType::Move:
+    case OpType::EmptyRecycle: return OpSpeedBasis::Bytes;
+    case OpType::RecycleDelete:
+    case OpType::RealDelete:
+    case OpType::RestoreRecycle: return OpSpeedBasis::Items;
+    default: return OpSpeedBasis::None;
+    }
+}
 
 struct CompletedOperation {
     OpType type = OpType::Copy;

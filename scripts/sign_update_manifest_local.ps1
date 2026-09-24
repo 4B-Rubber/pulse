@@ -11,8 +11,8 @@ is indistinguishable from one written by CI - same fields, same signature format
 
 Usage:
     powershell -File scripts/sign_update_manifest_local.ps1 `
-        -Installer dist/PulseSetup-1.0.36-dev.exe `
-        -DownloadPage https://github.com/4B-Rubber/pulse/releases/download/v1.0.36/PulseSetup-1.0.36-dev.exe
+        -Installer dist/PulseSetup-1.0.37-dev.exe `
+        -DownloadPage https://github.com/4B-Rubber/pulse/releases/download/v1.0.37/PulseSetup-1.0.37-dev.exe
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Installer,

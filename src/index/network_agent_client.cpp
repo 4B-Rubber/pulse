@@ -13,6 +13,10 @@ using pulse::ipc::PayloadWriter;
 using pulse::ipc::PipeRead;
 using pulse::ipc::PipeWrite;
 
+// The status poll runs every second. A handshake that keeps failing must not
+// turn into one created process per tick.
+constexpr ULONGLONG kSpawnRetryDelayMs = 5000;
+
 std::vector<uint8_t> QueryPayload(const Query& query) {
     PayloadWriter writer;
     uint32_t flags = 0;
@@ -49,21 +53,68 @@ std::wstring NetworkAgentClient::ExePath() {
     return std::wstring(path, slash + 1) + L"Pulse.Index.exe";
 }
 
-bool NetworkAgentClient::EnsureAgent() {
+bool NetworkAgentClient::EnsureAgent(bool force) {
     if (agent_process_ && WaitForSingleObject(agent_process_, 0) == WAIT_TIMEOUT) return true;
     if (agent_process_) {
         CloseHandle(agent_process_);
         agent_process_ = nullptr;
+        // An agent that outlived the retry window died of something other than a
+        // spawn loop, so the next poll may start a fresh one right away; a process
+        // that died in the same breath as its creation keeps the delay.
+        if (last_spawn_try_ != 0 && GetTickCount64() - last_spawn_try_ >= kSpawnRetryDelayMs)
+            last_spawn_try_ = 0;
     }
+    // Another Pulse window (or one that has just exited) may already own the
+    // singleton and serve the pipe. A second agent would lose that race and exit
+    // at once, so reuse the running instance instead of creating one process per
+    // status poll.
+    if (HANDLE serving = OpenMutexW(SYNCHRONIZE, FALSE, agent::kAgentSingletonName)) {
+        CloseHandle(serving);
+        return true;
+    }
+    // Starting the agent is what paints the shell's "starting" cursor, so it is
+    // worth a process only once the user has server folders to index.
+    if (!force && !server_folders_configured_.load()) return false;
+    const ULONGLONG now = GetTickCount64();
+    if (last_spawn_try_ != 0 && now - last_spawn_try_ < kSpawnRetryDelayMs) return false;
+    last_spawn_try_ = now;
+    if (!EnsureAgentJob()) return false;
     const std::wstring exe = ExePath();
     if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
     STARTUPINFOW startup{ sizeof(startup) };
     PROCESS_INFORMATION process{};
     std::wstring command = L"\"" + exe + L"\" --network-agent";
     if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return false;
+                        CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &process))
+        return false;
+    // The agent exists to serve this process and must not outlive it. The job
+    // kills it when the last handle closes, which also covers a Pulse crash.
+    if (!AssignProcessToJobObject(agent_job_, process.hProcess)) {
+        const DWORD error = GetLastError();
+        TerminateProcess(process.hProcess, error);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        SetLastError(error);
+        return false;
+    }
+    ResumeThread(process.hThread);
     CloseHandle(process.hThread);
     agent_process_ = process.hProcess;
+    return true;
+}
+
+bool NetworkAgentClient::EnsureAgentJob() {
+    if (agent_job_) return true;
+    agent_job_ = CreateJobObjectW(nullptr, nullptr);
+    if (!agent_job_) return false;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(agent_job_, JobObjectExtendedLimitInformation, &limits,
+                                 sizeof(limits))) {
+        CloseHandle(agent_job_);
+        agent_job_ = nullptr;
+        return false;
+    }
     return true;
 }
 
@@ -80,9 +131,10 @@ bool NetworkAgentClient::OpenPipe(HANDLE& pipe) {
 bool NetworkAgentClient::Request(uint32_t type, uint32_t id,
                                  const std::vector<uint8_t>& payload,
                                  uint32_t& response_type,
-                                 std::vector<uint8_t>& response) {
+                                 std::vector<uint8_t>& response,
+                                 bool force_agent) {
     std::lock_guard<std::mutex> request_lock(request_mu_);
-    if (!running_ || !EnsureAgent()) return false;
+    if (!running_ || !EnsureAgent(force_agent)) return false;
     HANDLE pipe = INVALID_HANDLE_VALUE;
     if (!OpenPipe(pipe)) return false;
     {
@@ -118,6 +170,7 @@ void NetworkAgentClient::Start(HWND notify, UINT status_msg, UINT search_msg) {
     status_msg_ = status_msg;
     search_msg_ = search_msg;
     running_ = true;
+    EnsureAgentJob();
     status_thread_ = std::thread([this] {
         std::unique_lock<std::mutex> lock(status_mu_);
         while (running_) {
@@ -150,6 +203,13 @@ void NetworkAgentClient::Stop() {
     if (agent_process_) {
         CloseHandle(agent_process_);
         agent_process_ = nullptr;
+    }
+    // Ending the job ends an agent this client started, so an exited Pulse never
+    // leaves the per-user agent behind. An agent owned by another window is not
+    // in this job and keeps running for that window.
+    if (agent_job_) {
+        CloseHandle(agent_job_);
+        agent_job_ = nullptr;
     }
 }
 
@@ -242,6 +302,10 @@ void NetworkAgentClient::RefreshRoots() {
         root.indexed_items = (static_cast<uint64_t>(hi) << 32) | lo;
         roots.push_back(std::move(root));
     }
+    // Any window that can see configured roots knows the agent is worth keeping:
+    // another window adding the first root, or owning the agent and then exiting,
+    // must not leave this session dormant.
+    if (!roots.empty()) server_folders_configured_ = true;
     {
         std::lock_guard<std::mutex> lock(mu_);
         roots_ = std::move(roots);
@@ -259,13 +323,18 @@ bool NetworkAgentClient::AddRoot(const std::wstring& path, std::wstring* error) 
     writer.PutString(path);
     uint32_t response_type = 0;
     std::vector<uint8_t> payload;
-    if (!Request(agent::REQ_ADD_ROOT, 2, writer.data(), response_type, payload) ||
+    // Adding the first server folder is what brings the agent up; nothing is
+    // configured yet, so this request has to start it.
+    if (!Request(agent::REQ_ADD_ROOT, 2, writer.data(), response_type, payload, true) ||
         response_type != agent::RSP_RESULT) return false;
     PayloadReader reader(payload.data(), payload.size());
     uint32_t ok = 0;
     std::wstring message;
     if (!reader.GetU32(ok) || !reader.GetString(message)) return false;
     if (!ok && error) *error = std::move(message);
+    // This session now has a server folder; keep the agent alive for the rest of
+    // the run even before the next launch reads the config.
+    if (ok) server_folders_configured_ = true;
     RefreshRoots();
     return ok != 0;
 }

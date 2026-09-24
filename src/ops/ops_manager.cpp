@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cwctype>
 #include <filesystem>
+#include <memory>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -223,6 +224,10 @@ struct CopyProgressContext {
 
 class TransferRateEstimator {
 public:
+    // Transfers treat "slower than 1 B/s" as too slow to estimate, but item operations
+    // routinely run below 1 item/s and still deserve a remaining-time readout.
+    void SetEtaFloor(double floor) { eta_floor_ = floor; }
+
     void Reset(ULONGLONG tick, uint64_t bytes) {
         samples_.clear();
         samples_.push_back({ tick, bytes });
@@ -267,7 +272,7 @@ public:
         }
         last_rate_tick_ = tick;
 
-        if (bytes >= total_bytes || smoothed_speed_ <= 1.0) {
+        if (bytes >= total_bytes || smoothed_speed_ <= eta_floor_) {
             eta_seconds_ = 0;
             return;
         }
@@ -297,6 +302,7 @@ private:
         uint64_t bytes = 0;
     };
     std::deque<Sample> samples_;
+    double eta_floor_ = 1.0;
     double smoothed_speed_ = 0.0;
     uint64_t eta_seconds_ = 0;
     ULONGLONG last_rate_tick_ = 0;
@@ -1241,8 +1247,18 @@ void OpsManager::WorkerThread() {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     ipc::ShellClient::Callbacks cb;
-    cb.progress = [this](uint32_t, float pct, std::wstring item,
-                         uint32_t items_done, uint32_t total_items) {
+    // Item operations (delete, restore) only ever report item counts — the shell has no
+    // byte callback for them — so their speed comes from counting items per second.
+    // The estimator lives with the callback because that outlives any single task, and
+    // it resets whenever the task id changes.
+    auto shell_item_rate = std::make_shared<TransferRateEstimator>();
+    // Deleting a folder tree runs well under one item per second and still deserves a
+    // countdown, so this estimator drops the byte-transfer floor.
+    shell_item_rate->SetEtaFloor(0.0);
+    auto shell_rate_task = std::make_shared<uint64_t>(0);
+    cb.progress = [this, shell_item_rate, shell_rate_task](
+                      uint32_t, float pct, std::wstring item,
+                      uint32_t items_done, uint32_t total_items) {
         shell_activity_tick_ = GetTickCount64();
         SetStatus([&](OpStatus& st) {
             st.percent = pct;
@@ -1250,6 +1266,18 @@ void OpsManager::WorkerThread() {
             if (total_items > 0) st.total_items = total_items;
             st.completed_items = (std::min)(static_cast<uint64_t>(items_done),
                                              st.total_items);
+            if (st.speed_basis == OpSpeedBasis::Items) {
+                const ULONGLONG now = GetTickCount64();
+                if (*shell_rate_task != st.task_id) {
+                    *shell_rate_task = st.task_id;
+                    shell_item_rate->Reset(now, st.completed_items);
+                }
+                shell_item_rate->Observe(now, st.completed_items, st.total_items);
+                st.items_per_second = shell_item_rate->speed();
+                st.peak_items_per_second = (std::max)(st.peak_items_per_second,
+                                                      st.items_per_second);
+                st.eta_seconds = shell_item_rate->eta_seconds();
+            }
             if (!item.empty()) {
                 std::wstring base = st.summary;
                 auto sep = base.find(L"  (");
@@ -1638,6 +1666,8 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
     SetStatus([&](OpStatus& st) {
         st.total_bytes = total_bytes;
         st.total_items = entries.size();
+        st.speed_basis = OpSpeedBasis::Bytes;
+        st.items_per_second = st.peak_items_per_second = 0.0;
         if (failure.empty()) {
             st.phase = OpPhase::Running;
             st.percent = 0.0f;
@@ -2116,6 +2146,8 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
             : (req.sources.empty() ? 1 : req.sources.size());
         st.completed_items = 0;
         st.bytes_per_second = st.peak_bytes_per_second = 0.0;
+        st.items_per_second = st.peak_items_per_second = 0.0;
+        st.speed_basis = SpeedBasisFor(req.type);
         st.eta_seconds = 0;
         if (req.type == OpType::EmptyRecycle) st.percent = -1.0f;
     });
@@ -2134,6 +2166,11 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
             st.total_bytes = start_bytes > 0 ? static_cast<uint64_t>(start_bytes) : 0;
             st.percent = have_start && start_items > 0 ? 0.0f : -1.0f;
         });
+
+        // The poller sees recycled bytes actually shrink, so empty-recycle reports a byte
+        // speed like a transfer does instead of leaving the graph flat.
+        TransferRateEstimator recycle_rate;
+        recycle_rate.Reset(GetTickCount64(), 0);
 
         std::atomic<bool> emptying{true};
         std::thread poller([&] {
@@ -2155,6 +2192,12 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
                         st.percent = 100.0f * static_cast<float>(done_items)
                             / static_cast<float>(start_items);
                         st.current_item = OpVerb(OpType::EmptyRecycle);
+                        const ULONGLONG now_tick = GetTickCount64();
+                        recycle_rate.Observe(now_tick, st.transferred_bytes, st.total_bytes);
+                        st.bytes_per_second = recycle_rate.speed();
+                        st.peak_bytes_per_second = (std::max)(st.peak_bytes_per_second,
+                                                              st.bytes_per_second);
+                        st.eta_seconds = recycle_rate.eta_seconds();
                     });
                 }
                 for (int i = 0; i < 8 && emptying.load(std::memory_order_relaxed); ++i)

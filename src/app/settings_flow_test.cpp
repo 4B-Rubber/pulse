@@ -206,9 +206,9 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
         l10n::SetLanguage(language);bool complete=true;
         // 1918 named the file-name index row, which the index status card made redundant.
         for(int id=1900;id<=1929;++id) if(id!=1918) complete &= !l10n::Get(static_cast<I>(id)).empty();
-        // Older runs only covered 1900-1929, so the 2020-2025 batch could fall outside the
+        // Older runs only covered 1900-1929, so the 2020-2026 batch could fall outside the
         // string range and paint as blank text without failing anything.
-        for(int id=2020;id<=2025;++id) complete &= !l10n::Get(static_cast<I>(id)).empty();
+        for(int id=2020;id<=2026;++id) complete &= !l10n::Get(static_cast<I>(id)).empty();
         check(complete,"new settings labels exist in both languages");
         check(TestSettingsFilter(l10n::Get(I::SettingsWallpaper),I::SettingsWallpaper),"settings search finds hidden advanced settings");
         check(TestSettingsFilter(l10n::Get(I::SettingsSearchIndex),I::IndexLocation),"settings search finds page and subsettings");

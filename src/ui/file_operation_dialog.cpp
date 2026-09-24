@@ -8,6 +8,8 @@
 #include <windowsx.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cwchar>
 #include <deque>
 #include <string>
 
@@ -214,6 +216,30 @@ std::wstring ParentName(const std::wstring& path) {
     const size_t slash = copy.find_last_of(L"\\/");
     if (slash == std::wstring::npos) return copy;
     return LeafName(copy.substr(0, slash));
+}
+
+// Speed comes in one of two units: bytes for copy/move/empty-recycle, items for
+// delete/restore. Formatting in one place keeps the current readout and the peak
+// label in step with whichever unit the task actually tracks.
+std::wstring FormatSpeedText(ops::OpSpeedBasis basis, double value) {
+    if (basis != ops::OpSpeedBasis::Items)
+        return pulse::format::ByteSize(static_cast<uint64_t>(value)) + L"/s";
+    // Item rates are small: deleting a folder tree of many files reports one item per
+    // several seconds, so rounding to whole items would print a flat "0 items/s" while
+    // the graph visibly moves. Keep decimals below 10 and trim the trailing zeros.
+    if (value >= 10.0)
+        return pulse::format::GroupedInt(static_cast<uint64_t>(value + 0.5)) + L" " +
+            l10n::Get(l10n::StringId::OpItemsPerSecond);
+    wchar_t text[32]{};
+    if (value >= 1.0) swprintf_s(text, L"%.1f", value);
+    else if (value >= 0.01) swprintf_s(text, L"%.2f", value);
+    else wcscpy_s(text, L"0");
+    std::wstring number = text;
+    if (number.find(L'.') != std::wstring::npos) {
+        while (!number.empty() && number.back() == L'0') number.pop_back();
+        if (!number.empty() && number.back() == L'.') number.pop_back();
+    }
+    return number + L" " + l10n::Get(l10n::StringId::OpItemsPerSecond);
 }
 
 std::wstring FormatDuration(uint64_t seconds) {
@@ -1136,14 +1162,14 @@ void FileOperationWindow::Render() {
     const auto stats = Rect(scale_, kPadX, 118, dip_w - kPadX * 2.0f, 52);
     painter_.FillRoundedRect(stats, ScaleDip(scale_, 12.0f),
         dark_ ? HexColor(0xFFFFFF, 0.05f) : HexColor(0x000000, 0.05f));
-    const bool byte_transfer = status_.type == ops::OpType::Copy
-        || status_.type == ops::OpType::Move;
+    const bool byte_basis = status_.speed_basis == ops::OpSpeedBasis::Bytes;
     const std::wstring time_text = failed ? l10n::Get(l10n::StringId::OpIncomplete).c_str()
         : completed ? l10n::Get(l10n::StringId::OpCompleted).c_str()
         : paused ? l10n::Get(l10n::StringId::OpPaused).c_str()
         : waiting ? l10n::Get(l10n::StringId::OpWaiting).c_str()
         : emptying ? l10n::Get(l10n::StringId::OpEmptying)
-        : !byte_transfer ? l10n::Get(l10n::StringId::OpNoEstimate).c_str()
+        : status_.speed_basis == ops::OpSpeedBasis::None
+            ? l10n::Get(l10n::StringId::OpNoEstimate).c_str()
         : status_.eta_seconds == 0 ? l10n::Get(l10n::StringId::OpEstimating).c_str()
         : l10n::Get(l10n::StringId::OpApprox).c_str() + FormatDuration(status_.eta_seconds);
     const uint64_t remain_items = status_.total_items > status_.completed_items
@@ -1154,14 +1180,19 @@ void FileOperationWindow::Render() {
     if (failed) items_text = l10n::Get(l10n::StringId::OpZeroItems).c_str();
     else if (completed) items_text = l10n::Get(l10n::StringId::OpZeroItems).c_str();
     else if (status_.total_items == 0) items_text = l10n::Get(l10n::StringId::OpCalculating).c_str();
-    else if (byte_transfer && status_.total_bytes > 0)
+    else if (byte_basis && status_.total_bytes > 0)
         items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountBytes).c_str()
             + pulse::format::ByteSize(remain_bytes) + L")";
     else items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountSuffix).c_str();
-    const std::wstring speed_text = emptying || !byte_transfer ? l10n::Get(l10n::StringId::OpNoEstimate).c_str()
-        : completed || failed || paused || waiting ? L"0 B/s"
-        : status_.bytes_per_second <= 0.0 ? l10n::Get(l10n::StringId::OpEstimating).c_str()
-        : pulse::format::ByteSize(static_cast<uint64_t>(status_.bytes_per_second)) + L"/s";
+    const double live_speed = status_.speed_basis == ops::OpSpeedBasis::Items
+        ? status_.items_per_second : status_.bytes_per_second;
+    const std::wstring speed_text =
+        status_.speed_basis == ops::OpSpeedBasis::None
+            ? l10n::Get(l10n::StringId::OpNoEstimate).c_str()
+        : completed || failed || paused || waiting
+            ? FormatSpeedText(status_.speed_basis, 0.0)
+        : live_speed <= 0.0 ? l10n::Get(l10n::StringId::OpEstimating).c_str()
+        : FormatSpeedText(status_.speed_basis, live_speed);
     const D2D1_COLOR_F time_color = failed ? theme.danger : theme.text;
     painter_.DrawText(l10n::Get(l10n::StringId::OpRemainingTime).c_str(), Rect(scale_, 32, 124, 120, 14),
                       compositor_.SmallFormat(), theme.text_secondary);
@@ -1184,8 +1215,11 @@ void FileOperationWindow::Render() {
         painter_.DrawGlyph(L"\xE8F1", Rect(scale_, 30, 188, 14, 14), sky);
         painter_.DrawText(l10n::Get(l10n::StringId::OpSpeedHistory).c_str(), Rect(scale_, 48, 186, 220, 18),
                           compositor_.SmallFormat(), theme.text_secondary);
-        const std::wstring peak = l10n::Get(l10n::StringId::OpPeak).c_str() + pulse::format::ByteSize(
-            static_cast<uint64_t>(status_.peak_bytes_per_second)) + L"/s";
+        const double peak_speed = status_.speed_basis == ops::OpSpeedBasis::Items
+            ? status_.peak_items_per_second : status_.peak_bytes_per_second;
+        const std::wstring peak = l10n::Get(l10n::StringId::OpPeak).c_str() +
+            FormatSpeedText(status_.speed_basis == ops::OpSpeedBasis::None
+                ? ops::OpSpeedBasis::Bytes : status_.speed_basis, peak_speed);
         painter_.DrawText(peak, Rect(scale_, 280, 186, 156, 18),
                           compositor_.SmallFormat(), theme.text_secondary,
                           fluent::HorizontalAlignment::Right);
@@ -1286,10 +1320,16 @@ LRESULT FileOperationWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM l
                 if (speed_sample_tick_ == 0 || now - speed_sample_tick_ >= 250) {
                     speed_sample_tick_ = now;
                     const bool running = status_.phase == ops::OpPhase::Running;
-                    const bool byte_transfer = status_.type == ops::OpType::Copy
-                        || status_.type == ops::OpType::Move;
-                    speed_history_.push_back(running && byte_transfer
-                        ? (std::max)(0.0, status_.bytes_per_second) : 0.0);
+                    // Sample whichever unit this task tracks: byte transfers and
+                    // empty-recycle feed the byte rate, delete and restore the item rate.
+                    double sample = 0.0;
+                    if (running) {
+                        if (status_.speed_basis == ops::OpSpeedBasis::Bytes)
+                            sample = status_.bytes_per_second;
+                        else if (status_.speed_basis == ops::OpSpeedBasis::Items)
+                            sample = status_.items_per_second;
+                    }
+                    speed_history_.push_back((std::max)(0.0, sample));
                     while (speed_history_.size() > 120) speed_history_.pop_front();
                 }
             }
