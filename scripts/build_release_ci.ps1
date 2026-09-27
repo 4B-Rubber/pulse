@@ -40,9 +40,9 @@ $testNames = @('pulse_rename_ops_test', 'pulse_child_edit_test', 'pulse_localiza
     'pulse_update_test', 'pulse_update_installer_test', 'pulse_app_controllers_test',
     'pulse_change_tracking_polling_test', 'pulse_change_tracking_test',
     'pulse_change_tracking_memory_test', 'pulse_change_feed_memory_test', 'pulse_usn_packet_queue_test',
-    'pulse_content_progress_ui_test')
+    'pulse_content_progress_ui_test', 'pulse_operation_presentation_test', 'pulse_column_strip_test')
 $testTargets = (@('pulse', 'pulse_index_engine_test', 'pulse_index_host_stress',
-    'pulse_preview_test', 'pulse_preview_handler_probe') + $testNames) -join ' '
+    'pulse_preview_test', 'pulse_preview_handler_probe', 'pulse_playback_controls_test') + $testNames) -join ' '
 $batch = Join-Path $build 'compile-release.bat'
 @"
 @echo off
@@ -62,6 +62,8 @@ foreach ($testName in $testNames) {
     & (Join-Path $build "$testName.exe")
     if ($LASTEXITCODE -ne 0) { throw "$testName failed" }
 }
+& (Join-Path $build 'pulse_playback_controls_test.exe') --timeline-only
+if ($LASTEXITCODE -ne 0) { throw 'Playback timeline regression failed' }
 & (Join-Path $build 'pulse_preview_test.exe') --vector-only
 if ($LASTEXITCODE -ne 0) { throw 'Vector preview regression failed' }
 & (Join-Path $build 'pulse_preview_handler_probe.exe') --cooldown-test
@@ -80,12 +82,12 @@ foreach ($mode in @('--parent-cycle-only', '--quiet-maintenance-only', '--name-p
 if ($LASTEXITCODE -ne 0) { throw 'Panel layout/preferences regression failed' }
 & (Join-Path $build 'pulse_change_feed_memory_test.exe') --probe
 if ($LASTEXITCODE -ne 0) { throw 'Opt-in memory probe regression failed' }
-foreach ($mode in @('--service-start-only', '--shutdown-only')) {
+foreach ($mode in @('--service-start-only', '--shutdown-only', '--live-dedup-only')) {
     & (Join-Path $build 'pulse_index_host_stress.exe') $mode
     if ($LASTEXITCODE -ne 0) { throw "Index lifecycle check $mode failed" }
 }
 $selftestCases = @('rename-editor', 'rename-editor-native', 'operation-toast',
-    'filter-controls', 'rename-outside', 'address-editor', 'address-editor-native', 'release-panels-hidden', 'pr-shell', 'pin-reorder')
+    'filter-controls', 'rename-outside', 'address-editor', 'address-editor-native', 'release-panels-hidden', 'pr-shell', 'pin-reorder', 'snapshot-patch', 'list-columns')
 $selftestLogs = @{
     'rename-editor' = 'bench_data/rename-editor/results.log'
     'rename-editor-native' = 'bench_data/rename-editor/results.log'
@@ -110,6 +112,19 @@ foreach ($testCase in $selftestCases) {
     }
 }
 Remove-Item Env:PULSE_SELFTEST_CASE
+$liveLog = Join-Path $build 'content-live-selection.log'
+$env:PULSE_TEST_SEARCH_FLOW = $liveLog
+$env:PULSE_TEST_CONTENT_LIVE_SELECTION = '1'
+$live = Start-Process -FilePath (Join-Path $build 'pulse.exe') -ArgumentList '--test-instance', '--shot',
+    (Join-Path $build 'content-live-selection.png'), $env:TEMP -WindowStyle Hidden -PassThru
+$liveDone = $live.WaitForExit(60000)
+if (-not $liveDone) { $live.Kill(); $live.WaitForExit() }
+$live.Refresh()
+Remove-Item Env:PULSE_TEST_SEARCH_FLOW, Env:PULSE_TEST_CONTENT_LIVE_SELECTION
+if (-not $liveDone -or $live.ExitCode -ne 0) {
+    Get-Content $liveLog -ErrorAction SilentlyContinue
+    throw 'Live content selection regression failed'
+}
 Remove-Item Env:PULSE_LUMATEXT
 # Strip the embedded test suite from the shipped executable after verification.
 (Get-Content -LiteralPath $batch -Raw).Replace('-DPULSE_WITH_SELFTEST=ON', '-DPULSE_WITH_SELFTEST=OFF').Replace("--target $testTargets", '--target pulse') |

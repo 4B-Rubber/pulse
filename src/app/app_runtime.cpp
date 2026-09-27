@@ -1,5 +1,6 @@
 // app_runtime.cpp — extracted from app_main.cpp.
 #include "app_internal.h"
+#include "app_column_view.h"
 #include "update_status.h"
 #include "../ui/lumatext_renderer.h"
 #include "../ui/fluent_menu.h"
@@ -12,6 +13,7 @@
 #include "../common/localization.h"
 #include "../common/text_format.h"
 #include "../common/path_utils.h"
+#include "../common/display_path.h"
 #include "../common/diagnostics_exporter.h"
 #include "snapshot_patch.h"
 #include "session.h"
@@ -410,6 +412,11 @@ D2D1_RECT_F ListRect(const AppState& s) {
     }
     if (virtual_kind == L"changes") extra += 36.0f * s.scale;
     const ui::ViewMode mode = tab ? tab->view_mode : ui::ViewMode::Details;
+    if (tab && tab->column_layout) {
+        ui::PaneViewModel strip;
+        app::FillColumnStripView(strip.column_strip, *tab);
+        pane = s.renderer.PaneBodyBounds(strip, pane);
+    }
     pane.top += s.renderer.PaneHeaderHeight() + extra +
                 (ui::ShowsColumnHeader(mode) ? s.renderer.ColumnHeaderHeight() : 0.0f);
     return pane;
@@ -800,6 +807,10 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
                 }
             }
             if (static_cast<int>(i) == s.hoverPaneIndex) slot.pane.hover_index = s.hoverRow;
+            if (s.stripResizing && static_cast<int>(i) == s.stripResizePane)
+                slot.pane.column_strip.resize_column = s.stripResizeColumn;
+            if (s.stripHScrolling && static_cast<int>(i) == s.stripResizePane)
+                slot.pane.column_strip.hscroll_pressed = true;
             if (static_cast<int>(i) == s.dropPaneIndex) {
                 slot.pane.drop_target_index = s.dropRow;
                 slot.pane.header_drop = s.dropHeader;
@@ -850,9 +861,7 @@ int TrayItemTotalCount(const app::StagingTray& tray) {
 
 // Extended-length prefixes leak into tooltips otherwise: \\?\C:\x -> C:\x.
 std::wstring TrayDisplayPath(const std::wstring& path) {
-    if (path.compare(0, 8, L"\\\\?\\UNC\\") == 0) return L"\\" + path.substr(7);
-    if (path.compare(0, 4, L"\\\\?\\") == 0) return path.substr(4);
-    return path;
+    return pulse::path::FriendlyPathText(path);
 }
 
 std::wstring TrayItemName(const std::wstring& path) {
@@ -1255,6 +1264,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
             tab->SetShowProtectedOsFiles(s.appPrefs.show_protected_os_files);
         }
     });
+    SyncColumnStrips(s);
     ui::WindowViewModel vm = app::BuildWindowViewModel(*s.pane, s.sidebar,
         s.pane->focused, s.maximized, s.darkMode, &s.places, s.sidebarCollapsedMask,
         s.sidebarHiddenMask, s.starredExpanded, &s.sidebarOrder,
@@ -1278,6 +1288,9 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     }
     vm.show_pinned_tab_names = s.appPrefs.show_pinned_tab_names;
     vm.show_title_brand = s.appPrefs.show_title_brand;
+    vm.settings_list_smart_date = s.appPrefs.list_smart_date;
+    vm.settings_list_zebra_rows = s.appPrefs.list_zebra_rows;
+    vm.settings_list_size_bar = s.appPrefs.list_size_bar;
     vm.sidebar_scroll = s.sidebarScroll;
     if (s.groupDragActive) {
         vm.sidebar_group_drag_id = s.groupDragId;
@@ -1286,6 +1299,13 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     if (s.pinDragActive) {
         vm.sidebar_pin_drag_index = s.pinDragRun;
         if (s.pinGapVisible) vm.sidebar_pin_gap_line_y = s.pinGapLineY;
+    }
+    if (app::Tab* sel_tab = ActiveTab(s); sel_tab && sel_tab->content_results && sel_tab->SelectedCount() > 1) {
+        wchar_t count[64]{};
+        swprintf_s(count, l10n::Get(l10n::StringId::SelectedCountFormat).c_str(), sel_tab->SelectedCount());
+        const std::optional<uint64_t> bytes = ContentSelectionSize(*sel_tab);
+        vm.status.selection_text = std::wstring(count) + L"  \u00B7  " +
+            (bytes ? pulse::format::ByteSize(*bytes, true) : l10n::Get(l10n::StringId::LoadingEllipsis));
     }
     ops::OpStatus st = s.ops.Status();
     if (st.active || !st.last_error.empty() || !st.summary.empty()) {
@@ -1550,11 +1570,8 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
             std::optional<uint64_t> contentSize;
             if(tab->content_results) {
                 files=selCount;contentSize=ContentSelectionSize(*tab);knownSize=contentSize.value_or(0);
-            } else for (int index : tab->SelectedIndices()) {
-                if (index < 0 || index >= static_cast<int>(tab->EntryCount())) continue;
-                const fs::DirEntry& entry = tab->EntryAt(static_cast<size_t>(index));
-                if (entry.is_dir) ++folders;
-                else { ++files; knownSize += entry.size; }
+            } else {
+                tab->SelectionSizeSummary(&knownSize, &files, &folders);
             }
             wchar_t composition[96]{};
             if (files && folders)
@@ -1808,6 +1825,7 @@ std::wstring TooltipForHover(AppState& s) {
     case R::SplitButton: return text(I::SplitLayout);
     case R::DetailsToggle: return text(s.showDetailsPanel ? I::CollapseDetails : I::ExpandDetails);
     case R::PaneMediumIcons: return text(I::MediumIcons);
+    case R::PaneColumnLayout: return text(I::ColumnLayout);
     case R::PaneViewButton: return text(I::View);
     case R::FilterBox: return text(I::FilterCurrent);
     case R::FilterClear: return text(I::Clear);
@@ -1869,6 +1887,23 @@ std::wstring TooltipForHover(AppState& s) {
                 full = tab->current_path;
                 if (!full.empty() && !full.ends_with(L"\\")) full += L"\\";
                 full += entry.name;
+            }
+            // Narrow panes drop columns; keep their facts reachable on hover.
+            if (tab->view_mode == ui::ViewMode::Details) {
+                using K = ui::MainRenderer::ColumnKind;
+                const uint32_t shown = s.renderer.PaintedColumnMask(std::max(0, s.hoverPaneIndex));
+                auto hidden = [&](K kind) { return shown && !(shown & (1u << static_cast<uint32_t>(kind))); };
+                std::wstring view_kind;
+                app::ParsePulsePath(tab->current_path, &view_kind, nullptr);
+                const bool search = view_kind == L"search";
+                if (search && hidden(K::Path) && !full.empty()) {
+                    const size_t slash = full.find_last_of(L'\\');
+                    if (slash != std::wstring::npos && slash > 0)
+                        tooltip += L" · " + full.substr(0, slash);
+                }
+                if (hidden(K::Date))
+                    tooltip += L" · " + pulse::l10n::Get(pulse::l10n::StringId::ColumnModified) + L" " +
+                               pulse::format::LocalFileTime(entry.mtime);
             }
             if (const auto* indices = s.places.TagIndicesForPath(full); indices && !indices->empty()) {
                 tooltip += pulse::l10n::Get(pulse::l10n::StringId::TooltipTags).c_str();
@@ -1995,4 +2030,6 @@ std::wstring SelectedFullPath(AppState& s) {
     return EntryFullPath(*tab, tab->selected_index);
 }
 
+// main's SyncSavedSearchSidebar is not carried over: the sidebar's saved-search section was
+// removed on this branch, so SidebarState has no saved_searches list to fill.
 } // namespace pulse

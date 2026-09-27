@@ -4,6 +4,7 @@
 #include "tab_shortcuts.h"
 #include "app_updates.h"
 #include "app_internal.h"
+#include "app_column_view.h"
 #include "../ui/lumatext_renderer.h"
 #include "../ui/fluent_menu.h"
 #include "../ui/drag_drop.h"
@@ -508,6 +509,7 @@ void ApplyMarqueeSelection(AppState& s) {
     const float clipR = std::min(right, list.right);
     const float clipB = std::min(bottom, list.bottom);
 
+    ++tab->selection_revision;
     tab->all_selected = false;
     tab->selected.clear();
     if (s.marqueeAdditive) tab->selected = s.marqueeBase;
@@ -884,6 +886,16 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         s->hoverPoint = POINT{ mx, my };
         s->bloom_accent.SetPointer(static_cast<float>(mx), static_cast<float>(my), true);
 
+        if (s->stripResizing || s->stripHScrolling) {
+            if ((GetKeyState(VK_LBUTTON) & 0x8000) == 0) {
+                EndColumnStripResize(*s);
+                if (GetCapture() == hwnd) ReleaseCapture();
+            } else {
+                UpdateColumnStripResize(*s, mx);
+            }
+            return 0;
+        }
+
         if (s->columnResizing) {
             if ((GetKeyState(VK_LBUTTON) & 0x8000) == 0) {
                 // The drag ended: keep the new edges for the folder it happened in. Virtual
@@ -904,8 +916,11 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     static_cast<float>(s->compositor.Height()));
                 if (s->columnResizePane >= 0 &&
                     s->columnResizePane < static_cast<int>(resizeVm.pane_slots.size())) {
-                    paneRect = resizeVm.pane_slots[
-                        static_cast<size_t>(s->columnResizePane)].rect;
+                    const auto& resizeSlot = resizeVm.pane_slots[
+                        static_cast<size_t>(s->columnResizePane)];
+                    paneRect = s->renderer.PaneBodyBounds(resizeSlot.pane, resizeSlot.rect);
+                } else {
+                    paneRect = s->renderer.PaneBodyBounds(resizeVm.pane, paneRect);
                 }
                 app::Pane* resizePane = PaneAtSlot(*s, s->columnResizePane);
                 app::Tab* resizeTab = resizePane ? resizePane->ActiveTab() : nullptr;
@@ -1962,6 +1977,11 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
+        if (HandleColumnStripMouseDown(*s, vm, hit, mx)) {
+            s->dragPending = false;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (hit.region == ui::HitTestResult::DetailsResize) {
             s->dragPending = false;
             s->detailsPanelResizing = true;
@@ -1995,6 +2015,25 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             if (s->renameIndex >= 0) HideRenameOverlay(*s, true);
             s->dragPending = false;
             s->columnResizing = true;
+            if (auto* resizePane = PaneAtSlot(*s, hit.pane_index)) {
+                if (auto* tab = resizePane->ActiveTab(); tab && hit.pane_index >= 0 &&
+                    hit.pane_index < static_cast<int>(vm.pane_slots.size())) {
+                    const auto& slot = vm.pane_slots[static_cast<size_t>(hit.pane_index)];
+                    const auto columns = s->renderer.DetailsColumns(
+                        s->renderer.PaneBodyBounds(slot.pane, slot.rect), slot.pane);
+                    using K = ui::MainRenderer::ColumnKind;
+                    for (int i = 0; i < columns.count; ++i) {
+                        const K kind = columns.kinds[i];
+                        const int stored = kind == K::Date ? 0 : kind == K::Type ? 1 : kind == K::Size ? 2 : -1;
+                        if (stored >= 0) {
+                            if (slot.pane.is_search) tab->search_column_dividers[stored + 1] = columns.widths[i] / s->scale;
+                            else tab->details_column_dividers[stored] = columns.widths[i] / s->scale;
+                        } else if (slot.pane.is_search && kind == K::Name && columns.Has(K::Path)) {
+                            tab->search_column_dividers[0] = columns.widths[i] / s->scale;
+                        }
+                    }
+                }
+            }
             s->columnResizeIndex = hit.index;
             s->columnResizePane = hit.pane_index;
             s->hoverRegion = static_cast<int>(ui::HitTestResult::ColumnDivider);
@@ -2639,6 +2678,10 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
 LRESULT HandleLButtonDblClk(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (!s) return DefWindowProcW(hwnd, msg, wParam, lParam);
+        if (ColumnStripSwallowDoubleClick(*s)) {
+            s->stripClickTick = 0;
+            return 0;
+        }
         app::Tab* double_tab = ActiveTab(*s);
         const bool blank_double = s->blankDoubleTab && double_tab == s->blankDoubleTab &&
             s->pane == s->blankDoublePane && double_tab->view_generation == s->blankDoubleGeneration &&
@@ -2662,8 +2705,36 @@ LRESULT HandleLButtonDblClk(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPA
             s->blankDoublePending = blank_double && s->blankClickTab != nullptr;
             return 0;
         }
+        if (hit.region == ui::HitTestResult::ColumnStripDivider) {
+            ResetColumnStripWidth(*s, hit);
+            if (GetCapture() == hwnd) ReleaseCapture();
+            return 0;
+        }
         if (hit.region == ui::HitTestResult::DetailsPreview) {
             s->renderer.ToggleDetailsPreviewFit(static_cast<float>(mx), static_cast<float>(my));
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        if (hit.region == ui::HitTestResult::ColumnDivider) {
+            // Double-click a column divider: both neighbours return to their
+            // content-fitted widths.
+            s->columnResizing = false;
+            s->columnResizeIndex = -1;
+            s->columnResizePane = -1;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            app::Pane* fitPane = PaneAtSlot(*s, hit.pane_index);
+            app::Tab* fitTab = fitPane ? fitPane->ActiveTab() : nullptr;
+            if (fitTab && hit.pane_index >= 0 &&
+                hit.pane_index < static_cast<int>(vm.pane_slots.size())) {
+                std::wstring kind;
+                app::ParsePulsePath(fitTab->current_path, &kind, nullptr);
+                s->renderer.AutoFitColumnDivider(
+                    s->renderer.PaneBodyBounds(vm.pane_slots[static_cast<size_t>(hit.pane_index)].pane,
+                        vm.pane_slots[static_cast<size_t>(hit.pane_index)].rect),
+                    fitTab->details_column_dividers, kind == L"search",
+                    fitTab->search_column_dividers, hit.index);
+                if (s->renameIndex >= 0) LayoutRenameOverlay(*s);
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -3027,6 +3098,7 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             s->columnResizing = false;
             s->columnResizeIndex = -1;
             s->columnResizePane = -1;
+            EndColumnStripResize(*s);
             s->splitterDragIndex = -1;
             s->tabDragPending = false;
             s->tabDragging = false;
@@ -3045,6 +3117,7 @@ LRESULT HandleCaptureChanged(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LP
             s->columnResizing = false;
             s->columnResizeIndex = -1;
             s->columnResizePane = -1;
+            EndColumnStripResize(*s);
             if (s->renameClickCandidate && s->renameClickDue == 0)
                 CancelRenameClick(*s);
             if (s->starDragPending || s->starDragActive) {
@@ -3083,6 +3156,11 @@ LRESULT HandleCaptureChanged(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LP
                 s->tabDragIndex = -1;
                 s->tabDragExternal = false;
                 s->tabDragGhost.Hide();
+                s->tabDragRunPos = 0;
+                s->tabDragRunLen = 1;
+                s->tabDragFromChip = false;
+                s->tabDragGroupId = 0;
+                s->tabDragSlots = 1.0f;
                 s->tabOrder.clear();
                 s->tabTracks.clear();
                 s->tabOffsets.clear();
@@ -3280,6 +3358,7 @@ LRESULT HandleMouseWheel(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         ui::WindowViewModel wheelVm = BuildVm(*s);
         D2D1_RECT_F wheelRect = D2D1::RectF(0, 0, (float)s->compositor.Width(), (float)s->compositor.Height());
         ui::HitTestResult wheelHit = s->renderer.HitTest(wheelVm, wheelRect, (float)pt.x, (float)pt.y);
+        if (HandleColumnStripWheel(*s, wheelVm, wheelHit, GET_WHEEL_DELTA_WPARAM(wParam))) return 0;
         const D2D1_RECT_F sidebarRc = s->renderer.SidebarRect(wheelRect.right, wheelRect.bottom);
         // Tray deck first: the panel lives inside the sidebar rect, so the
         // sidebar branch below would swallow every wheel event over it.
@@ -3504,6 +3583,9 @@ LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 ResetMarquee(*s);
                 s->clickCollapseIndex = -1;
             }
+        } else if (!shift && (wParam == VK_LEFT || wParam == VK_RIGHT) &&
+                   HandleColumnArrowKey(*s, wParam == VK_RIGHT)) {
+            CancelScrollAnimation(*s);
         } else if (wParam == VK_DOWN || wParam == VK_UP ||
                    wParam == VK_LEFT || wParam == VK_RIGHT) {
             CancelScrollAnimation(*s);

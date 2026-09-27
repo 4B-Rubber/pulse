@@ -54,6 +54,9 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
     l.hidden_files_row=row(64);
     y+=8*scale; l.protected_files_row=row(64);
     y+=8*scale; l.pinned_names_row=row(64);
+    // List row rendering switches from main's 1.0.39 details rework: they belong to the list
+    // card, not behind a disclosure.
+    for(auto& list_row : l.list_style_row) { y+=8*scale; list_row=row(64); }
     y+=8*scale; l.tooltip_row=row(64);
     l.tooltip_delay_row=row(narrow ? 98.0f : 64.0f); segments(l.tooltip_delay_row,l.tooltip_delay,4,282);
     y+=8*scale; l.thumb_cache_row=row(64);

@@ -1,4 +1,4 @@
-param([Parameter(Mandatory = $true)][string]$BuildDir)
+param([Parameter(Mandatory = $true)][string]$BuildDir, [switch]$RequireStaticRuntime)
 $ErrorActionPreference = 'Stop'
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -47,13 +47,16 @@ while ($pending.Count -gt 0) {
     }
 }
 $buildRoot = (Resolve-Path -LiteralPath $BuildDir).Path
+if ($RequireStaticRuntime -and $required.Count -gt 0) {
+    throw "Release payload still requires MSVC runtime DLLs: $($required.Keys -join ', '). Rebuild all payloads, including LumaText, with /MT."
+}
 $destination = Join-Path $buildRoot 'msvc-runtime'
 New-Item -ItemType Directory -Path $destination -Force | Out-Null
 # Remove only stale DLLs in this dedicated staging folder, never application files.
 Get-ChildItem -LiteralPath $destination -Filter '*.dll' -File | ForEach-Object {
     if (-not $required.ContainsKey($_.Name)) { Remove-Item -LiteralPath $_.FullName }
 }
-$manifest = foreach ($name in ($required.Keys | Sort-Object)) {
+$manifest = @(foreach ($name in ($required.Keys | Sort-Object)) {
     $target = Join-Path $destination $name
     Copy-Item -LiteralPath $required[$name] -Destination $target -Force
     $stream = [IO.File]::OpenRead($target)
@@ -61,6 +64,6 @@ $manifest = foreach ($name in ($required.Keys | Sort-Object)) {
     try { $hash = [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '') }
     finally { $stream.Dispose(); $algorithm.Dispose() }
     [pscustomobject]@{ name = $name; sha256 = $hash }
-}
-$manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $buildRoot 'installer-runtime-manifest.json') -Encoding UTF8
+})
+ConvertTo-Json -InputObject @($manifest) | Set-Content -LiteralPath (Join-Path $buildRoot 'installer-runtime-manifest.json') -Encoding UTF8
 Write-Output "Staged $($required.Count) required x64 MSVC runtime DLLs: $($required.Keys -join ', ')"

@@ -28,6 +28,7 @@ constexpr DWORD kRecallOnOpen = 0x00040000;
 constexpr DWORD kRecallOnData = 0x00400000;
 constexpr DWORD kPinned = 0x00080000;
 constexpr float kCloseButtonWidth = 46.0f;
+constexpr float kChromeButtonWidth = 40.0f;   // prev / next / more, left of close
 constexpr float kCloseGlyphSize = 16.0f * 0.66f;
 constexpr float kFindBarHeight = 44.0f;
 constexpr float kHudHeight = 28.0f;
@@ -38,11 +39,23 @@ constexpr size_t kFindQueryLimit = 256;
 constexpr wchar_t kSearchGlyph[] = L"\xE721";
 constexpr wchar_t kCopyGlyph[] = L"\xE8C8";
 constexpr wchar_t kSelectAllGlyph[] = L"\xE8B3";
+constexpr wchar_t kPrevGlyph[] = L"\xE72B";
+constexpr wchar_t kNextGlyph[] = L"\xE72A";
+constexpr wchar_t kMoreGlyph[] = L"\xE712";
+constexpr wchar_t kOpenGlyph[] = L"\xE8E5";
+constexpr wchar_t kCutGlyph[] = L"\xE8C6";
+constexpr wchar_t kLinkGlyph[] = L"\xE71B";
+constexpr wchar_t kStarGlyph[] = L"\xE734";
+constexpr wchar_t kStarFilledGlyph[] = L"\xE735";
+constexpr wchar_t kRenameGlyph[] = L"\xE8AC";
+constexpr wchar_t kDeleteGlyph[] = L"\xE74D";
+constexpr wchar_t kPropertiesGlyph[] = L"\xE946";
 
 enum {
     kTextCmdCopy = 1,
     kTextCmdSelectAll,
     kTextCmdFind,
+    kFileCmdBase = 100,  // + static_cast<int>(QuickPreviewAction)
 };
 
 std::wstring ExtensionLabel(const std::wstring& path) {
@@ -94,11 +107,13 @@ QuickPreviewWindow::~QuickPreviewWindow() {
     if (hwnd_) DestroyWindow(hwnd_);
 }
 
-bool QuickPreviewWindow::Initialize(HWND owner, UINT navigate_message, UINT open_message) {
+bool QuickPreviewWindow::Initialize(HWND owner, UINT navigate_message, UINT open_message,
+                                    UINT command_message) {
     if (hwnd_) return true;
     owner_ = owner;
     navigate_message_ = navigate_message;
     open_message_ = open_message;
+    command_message_ = command_message;
     WNDCLASSEXW window_class{sizeof(window_class)};
     window_class.hInstance = GetModuleHandleW(nullptr);
     window_class.style = CS_DBLCLKS;
@@ -127,6 +142,7 @@ void QuickPreviewWindow::ResetTextState() {
 }
 
 void QuickPreviewWindow::ResetView() {
+    ResetPlayback();
     text_scroll_ = 0.0f;
     pan_x_ = 0.0f;
     pan_y_ = 0.0f;
@@ -140,6 +156,7 @@ void QuickPreviewWindow::ResetView() {
 }
 
 void QuickPreviewWindow::ResetAnimation() {
+    CancelPlaybackScrub();
     if (hwnd_) KillTimer(hwnd_, kAnimationTimer);
     frame_index_ = 0; requested_frame_ = 0; frame_count_ = 1; frame_delay_ms_ = 0;
     loop_count_ = 0; completed_loops_ = 0;
@@ -210,6 +227,7 @@ void QuickPreviewWindow::Show(const QuickPreviewItem& item, bool dark, WindowEff
     ++generation_;
     ResetView();
     ResetAnimation();
+    BeginVideo();
     RECT owner_rect{};
     GetWindowRect(owner_, &owner_rect);
     const int owner_width = owner_rect.right - owner_rect.left;
@@ -234,9 +252,15 @@ void QuickPreviewWindow::Update(const QuickPreviewItem& item) {
     ResetView();
     ResetAnimation();
     handler_.Reset();
+    BeginVideo();
     SetWindowTextW(hwnd_, item_.name.empty()
         ? pulse::l10n::Get(pulse::l10n::StringId::QuickPreview).c_str() : item_.name.c_str());
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void QuickPreviewWindow::SetStarred(bool starred) {
+    if (item_.starred == starred) return;
+    item_.starred = starred;
 }
 
 void QuickPreviewWindow::Close() {
@@ -247,6 +271,7 @@ void QuickPreviewWindow::Close() {
     thumbnails_.Evict();
     preview_pixels_ = 0;
     close_hover_ = false;
+    chrome_hover_ = ChromeButton::None;
     ShowWindow(hwnd_, SW_HIDE);
     if (owner_) SetForegroundWindow(owner_);
 }
@@ -298,7 +323,59 @@ D2D1_RECT_F QuickPreviewWindow::ContentRect() const {
     const float width = static_cast<float>(compositor_.Width());
     const float height = static_cast<float>(compositor_.Height());
     const float header = kTitleBarHeight * scale_;
-    return D2D1::RectF(0, header + FindBarHeight(), width, height);
+    return D2D1::RectF(0, header + FindBarHeight(), width, height - PlaybackHeight());
+}
+
+D2D1_RECT_F QuickPreviewWindow::ChromeButtonRect(ChromeButton button) const {
+    const float width = static_cast<float>(compositor_.Width());
+    const float header = kTitleBarHeight * scale_;
+    const float slot = kChromeButtonWidth * scale_;
+    // Left to right: prev, next, more, then the non-client close button.
+    float right = width - kCloseButtonWidth * scale_;
+    switch (button) {
+    case ChromeButton::More: break;
+    case ChromeButton::Next: right -= slot; break;
+    case ChromeButton::Prev: right -= slot * 2.0f; break;
+    default: return D2D1::RectF(0, 0, 0, 0);
+    }
+    return D2D1::RectF(right - slot, 0, right, header);
+}
+
+QuickPreviewWindow::ChromeButton QuickPreviewWindow::HitChromeButton(POINT client) const {
+    const float x = static_cast<float>(client.x);
+    const float y = static_cast<float>(client.y);
+    for (ChromeButton button : {ChromeButton::Prev, ChromeButton::Next, ChromeButton::More}) {
+        const D2D1_RECT_F rect = ChromeButtonRect(button);
+        if (x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom) return button;
+    }
+    return ChromeButton::None;
+}
+
+void QuickPreviewWindow::ActivateChromeButton(ChromeButton button) {
+    switch (button) {
+    case ChromeButton::Prev:
+        if (owner_ && navigate_message_)
+            PostMessageW(owner_, navigate_message_, static_cast<WPARAM>(-1), 0);
+        break;
+    case ChromeButton::Next:
+        if (owner_ && navigate_message_) PostMessageW(owner_, navigate_message_, 1, 0);
+        break;
+    case ChromeButton::More: {
+        const D2D1_RECT_F rect = ChromeButtonRect(ChromeButton::More);
+        POINT screen{static_cast<LONG>(rect.left), static_cast<LONG>(rect.bottom)};
+        ClientToScreen(hwnd_, &screen);
+        ShowContextMenu(screen);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void QuickPreviewWindow::PostAction(QuickPreviewAction action) {
+    if (!owner_ || !command_message_ || action == QuickPreviewAction::None) return;
+    const LPARAM modifiers = (GetKeyState(VK_SHIFT) & 0x8000) ? 1 : 0;
+    PostMessageW(owner_, command_message_, static_cast<WPARAM>(action), modifiers);
 }
 
 float QuickPreviewWindow::FitScale(float view_w, float view_h) const noexcept {
@@ -771,35 +848,61 @@ LRESULT CALLBACK QuickPreviewWindow::FindEditProc(HWND hwnd, UINT message, WPARA
     return DefSubclassProc(hwnd, message, wparam, lparam);
 }
 
-void QuickPreviewWindow::ShowTextContextMenu(POINT screen) {
-    if (native_kind_ != NativeKind::Text && native_kind_ != NativeKind::Hex) return;
+void QuickPreviewWindow::ShowContextMenu(POINT screen) {
     if (!text_menu_.Create(hwnd_, &compositor_, scale_)) return;
     text_menu_.SetTheme(dark_, HexColor(0x0078D4));
+    // System preview handlers (video, PDF, Office) sit in a topmost overlay
+    // over the content area; a plain popup would open underneath it.
+    text_menu_.SetTopmost(native_kind_ == NativeKind::None);
+    using pulse::l10n::StringId;
+    const bool text_kind = native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex;
+    const bool file_verbs = owner_ && command_message_ != 0 && !item_.path.empty();
     std::vector<FluentMenuItem> items;
-    FluentMenuItem copy;
-    copy.command = kTextCmdCopy;
-    copy.text = pulse::l10n::Get(pulse::l10n::StringId::Copy);
-    copy.glyph = kCopyGlyph;
-    copy.shortcut = L"Ctrl+C";
-    copy.enabled = HasTextSelection();
-    items.push_back(std::move(copy));
-    FluentMenuItem select_all;
-    select_all.command = kTextCmdSelectAll;
-    select_all.text = pulse::l10n::Get(pulse::l10n::StringId::SelectAll);
-    select_all.glyph = kSelectAllGlyph;
-    select_all.shortcut = L"Ctrl+A";
-    select_all.separator_after = true;
-    items.push_back(std::move(select_all));
-    FluentMenuItem find;
-    find.command = kTextCmdFind;
-    find.text = pulse::l10n::Get(pulse::l10n::StringId::Search);
-    find.glyph = kSearchGlyph;
-    find.shortcut = L"Ctrl+F";
-    items.push_back(std::move(find));
+    const auto add = [&](int command, StringId label, const wchar_t* glyph,
+                         const wchar_t* shortcut, bool enabled = true,
+                         bool separator_after = false) {
+        FluentMenuItem item;
+        item.command = command;
+        item.text = pulse::l10n::Get(label);
+        item.glyph = glyph;
+        item.shortcut = shortcut;
+        item.enabled = enabled;
+        item.separator_after = separator_after;
+        items.push_back(std::move(item));
+    };
+    const auto file_cmd = [](QuickPreviewAction action) {
+        return kFileCmdBase + static_cast<int>(action);
+    };
+    if (text_kind) {
+        // Text verbs keep their ids and order; file verbs follow below them.
+        add(kTextCmdCopy, StringId::Copy, kCopyGlyph, L"Ctrl+C", HasTextSelection());
+        add(kTextCmdSelectAll, StringId::SelectAll, kSelectAllGlyph, L"Ctrl+A", true, !file_verbs);
+        add(kTextCmdFind, StringId::Search, kSearchGlyph, L"Ctrl+F", true, file_verbs);
+    }
+    if (file_verbs) {
+        const bool writable = !item_.read_only;
+        add(file_cmd(QuickPreviewAction::Open), StringId::Open, kOpenGlyph, L"Enter");
+        if (!text_kind)
+            add(file_cmd(QuickPreviewAction::Copy), StringId::Copy, kCopyGlyph, L"Ctrl+C");
+        add(file_cmd(QuickPreviewAction::Cut), StringId::Cut, kCutGlyph, L"Ctrl+X", writable);
+        add(file_cmd(QuickPreviewAction::CopyPath), StringId::CopyPath, kLinkGlyph,
+            L"Ctrl+Shift+C", true, true);
+        add(file_cmd(QuickPreviewAction::ToggleStar),
+            item_.starred ? StringId::Unstar : StringId::Star,
+            item_.starred ? kStarFilledGlyph : kStarGlyph, L"", true, true);
+        add(file_cmd(QuickPreviewAction::Rename), StringId::Rename, kRenameGlyph, L"F2", writable);
+        add(file_cmd(QuickPreviewAction::Delete), StringId::Delete, kDeleteGlyph, L"Delete",
+            writable, true);
+        add(file_cmd(QuickPreviewAction::Properties), StringId::Properties, kPropertiesGlyph,
+            L"Alt+Enter");
+    }
+    if (items.empty()) return;
     const int cmd = text_menu_.TrackPopup(screen, std::move(items));
     if (cmd == kTextCmdCopy) CopyTextSelection(true);
     else if (cmd == kTextCmdSelectAll) SelectAllText();
     else if (cmd == kTextCmdFind) OpenFind();
+    else if (cmd >= kFileCmdBase)
+        PostAction(static_cast<QuickPreviewAction>(cmd - kFileCmdBase));
 }
 
 void QuickPreviewWindow::UpdateFindMatches() {
@@ -920,6 +1023,8 @@ bool QuickPreviewWindow::ClientPoint(LPARAM lparam, POINT& out) const {
 }
 
 HCURSOR QuickPreviewWindow::ContentCursor(POINT client) const {
+    if (HasPlayback() && client.y >= PlaybackRect().top)
+        return LoadCursorW(nullptr, IDC_HAND);
     if (find_open_ && FindBarHeight() > 0.0f) {
         const D2D1_RECT_F field = FindFieldRect();
         if (client.x >= field.left && client.x < field.right &&
@@ -934,6 +1039,42 @@ HCURSOR QuickPreviewWindow::ContentCursor(POINT client) const {
         return LoadCursorW(nullptr, IDC_IBEAM);
     if (panning_ || CanPanImage()) return LoadCursorW(nullptr, IDC_SIZEALL);
     return LoadCursorW(nullptr, IDC_ARROW);
+}
+
+void QuickPreviewWindow::DrawChromeButtons(ID2D1DeviceContext* dc,
+                                           ID2D1SolidColorBrush* text_brush) {
+    if (!dc || !text_brush) return;
+    ComPtr<ID2D1SolidColorBrush> hover_brush;
+    D2D1_COLOR_F hover_color = text_brush->GetColor();
+    hover_color.a = dark_ ? 0.10f : 0.08f;
+    dc->CreateSolidColorBrush(hover_color, &hover_brush);
+    struct Spec {
+        ChromeButton button;
+        const wchar_t* glyph;
+    };
+    const Spec specs[] = {
+        {ChromeButton::Prev, kPrevGlyph},
+        {ChromeButton::Next, kNextGlyph},
+        {ChromeButton::More, kMoreGlyph},
+    };
+    const float inset_x = 3.0f * scale_;
+    const float inset_y = 6.0f * scale_;
+    const float radius = 4.0f * scale_;
+    for (const Spec& spec : specs) {
+        const D2D1_RECT_F rect = ChromeButtonRect(spec.button);
+        if (chrome_hover_ == spec.button && hover_brush.get()) {
+            const D2D1_ROUNDED_RECT pill{
+                D2D1::RectF(rect.left + inset_x, rect.top + inset_y,
+                            rect.right - inset_x, rect.bottom - inset_y),
+                radius, radius};
+            dc->FillRoundedRectangle(pill, hover_brush.get());
+        }
+        if (!DrawLegacyIcon(dc, compositor_.DwriteFactory(), spec.glyph, rect, text_brush))
+            dc->DrawTextW(spec.glyph, 1,
+                      close_format_.get() ? close_format_.get() : compositor_.IconFormat(), rect,
+                      text_brush, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                      DWRITE_MEASURING_MODE_NATURAL);
+    }
 }
 
 void QuickPreviewWindow::Render() {
@@ -970,7 +1111,8 @@ void QuickPreviewWindow::Render() {
     const float pad = 20.0f * scale_;
     const float header = kTitleBarHeight * scale_;
     const D2D1_RECT_F title_rect = typography::SnapVerticalBounds(D2D1::RectF(
-        pad, 8.0f * scale_, width - (kCloseButtonWidth + 8.0f) * scale_, header));
+        pad, 8.0f * scale_,
+        width - (kCloseButtonWidth + kChromeButtonWidth * 3.0f + 8.0f) * scale_, header));
     dc->DrawTextW(item_.name.data(), static_cast<UINT32>(item_.name.size()),
                   compositor_.HeaderFormat(), title_rect, text_brush.get(),
                   D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
@@ -990,9 +1132,10 @@ void QuickPreviewWindow::Render() {
                   close_format_.get() ? close_format_.get() : compositor_.IconFormat(), close_rect,
                   close_brush.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP,
                   DWRITE_MEASURING_MODE_NATURAL);
+    DrawChromeButtons(dc, text_brush.get());
     const D2D1_RECT_F full_content = D2D1::RectF(0, header, width, height);
     const bool offline = OfflinePlaceholder();
-    const bool use_handler = !offline && !safe_mode_ &&
+    const bool use_handler = !offline && !safe_mode_ && !video_.active() &&
         PreviewHandlerHost::CanHost(item_.path);
     handler_.Sync(hwnd_, full_content, item_.path, item_.attrs, generation_, item_.modified,
                   item_.size, dark_, background, foreground, use_handler,
@@ -1002,6 +1145,17 @@ void QuickPreviewWindow::Render() {
     if (offline) {
         native_kind_ = NativeKind::None;
         status = pulse::l10n::Get(pulse::l10n::StringId::PreviewCloudOnly);
+    } else if (video_.active()) {
+        native_kind_ = NativeKind::None;
+        const auto video = video_.Snapshot();
+        const auto content = ContentRect();
+        const RECT bounds{static_cast<LONG>(content.left), static_cast<LONG>(content.top),
+            static_cast<LONG>(content.right), static_cast<LONG>(content.bottom)};
+        video_.Layout(bounds, video.ready && SUCCEEDED(video.error) && visible());
+        if (FAILED(video.error))
+            status = pulse::l10n::Get(pulse::l10n::StringId::PreviewCannotRender);
+        else if (!video.ready)
+            status = pulse::l10n::Get(pulse::l10n::StringId::PreviewLoading);
     } else if (use_handler) {
         native_kind_ = NativeKind::None;
         const auto state = handler_.state();
@@ -1037,6 +1191,7 @@ void QuickPreviewWindow::Render() {
         }
         bool committed_frame = false;
         if (result == PreviewDrawResult::Bitmap && reported_frame_count > 1) {
+            if (frame_count_ <= 1) InvalidateRect(hwnd_, nullptr, FALSE);
             frame_count_ = reported_frame_count;
             frame_delay_ms_ = std::clamp(reported_delay_ms, 20u, 2000u);
             loop_count_ = reported_loop_count;
@@ -1050,7 +1205,7 @@ void QuickPreviewWindow::Render() {
                 animation_active_ = true;
                 committed_frame = true;
             }
-            if (committed_frame && animation_active_)
+            if (committed_frame && animation_active_ && !playback_scrub_pending_)
                 SetTimer(hwnd_, kAnimationTimer, frame_delay_ms_, nullptr);
         } else if (result == PreviewDrawResult::Pending && animation_started_) {
             std::wstring ignored_text;
@@ -1058,12 +1213,14 @@ void QuickPreviewWindow::Render() {
             bool ignored_truncated = false;
             uint32_t ignored_bytes = 0;
             uint32_t ignored_count = 1, ignored_delay = 0, ignored_loop = 0;
-            thumbnails_.Draw(dc, draw, item_.path, item_.attrs,
+            const auto fallback = thumbnails_.Draw(dc, draw, item_.path, item_.attrs,
                 preview_pixels_ ? preview_pixels_ : want, generation_,
                 item_.modified, item_.size, 1.0f, &ignored_text, &ignored_truncated,
                 &ignored_bytes, true, &ignored_error, nullptr, nullptr, nullptr, nullptr,
                 frame_index_, &ignored_count, &ignored_delay, &ignored_loop,
                 &decoded_w_, &decoded_h_, &source_w_, &source_h_);
+            // Keep the displayed frame's HUD while the next frame is decoding.
+            if (fallback == PreviewDrawResult::Bitmap) result = fallback;
             status.clear();
         } else if (result != PreviewDrawResult::Pending) {
             ResetAnimation();
@@ -1103,11 +1260,12 @@ void QuickPreviewWindow::Render() {
             DrawFindBar(dc, FindBarRect());
         }
     }
+    DrawPlayback(dc, text_brush.get());
     if (!status.empty()) {
         compositor_.TextFormat()->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         compositor_.TextFormat()->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         dc->DrawTextW(status.data(), static_cast<UINT32>(status.size()),
-            compositor_.TextFormat(), full_content, secondary_brush.get());
+            compositor_.TextFormat(), ContentRect(), secondary_brush.get());
         compositor_.TextFormat()->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         compositor_.TextFormat()->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
@@ -1160,8 +1318,10 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
             if (bottom) return HTBOTTOM;
         }
         const int close_left = client.right - static_cast<int>(kCloseButtonWidth * scale_);
+        const int chrome_left = close_left - static_cast<int>(kChromeButtonWidth * 3.0f * scale_);
         if (point.y >= 0 && point.y < static_cast<int>(kTitleBarHeight * scale_)) {
             if (point.x >= close_left) return HTCLOSE;
+            if (point.x >= chrome_left) return HTCLIENT;  // prev / next / more buttons
             return HTCAPTION;
         }
         return HTCLIENT;
@@ -1230,6 +1390,12 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
     case WM_LBUTTONDOWN: {
         POINT point{};
         ClientPoint(lparam, point);
+        if (PlaybackMouseDown(point)) return 0;
+        if (const ChromeButton button = HitChromeButton(point); button != ChromeButton::None) {
+            if (GetFocus() != hwnd_) SetFocus(hwnd_);  // provider may hold focus
+            ActivateChromeButton(button);
+            return 0;
+        }
         if (find_open_ && FindBarHeight() > 0.0f) {
             const D2D1_RECT_F bar = FindBarRect();
             if (point.x >= bar.left && point.x < bar.right &&
@@ -1260,6 +1426,11 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
     case WM_LBUTTONDBLCLK: {
         POINT point{};
         ClientPoint(lparam, point);
+        if (PlaybackMouseDown(point)) return 0;
+        if (const ChromeButton button = HitChromeButton(point); button != ChromeButton::None) {
+            ActivateChromeButton(button);  // rapid clicks keep stepping through files
+            return 0;
+        }
         const D2D1_RECT_F content = ContentRect();
         if (native_kind_ == NativeKind::Bitmap &&
             point.x >= content.left && point.x < content.right &&
@@ -1272,6 +1443,20 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
     case WM_MOUSEMOVE: {
         POINT point{};
         ClientPoint(lparam, point);
+        if (playback_drag_) {
+            SeekPlayback(static_cast<float>(point.x));
+            return 0;
+        }
+        if (const ChromeButton hover = (panning_ || selecting_) ? ChromeButton::None
+                                                                 : HitChromeButton(point);
+            hover != chrome_hover_) {
+            chrome_hover_ = hover;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        if (!mouse_tracking_) {
+            TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, hwnd_, 0};
+            mouse_tracking_ = TrackMouseEvent(&tracking) != FALSE;
+        }
         if (panning_) {
             pan_x_ = pan_start_x_ + static_cast<float>(point.x - pan_anchor_.x);
             pan_y_ = pan_start_y_ + static_cast<float>(point.y - pan_anchor_.y);
@@ -1287,8 +1472,18 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
         }
         return 0;
     }
+    case WM_MOUSELEAVE:
+        mouse_tracking_ = false;
+        if (chrome_hover_ != ChromeButton::None) {
+            chrome_hover_ = ChromeButton::None;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return 0;
     case WM_LBUTTONUP:
     case WM_CAPTURECHANGED:
+        if (message == WM_LBUTTONUP && playback_drag_)
+            SeekPlayback(static_cast<float>(GET_X_LPARAM(lparam)));
+        EndPlaybackDrag(message == WM_LBUTTONUP);
         panning_ = false;
         selecting_ = false;
         if (message == WM_LBUTTONUP) ReleaseCapture();
@@ -1305,9 +1500,9 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
             }
         }
         const D2D1_RECT_F content = ContentRect();
-        if ((native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex) &&
-            point.x >= content.left && point.x < content.right &&
-            point.y >= content.top && point.y < content.bottom) {
+        const bool in_content = point.x >= content.left && point.x < content.right &&
+            point.y >= content.top && point.y < content.bottom;
+        if ((native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex) && in_content) {
             uint32_t index = 0;
             if (HitTestText(static_cast<float>(point.x), static_cast<float>(point.y), index)) {
                 const uint32_t a = (std::min)(sel_anchor_, sel_focus_);
@@ -1315,14 +1510,16 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
                 if (!(b > a && index >= a && index < b))
                     sel_anchor_ = sel_focus_ = index;
             }
-            POINT screen = point;
-            ClientToScreen(hwnd_, &screen);
-            ShowTextContextMenu(screen);
         }
+        POINT screen = point;
+        ClientToScreen(hwnd_, &screen);
+        ShowContextMenu(screen);
         return 0;
     }
     case WM_CONTEXTMENU: {
-        if (native_kind_ != NativeKind::Text && native_kind_ != NativeKind::Hex) break;
+        // Also reached from the preview-handler overlay (forwarded by post);
+        // never keep a cross-thread sender waiting on the modal menu.
+        if (InSendMessage()) ReplyMessage(0);
         POINT screen{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         if (screen.x == -1 && screen.y == -1) {
             const D2D1_RECT_F content = ContentRect();
@@ -1335,18 +1532,27 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
             const D2D1_RECT_F content = ContentRect();
             if (client.x < content.left || client.x >= content.right ||
                 client.y < content.top || client.y >= content.bottom)
-                return 0;
+                break;  // caption right-click keeps the system menu
         }
-        ShowTextContextMenu(screen);
+        ShowContextMenu(screen);
         return 0;
     }
     case WM_TIMER:
+        if (wparam == 9) {
+            TickPlaybackSeek();
+            return 0;
+        }
+        if (wparam == 8 && video_.active()) {
+            if (visible() && !IsIconic(hwnd_)) InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        }
         if (wparam == kAnimationTimer && animation_active_ && visible()) {
-            if (frame_count_ > 1 && !waiting_for_frame_) {
+            if (frame_count_ > 1 && !waiting_for_frame_ && !playback_scrub_pending_) {
                 if (frame_index_ + 1 >= frame_count_) {
                     if (loop_count_ != 0 && completed_loops_ >= loop_count_) {
                         animation_active_ = false;
                         KillTimer(hwnd_, kAnimationTimer);
+                        InvalidateRect(hwnd_, nullptr, FALSE);
                         return 0;
                     }
                     requested_frame_ = 0;
@@ -1428,9 +1634,41 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
             else Close();
             return 0;
         }
+        if (!find_open_ && HasPlayback() && !ctrl) {
+            if (wparam == VK_SPACE) {
+                if (!(lparam & (1LL << 30))) TogglePlayback();
+                return 0;
+            }
+            if (wparam == VK_OEM_COMMA || wparam == VK_OEM_PERIOD) {
+                StepPlayback(wparam == VK_OEM_COMMA ? -1 : 1);
+                return 0;
+            }
+            if (wparam == VK_HOME || wparam == VK_END) {
+                if (video_.active()) video_.Play(false);
+                animation_active_ = false;
+                KillTimer(hwnd_, kAnimationTimer);
+                const auto track = PlaybackTrackRect();
+                SeekPlayback(wparam == VK_HOME ? track.left : track.right);
+                return 0;
+            }
+        }
         if (wparam == VK_SPACE && !find_open_) {
             Close();
             return 0;
+        }
+        const bool text_kind = native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex;
+        if (!find_open_ && command_message_) {
+            // File verbs on the previewed entry (same keys as the main list).
+            QuickPreviewAction action = QuickPreviewAction::None;
+            if (ctrl && shift && wparam == 'C') action = QuickPreviewAction::CopyPath;
+            else if (ctrl && wparam == 'C' && !text_kind) action = QuickPreviewAction::Copy;
+            else if (ctrl && wparam == 'X') action = QuickPreviewAction::Cut;
+            else if (wparam == VK_DELETE) action = QuickPreviewAction::Delete;
+            else if (wparam == VK_F2) action = QuickPreviewAction::Rename;
+            if (action != QuickPreviewAction::None) {
+                PostAction(action);
+                return 0;
+            }
         }
         if (ctrl && wparam == 'F' &&
             (native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex)) {
@@ -1473,6 +1711,12 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
             PostMessageW(owner_, navigate_message_, 1, 0);
         return 0;
     }
+    case WM_SYSKEYDOWN:
+        if (wparam == VK_RETURN && (lparam & (1 << 29)) && !find_open_) {
+            PostAction(QuickPreviewAction::Properties);  // Alt+Enter → properties
+            return 0;
+        }
+        break;
     case WM_ACTIVATE: {
         const bool active = LOWORD(wparam) != WA_INACTIVE;
         handler_.NotifyAppActivate(active);
@@ -1501,6 +1745,7 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
         Close();
         return 0;
     case WM_DESTROY:
+        ResetPlayback();
         ResetAnimation();
         handler_.Reset();
         thumbnails_.Reset();

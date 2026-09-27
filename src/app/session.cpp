@@ -51,6 +51,7 @@ int SidebarMaskFromV7(int mask) {
 
 // Column edges ("cols" / "searchCols") are the per-ten-thousand integers FormatScaled3/4 and
 // ParseScaled3/4 from ../common/scaled_edges.h handle, shared with the per-folder view store.
+// main's local copies of that pair are not carried over: the shared header owns them here.
 
 std::wstring FormatScaledList(const std::vector<float>& values) {
     std::wstring out;
@@ -74,6 +75,32 @@ std::vector<float> ParseScaledList(const std::wstring& value) {
         if (comma == std::wstring::npos) break;
         pos = comma + 1;
     }
+    return out;
+}
+
+// Column view widths: whole DIP values, 0 = default width for that slot.
+std::wstring FormatDipList(const std::vector<float>& values) {
+    std::wstring out;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) out += L",";
+        out += std::to_wstring(std::max(0, static_cast<int>(std::lround(values[i]))));
+    }
+    return out;
+}
+
+std::vector<float> ParseDipList(const std::wstring& value) {
+    std::vector<float> out;
+    size_t pos = 0;
+    while (pos < value.size() && out.size() < 64) {
+        const size_t comma = value.find(L',', pos);
+        const std::wstring token = value.substr(
+            pos, comma == std::wstring::npos ? std::wstring::npos : comma - pos);
+        const int dip = _wtoi(token.c_str());
+        out.push_back(dip > 0 && dip < 4096 ? static_cast<float>(dip) : 0.0f);
+        if (comma == std::wstring::npos) break;
+        pos = comma + 1;
+    }
+    while (!out.empty() && out.back() <= 0.0f) out.pop_back();
     return out;
 }
 
@@ -111,6 +138,10 @@ std::wstring LayoutTabsToJson(const std::vector<LayoutTabSnapshot>& tabs) {
             out += FormatScaled3(pane.columns);
             out += L"\",\"searchCols\":\"";
             out += FormatScaled4(pane.search_columns);
+            out += L"\",\"colLayout\":";
+            out += pane.column_layout ? L"true" : L"false";
+            out += L",\"colWidths\":\"";
+            out += FormatDipList(pane.column_widths);
             out += L"\"}";
         }
         out += L"]}";
@@ -252,6 +283,8 @@ bool ParseLayoutTabs(const std::wstring& array_json,
                 pane.columns = ParseScaled3(pulse::json::ExtractString(pj, L"cols"));
                 pane.search_columns = ParseScaled4(
                     pulse::json::ExtractString(pj, L"searchCols"));
+                pane.column_layout = pulse::json::ExtractBool(pj, L"colLayout");
+                pane.column_widths = ParseDipList(pulse::json::ExtractString(pj, L"colWidths"));
                 tab.panes.push_back(std::move(pane));
             }
         }

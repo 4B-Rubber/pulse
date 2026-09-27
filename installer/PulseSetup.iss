@@ -90,6 +90,15 @@ Source: "{#BuildDir}\Pulse.Document.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\Pulse.Preview.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\pulse_shell.exe"; DestDir: "{app}"; Flags: ignoreversion
 
+#ifndef AppLocalRuntime
+[InstallDelete]
+; Exact app-local files from older MD releases; never touch Windows runtimes.
+Type: files; Name: "{app}\msvcp140.dll"
+Type: files; Name: "{app}\msvcp140_atomic_wait.dll"
+Type: files; Name: "{app}\vcruntime140.dll"
+Type: files; Name: "{app}\vcruntime140_1.dll"
+#endif
+
 [Icons]
 Name: "{group}\Pulse"; Filename: "{app}\pulse.exe"; WorkingDir: "{app}"; AppUserModelID: "Pulse.FileManager"
 Name: "{group}\{cm:UninstallProgram,Pulse}"; Filename: "{uninstallexe}"

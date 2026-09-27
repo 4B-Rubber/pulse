@@ -6,6 +6,7 @@
 #include "fluent_components.h"
 #include "shell_icons.h"
 #include "view_layout.h"
+#include "column_strip_layout.h"
 #include "panel_metrics.h"
 #include "thumbnail_cache.h"
 #include "name_highlight.h"
@@ -126,6 +127,38 @@ struct ChangePopover {
     int pane_index = -1, row_index = -1;
 };
 
+// One folder listing in the column view (an ancestor or the child column).
+struct ColumnStripColumnView {
+    std::wstring path;
+    std::wstring title;           // caption; empty = last path segment
+    fs::SnapshotPtr snapshot;
+    // Visible source indices into snapshot (hidden files already filtered).
+    std::shared_ptr<const std::vector<int>> rows;
+    int highlight_row = -1;       // row on the navigation path (index into rows)
+    float scroll_dip = 0.0f;      // used when auto_scroll is false
+    bool auto_scroll = true;      // keep highlight_row centered until the user scrolls
+    bool loading = false;
+    bool error = false;
+};
+
+// Column view of a folder pane: ancestors on the left, the regular list in
+// the middle, and the selected folder's contents on the right.
+struct ColumnStripView {
+    bool enabled = false;         // pane toggle state (header button)
+    bool eligible = false;        // real folder view that can show columns
+    std::vector<ColumnStripColumnView> ancestors; // root -> parent
+    // Contents of the single selected folder. Files, multi-selection and no
+    // selection show no extra column: the details panel covers those.
+    bool has_child = false;
+    ColumnStripColumnView child;
+    std::vector<float> widths_dip; // see ColumnStripWidthDip
+    float scroll_from_right_dip = 0.0f; // ancestor strip scroll (0 = parent visible)
+    int resize_column = -1;       // column id whose divider is being dragged
+    bool hscroll_pressed = false; // ancestor scrollbar thumb is being dragged
+
+    bool Active() const { return enabled && eligible; }
+};
+
 struct PaneViewModel {
     using FilterMap = std::vector<int>;
     using TagDots = std::unordered_map<int, std::vector<D2D1_COLOR_F>>;
@@ -196,6 +229,7 @@ struct PaneViewModel {
     bool focused = true;
     bool marquee_active = false;
     D2D1_RECT_F marquee_rect{};
+    ColumnStripView column_strip;
 
     bool IsRowSelected(int index) const {
         if (index < 0) return false;
@@ -545,6 +579,10 @@ struct WindowViewModel {
     // The title bar mark (app icon + name). The tab strip starts where it ends.
     bool show_title_brand = true;
     bool settings_show_title_brand = true;
+    // List row rendering switches (main's 1.0.39 details rework).
+    bool settings_list_smart_date = true;
+    bool settings_list_zebra_rows = true;
+    bool settings_list_size_bar = false;
     bool settings_open_folders = false;
     bool settings_blank_click_go_back = false;
     bool settings_change_tracking = false;
@@ -715,7 +753,12 @@ struct HitTestResult {
         SettingsDupDeleteAll,
         SearchFilter,
         TabGroupCard,             // group hover card surface (padding/gaps)
-        TabGroupCardRow           // one row inside the hover card
+        TabGroupCardRow,          // one row inside the hover card
+        PaneColumnLayout,
+        ColumnStripRow,      // index = row, sub_index = column id
+        ColumnStripDivider,  // sub_index = column id
+        ColumnStripBlank,    // sub_index = column id
+        ColumnStripHScroll   // ancestor strip scrollbar
     } region = None;
     SidebarAddAction sidebar_action = SidebarAddAction::None;
     int index = -1;          // tab/row/sidebar item/tray batch/tray item.
@@ -756,6 +799,8 @@ public:
     float ColumnHeaderHeight() const { return column_header_height_; }
     float RowHeight() const { return row_height_; }
     float ListRowHeightDip(const PaneViewModel& vm) const;
+    // Same, but aware of the two-line (name + path) narrow search layout.
+    float ListRowHeightDip(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds) const;
     // File-list row height preference (DIPs); survives SetScale recompute.
     void SetRowHeightDip(float dip) {
         row_height_dip_ = std::clamp(dip, 24.0f, 48.0f);
@@ -798,6 +843,20 @@ public:
                                     float filter_expand = 1.0f) const;
     D2D1_RECT_F PaneViewButtonRect(const D2D1_RECT_F& pane_bounds,
                                    float filter_expand = 1.0f) const;
+    D2D1_RECT_F PaneColumnLayoutRect(const D2D1_RECT_F& pane_bounds,
+                                     float filter_expand = 1.0f) const;
+    // Column view geometry for a pane. When active, PaneBodyBounds replaces
+    // the pane bounds for the regular list (header stays full width).
+    ColumnStripLayout ColumnStripGeometry(const PaneViewModel& vm,
+                                          const D2D1_RECT_F& pane_bounds) const;
+    D2D1_RECT_F PaneBodyBounds(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds) const;
+    float ColumnStripScrollPx(const ColumnStripColumnView& column, float view_h) const;
+    float ColumnStripMaxScrollPx(const ColumnStripColumnView& column, float view_h) const;
+    // Height of the scrolling row area inside a column rect (below its caption).
+    float ColumnStripViewHeight(const D2D1_RECT_F& column_rect) const;
+    // Horizontal scrollbar of the ancestor strip; false when it does not overflow.
+    bool ColumnStripHScrollRects(const ColumnStripLayout& layout, D2D1_RECT_F& track,
+                                 D2D1_RECT_F& thumb) const;
     D2D1_RECT_F PaneNavUpRect(const D2D1_RECT_F& pane_bounds,
                               float filter_expand = 1.0f) const;
     D2D1_RECT_F PaneNavForwardRect(const D2D1_RECT_F& pane_bounds,
@@ -824,11 +883,18 @@ public:
     void ScrollDetailsPreview(float steps, float x, float y, bool horizontal = false);
     void ToggleDetailsPreviewFit(float x, float y);
 
+    enum class ColumnKind : uint8_t { Name, Path, Date, Type, Size };
+    // Details columns in display order. Name is always first; Path only in
+    // wide search views; Type then Date are dropped first when space is short.
     struct DetailsColumnLayout {
         float left = 0.0f;
         float right = 0.0f;
         std::array<float, 5> widths{};
-        int count = 4; // 5 in search views (extra 路径 column)
+        std::array<ColumnKind, 5> kinds{ColumnKind::Name, ColumnKind::Date,
+                                        ColumnKind::Type, ColumnKind::Size, ColumnKind::Size};
+        int count = 4;
+        // Narrow search view: the folder path is drawn under the name.
+        bool two_line = false;
 
         float DividerX(int index) const {
             float x = left;
@@ -836,7 +902,45 @@ public:
                 x += widths[static_cast<size_t>(i)];
             return x;
         }
+        int IndexOf(ColumnKind kind) const {
+            for (int i = 0; i < count; ++i)
+                if (kinds[static_cast<size_t>(i)] == kind) return i;
+            return -1;
+        }
+        bool Has(ColumnKind kind) const { return IndexOf(kind) >= 0; }
+        float Left(ColumnKind kind) const {
+            const int i = IndexOf(kind);
+            return i <= 0 ? left : DividerX(i - 1);
+        }
+        float Width(ColumnKind kind) const {
+            const int i = IndexOf(kind);
+            return i < 0 ? 0.0f : widths[static_cast<size_t>(i)];
+        }
     };
+    // Content-fitted metadata widths (DIP) measured from the current font,
+    // language, DPI and date format; independent of row data so layout,
+    // hit testing and painting always agree.
+    struct ColumnAutoWidths { float date = 130.0f, type = 128.0f, size = 90.0f; };
+    ColumnAutoWidths AutoColumnWidths() const;
+    float TypeChipWidthDip(const std::wstring& chip) const;
+    // Cached max(LumaText, DWrite) advance for list cells (small=true: SmallFormat).
+    float CellTextWidth(const std::wstring& text, bool small_text = false) const;
+    void SetListStyle(bool smart_date, bool zebra, bool size_bar) {
+        list_smart_date_ = smart_date; list_zebra_ = zebra; list_size_bar_ = size_bar;
+        auto_widths_scale_ = -1.0f;
+    }
+    bool ListSmartDate() const { return list_smart_date_; }
+    // Columns shown by the last painted Details header of a pane: bit
+    // (1 << ColumnKind), plus bit 8 for the two-line search layout. 0 = unknown.
+    uint32_t PaintedColumnMask(int pane_index) const {
+        return pane_index >= 0 && pane_index < static_cast<int>(painted_columns_.size())
+            ? painted_columns_[static_cast<size_t>(pane_index)] : 0u;
+    }
+    // Double-click on a divider: drop the manual widths on both sides so the
+    // columns return to their fitted widths.
+    void AutoFitColumnDivider(const D2D1_RECT_F& pane_bounds,
+                              std::array<float, 3>& dividers, bool search_view,
+                              std::array<float, 4>& search_dividers, int divider_index) const;
     DetailsColumnLayout DetailsColumns(
         const D2D1_RECT_F& pane_bounds,
         const std::array<float, 3>& dividers = {},
@@ -972,6 +1076,14 @@ private:
                         const Theme& theme);
     void DrawPaneEmptyState(const WindowViewModel& vm, const PaneViewModel& pane,
                             const D2D1_RECT_F& bounds, int pane_index, const Theme& theme);
+    void DrawColumnStrip(const WindowViewModel& vm, const PaneViewModel& pane,
+                         const D2D1_RECT_F& bounds, int pane_index, const Theme& theme);
+    void DrawColumnStripColumn(const WindowViewModel& vm, const PaneViewModel& pane,
+                               const ColumnStripColumnView& column, int column_id,
+                               const D2D1_RECT_F& rc, int pane_index, const Theme& theme);
+    void DrawColumnLayoutGlyph(const D2D1_RECT_F& rc, const D2D1_COLOR_F& color);
+    bool HitTestColumnStrip(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds,
+                            float x, float y, HitTestResult& out) const;
     void DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettingsContext(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
@@ -1011,7 +1123,7 @@ private:
     bool EnsureFluentSvg(int resource_id);
     bool DrawFluentSvg(int resource_id, const D2D1_RECT_F& bounds, float opacity = 1.0f);
     void DrawTruncatedName(const std::wstring& name, float x, float y, float w, float h,
-                           const Theme& theme, bool selected, const std::vector<NameMatchRange>& matches);
+                           const Theme& theme, bool selected, const std::vector<NameMatchRange>& matches, bool dim_extension = false);
     void DrawCenteredIconName(const std::wstring& name, const D2D1_RECT_F& bounds,
                               const D2D1_COLOR_F& color, const Theme& theme,
                               const std::vector<NameMatchRange>& matches);
@@ -1036,6 +1148,13 @@ private:
     float column_header_height_ = 32.0f;
     float row_height_ = 34.0f;
     float row_height_dip_ = 34.0f;
+    bool list_smart_date_ = true, list_zebra_ = true, list_size_bar_ = false;
+    mutable ColumnAutoWidths auto_widths_{};
+    mutable float auto_widths_scale_ = -1.0f;
+    mutable std::wstring auto_widths_language_;
+    mutable std::unordered_map<std::wstring, float> cell_text_widths_;
+    mutable float cell_text_widths_scale_ = 0.0f;
+    std::array<uint32_t, 8> painted_columns_{};
     float tray_icon_dip_ = 48.0f;
     float margin_ = 4.0f;
     float control_gap_ = 4.0f;

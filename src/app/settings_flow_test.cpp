@@ -1,4 +1,5 @@
 #include "app_internal.h"
+#include "app_input.h"
 #include "../ui/ui_renderer_internal.h"
 #include <fstream>
 #include <filesystem>
@@ -140,28 +141,33 @@ int RunSearchColumnsTest(AppState& s,const wchar_t* output) {
     HandleSettingsControl(s,disclosure);check(!(s.settingsExpanded&2u),"storage can still collapse");
     HandleSettingsControl(s,disclosure);check((s.settingsExpanded&2u)!=0,"storage can reopen");
     Render(s);check(s.compositor.SaveSnapshot((base/L"storage-expanded.png").c_str()),"default expanded storage screenshot captured");
+    // Pre-1.0.39 sessions stored divider ratios; they read back as automatic widths.
     const std::array<float,4> saved{0.31f,0.43f,0.62f,0.82f};
+    using K=ui::MainRenderer::ColumnKind;
     for(float scale:{1.0f,1.25f,1.5f,2.0f}) {
         s.renderer.SetScale(scale);
-        bool compact=true,positive=true,filled=true,dragged=true;
+        bool compact=true,positive=true,filled=true,dragged=true,legacy=true;
         for(float width:{500.0f,800.0f,1440.0f,2400.0f}) {
             const auto pane=D2D1::RectF(0,0,width*scale,600*scale);
+            const auto automatic=s.renderer.DetailsColumns(pane,{},true,{});
             for(const auto& dividers:{std::array<float,4>{},saved}) {
                 const auto c=s.renderer.DetailsColumns(pane,{},true,dividers);
-                compact &= c.widths[2]<=144*scale+0.01f && c.widths[3]<=128*scale+0.01f && c.widths[4]<=90*scale+0.01f;
+                compact &= c.Width(K::Date)<=176*scale+0.01f && c.Width(K::Type)<=196*scale+0.01f && c.Width(K::Size)<=112*scale+0.01f;
                 float sum=0;for(int i=0;i<c.count;++i){positive &= c.widths[i]>0;sum+=c.widths[i];}
                 filled &= std::abs(sum-(c.right-c.left))<0.05f;
-                if(width>=800) {
+                legacy &= c.count==automatic.count && std::abs(c.widths[0]-automatic.widths[0])<0.05f;
+                if(c.Has(K::Path)) {
                     const auto moved=s.renderer.ResizeSearchColumnDivider(pane,dividers,0,c.DividerX(0)-40*scale);
                     const auto after=s.renderer.DetailsColumns(pane,{},true,moved);
                     dragged &= std::abs(after.widths[1]-c.widths[1]-40*scale)<0.05f;
-                    compact &= c.widths[0]+c.widths[1]>c.widths[2]+c.widths[3]+c.widths[4];
                 }
+                if(width>=1440) compact &= c.widths[0]+c.widths[1]>c.Width(K::Date)+c.Width(K::Type)+c.Width(K::Size);
             }
         }
-        check(compact,"default and saved layouts prioritize name/path at narrow and wide sizes");
+        check(compact,"fitted metadata columns stay compact and leave room for name/path");
         check(positive && filled,"columns stay positive and fill the available width");
         check(dragged,"name/path divider drag keeps its requested width");
+        check(legacy,"legacy divider ratios fall back to fitted widths");
     }
     s.renderer.SetScale(s.scale);
     ui::WindowViewModel vm;vm.dark=s.darkMode;vm.window_effect=ui::WindowEffect::None;
@@ -184,7 +190,223 @@ int RunSearchColumnsTest(AppState& s,const wchar_t* output) {
     log<<"failures="<<failures<<std::endl;return failures ? 1 : 0;
 }
 
+int RunAdaptiveColumnsTest(AppState& s, const wchar_t* output) {
+    std::ofstream log{std::filesystem::path(output)};
+    int failures = 0;
+    auto check = [&](bool ok, const char* label) {
+        log << (ok ? "[PASS] " : "[FAIL] ") << label << std::endl;
+        if (!ok) ++failures;
+    };
+    const auto base = std::filesystem::path(output).parent_path();
+    const float original_scale = s.scale;
+    if (auto* tab = ActiveTab(s)) {
+        const auto saved_path = tab->current_path;
+        const auto saved_view = tab->view_mode;
+        const auto saved_details = tab->details_column_dividers;
+        const auto saved_search = tab->search_column_dividers;
+        // Reuse the isolated application's tab; no navigation or disk fixture is needed.
+        tab->current_path = L"C:\\";
+        tab->view_mode = ui::ViewMode::Details;
+        tab->details_column_dividers = {0.48f, 0.70f, 0.86f};
+        tab->search_column_dividers = {0.28f, 0.48f, 0.70f, 0.86f};
+        const auto vm = BuildVm(s, false);
+        const auto window = D2D1::RectF(0, 0, static_cast<float>(s.compositor.Width()),
+            static_cast<float>(s.compositor.Height()));
+        bool exercised = false;
+        for (size_t i = 0; i < vm.pane_slots.size(); ++i) {
+            if (PaneAtSlot(s, static_cast<int>(i)) != s.pane) continue;
+            const auto& slot = vm.pane_slots[i];
+            const auto columns = s.renderer.DetailsColumns(slot.rect, slot.pane);
+            const auto list = s.renderer.PaneListRect(slot.pane, slot.rect);
+            const int x = static_cast<int>(std::lround(columns.DividerX(0)));
+            const int y = static_cast<int>(std::lround(list.top - 8 * s.scale));
+            const auto hit = s.renderer.HitTest(vm, window, static_cast<float>(x), static_cast<float>(y));
+            check(hit.region == ui::HitTestResult::ColumnDivider && hit.pane_index == static_cast<int>(i),
+                "double-click fixture hits the active tab's actual column divider");
+            if (hit.region != ui::HitTestResult::ColumnDivider) break;
+            s.columnResizing = true;
+            s.columnResizeIndex = hit.index;
+            s.columnResizePane = hit.pane_index;
+            SetCapture(s.hwnd);
+            check(GetCapture() == s.hwnd, "double-click fixture begins with mouse capture");
+            HandleLButtonDblClk(&s, s.hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, MAKELPARAM(x, y));
+            check(tab->details_column_dividers[0] == 0.0f &&
+                  tab->search_column_dividers == std::array<float, 4>{0.28f, 0.48f, 0.70f, 0.86f},
+                "actual divider double-click refits adjacent columns without changing the other layout");
+            check(!s.columnResizing && s.columnResizeIndex == -1 && s.columnResizePane == -1 &&
+                  GetCapture() != s.hwnd,
+                "actual divider double-click stops resizing and releases mouse capture");
+            exercised = true;
+            break;
+        }
+        check(exercised, "actual divider double-click regression was exercised");
+        if (GetCapture() == s.hwnd) ReleaseCapture();
+        s.columnResizing = false;
+        s.columnResizeIndex = -1;
+        s.columnResizePane = -1;
+        tab->current_path = saved_path;
+        tab->view_mode = saved_view;
+        tab->details_column_dividers = saved_details;
+        tab->search_column_dividers = saved_search;
+    } else {
+        check(false, "isolated application supplies a tab for the double-click regression");
+    }
+    auto fixture = [](bool search, bool long_type) {
+        ui::PaneViewModel pane;
+        pane.is_search = search;
+        pane.header_text = search ? L"搜索结果 · 自适应列宽" : L"文件夹 · 自适应列宽";
+        const wchar_t* types[] = { L"文件", L"应用程序", L"压缩文件",
+            L"Microsoft PowerPoint Presentation", L"带有较长中文类型名称的项目归档文件" };
+        for (int i = 0; i < (long_type ? 5 : 3); ++i) {
+            ui::ListEntryView row;
+            row.name = L"2026-项目资料-Quarterly-report-" + std::to_wstring(i) + L".dat";
+            row.path = L"C:\\Projects\\季度资料\\Archive\\" + row.name;
+            row.type_text = types[i];
+            row.date_text = L"2026-09-21 07:44";
+            row.size_text = i == 0 ? L"321.9 MB" : (i == 1 ? L"321.9MB" : L"999.99 GB");
+            pane.entries.push_back(std::move(row));
+        }
+        return pane;
+    };
+    for (float scale : {1.0f, 1.5f, 2.0f}) {
+        s.compositor.RecreateTextFormats(scale);
+        s.renderer.SetScale(scale);
+        auto measure = [&](const std::wstring& value) {
+            ui::ComPtr<IDWriteTextLayout> layout;
+            const HRESULT hr = s.compositor.DwriteFactory()->CreateTextLayout(value.c_str(),
+                static_cast<UINT32>(value.size()), s.compositor.TextFormat(),
+                10000.0f * scale, 100.0f * scale, &layout);
+            DWRITE_TEXT_METRICS metrics{};
+            if (FAILED(hr) || !layout.get() || FAILED(layout->GetMetrics(&metrics))) return 100000.0f;
+            float luma = 0.0f;
+            s.compositor.MeasureLumaText(value, s.compositor.TextFormat(), luma);
+            return std::max(metrics.widthIncludingTrailingWhitespace, luma);
+        };
+        for (bool search : {false, true}) {
+            log << "scale=" << scale << " search=" << search << std::endl;
+            for (float width : {280.0f, 480.0f, 600.0f, 800.0f, 1440.0f}) {
+                const auto bounds = D2D1::RectF(0, 0, width * scale, 600 * scale);
+                auto pane = fixture(search, true);
+                const auto columns = s.renderer.DetailsColumns(bounds, pane);
+                float sum = 0.0f;
+                bool positive = true;
+                for (int i = 0; i < columns.count; ++i) {
+                    positive &= std::isfinite(columns.widths[i]) && columns.widths[i] > 0;
+                    sum += columns.widths[i];
+                }
+                check(positive && columns.Has(ui::MainRenderer::ColumnKind::Name) &&
+                    columns.Has(ui::MainRenderer::ColumnKind::Size),
+                    "normal and search columns remain positive at narrow widths and every DPI");
+                check(std::abs(sum - (columns.right - columns.left)) < 0.1f,
+                    "adaptive columns exactly fill the available pane width");
+                if (width >= 600 && columns.Has(ui::MainRenderer::ColumnKind::Date)) {
+                    bool compact_fields_fit = true;
+                    for (const auto& row : pane.entries) {
+                        compact_fields_fit &= measure(row.date_text) + 20 * scale <=
+                            columns.Width(ui::MainRenderer::ColumnKind::Date) + 0.1f;
+                        compact_fields_fit &= measure(row.size_text) + 20 * scale <=
+                            columns.widths[columns.count - 1] + 0.1f;
+                    }
+                    check(compact_fields_fit, "long type descriptions do not squeeze dates or sizes");
+                }
+                if (width >= 800 && columns.Has(ui::MainRenderer::ColumnKind::Type)) {
+                    bool fits = true;
+                    for (const auto& row : pane.entries) {
+                        const std::wstring* values[] = { &row.date_text, &row.type_text, &row.size_text };
+                        for (int i = 0; i < 3; ++i)
+                            fits &= measure(*values[i]) + 20 * scale <=
+                                columns.widths[columns.count - 3 + i] + 0.1f;
+                    }
+                    check(fits, "actual rendered font fits full dates, sizes, and long Chinese/English types");
+                }
+                const auto short_columns = s.renderer.DetailsColumns(bounds, fixture(search, false));
+                if (width >= 800 && columns.Has(ui::MainRenderer::ColumnKind::Type))
+                    check(columns.widths[columns.count - 2] > short_columns.widths[columns.count - 2],
+                        "long type descriptions expand the type column beyond short labels");
+                if (width >= 800 && columns.Has(ui::MainRenderer::ColumnKind::Type)) {
+                    auto captured = pane;
+                    using K = ui::MainRenderer::ColumnKind;
+                    captured.details_column_dividers = {
+                        columns.Width(K::Date) / scale, columns.Width(K::Type) / scale,
+                        columns.Width(K::Size) / scale};
+                    captured.search_column_dividers = {
+                        columns.Has(K::Path) ? columns.Width(K::Name) / scale : 0.0f,
+                        columns.Width(K::Date) / scale, columns.Width(K::Type) / scale,
+                        columns.Width(K::Size) / scale};
+                    const auto restored = s.renderer.DetailsColumns(bounds, captured);
+                    bool stable = true;
+                    for (int i = 0; i < columns.count; ++i)
+                        stable &= std::abs(restored.widths[i] - columns.widths[i]) < 0.1f;
+                    check(stable, "capturing measured layout as manual DIP widths preserves every column without a jump");
+                }
+                pane.details_column_dividers = {140.0f, 150.0f, 90.0f};
+                pane.search_column_dividers = {200.0f, 140.0f, 150.0f, 90.0f};
+                const auto manual = s.renderer.DetailsColumns(bounds, pane);
+                const auto expected = s.renderer.DetailsColumns(bounds, pane.details_column_dividers,
+                    search, pane.search_column_dividers);
+                bool preserved = true;
+                for (int i = 0; i < manual.count; ++i)
+                    preserved &= std::abs(manual.widths[i] - expected.widths[i]) < 0.01f;
+                check(preserved, "explicit manual divider layout overrides content measurement");
+            }
+        }
+        for (bool dark : {false, true}) {
+            for (bool narrow : {false, true}) {
+                const float width = (narrow ? 760.0f : 1500.0f) * scale;
+                const float height = 820.0f * scale;
+                s.compositor.Resize(static_cast<UINT>(width), static_cast<UINT>(height));
+                ui::WindowViewModel vm;
+                vm.dark = dark;
+                vm.window_effect = ui::WindowEffect::None;
+                vm.tabs.push_back({L"自适应列宽 / Adaptive columns", true});
+                for (int i = 0; i < 2; ++i) {
+                    ui::PaneSlotView slot;
+                    slot.rect = D2D1::RectF(220 * scale, (100 + i * 338) * scale,
+                        width - 12 * scale, (420 + i * 338) * scale);
+                    slot.focused = i == 0;
+                    slot.pane = fixture(i == 1, true);
+                    vm.pane_slots.push_back(std::move(slot));
+                }
+                auto* dc = s.compositor.Dc();
+                dc->BeginDraw();
+                s.renderer.Render(vm, D2D1::RectF(0, 0, width, height), ui::MakeTheme(dark, s.accentColor));
+                check(SUCCEEDED(dc->EndDraw()), "adaptive columns render without Direct2D errors");
+                const auto name = std::wstring(L"adaptive-columns-") + (dark ? L"dark-" : L"light-") +
+                    (narrow ? L"narrow-" : L"wide-") + std::to_wstring(static_cast<int>(scale * 100)) + L".png";
+                check(s.compositor.SaveSnapshot((base / name).c_str()), "adaptive column theme/DPI screenshot captured");
+                auto& strip = vm.pane_slots[0].pane.column_strip;
+                strip.enabled = strip.eligible = strip.has_child = true;
+                auto entries = std::make_shared<std::vector<fs::DirEntry>>(3);
+                auto rows = std::make_shared<std::vector<int>>(std::initializer_list<int>{0, 1, 2});
+                for (size_t i = 0; i < entries->size(); ++i) {
+                    (*entries)[i].name = L"项目文件夹 / Folder " + std::to_wstring(i + 1);
+                    (*entries)[i].is_dir = true;
+                }
+                ui::ColumnStripColumnView column;
+                column.title = L"父目录 / Parent";
+                column.snapshot = entries;
+                column.rows = rows;
+                column.highlight_row = 1;
+                strip.ancestors = {column, column, column};
+                strip.child = column;
+                strip.child.title = L"子目录 / Child";
+                dc->BeginDraw();
+                s.renderer.Render(vm, D2D1::RectF(0, 0, width, height), ui::MakeTheme(dark, s.accentColor));
+                check(SUCCEEDED(dc->EndDraw()), "ancestor/current/child columns render across themes and DPI");
+                check(s.compositor.SaveSnapshot((base / (L"strip-" + name)).c_str()),
+                    "column strip theme/DPI screenshot captured");
+            }
+        }
+    }
+    s.compositor.RecreateTextFormats(original_scale);
+    s.renderer.SetScale(original_scale);
+    log << "failures=" << failures << std::endl;
+    return failures ? 1 : 0;
+}
+
 int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
+    if (GetEnvironmentVariableW(L"PULSE_TEST_ADAPTIVE_COLUMNS", nullptr, 0))
+        return RunAdaptiveColumnsTest(s, output);
     if (GetEnvironmentVariableW(L"PULSE_TEST_SEARCH_COLUMNS", nullptr, 0))
         return RunSearchColumnsTest(s, output);
     if (GetEnvironmentVariableW(L"PULSE_TEST_SETTINGS_DROPDOWN", nullptr, 0))

@@ -3,6 +3,7 @@
 #include "app_model.h"
 #include "../common/localization.h"
 #include "../common/path_utils.h"
+#include "../common/display_path.h"
 #include "../fs/fs_enum.h"
 #include "../ipc/ctx_menu_util.h"
 #include <windows.h>
@@ -325,9 +326,7 @@ std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode, bool de
 }
 
 static std::wstring DisplayPath(const std::wstring& path) {
-    if (path.starts_with(L"\\\\?\\UNC\\")) return L"\\\\" + path.substr(8);
-    if (path.starts_with(L"\\\\?\\")) return path.substr(4);
-    return path;
+    return pulse::path::FriendlyPathText(path);
 }
 
 static std::wstring FolderTitle(const std::wstring& path) {

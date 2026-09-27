@@ -82,4 +82,8 @@ CONERR$
 /.summary.jsonl
 /.c2c.json
 
+# Local promotional video (not part of source releases).
+/docs/video/*.mp4
+
+# Local IDE assistant state
 .codebuddy/

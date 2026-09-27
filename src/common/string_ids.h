@@ -830,42 +830,54 @@
 #define IDS_UPDATE_LAUNCHING 1996
 #define IDS_UPDATE_INSTALLING_STATUS 1997
 
-// Second window: tab menu entry and tray menu entry. (Numbered past the shared update
-// progress strings above, which landed on main while this branch was in review.)
-#define IDS_TAB_OPEN_NEW_WINDOW 1998
-#define IDS_TRAY_NEW_WINDOW 1999
-#define IDS_JUMPLIST_PINNED 2000
+// Ids main allocated for its 1.0.39/1.0.40 list work. Dev-side ids always continue past
+// main's numbering: when a merge collides, renumber the dev side, never main's.
+#define IDS_DATE_WEEKDAYS 1998
+#define IDS_DATE_MONTH_DAY_FORMAT 1999
+#define IDS_LIST_SMART_DATE 2000
+#define IDS_LIST_SMART_DATE_DESC 2001
+#define IDS_LIST_ZEBRA 2002
+#define IDS_LIST_ZEBRA_DESC 2003
+#define IDS_LIST_SIZE_BAR 2004
+#define IDS_LIST_SIZE_BAR_DESC 2005
+
+#define IDS_COLUMN_LAYOUT 2006
+
+// Second window: tab menu entry and tray menu entry.
+#define IDS_TAB_OPEN_NEW_WINDOW 2007
+#define IDS_TRAY_NEW_WINDOW 2008
+#define IDS_JUMPLIST_PINNED 2009
 // Tab-group hover card.
-#define IDS_TAB_GROUP_EDIT 2001
+#define IDS_TAB_GROUP_EDIT 2010
 // Recent/starred item menu: reveal the row in its containing folder.
-#define IDS_OPEN_ITEM_LOCATION 2002
+#define IDS_OPEN_ITEM_LOCATION 2011
 // Settings: hover hints switch and delay.
-#define IDS_SETTINGS_TOOLTIPS 2003
-#define IDS_SETTINGS_TOOLTIPS_DESC 2004
-#define IDS_SETTINGS_TOOLTIP_DELAY 2005
-#define IDS_SETTINGS_TOOLTIP_DELAY_DESC 2006
-#define IDS_TOOLTIP_DELAY_SHORT 2007
-#define IDS_TOOLTIP_DELAY_STANDARD 2008
-#define IDS_TOOLTIP_DELAY_LONG 2009
+#define IDS_SETTINGS_TOOLTIPS 2012
+#define IDS_SETTINGS_TOOLTIPS_DESC 2013
+#define IDS_SETTINGS_TOOLTIP_DELAY 2014
+#define IDS_SETTINGS_TOOLTIP_DELAY_DESC 2015
+#define IDS_TOOLTIP_DELAY_SHORT 2016
+#define IDS_TOOLTIP_DELAY_STANDARD 2017
+#define IDS_TOOLTIP_DELAY_LONG 2018
 // Item menu: drop the mark-of-the-web stream and checksum a file.
-#define IDS_UNBLOCK_FILE 2010
-#define IDS_HASH_FILE 2011
-#define IDS_HASH_COPIED 2012
-#define IDS_UNBLOCK_DONE 2013
+#define IDS_UNBLOCK_FILE 2019
+#define IDS_HASH_FILE 2020
+#define IDS_HASH_COPIED 2021
+#define IDS_UNBLOCK_DONE 2022
 // Settings: the on-disk preview cache and its clear button.
-#define IDS_SETTINGS_THUMB_CACHE 2014
-#define IDS_SETTINGS_FILE_HASH 2015
-#define IDS_SETTINGS_FILE_HASH_DESC 2016
-#define IDS_TOOLTIP_DELAY_CUSTOM 2017
-#define IDS_SETTINGS_TITLE_BRAND 2018
-#define IDS_SETTINGS_TITLE_BRAND_DESC 2019
+#define IDS_SETTINGS_THUMB_CACHE 2023
+#define IDS_SETTINGS_FILE_HASH 2024
+#define IDS_SETTINGS_FILE_HASH_DESC 2025
+#define IDS_TOOLTIP_DELAY_CUSTOM 2027
+#define IDS_SETTINGS_TITLE_BRAND 2028
+#define IDS_SETTINGS_TITLE_BRAND_DESC 2029
 // Settings: the background update check (and its install prompt) can be turned off.
-#define IDS_SETTINGS_AUTO_UPDATE 2020
-#define IDS_SETTINGS_AUTO_UPDATE_DESC 2021
+#define IDS_SETTINGS_AUTO_UPDATE 2030
+#define IDS_SETTINGS_AUTO_UPDATE_DESC 2031
 // Two buttons read "添加文件夹" in the same page; name what they add.
-#define IDS_ADD_EXCLUDE_FOLDER 2022
-#define IDS_ADD_SERVER_FOLDER 2023
+#define IDS_ADD_EXCLUDE_FOLDER 2032
+#define IDS_ADD_SERVER_FOLDER 2033
 // The two "移除" buttons on that page get the same treatment: one drops a path from
 // the exclusion list, the other one a server folder.
-#define IDS_REMOVE_EXCLUDE_FOLDER 2024
-#define IDS_REMOVE_SERVER_FOLDER 2025
+#define IDS_REMOVE_EXCLUDE_FOLDER 2034
+#define IDS_REMOVE_SERVER_FOLDER 2035

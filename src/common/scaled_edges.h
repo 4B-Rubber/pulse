@@ -1,7 +1,9 @@
 #pragma once
 // Column edges are stored as per-ten-thousand integers ("1234,2345,6789"), the shape
-// session.json and the per-folder view store both use, so both read and write them here. A zero
-// in the first slot means "no stored edges": the defaults are computed from the window instead.
+// session.json and the per-folder view store both use, so both read and write them here.
+// 0 = automatic: the width is measured from the content and the window. A value above 1
+// after the division is a manual DIP width captured by a divider drag; values <= 1 are the
+// pre-1.0.39 divider ratios, which main reads back as "automatic" too.
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -20,8 +22,7 @@ inline std::array<float, 3> ParseScaled3(const std::wstring& value) {
     std::array<float, 3> ratios{};
     if (swscanf_s(value.c_str(), L"%d,%d,%d",
                   &edges[0], &edges[1], &edges[2]) == 3 &&
-        edges[0] > 0 && edges[0] < edges[1] &&
-        edges[1] < edges[2] && edges[2] < 10000) {
+        std::all_of(edges.begin(), edges.end(), [](int v) { return v >= 0 && v <= 40000000; })) {
         for (size_t i = 0; i < ratios.size(); ++i)
             ratios[i] = static_cast<float>(edges[i]) / 10000.0f;
     }

@@ -77,6 +77,12 @@ void ApplyAccentFromPrefs(AppState& s, bool snap_picker);
 bool SelectedQuickPreviewItem(AppState& s, ui::QuickPreviewItem& item);
 void ToggleQuickPreview(AppState& s);
 void NavigateQuickPreview(AppState& s, int direction);
+// File verb requested from inside the quick preview (WM_QUICK_PREVIEW_COMMAND).
+void HandleQuickPreviewCommand(AppState& s, ui::QuickPreviewAction action, bool shift);
+// Keeps an open quick preview in step with the focused listing after a
+// snapshot refresh or directory notification: reloads a changed file,
+// re-anchors after an in-preview delete, closes when the entry is gone.
+void SyncQuickPreview(AppState& s);
 void ApplySettingsEffects(AppState& s, app::SettingsEffect effects);
 app::SettingsTaskCompletion SettingsCompletion(HWND hwnd);
 void SetThemeMode(AppState& s, int mode);

@@ -10,10 +10,10 @@ namespace {
 
 constexpr UINT kFirstString = IDS_SETTINGS;
 // Must stay on the highest allocated string id, otherwise Get() returns empty.
-// The 2020-2025 ids (the automatic update switch and the four add/remove folder
-// buttons) once sat past this bound and drew as blank text, so raise it with
-// every new batch in string_ids.h.
-constexpr UINT kLastString = IDS_OP_ITEMS_PER_SECOND;
+// The dev-side ids (hover hints, hash and unblock, the automatic update switch, the
+// four add/remove folder buttons) once sat past this bound and drew as blank text, so
+// raise it with every new batch in string_ids.h — it must match the highest id there.
+constexpr UINT kLastString = IDS_REMOVE_SERVER_FOLDER;
 static_assert(static_cast<UINT>(StringId::SettingsChangeTracking) >= kFirstString &&
               static_cast<UINT>(StringId::ChangeDisabled) <= kLastString);
 

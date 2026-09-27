@@ -237,6 +237,8 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 r.region=HitTestResult::SettingsDropdown;r.index=ContainsPt(lay.effect_choice,x,y) ? 0 : 1;return r;
             }
             if(ContainsPt(lay.performance_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=4;return r;}
+            for(int list_row=0;list_row<3;++list_row)
+                if(ContainsPt(lay.list_style_row[list_row],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=21+list_row;return r;}
             const D2D1_RECT_F actions[]={lay.content_pause,lay.content_options,lay.content_rebuild};
             for(int i=0;i<3;++i) if(ContainsPt(actions[i],x,y)) {r.region=HitTestResult::SettingsContentAction;r.index=i+1;return r;}
 
@@ -743,7 +745,10 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
         }
     }
 
-    auto hitPaneBounds = [&](const PaneViewModel& paneVm, const D2D1_RECT_F& paneRc, int paneIndex) -> HitTestResult {
+    auto hitPaneBounds = [&](const PaneViewModel& paneVm, const D2D1_RECT_F& paneRect, int paneIndex) -> HitTestResult {
+        // Header controls use the full pane; below the header the column
+        // view narrows the regular list to its body.
+        D2D1_RECT_F paneRc = paneRect;
         HitTestResult out;
         out.pane_index = paneIndex;
         if (x < paneRc.left || x >= paneRc.right || y < paneRc.top || y >= paneRc.bottom)
@@ -759,6 +764,11 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
         const D2D1_RECT_F mediumRc = PaneMediumIconsRect(paneRc, paneVm.filter_expand);
         if (RectContains(mediumRc, x, y)) {
             out.region = HitTestResult::PaneMediumIcons;
+            out.index = paneIndex;
+            return out;
+        }
+        if (RectContains(PaneColumnLayoutRect(paneRc, paneVm.filter_expand), x, y)) {
+            out.region = HitTestResult::PaneColumnLayout;
             out.index = paneIndex;
             return out;
         }
@@ -788,6 +798,10 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             out.region = HitTestResult::NavUp;
             out.index = paneIndex;
             return out;
+        }
+        if (y >= paneRect.top + pane_header_height_ && paneVm.column_strip.Active()) {
+            if (HitTestColumnStrip(paneVm, paneRect, x, y, out)) return out;
+            paneRc = PaneBodyBounds(paneVm, paneRect);
         }
         const float banner = PaneBannerHeight(paneVm, paneRc.right - paneRc.left, scale_, compositor_);
         if (paneVm.is_content_search && banner > 0) {
@@ -868,15 +882,18 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 }
             }
             out.region = HitTestResult::ColumnHeader;
-            if (x < columns.DividerX(0)) out.column = SortColumn::Name;
-            else if (paneVm.is_search && x < columns.DividerX(1)) {
-                if(paneVm.content_results) out.column=SortColumn::Path;
-                else out.region=HitTestResult::Pane;
-                return out;
+            int col = 0;
+            while (col < columns.count - 1 && x >= columns.DividerX(col)) ++col;
+            switch (columns.kinds[static_cast<size_t>(col)]) {
+            case ColumnKind::Name: out.column = SortColumn::Name; break;
+            case ColumnKind::Path:
+                if (paneVm.content_results) out.column = SortColumn::Path;
+                else out.region = HitTestResult::Pane;
+                break;
+            case ColumnKind::Date: out.column = SortColumn::Mtime; break;
+            case ColumnKind::Type: out.column = SortColumn::Type; break;
+            case ColumnKind::Size: out.column = SortColumn::Size; break;
             }
-            else if (x < columns.DividerX(paneVm.is_search ? 2 : 1)) out.column = SortColumn::Mtime;
-            else if (x < columns.DividerX(paneVm.is_search ? 3 : 2)) out.column = SortColumn::Type;
-            else out.column = SortColumn::Size;
             return out;
         }
         if (y >= listTop && y < paneRc.bottom) {
@@ -897,7 +914,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             }
             if (paneVm.view_mode == ViewMode::List &&
                 y >= paneRc.bottom - 12.0f * scale_ &&
-                MaxScrollXForPane(paneVm, paneRc) > 0.0f) {
+                MaxScrollXForPane(paneVm, paneRect) > 0.0f) {
                 out.region = HitTestResult::Scrollbar;
                 out.sub_index = 1;
                 return out;
@@ -906,7 +923,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 out.region = HitTestResult::Scrollbar;
                 return out;
             }
-            int idx = ItemFromPointInPane(paneVm, paneRc, x, y);
+            int idx = ItemFromPointInPane(paneVm, paneRect, x, y);
             if(idx>=0 && paneVm.content_results && !paneVm.content_results->Ready(static_cast<size_t>(idx))) {
                 paneVm.content_results->Prefetch(static_cast<size_t>(idx));
                 out.region=HitTestResult::Pane; return out;
@@ -919,7 +936,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                         const DetailsColumnLayout columns = DetailsColumns(list, paneVm);
                         ViewLayout layout(paneVm.view_mode, list, paneVm.EntryCount(),
                                           paneVm.scroll_x, paneVm.scroll_y, scale_,
-                                          ListRowHeightDip(paneVm));
+                                          ListRowHeightDip(paneVm, list));
                         const D2D1_RECT_F nameRc = layout.NameRect(viewRow);
                         const D2D1_RECT_F cell = layout.ItemRect(viewRow);
                         const ListEntryView& entry = MakeVisibleEntry(paneVm, static_cast<size_t>(idx));

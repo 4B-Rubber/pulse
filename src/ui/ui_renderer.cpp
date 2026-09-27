@@ -3,6 +3,7 @@
 #include "ui_renderer.h"
 #include "ui_renderer_internal.h"
 #include "../common/localization.h"
+#include "../common/display_path.h"
 #include "tab_shape.h"
 #include "bloom_accent_picker.h"
 #include "typography.h"
@@ -1038,9 +1039,10 @@ void MainRenderer::DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& r
     MakeBrush(dc, theme.text_secondary, brTextSecondary_);
     const float gap = 16.0f * scale_;
     const float statusLimit = centered_progress ? std::min(rect.right * 0.30f, sb.task.left - gap) : rect.right * 0.30f;
+    const std::wstring status_text = path::FriendlyPathText(vm.status.status_text);
     const float statusWidth = std::min(std::max(0.0f, statusLimit - sb.pad),
-        MeasureTextWidth(factory, small_fmt, vm.status.status_text));
-    DrawTextEndEllipsis(dc, factory, small_fmt, brTextSecondary_.get(), vm.status.status_text,
+        MeasureTextWidth(factory, small_fmt, status_text));
+    DrawTextEndEllipsis(dc, factory, small_fmt, brTextSecondary_.get(), status_text,
         sb.pad, y, statusWidth, status_height_);
     const float selectionLeft = sb.pad + statusWidth + gap;
     const bool hasTask = vm.status.query_active || !vm.status.task_text.empty() || vm.status.task_progress >= 0.0f;

@@ -15,6 +15,7 @@
 #include "../fs/fs_snapshot.h"
 #include "../fs/fs_watch.h"
 #include "app_model.h"
+#include <deque>
 #include "content_results_ui.h"
 #include "app_worker.h"
 #include "folder_views.h"
@@ -77,6 +78,7 @@ constexpr UINT WM_CONTENT_SELECTION = WM_APP + 64;
 constexpr UINT WM_DUPLICATE_SCAN = WM_APP + 58;
 constexpr UINT WM_QUICK_PREVIEW_NAVIGATE = WM_APP + 54;
 constexpr UINT WM_QUICK_PREVIEW_OPEN = WM_APP + 55;
+constexpr UINT WM_QUICK_PREVIEW_COMMAND = WM_APP + 65;  // wParam ui::QuickPreviewAction, lParam bit0 = Shift
 constexpr UINT WM_UPDATE_RESULT = WM_APP + 56;
 constexpr UINT WM_RECYCLE_INFO = WM_APP + 57;
 constexpr UINT WM_DUP_VOLUMES = WM_APP + 59;
@@ -84,8 +86,9 @@ constexpr UINT WM_UPDATE_DOWNLOADED = WM_APP + 60;
 constexpr UINT WM_UPDATE_INSTALL = WM_APP + 61;
 constexpr UINT WM_SEARCH_HISTORY = WM_APP + 62;
 constexpr UINT WM_CHANGE_TRACKING = WM_APP + 63;
-// The checksum worker finished (wParam unused): the handler takes the result.
-constexpr UINT WM_FILE_HASH_DONE = WM_APP + 65;
+// The checksum worker finished (wParam unused): the handler takes the result. (65 is taken by
+// main's WM_QUICK_PREVIEW_COMMAND, which landed while this branch was in review.)
+constexpr UINT WM_FILE_HASH_DONE = WM_APP + 66;
 constexpr UINT kTimerUi = 1;
 
 enum class OmnibarMode { Path, Mixed, Command, Project };
@@ -134,6 +137,10 @@ struct AppState {
     ui::NotificationToast notification_toast;
     ui::MainRenderer renderer;
     ui::QuickPreviewWindow quickPreview;
+    // View row the quick preview was anchored to when Delete ran from inside
+    // it; SyncQuickPreview re-anchors there once the listing drops the entry
+    // so the preview steps to the neighbouring file instead of closing.
+    int quickPreviewAnchorView = -1;
 
     app::WindowTabs window_tabs;
     app::Pane* pane = nullptr;          // focused leaf of the current layout tab
@@ -272,6 +279,7 @@ struct AppState {
     double lastFrameMs = 0.0;
     double lastFps = 0.0;
     std::chrono::steady_clock::time_point lastFrameTime;
+    std::deque<std::chrono::steady_clock::time_point> fpsWindow; // recent Present times
     double processCpuPercent = 0.0;
     double workingSetMb = 0.0;
     ULONGLONG processSampleTick = 0;
@@ -302,6 +310,18 @@ struct AppState {
     bool columnResizing = false;
     int columnResizeIndex = -1;
     int columnResizePane = -1;
+
+    // Column view divider drag and click bookkeeping (app_column_view.cpp).
+    bool stripResizing = false;
+    int stripResizePane = -1;
+    int stripResizeColumn = -1;
+    int stripResizeStartX = 0;
+    float stripResizeStartDip = 0.0f;
+    ULONGLONG stripClickTick = 0;
+    bool stripHScrolling = false;        // ancestor scrollbar thumb drag
+    float stripHScrollStartDip = 0.0f;   // scroll_from_right_dip at press
+    float stripHScrollRatio = 0.0f;      // strip px per thumb px
+    float stripHScrollMaxDip = 0.0f;
 
     bool tabDragPending = false;
     bool tabDragging = false;

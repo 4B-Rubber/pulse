@@ -408,7 +408,7 @@ void FluentMenu::LayoutWindow(POINT screen_pt) {
         SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex & ~WS_EX_NOACTIVATE);
     else
         SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE);
-    SetWindowPos(hwnd_, HWND_TOP, x, y, w, h,
+    SetWindowPos(hwnd_, topmost_ ? HWND_TOPMOST : HWND_TOP, x, y, w, h,
                  (filter_fn_ && !external_edit_) ? SWP_SHOWWINDOW : (SWP_NOACTIVATE | SWP_SHOWWINDOW));
 }
 
@@ -706,7 +706,8 @@ void FluentMenu::OpenSubmenu(int row) {
     if (y < mi.rcWork.top - kShadowMargin) y = mi.rcWork.top - kShadowMargin;
     sub_x_ = x;
     sub_y_ = y;
-    SetWindowPos(sub_hwnd_, HWND_TOP, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(sub_hwnd_, topmost_ ? HWND_TOPMOST : HWND_TOP, x, y, w, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
     if (RenderSub()) PresentSub(255);
     if (Render()) Present(255, present_offset_); // header row stays active
 }
@@ -1247,6 +1248,22 @@ int FluentMenu::RunModalLoop() {
         }
         DWORD wait = MsgWaitForMultipleObjects(0, nullptr, FALSE, 16, QS_ALLINPUT);
         (void)wait;
+        if (topmost_ && open_ && !animating_out_ &&
+            ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000)) {
+            // A press over the foreign overlay never reaches this thread's
+            // queue; treat it like any other click outside the palette.
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            const HWND under = WindowFromPoint(cursor);
+            if (under && !IsPaletteHwnd(under) &&
+                GetWindowThreadProcessId(under, nullptr) != GetCurrentThreadId()) {
+                result_ = 0;
+                open_ = false;
+                HideFilterEdit();
+                HideSubWindow();
+                ShowWindow(hwnd_, SW_HIDE);
+            }
+        }
         while (open_ && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
                 open_ = false;

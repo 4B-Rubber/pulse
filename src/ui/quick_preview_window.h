@@ -5,6 +5,7 @@
 #include "preview_handler_host.h"
 #include "window_material.h"
 #include "fluent_menu.h"
+#include "video_preview.h"
 
 #include <string>
 #include <vector>
@@ -17,6 +18,23 @@ struct QuickPreviewItem {
     DWORD attrs = 0;
     uint64_t modified = 0;
     uint64_t size = 0;
+    bool starred = false;    // Places star state; drives the Star/Unstar verb label
+    bool read_only = false;  // recycle / read-only view: no cut, rename, delete
+};
+
+// File verbs the preview asks its owner to run on the previewed entry. Posted
+// as wParam of the command message given to Initialize; lParam bit 0 mirrors
+// the Shift key so Delete can mean "permanent delete" like the main list.
+enum class QuickPreviewAction : int {
+    None = 0,
+    Open,
+    Cut,
+    Copy,
+    CopyPath,
+    ToggleStar,
+    Rename,
+    Delete,
+    Properties,
 };
 
 class QuickPreviewWindow {
@@ -26,18 +44,24 @@ public:
     QuickPreviewWindow(const QuickPreviewWindow&) = delete;
     QuickPreviewWindow& operator=(const QuickPreviewWindow&) = delete;
 
-    bool Initialize(HWND owner, UINT navigate_message, UINT open_message);
+    bool Initialize(HWND owner, UINT navigate_message, UINT open_message,
+                    UINT command_message = 0);
     void Show(const QuickPreviewItem& item, bool dark, WindowEffect effect, bool safe_mode);
     void Update(const QuickPreviewItem& item);
     // A theme switched while the panel is open: the host passes its own answer down, so the
     // panel follows instead of keeping the colours it was opened with.
     void SetAppearance(bool dark, WindowEffect effect);
+    // Star/unstar the file the panel is showing, from the panel's own toolbar.
+    void SetStarred(bool starred);
     void Close();
     bool visible() const noexcept;
     HWND hwnd() const noexcept { return hwnd_; }
+    const QuickPreviewItem& item() const noexcept { return item_; }
 
 private:
+    friend struct QuickPreviewPlaybackProbe;
     enum class NativeKind { None, Bitmap, Text, Hex };
+    enum class ChromeButton { None, Prev, Next, More };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
     LRESULT HandleMessage(UINT message, WPARAM wparam, LPARAM lparam);
@@ -47,6 +71,24 @@ private:
     void RecreateFormats();
     bool OfflinePlaceholder() const noexcept;
     void ResetAnimation();
+    void BeginVideo();
+    void ResetPlayback();
+    bool HasPlayback() const noexcept;
+    float PlaybackHeight() const noexcept;
+    D2D1_RECT_F PlaybackRect() const;
+    D2D1_RECT_F PlaybackButtonRect(int button) const;
+    D2D1_RECT_F PlaybackTrackRect() const;
+    void TogglePlayback();
+    void StepPlayback(int direction);
+    void SeekPlayback(float x);
+    void SubmitPlaybackSeek(bool immediate);
+    void TickPlaybackSeek();
+    void CancelPlaybackScrub();
+    double PlaybackFraction(const VideoPreview::State& state) const;
+    std::wstring PlaybackInfo(const VideoPreview::State& state) const;
+    bool PlaybackMouseDown(POINT point);
+    void EndPlaybackDrag(bool resume);
+    void DrawPlayback(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* brush);
     void ResetTextState();
 
     D2D1_RECT_F ContentRect() const;
@@ -86,7 +128,12 @@ private:
     void DestroyFindEdit();
     void PaintFindEditLuma(HWND hwnd, HDC hdc);
     LRESULT ForwardFindEditKeepLuma(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
-    void ShowTextContextMenu(POINT screen);
+    void ShowContextMenu(POINT screen);
+    void PostAction(QuickPreviewAction action);
+    D2D1_RECT_F ChromeButtonRect(ChromeButton button) const;
+    ChromeButton HitChromeButton(POINT client) const;
+    void ActivateChromeButton(ChromeButton button);
+    void DrawChromeButtons(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* text_brush);
     static LRESULT CALLBACK FindEditProc(HWND hwnd, UINT message, WPARAM wparam,
                                          LPARAM lparam, UINT_PTR id, DWORD_PTR data);
 
@@ -94,9 +141,17 @@ private:
     HWND owner_ = nullptr;
     UINT navigate_message_ = 0;
     UINT open_message_ = 0;
+    UINT command_message_ = 0;
     Compositor compositor_;
     ThumbnailCache thumbnails_;
     PreviewHandlerHost handler_;
+    VideoPreview video_;
+    bool playback_drag_ = false;
+    bool playback_resume_ = false;
+    bool playback_scrub_pending_ = false;
+    bool playback_seek_dirty_ = false;
+    double playback_scrub_fraction_ = 0;
+    ULONGLONG playback_last_seek_ms_ = 0;
     ComPtr<IDWriteTextFormat> close_format_;
     ComPtr<IDWriteTextFormat> preview_text_format_;
     ComPtr<IDWriteTextLayout> text_layout_;
@@ -123,6 +178,8 @@ private:
     float pan_start_x_ = 0.0f;
     float pan_start_y_ = 0.0f;
     bool close_hover_ = false;
+    ChromeButton chrome_hover_ = ChromeButton::None;
+    bool mouse_tracking_ = false;
     uint32_t frame_index_ = 0;
     uint32_t requested_frame_ = 0;
     uint32_t frame_count_ = 1;

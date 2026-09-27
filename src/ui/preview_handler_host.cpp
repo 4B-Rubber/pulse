@@ -846,6 +846,14 @@ LRESULT CALLBACK PreviewHandlerHost::WndProc(HWND hwnd, UINT msg, WPARAM wParam,
     switch (msg) {
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
+    case WM_CONTEXTMENU:
+        // A right-click the provider declined bubbles up to this owned popup.
+        // Hand it to the owner asynchronously: the owner may run a modal menu,
+        // and this apartment must never wait on it.
+        if (self->owner && IsWindow(self->owner))
+            PostMessageW(self->owner, WM_CONTEXTMENU,
+                         reinterpret_cast<WPARAM>(self->owner), lParam);
+        return 0;
     case WM_ERASEBKGND: {
         // Some Office previewers render into this host instead of an opaque
         // child. Erasing after DoPreview replaces valid content with white

@@ -152,6 +152,11 @@ public:
 
     // Borrow the search editor; show only results below its screen rect.
     void SetExternalFilterEdit(HWND edit) { external_edit_ = edit; }
+    // Owner hosts a topmost overlay (system preview handler) over the area the
+    // menu opens into: place the popup in the topmost band so it stays visible,
+    // and dismiss on clicks that land in windows of other threads, which the
+    // modal loop cannot otherwise observe. Sticky until changed.
+    void SetTopmost(bool topmost) { topmost_ = topmost; }
 
     static constexpr int kShadowMargin = 20; // px of transparent border around the card
 
@@ -229,6 +234,7 @@ private:
     bool dropdown_ = false;
     POINT popup_pt_{};
     bool top_center_ = false;
+    bool topmost_ = false;
     HWND external_edit_ = nullptr; // borrowed; never moved, hidden or destroyed
     HWND edit_ = nullptr;
     HFONT edit_font_ = nullptr;

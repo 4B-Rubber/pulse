@@ -62,7 +62,8 @@ LayoutTabSnapshot CaptureLayoutTab(const LayoutTab& tab) {
             continue;
         }
         snapshot.panes.push_back({view->current_path, view->view_mode,
-            view->details_column_dividers, view->search_column_dividers});
+            view->details_column_dividers, view->search_column_dividers,
+            view->column_layout, view->column_widths_dip});
     }
     return snapshot;
 }
@@ -84,6 +85,8 @@ void RestoreLayoutTab(LayoutTab& tab, const LayoutTabSnapshot& snapshot,
         pane->view.view_mode = saved.view;
         pane->view.details_column_dividers = saved.columns;
         pane->view.search_column_dividers = saved.search_columns;
+        pane->view.column_layout = saved.column_layout;
+        pane->view.column_widths_dip = saved.column_widths;
         Tab* raw = pane->ActiveTab();
         tab.panes.push_back(std::move(pane));
         if (load_tab) load_tab(*raw, saved.path);
@@ -101,6 +104,8 @@ void RestoreLayoutTab(LayoutTab& tab, const LayoutTabSnapshot& snapshot,
         pane->view.view_mode = source.view_mode;
         pane->view.details_column_dividers = source.details_column_dividers;
         pane->view.search_column_dividers = source.search_column_dividers;
+        pane->view.column_layout = source.column_layout;
+        pane->view.column_widths_dip = source.column_widths_dip;
         const std::wstring clone = source.current_path.empty() ? L"C:\\" : source.current_path;
         pane->view.current_path = clone;
         Tab* raw = pane->ActiveTab();

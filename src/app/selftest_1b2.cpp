@@ -3590,6 +3590,114 @@ void TestSnapshotPatch() {
     RemoveDirectoryW(dir.c_str());
 }
 
+void TestSnapshotPatchBatch() {
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    const std::wstring dir = std::wstring(temp) + L"PulsePatchBatch-" +
+                             std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const auto full = [&](const wchar_t* name) { return dir + L"\\" + name; };
+    const auto make = [&](const wchar_t* name, DWORD bytes) {
+        HANDLE hf = CreateFileW(full(name).c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return;
+        std::vector<char> data(bytes, 'x');
+        DWORD written = 0;
+        if (bytes) WriteFile(hf, data.data(), bytes, &written, nullptr);
+        CloseHandle(hf);
+    };
+    const struct { const wchar_t* name; DWORD bytes; } seed[] = {
+        {L"alpha.txt", 0}, {L"beta.log", 10}, {L"Gamma.txt", 10}, {L"delta.txt", 20},
+        {L"epsilon.md", 5}, {L"file2.txt", 0}, {L"file10.txt", 30}, {L"zeta.txt", 10}};
+    std::vector<fs::DirEntry> initial;
+    for (const auto& item : seed) {
+        make(item.name, item.bytes);
+        fs::DirEntry entry;
+        if (FillDirEntry(dir, item.name, entry)) initial.push_back(std::move(entry));
+    }
+    CreateDirectoryW(full(L"docs").c_str(), nullptr);
+    {
+        fs::DirEntry entry;
+        if (FillDirEntry(dir, L"docs", entry)) initial.push_back(std::move(entry));
+    }
+
+    // Disk reaches its final state first; both paths then stat the same files.
+    make(L"file3.txt", 7);
+    DeleteFileW(full(L"beta.log").c_str());
+    MoveFileW(full(L"delta.txt").c_str(), full(L"omega.txt").c_str());
+    MoveFileW(full(L"Gamma.txt").c_str(), full(L"gamma.txt").c_str());
+    make(L"zeta.txt", 99);
+    make(L"file20.txt", 1);
+    const auto ev = [](DWORD action, const wchar_t* name, const wchar_t* old_name = L"") {
+        fs::DirNotifyEvent event;
+        event.action = action;
+        event.name = name;
+        event.old_name = old_name;
+        return event;
+    };
+    const std::vector<fs::DirNotifyEvent> events = {
+        ev(FILE_ACTION_ADDED, L"file3.txt"), ev(FILE_ACTION_MODIFIED, L"file3.txt"),
+        ev(FILE_ACTION_REMOVED, L"beta.log"),
+        ev(FILE_ACTION_RENAMED_NEW_NAME, L"omega.txt", L"delta.txt"),
+        ev(FILE_ACTION_RENAMED_NEW_NAME, L"gamma.txt", L"Gamma.txt"),
+        ev(FILE_ACTION_ADDED, L"temp.tmp"), ev(FILE_ACTION_REMOVED, L"temp.tmp"),
+        ev(FILE_ACTION_MODIFIED, L"zeta.txt"), ev(FILE_ACTION_ADDED, L"file20.txt"),
+        ev(FILE_ACTION_ADDED, L"ghost.txt"), ev(FILE_ACTION_REMOVED, L"missing.txt")};
+
+    bool same = true;
+    const ui::SortColumn cols[] = {ui::SortColumn::Name, ui::SortColumn::Size,
+                                   ui::SortColumn::Mtime, ui::SortColumn::Type};
+    const ui::SortDirection dirs[] = {ui::SortDirection::Asc, ui::SortDirection::Desc};
+    std::vector<fs::DirEntry> last;
+    for (const auto col : cols) {
+        for (const auto sort_dir : dirs) {
+            std::vector<fs::DirEntry> base = initial;
+            std::sort(base.begin(), base.end(), [&](const fs::DirEntry& a, const fs::DirEntry& b) {
+                return EntryLess(a, b, col, sort_dir);
+            });
+            std::vector<fs::DirEntry> seq = base;
+            for (const auto& event : events)
+                ApplyDirNotify(seq, dir, event, col, sort_dir);
+            std::vector<fs::DirEntry> batch = base;
+            if (ApplyDirNotifyBatch(batch, dir, events, col, sort_dir) != NotifyPatch::Applied ||
+                batch.size() != seq.size()) {
+                same = false;
+                continue;
+            }
+            for (size_t i = 0; i < seq.size(); ++i) {
+                if (seq[i].name != batch[i].name || seq[i].size != batch[i].size ||
+                    seq[i].is_dir != batch[i].is_dir)
+                    same = false;
+            }
+            last = batch;
+        }
+    }
+    Check(same, L"patch batch: identical to per-event patching for every sort order");
+    const auto has = [&](const wchar_t* name) {
+        return std::any_of(last.begin(), last.end(),
+                           [&](const fs::DirEntry& e) { return e.name == name; });
+    };
+    Check(last.size() == 10 && has(L"file3.txt") && has(L"file20.txt") && has(L"omega.txt") &&
+              has(L"gamma.txt") && !has(L"Gamma.txt") && !has(L"beta.log") &&
+              !has(L"delta.txt") && !has(L"temp.tmp") && !has(L"ghost.txt"),
+          L"patch batch: adds, removes, renames and case-only renames resolve");
+    const std::vector<fs::DirNotifyEvent> nested = {
+        ev(FILE_ACTION_ADDED, L"a.txt"), ev(FILE_ACTION_ADDED, L"b.txt"),
+        ev(FILE_ACTION_ADDED, L"c.txt"), ev(FILE_ACTION_ADDED, L"d.txt"),
+        ev(FILE_ACTION_ADDED, L"sub\\file.txt")};
+    std::vector<fs::DirEntry> scratch = initial;
+    Check(ApplyDirNotifyBatch(scratch, dir, nested, ui::SortColumn::Name,
+                              ui::SortDirection::Asc) == NotifyPatch::NeedFullEnum,
+          L"patch batch: nested names require a full enumeration");
+
+    for (const wchar_t* name : {L"alpha.txt", L"gamma.txt", L"omega.txt", L"epsilon.md",
+                                L"file2.txt", L"file3.txt", L"file10.txt", L"file20.txt",
+                                L"zeta.txt"})
+        DeleteFileW(full(name).c_str());
+    RemoveDirectoryW(full(L"docs").c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
 void TestSnapshotStorePutKeepsWorkerGeneration() {
     fs::SnapshotStore store(8);
     auto first = std::make_shared<std::vector<fs::DirEntry>>();
@@ -5585,6 +5693,86 @@ void TestViewLayouts() {
           L"search: dragging the path divider widens the path column");
 }
 
+
+// Content-fitted details columns (1.0.39). No compositor here, so fitted
+// widths are the fallbacks: Date 130, Type 128, Size 90 DIP.
+void TestListColumns() {
+    using K = ui::MainRenderer::ColumnKind;
+    for (float scale : {1.0f, 1.5f, 2.0f}) {
+        ui::MainRenderer r;
+        r.SetScale(scale);
+        auto pane = [&](float w) { return D2D1::RectF(0.0f, 0.0f, w * scale, 400.0f * scale); };
+        auto fills = [&](const ui::MainRenderer::DetailsColumnLayout& c) {
+            float sum = 0.0f;
+            bool positive = true;
+            for (int i = 0; i < c.count; ++i) {
+                sum += c.widths[static_cast<size_t>(i)];
+                positive &= c.widths[static_cast<size_t>(i)] > 0.0f;
+            }
+            return positive && std::abs(sum - (c.right - c.left)) < 0.05f;
+        };
+        auto close_to = [&](float px, float dip) { return std::abs(px - dip * scale) < 0.05f; };
+
+        const auto wide = r.DetailsColumns(pane(1200.0f), {}, false);
+        Check(wide.count == 4 && wide.kinds[0] == K::Name && wide.kinds[1] == K::Date &&
+              wide.kinds[2] == K::Type && wide.kinds[3] == K::Size && fills(wide) &&
+              close_to(wide.Width(K::Date), 130.0f) && close_to(wide.Width(K::Size), 90.0f),
+              L"columns: wide details shows name/date/type/size at fitted widths");
+        const auto mid = r.DetailsColumns(pane(540.0f), {}, false);
+        Check(mid.Has(K::Date) && !mid.Has(K::Type) && mid.Has(K::Size) && fills(mid) &&
+              mid.Width(K::Name) >= 210.0f * scale - 0.05f,
+              L"columns: narrowing hides Type first and keeps the name readable");
+        const auto slim = r.DetailsColumns(pane(400.0f), {}, false);
+        Check(!slim.Has(K::Date) && !slim.Has(K::Type) && slim.Has(K::Size) && fills(slim),
+              L"columns: very narrow panes hide Date after Type");
+        const auto tiny = r.DetailsColumns(pane(200.0f), {}, false);
+        Check(tiny.Width(K::Name) >= 80.0f * scale - 0.05f && fills(tiny),
+              L"columns: the name keeps its 80 DIP floor");
+
+        const auto legacy = r.DetailsColumns(pane(1200.0f), {0.42f, 0.61f, 0.82f}, false);
+        Check(close_to(legacy.Width(K::Date), 130.0f) && close_to(legacy.Width(K::Type), 128.0f),
+              L"columns: pre-1.0.39 divider ratios read back as automatic widths");
+        const auto manual = r.DetailsColumns(pane(1200.0f), {200.0f, 0.0f, 0.0f}, false);
+        Check(close_to(manual.Width(K::Date), 200.0f) && close_to(manual.Width(K::Type), 128.0f),
+              L"columns: a manual DIP width is honoured and the rest stay fitted");
+
+        std::array<float, 3> dividers{};
+        dividers = r.ResizeDetailsColumnDivider(pane(1200.0f), dividers, 0, wide.DividerX(0) - 50.0f * scale);
+        const auto grown = r.DetailsColumns(pane(1200.0f), dividers, false);
+        Check(close_to(grown.Width(K::Date), 180.0f) && close_to(grown.Width(K::Size), 90.0f) &&
+              std::abs(grown.DividerX(1) - wide.DividerX(1)) < 0.05f,
+              L"columns: dragging the name divider resizes Date and keeps its right edge");
+        dividers = r.ResizeDetailsColumnDivider(pane(1200.0f), dividers, 1, grown.DividerX(1) + 20.0f * scale);
+        const auto moved = r.DetailsColumns(pane(1200.0f), dividers, false);
+        Check(close_to(moved.Width(K::Date), 200.0f) && close_to(moved.Width(K::Type), 128.0f),
+              L"columns: dragging between metadata columns resizes the left one only");
+        std::array<float, 4> unused{};
+        r.AutoFitColumnDivider(pane(1200.0f), dividers, false, unused, 1);
+        const auto refit = r.DetailsColumns(pane(1200.0f), dividers, false);
+        Check(dividers[0] == 0.0f && dividers[1] == 0.0f && close_to(refit.Width(K::Date), 130.0f),
+              L"columns: double-click auto-fit restores fitted widths");
+
+        const auto search_wide = r.DetailsColumns(pane(1000.0f), {}, true);
+        Check(search_wide.kinds[1] == K::Path && !search_wide.two_line && fills(search_wide),
+              L"columns: wide search keeps a folder column");
+        const auto search_narrow = r.DetailsColumns(pane(700.0f), {}, true);
+        Check(!search_narrow.Has(K::Path) && search_narrow.two_line && search_narrow.Has(K::Type) &&
+              fills(search_narrow),
+              L"columns: narrow search moves the folder under the name");
+        ui::PaneViewModel vm;
+        vm.view_mode = ui::ViewMode::Details;
+        vm.is_search = true;
+        Check(r.ListRowHeightDip(vm, pane(700.0f)) >= 42.0f && r.ListRowHeightDip(vm, pane(1000.0f)) < 42.0f,
+              L"columns: only the two-line search layout grows the row height");
+        std::array<float, 4> search_dividers{};
+        search_dividers = r.ResizeSearchColumnDivider(pane(1000.0f), search_dividers, 0,
+                                                      search_wide.DividerX(0) - 60.0f * scale);
+        const auto search_moved = r.DetailsColumns(pane(1000.0f), {}, true, search_dividers);
+        Check(std::abs(search_moved.widths[1] - search_wide.widths[1] - 60.0f * scale) < 0.05f,
+              L"columns: the name/folder divider keeps the requested width");
+    }
+}
+
 } // namespace
 
 void TestLinkResolve() {
@@ -6776,6 +6964,13 @@ int RunSelfTest1B2() {
         return g_fail ? 1 : 0;
     }
     if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"snapshot-patch") == 0) {
+        TestSnapshotPatch();
+        TestSnapshotPatchBatch();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
         wcscmp(test_case, L"context-verbs") == 0) {
         DumpContextVerbs();
         if (g_log) { fclose(g_log); g_log = nullptr; }
@@ -6785,6 +6980,13 @@ int RunSelfTest1B2() {
         wcscmp(test_case, L"release-panels-hidden") == 0) {
         TestDetailsPreviewInteraction();
         TestHiddenFiles();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"list-columns") == 0) {
+        TestListColumns();
+        TestViewLayouts();
         if (g_log) { fclose(g_log); g_log = nullptr; }
         return g_fail ? 1 : 0;
     }
@@ -6948,6 +7150,7 @@ int RunSelfTest1B2() {
     TestDirWatch();
     TestNavigateAlwaysEnumerates();
     TestSnapshotPatch();
+    TestSnapshotPatchBatch();
     TestSnapshotStorePutKeepsWorkerGeneration();
     TestDataObject();
     TestClipboardText();
@@ -6955,6 +7158,7 @@ int RunSelfTest1B2() {
     TestMultiSelect();
     TestSplitLayout();
     TestViewLayouts();
+    TestListColumns();
     TestHiddenFiles();
     TestQuickAccess();
     TestPlacesAndIndex();

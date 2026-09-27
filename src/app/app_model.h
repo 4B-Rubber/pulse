@@ -5,6 +5,7 @@
 #include "../fs/fs_snapshot.h"
 #include "../ui/ui_renderer.h"
 #include "places.h"
+#include "column_view_model.h"
 #include "../index/content_result_store.h"
 #include <map>
 #include <memory>
@@ -49,6 +50,10 @@ struct Tab {
     std::array<float, 4> search_column_dividers{};
     std::wstring filter_text;
     bool show_hidden_files = false;
+    // Column (Miller) view toggle and user-dragged widths in DIP
+    // (slot 0 = child column, slot k = k-th ancestor; see ColumnStripWidthDip).
+    bool column_layout = false;
+    std::vector<float> column_widths_dip;
     bool show_protected_os_files = false;
     std::wstring virtual_title; // tag/search views; empty for real folders
     std::wstring banner_title;
@@ -73,6 +78,7 @@ struct Tab {
     std::wstring pending_selected_name;
     std::vector<std::wstring> pending_selected_names;
     bool pending_ensure_selection_visible = false;
+    ColumnStripState column_strip; // listings shown beside the list in column view
     std::wstring git_root;
     std::shared_ptr<std::vector<fs::DirEntry>> search_entries;
     std::shared_ptr<index::ContentResultStore> content_results;
@@ -87,6 +93,17 @@ struct Tab {
     std::shared_ptr<ContentSelectionRestore> content_selection_restore;
     uint64_t selection_revision = 0;
     std::shared_ptr<ContentSizeSummary> content_size_summary;
+    // Cached file-size summary of a snapshot selection (see SelectionSizeSummary).
+    struct SelectionSizeCache {
+        uint64_t revision = UINT64_MAX;
+        const void* snapshot = nullptr;
+        size_t entry_count = 0;
+        int selected_count = -1;
+        uint64_t bytes = 0;
+        int files = 0;
+        int folders = 0;
+    };
+    mutable SelectionSizeCache selection_size_cache;
     std::wstring content_filter;
     // Explicit bulk actions resolve off-page selections asynchronously. These
     // rows are pinned only for the duration of the action, not for browsing.
@@ -116,6 +133,11 @@ struct Tab {
     bool search_relevance = true;
     bool search_allow_scan = false;
     std::wstring search_preserve_selection;
+    // Focused content row identity, captured while row indices still match
+    // content_revision; live deltas re-sort the store and are remapped by it.
+    std::wstring content_focus_path;
+    uint64_t content_focus_selection = UINT64_MAX;
+    uint64_t content_focus_revision = UINT64_MAX;
     std::wstring search_origin_path;
     bool search_origin_valid = false;
     bool search_retaining_results = false;
@@ -152,6 +174,10 @@ struct Tab {
     bool IsSelected(int index) const;
     int SelectedCount() const;
     std::vector<int> SelectedIndices() const;
+    // Sum of selected file sizes (folders counted, not sized). Cached per
+    // selection revision + snapshot so the status bar stays O(1) per paint.
+    // Not for content_results tabs (use ContentSelectionSize).
+    void SelectionSizeSummary(uint64_t* bytes, int* files, int* folders) const;
     void RemapSelection(const std::vector<std::wstring>& names, const std::wstring& focus_name);
 
     // Navigation helpers.

@@ -134,6 +134,21 @@ void UpdateProcessMetrics(AppState& s) {
     s.processSampleTick = now;
 }
 
+// Index status only reaches the screen through search views, the palette and
+// the settings page (see BuildVm); other notifications need no repaint.
+static bool IndexStatusVisible(AppState& s) {
+    if (s.paletteSearching) return true;
+    bool visible = false;
+    ForEachPane(s, [&](app::Pane& pane) {
+        const app::Tab* tab = pane.ActiveTab();
+        std::wstring kind;
+        if (tab && app::ParsePulsePath(tab->current_path, &kind, nullptr) &&
+            (kind == L"search" || kind == L"saved-search" || kind == L"settings"))
+            visible = true;
+    });
+    return visible;
+}
+
 void Render(AppState& s) {
     auto t0 = std::chrono::steady_clock::now();
 
@@ -202,8 +217,23 @@ void Render(AppState& s) {
 
     auto t1 = std::chrono::steady_clock::now();
     s.lastFrameMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    double dt = std::chrono::duration<double>(t1 - s.lastFrameTime).count();
-    if (dt > 0.0) s.lastFps = 1.0 / dt;
+    // FPS = frames presented per second over a sliding ~1 s window of
+    // continuous rendering. Pulse paints on demand: 1/dt of two adjacent
+    // paints reported the idle gap as "1 FPS" and back-to-back paints as
+    // thousands. An idle gap restarts the window instead of being averaged in,
+    // and the value only updates once the window spans enough frames.
+    {
+        using secs = std::chrono::duration<double>;
+        constexpr double kIdleGap = 0.25, kWindow = 1.0, kMinSpan = 0.05;
+        if (!s.fpsWindow.empty() && secs(t1 - s.fpsWindow.back()).count() > kIdleGap)
+            s.fpsWindow.clear();
+        s.fpsWindow.push_back(t1);
+        while (s.fpsWindow.size() > 2 && secs(t1 - s.fpsWindow.front()).count() > kWindow)
+            s.fpsWindow.pop_front();
+        const double span = secs(t1 - s.fpsWindow.front()).count();
+        if (s.fpsWindow.size() >= 3 && span >= kMinSpan)
+            s.lastFps = static_cast<double>(s.fpsWindow.size() - 1) / span;
+    }
     s.lastFrameTime = t1;
 }
 
@@ -259,6 +289,19 @@ static void SaveWindowSession(AppState& s, HWND hwnd) {
     app::SaveSession(snap);
 }
 
+// kTimerUi drives animations and light polling. Minimized or hidden to the
+// tray nothing animates, so poll gently instead of 60 wakeups per second.
+constexpr UINT kUiTimerVisibleMs = 16;
+constexpr UINT kUiTimerHiddenMs = 200;
+static UINT g_uiTimerMs = kUiTimerVisibleMs;
+
+static void SyncUiTimerRate(HWND hwnd, bool visible) {
+    const UINT want = visible ? kUiTimerVisibleMs : kUiTimerHiddenMs;
+    if (want == g_uiTimerMs) return;
+    g_uiTimerMs = want;
+    SetTimer(hwnd, kTimerUi, want, nullptr);
+}
+
 LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     AppState* s = GetAppState(hwnd);
     if (s && s->notification_toast.HandleMessage(hwnd, msg, wParam, lParam)) return 0;
@@ -309,7 +352,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->renderer.SetScale(s->scale);
         s->renderer.SetIconNotifyWindow(hwnd);
         s->quickPreview.Initialize(hwnd, WM_QUICK_PREVIEW_NAVIGATE,
-                                   WM_QUICK_PREVIEW_OPEN);
+                                   WM_QUICK_PREVIEW_OPEN, WM_QUICK_PREVIEW_COMMAND);
 
         s->window_tabs.EnsureDefault();
         BindCurrentLayout(*s);
@@ -380,6 +423,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             StartShellRegistryWatch(hwnd);
         }
         s->renderer.SetRowHeightDip(static_cast<float>(s->appPrefs.row_height));
+        s->renderer.SetListStyle(s->appPrefs.list_smart_date, s->appPrefs.list_zebra_rows,
+                                 s->appPrefs.list_size_bar);
         s->renderer.SetSidebarWidthDip(static_cast<float>(s->appPrefs.sidebar_width));
         s->renderer.SetTrayIconDip(static_cast<float>(s->appPrefs.tray_icon_size));
         ApplyAccentFromPrefs(*s, true);
@@ -851,6 +896,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
 
+    case WM_SHOWWINDOW:
+        // Sent before the window becomes visible; restore full rate right away.
+        if (s && wParam && !IsIconic(hwnd)) SyncUiTimerRate(hwnd, true);
+        break;
+
     case WM_ACTIVATE:
         if (s) s->renderer.NotifyPreviewActivate(LOWORD(wParam) != WA_INACTIVE);
         break;
@@ -883,6 +933,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->maximized = (wParam == SIZE_MAXIMIZED);
             // The card is anchored to the chip; a resize invalidates that.
             HideTabGroupCard(*s);
+            if (wParam != SIZE_MINIMIZED && IsWindowVisible(hwnd)) SyncUiTimerRate(hwnd, true);
             if (s->addressEditing) LayoutAddressEditor(*s);
             if (s->filterEditing && !s->filterFocusPending) LayoutFilterEditor(*s);
             if (!s->tagRenameId.empty()) LayoutTagRenameOverlay(*s);
@@ -915,6 +966,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_TIMER: {
         if (s && wParam == kTimerUi) {
+            SyncUiTimerRate(hwnd, IsWindowVisible(hwnd) && !IsIconic(hwnd));
             bool dirty = false;
             if (TickChangeTracking(*s)) dirty = true;
             DrainDirNotifies(*s);
@@ -1116,7 +1168,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
             return TRUE;
         }
-        if (s->columnResizing || hit.region == ui::HitTestResult::ColumnDivider) {
+        if (s->columnResizing || hit.region == ui::HitTestResult::ColumnDivider ||
+            s->stripResizing || hit.region == ui::HitTestResult::ColumnStripDivider) {
             SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
             return TRUE;
         }
@@ -1219,6 +1272,14 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ShowOmnibar(*s, OmnibarMode::Path);
             return 0;
         }
+        // Alt+Enter arrives as WM_SYSKEYDOWN, so HandleKeyDown's advertised
+        // Properties shortcut (alt && VK_RETURN) was unreachable.
+        if (s && wParam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000))
+            return HandleKeyDown(s, hwnd, msg, wParam, lParam);
+        break;
+
+    case WM_SYSCHAR:
+        if (wParam == L'\r') return 0; // Alt+Enter handled above; no default beep
         break;
 
     case WM_KEYDOWN:
@@ -1471,13 +1532,13 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 });
             }
             s->pinyinReadyLast = ready;
-            InvalidateRect(hwnd, nullptr, FALSE);
+            if (IndexStatusVisible(*s)) InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     }
 
     case WM_NETWORK_INDEX_NOTIFY: {
-        if (s) InvalidateRect(hwnd, nullptr, FALSE);
+        if (s && IndexStatusVisible(*s)) InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
 
@@ -1593,6 +1654,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     }
+
+    case WM_QUICK_PREVIEW_COMMAND:
+        if (s) HandleQuickPreviewCommand(*s, static_cast<ui::QuickPreviewAction>(wParam),
+                                         (lParam & 1) != 0);
+        return 0;
 
     case WM_NET_PROBE: {
         auto* result = reinterpret_cast<fs::UncProbeResult*>(lParam);
