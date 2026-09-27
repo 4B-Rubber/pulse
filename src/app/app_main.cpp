@@ -860,6 +860,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->detailsPreviewPanning = false;
             s->renderer.EndDetailsPreviewPan();
             if (GetCapture() == hwnd) ReleaseCapture();
+            // Switching to another app must dismiss an open popup: the menu window
+            // is WS_EX_NOACTIVATE, so it never sees the activation change itself
+            // and its modal loop would keep the card on screen (native menus close).
+            if (s->menu) s->menu->Dismiss();
         }
         if (s) s->renderer.NotifyPreviewActivate(wParam != 0);
         return 0;
