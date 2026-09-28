@@ -329,7 +329,7 @@ private:
             &job_.value, sizeof(job_.value), nullptr, nullptr) != FALSE;
         STARTUPINFOEXW startup{};
         startup.StartupInfo.cb = sizeof(startup);
-        startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+        startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW | STARTF_FORCEOFFFEEDBACK;
         startup.StartupInfo.wShowWindow = SW_HIDE;
         startup.lpAttributeList = list;
         PROCESS_INFORMATION process{};

@@ -881,3 +881,17 @@
 // the exclusion list, the other one a server folder.
 #define IDS_REMOVE_EXCLUDE_FOLDER 2034
 #define IDS_REMOVE_SERVER_FOLDER 2035
+
+// Shortcut help card (upstream's numbering, so the id table keeps merging cleanly).
+#define IDS_SHORTCUT_HINTS 2037
+#define IDS_SELECTION_HINT 2038
+#define IDS_SELECTION_KEYS 2039
+#define IDS_HELP_TITLE 2040
+#define IDS_HELP_DESCRIPTION 2041
+#define IDS_HELP_OPEN 2042
+#define IDS_HELP_CLIPBOARD 2043
+#define IDS_HELP_TIP 2044
+// View menu: the Miller column browsing toggle. Not upstream's "分栏" (IDS_COLUMN_LAYOUT),
+// because on this branch "左右分栏 / 四宫格" are the pane layouts and the two entries share a
+// menu - the reader cannot tell them apart otherwise.
+#define IDS_COLUMN_VIEW 2045

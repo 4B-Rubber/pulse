@@ -209,7 +209,8 @@ void AppendBackgroundViewCommands(std::vector<ui::FluentMenuItem>& items,
                                   const BackgroundViewOptions& options) {
     auto view = Item(CmdNone, l10n::Get(l10n::StringId::View).c_str(), L"\xE8A9");
     view.children = BuildViewMenu(options.view_mode, options.details_panel,
-                                  options.show_hidden, options.show_protected);
+                                  options.show_hidden, options.show_protected,
+                                  options.column_layout);
     auto sort = Item(CmdNone, l10n::Get(l10n::StringId::SortBy).c_str(), L"\xE8CB",
                      nullptr, options.can_sort);
     struct SortRow { int command; ui::SortColumn column; l10n::StringId label; };
@@ -286,7 +287,8 @@ std::vector<ui::FluentMenuItem> BuildSplitMenu(int current_preset) {
 }
 
 std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode, bool details_panel,
-                                             bool show_hidden, bool show_protected) {
+                                             bool show_hidden, bool show_protected,
+                                             bool column_layout) {
     static constexpr l10n::StringId labels[] = {
         l10n::StringId::ViewExtraLarge, l10n::StringId::ViewLarge,
         l10n::StringId::MediumIcons, l10n::StringId::ViewSmall,
@@ -312,6 +314,12 @@ std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode, bool de
     panel.checked = details_panel;
     panel.separator_after = true;
     items.push_back(std::move(panel));
+    // Column browsing (parent / current / selected child) is toggled from the pane header too;
+    // the menu entry is what makes it discoverable, and what lets the user get back out of it.
+    auto columns = Item(CmdColumnLayout, l10n::Get(l10n::StringId::ColumnView).c_str(), L"");
+    columns.checked = column_layout;
+    columns.separator_after = true;
+    items.push_back(std::move(columns));
     // The visibility switches live here too: reaching them through the settings page means
     // leaving the folder the user is looking at.
     auto hidden = Item(CmdToggleHiddenItems,
@@ -323,6 +331,10 @@ std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode, bool de
     protected_files.checked = show_protected;
     items.push_back(std::move(protected_files));
     return items;
+}
+
+ui::FluentMenuItem BuildShortcutHints() {
+    return Item(CmdShortcutHelp, l10n::Get(l10n::StringId::ShortcutHints).c_str(), L"\xE946");
 }
 
 static std::wstring DisplayPath(const std::wstring& path) {
@@ -426,6 +438,7 @@ std::vector<ui::FluentMenuItem> BuildCommandPalette(const std::wstring& query,
         add_cmd(CmdCopyPath, l10n::Get(l10n::StringId::CopyPath).c_str(), kGlyphLink, L"Ctrl+Shift+C");
         add_cmd(CmdInstallFullIndex, l10n::Get(l10n::StringId::EnableFullIndex).c_str(), kGlyphSearch, nullptr);
         add_cmd(CmdSettings, l10n::Get(l10n::StringId::Settings).c_str(), kGlyphSettings, nullptr);
+        add_cmd(CmdShortcutHelp, l10n::Get(l10n::StringId::ShortcutHints).c_str(), L"\xE946", nullptr);
         add_cmd(CmdOpenRecycle, l10n::Get(l10n::StringId::RecycleBin).c_str(), kGlyphRecycle, nullptr);
         add_cmd(CmdBatchRename, l10n::Get(l10n::StringId::BatchRename).c_str(), kGlyphRename, L"Ctrl+Shift+R");
         add_cmd(CmdAdvancedSearch, l10n::Get(l10n::StringId::AdvancedSearch).c_str(), kGlyphSearch, L"Ctrl+Shift+F");

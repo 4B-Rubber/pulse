@@ -4,6 +4,8 @@
 #include "global_search_controller.h"
 #include "../ui/lumatext_renderer.h"
 #include "../ui/fluent_menu.h"
+#include "../ui/shortcut_help.h"
+#include "app_column_view.h"
 #include "../ui/drag_drop.h"
 #include "../ui/file_operation_dialog.h"
 #include "../ui/batch_rename_dialog.h"
@@ -634,6 +636,14 @@ void DispatchMenuCommand(AppState& s, int cmd) {
     // The view menu carries these two so a folder full of dotfiles can be inspected
     // without leaving it for the settings page. They write the same preference the page
     // does, so both stay in step.
+    case app::CmdColumnLayout:
+        // -1 lands on the focused pane; virtual views ignore the flag (Eligible()), so the
+        // entry is a no-op there rather than a broken column strip.
+        ToggleColumnLayout(s, -1);
+        break;
+    case app::CmdShortcutHelp:
+        ui::ShowShortcutHelp(s.hwnd, s.darkMode, s.accentColor);
+        break;
     case app::CmdToggleHiddenItems:
         s.appPrefs.show_hidden_files = !s.appPrefs.show_hidden_files;
         s.appPrefs.Save();
@@ -1068,6 +1078,7 @@ void ShowBackgroundContextMenu(AppState& s, POINT screen_pt) {
     view_options.sort_column = tab->sort_column;
     view_options.sort_direction = tab->sort_direction;
     view_options.details_panel = s.showDetailsPanel;
+    view_options.column_layout = tab->column_layout;
     view_options.can_sort = kind != L"starred" && kind != L"recent";
     view_options.indexed_search = (kind == L"search" || kind == L"saved-search") && !tab->content_results;
     view_options.show_path = kind == L"search" || kind == L"saved-search" || kind == L"recycle";
@@ -1377,9 +1388,14 @@ void ShowViewDropdown(AppState& s, int pane_index) {
     const D2D1_RECT_F button = s.renderer.PaneViewButtonRect(paneRect, filterExpand);
     POINT anchor{ static_cast<LONG>(button.left), static_cast<LONG>(button.bottom) };
     ClientToScreen(s.hwnd, &anchor);
-    const int cmd = s.menu->TrackPopup(anchor, app::BuildViewMenu(
+    auto items = app::BuildViewMenu(
         tab->view_mode, s.showDetailsPanel,
-        s.appPrefs.show_hidden_files, s.appPrefs.show_protected_os_files));
+        s.appPrefs.show_hidden_files, s.appPrefs.show_protected_os_files,
+        tab->column_layout);
+    // The shortcut card closes the dropdown, the way upstream's menu does.
+    if (!items.empty()) items.back().separator_after = true;
+    items.push_back(app::BuildShortcutHints());
+    const int cmd = s.menu->TrackPopup(anchor, items);
     if (cmd != app::CmdNone) DispatchMenuCommand(s, cmd);
 }
 

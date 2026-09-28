@@ -66,6 +66,7 @@ bool ShellClient::SpawnChild() {
     cmd += std::to_wstring(GetCurrentProcessId());
 
     STARTUPINFOW si{ sizeof(si) };
+    si.dwFlags = STARTF_FORCEOFFFEEDBACK; // hidden shell host: no AppStarting cursor
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {

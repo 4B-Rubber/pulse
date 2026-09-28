@@ -5665,20 +5665,24 @@ void TestViewLayouts() {
     Check(list.MaxScrollX() > 0 && list.MaxScrollY() == 0,
           L"view: list is column-major with horizontal scrolling");
     auto menu = BuildViewMenu(ui::ViewMode::Details);
-    Check(menu.size() == 11 && menu[5].radio && !menu[0].radio &&
+    Check(menu.size() == 12 && menu[5].radio && !menu[0].radio &&
           menu[8].command == CmdDetailsPanel &&
-          menu[9].command == CmdToggleHiddenItems &&
-          menu[10].command == CmdToggleProtectedItems,
-          L"view: menu has eight view choices plus panel and visibility switches");
+          menu[9].command == CmdColumnLayout &&
+          menu[10].command == CmdToggleHiddenItems &&
+          menu[11].command == CmdToggleProtectedItems,
+          L"view: menu has eight view choices plus panel, column browsing and the switches");
     Check(menu[0].glyph_scale > menu[1].glyph_scale &&
           menu[1].glyph_scale > menu[2].glyph_scale,
           L"view: icon menu communicates extra-large, large, and medium scale");
     auto hidden_menu = BuildViewMenu(ui::ViewMode::Details, false, true, false);
-    Check(hidden_menu[9].checked && !hidden_menu[10].checked && hidden_menu[10].enabled,
+    Check(hidden_menu[10].checked && !hidden_menu[11].checked && hidden_menu[11].enabled,
           L"view: the hidden switch reflects the preference and frees the protected one");
     auto quiet_menu = BuildViewMenu(ui::ViewMode::Details, false, false, false);
-    Check(!quiet_menu[9].checked && !quiet_menu[10].enabled,
+    Check(!quiet_menu[10].checked && !quiet_menu[11].enabled,
           L"view: protected files stay unreachable until hidden items show");
+    auto column_menu = BuildViewMenu(ui::ViewMode::Details, false, false, false, true);
+    Check(column_menu[9].checked && !menu[9].checked,
+          L"view: column browsing shows as a checked menu entry");
 
     ui::MainRenderer columns;
     columns.SetScale(1.0f);

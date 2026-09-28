@@ -79,6 +79,7 @@ bool IndexClient::SpawnHelper() {
     }
     std::wstring cmd = L"\"" + exe + L"\" " + std::to_wstring(GetCurrentProcessId());
     STARTUPINFOW si{ sizeof(si) };
+    si.dwFlags = STARTF_FORCEOFFFEEDBACK; // background index host: no AppStarting cursor
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {

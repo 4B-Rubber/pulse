@@ -91,12 +91,15 @@ enum MenuCmd : int {
     CmdOpenRecycle,
     CmdPinQuickAccess,
     CmdUnpinQuickAccess,
+    // Opens the file-list shortcut card (id kept clear of the 170s used above).
+    CmdShortcutHelp = 182,
     CmdToggleHiddenItems = 185,   // view menu: show hidden files toggle
     CmdToggleProtectedItems,      // view menu: show protected OS files toggle
     CmdUnblockFile = 187,         // item menu: drop the Zone.Identifier stream
     CmdHashSha256,                // item menu: copy the SHA-256 of the selected file
     CmdHashMd5,                   // item menu: copy the MD5 of the selected file
     CmdViewRecentChanges = 180,
+    CmdColumnLayout = 181,        // view menu: Miller column browsing toggle
     CmdRecentBase = 200,
     CmdIndexBase = 1000,
     // Explorer integration (优化.md §7): registry static verbs bound to the
@@ -156,6 +159,7 @@ struct BackgroundViewOptions {
     ui::SortColumn sort_column = ui::SortColumn::Name;
     ui::SortDirection sort_direction = ui::SortDirection::Asc;
     bool details_panel = false;
+    bool column_layout = false;
     bool can_sort = true;
     bool indexed_search = false;
     bool show_path = false;
@@ -175,6 +179,9 @@ std::vector<ui::FluentMenuItem> BuildRecyclePlaceMenu(bool can_empty);
 // Toolbar "新建▾" dropdown (reuses the same FluentMenu component).
 std::vector<ui::FluentMenuItem> BuildNewMenu();
 
+// The shortcut help card entry: the view dropdown and the background menu end with it.
+ui::FluentMenuItem BuildShortcutHints();
+
 std::vector<ui::FluentMenuItem> BuildBreadcrumbMenu(bool filesystem);
 
 // Split-button layout presets.
@@ -182,7 +189,8 @@ std::vector<ui::FluentMenuItem> BuildSplitMenu(int current_preset);
 std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode,
                                              bool details_panel = false,
                                              bool show_hidden = false,
-                                             bool show_protected = false);
+                                             bool show_protected = false,
+                                             bool column_layout = false);
 
 // Ctrl+K / address omnibar: verbs + index hits + recent folders at the end.
 struct OmnibarQuery {

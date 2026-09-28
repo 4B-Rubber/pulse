@@ -59,15 +59,19 @@ public:
         }
     }
 private:
-    bool Transfer(void* value,DWORD count,bool write) {
+    bool Transfer(void* value,DWORD count,bool write, DWORD timeout = 5000) {
         HANDLE event=CreateEventW(nullptr,TRUE,FALSE,nullptr); bool ok=true;
+        if (!event) return false;
         auto* bytes=static_cast<uint8_t*>(value);
         while(count) {
+            // A cancelled request must not sit in the pipe until the full timeout: the feed is
+            // polled from the index host, and a page nobody waits for still costs a round trip.
+            if (cancel_ && WaitForSingleObject(cancel_, 0) == WAIT_OBJECT_0) { ok=false; break; }
             OVERLAPPED operation{}; operation.hEvent=event; ResetEvent(event); DWORD done=0;
             BOOL result=write ? WriteFile(pipe_,bytes,count,&done,&operation) : ReadFile(pipe_,bytes,count,&done,&operation);
             if(!result && GetLastError()==ERROR_IO_PENDING) {
                 HANDLE events[]{event,cancel_};
-                const DWORD wait=WaitForMultipleObjects(cancel_ ? 2u : 1u,events,FALSE,5000);
+                const DWORD wait=WaitForMultipleObjects(cancel_ ? 2u : 1u,events,FALSE,timeout);
                 if(wait!=WAIT_OBJECT_0) { CancelIoEx(pipe_,&operation); GetOverlappedResult(pipe_,&operation,&done,TRUE); ok=false; break; }
                 result=GetOverlappedResult(pipe_,&operation,&done,FALSE);
             }

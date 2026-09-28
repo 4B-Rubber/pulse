@@ -259,6 +259,9 @@ bool ContentSearchClient::EnsurePersistent() {
     const auto exe = ExePath();
     std::wstring command = L"\"" + exe + (mode_ == ContentAgentMode::Instant ? L"\" --content-instant-agent " : read_only_ ? L"\" --content-index-observer " : L"\" --content-index-agent ") + persistent_token_ + L" " + std::to_wstring(GetCurrentProcessId());
     STARTUPINFOW startup{sizeof(startup)}; PROCESS_INFORMATION created{};
+    // Background agent: asking the shell not to raise the AppStarting cursor is what keeps the
+    // desktop and other windows free of the blue ring while this starts.
+    startup.dwFlags = STARTF_FORCEOFFFEEDBACK;
     if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &created)) {
         std::lock_guard lock(state_mu_); status_.error = GetLastError(); return false;
     }
@@ -423,6 +426,7 @@ void ContentSearchClient::Run(ContentSearchRequest request, const std::shared_pt
         const auto exe = ExePath(); token = NewToken();
         std::wstring command = L"\"" + exe + L"\" --content-agent " + token;
         STARTUPINFOW startup{sizeof(startup)}; PROCESS_INFORMATION created{};
+        startup.dwFlags = STARTF_FORCEOFFFEEDBACK; // no AppStarting cursor
         if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &created)) {
             fail(GetLastError()); return;
         }

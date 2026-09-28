@@ -82,6 +82,7 @@ bool NetworkAgentClient::EnsureAgent(bool force) {
     const std::wstring exe = ExePath();
     if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
     STARTUPINFOW startup{ sizeof(startup) };
+    startup.dwFlags = STARTF_FORCEOFFFEEDBACK; // background agent: no AppStarting cursor
     PROCESS_INFORMATION process{};
     std::wstring command = L"\"" + exe + L"\" --network-agent";
     if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE,

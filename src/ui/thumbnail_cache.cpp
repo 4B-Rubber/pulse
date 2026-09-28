@@ -55,6 +55,7 @@ bool ThumbnailCache::Connect() {
     std::wstring cmd = L"\"" + std::wstring(exe) + L"Pulse.Preview.exe\" " +
         std::to_wstring(pipe_token_);
     STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_FORCEOFFFEEDBACK; // background helper: no AppStarting cursor
     if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
                         nullptr, nullptr, &si, &child_)) return false;
     const ULONGLONG deadline = GetTickCount64() + 3000;
