@@ -263,6 +263,19 @@ static bool SessionWritable(const AppState& s) {
     return !s.shot.active && !s.menushot && (!s.isolatedTest || s.isolatedTestPersist) &&
         !ShellTagHeadlessLaunch();
 }
+// Recent, starred and tag views list real files that live in folders nobody has open, so no
+// directory notification ever reaches them: a slow pass re-reads them instead, and coming back
+// to the window does it right away (that is when the user looks at the list again).
+constexpr ULONGLONG kVirtualViewRefreshMs = 10000;
+constexpr ULONGLONG kVirtualViewForegroundRefreshMs = 3000;
+static ULONGLONG virtual_view_refresh_tick = 0;
+
+static void MaybeRefreshVirtualViews(AppState& s, bool allow_network_paths, ULONGLONG min_gap_ms) {
+    const ULONGLONG now = GetTickCount64();
+    if (now - virtual_view_refresh_tick < min_gap_ms) return;
+    virtual_view_refresh_tick = now;
+    RefreshPathBackedViews(s, allow_network_paths);
+}
 
 static app::SessionSnapshot CaptureWindowSession(AppState& s, HWND hwnd) {
     app::SessionSnapshot snap;
@@ -323,6 +336,9 @@ static void TickSessionAutosave(AppState& s, HWND hwnd, ULONGLONG now) {
     // GetKeyState is not used: its queued button state can stay "down" after a click
     // whose button-up a drag-detect loop consumed, which silently stopped autosave.
     if (GetCapture() != nullptr || s.sidebarResizing) return;
+    // A second window owns none of the persisted layout: the autosave must not
+    // replace the primary's session with its own.
+    if (s.secondaryInstance || s.mergedAway) return;
     SaveWindowSession(s, hwnd, false);
 }
 
@@ -756,6 +772,14 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         StartLoadingPath(*s, *s->pane->ActiveTab(), startPath,
             !s->shot.active && !s->session_path.empty()
                 ? PathLoadReason::RestoreSession : PathLoadReason::Navigate);
+        // After StartLoadingPath: it clears the pending rows of a fresh load, so the
+        // hand-off has to be armed behind it. A window started by tearing a tab out of
+        // another one then puts the rows that tab had selected back under the cursor
+        // (and its details preview follows the same file).
+        if (app::Tab* opened = s->pane->ActiveTab()) {
+            opened->pending_selected_names = std::move(s->pending_handoff_names);
+            opened->pending_selected_name = std::move(s->pending_handoff_focus);
+        }
         RememberPath(*s, startPath);
         if (!s->shot.active && s->session_path.empty() && !s->open_path.empty())
             SelectLaunchedFile(*s, s->open_path);
@@ -930,7 +954,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             return TRUE; // acceptance, not a claim that asynchronous enumeration succeeded
         }
         std::wstring path;
-        if (s && app::SingleInstanceCoordinator::DecodeTabTransfer(cds, path)) {
+        app::SingleInstanceCoordinator::TabTransfer transfer;
+        if (s && app::SingleInstanceCoordinator::DecodeTabTransfer(cds, transfer)) {
             // The window that sent this is closing: the tab it could not keep is
             // ours now, and so are the resources it used to own. Always a new
             // tab - the tab the user dragged has to show up here, even when this
@@ -938,6 +963,24 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // activates the existing tab instead).
             // A virtual location ("pulse:recent", a tag, a search) is opened as
             // it is; only a real path is resolved to its folder.
+            const std::wstring resolved =
+                fs::IsVirtualPath(transfer.path) ? transfer.path
+                                                 : ResolveOpenFolderPath(transfer.path);
+            if (!resolved.empty()) {
+                NewTab(*s, resolved);
+                if (app::Tab* opened = s->pane ? s->pane->ActiveTab() : nullptr) {
+                    // The rows the user had selected travel too, so this window shows
+                    // the same file under the cursor (and previews it) once its listing
+                    // arrives.
+                    opened->pending_selected_names = std::move(transfer.selected_names);
+                    opened->pending_selected_name = std::move(transfer.focus_name);
+                }
+            }
+            AdoptSingletonOwnership(*s);
+            return TRUE;
+        }
+        if (s && app::SingleInstanceCoordinator::DecodeTabTransfer(cds, path)) {
+            // A window of an older build hands the folder over without its selection.
             const std::wstring resolved =
                 fs::IsVirtualPath(path) ? path : ResolveOpenFolderPath(path);
             if (!resolved.empty()) NewTab(*s, resolved);
@@ -1026,6 +1069,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->renderer.EndDetailsPreviewPan();
             if (GetCapture() == hwnd) ReleaseCapture();
         }
+        // The user is looking at the window again: a list of files that live elsewhere should
+        // be current by the time they read it (network paths included - they may be back).
+        if (s && wParam) MaybeRefreshVirtualViews(*s, true, kVirtualViewForegroundRefreshMs);
         if (s) s->renderer.NotifyPreviewActivate(wParam != 0);
         return 0;
 
@@ -1124,6 +1170,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const ULONGLONG now = GetTickCount64();
             TickUpdates(*s, now);
             TickSessionAutosave(*s, hwnd, now);
+            // Path-backed virtual views (Recent, starred, a tag) get re-read on a slow pass.
+            MaybeRefreshVirtualViews(*s, false, kVirtualViewRefreshMs);
             if (s->renderer.TickDetailsPreview(now)) dirty = true;
             if (s->renderer.TickMotion(now)) {
                 // Paced by the frame pump when it runs; the timer only
@@ -2411,6 +2459,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         } else if (wcscmp(__wargv[i], L"--shot-details-multi") == 0) {
             state.shot_details = true;
             state.shot_details_multi = true;
+        } else if (wcscmp(__wargv[i], L"--entry") == 0 && i + 1 < __argc) {
+            // A torn-off tab's selection, one flag per entry (mirrors the transfer
+            // message another window sends).
+            state.pending_handoff_names.emplace_back(__wargv[++i]);
+        } else if (wcscmp(__wargv[i], L"--focus") == 0 && i + 1 < __argc) {
+            state.pending_handoff_focus = __wargv[++i];
         } else if (wcscmp(__wargv[i], L"--shot-scale") == 0 && i + 1 < __argc) {
             state.shot_scale_override = std::clamp(
                 static_cast<float>(_wtof(__wargv[++i])), 1.0f, 2.5f);

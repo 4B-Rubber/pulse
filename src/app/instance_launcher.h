@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <windows.h>
 
 namespace pulse::app {
@@ -10,6 +11,12 @@ namespace pulse::app {
 // asked for it instead of opening a tab there. `path` may be empty, in which
 // case the new window picks its own starting folder.
 bool LaunchNewWindow(const std::wstring& path);
+
+// A tab torn off to the desktop keeps what the user had selected: the entries
+// travel as `--entry`/`--focus` names, so the new window selects the same rows
+// (and previews the same file) once its folder has loaded.
+bool LaunchNewWindow(const std::wstring& path, const std::vector<std::wstring>& selected_names,
+                     const std::wstring& focus_name);
 
 // The Pulse window under a screen point, unless it is `exclude` - the window
 // that is asking, such as a tab drag source. Each instance is one window, so

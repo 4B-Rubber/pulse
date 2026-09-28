@@ -24,10 +24,20 @@ std::wstring Quoted(const std::wstring& text) {
 } // namespace
 
 bool LaunchNewWindow(const std::wstring& path) {
+    return LaunchNewWindow(path, {}, {});
+}
+
+bool LaunchNewWindow(const std::wstring& path, const std::vector<std::wstring>& selected_names,
+                     const std::wstring& focus_name) {
     wchar_t exe[MAX_PATH]{};
     if (GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe)) == 0) return false;
     std::wstring arguments = L"--new-window";
     if (!path.empty()) arguments += L" " + Quoted(path);
+    // One flag per entry: a file name may contain any separator an argument list
+    // could use, so the names never share one argument.
+    for (const auto& name : selected_names)
+        if (!name.empty()) arguments += L" --entry " + Quoted(name);
+    if (!focus_name.empty()) arguments += L" --focus " + Quoted(focus_name);
     const auto result = ShellExecuteW(nullptr, L"open", exe, arguments.c_str(),
                                       nullptr, SW_SHOWNORMAL);
     return reinterpret_cast<INT_PTR>(result) > 32;

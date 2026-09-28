@@ -36,12 +36,26 @@ public:
     // on another Pulse window. The target opens the folder as its own tab.
     static bool SendOpenPathToWindow(HWND target, const std::wstring& path,
                                      DWORD timeout_ms = 2000);
+    // A tab dropped on another window, together with what the user had selected
+    // there: the receiving window puts the same rows back under the cursor and
+    // its details preview follows the same file. Names, not indices, because the
+    // receiving window sorts and filters on its own.
+    struct TabTransfer {
+        std::wstring path;
+        std::wstring focus_name;
+        std::vector<std::wstring> selected_names;
+    };
     // The last tab of a window, dropped on another one: the source has nothing
     // left to show and closes, so the target also takes over the singleton
     // resources the source is about to release (mutex, tray, hotkey, session).
     static bool SendTabTransfer(HWND target, const std::wstring& path,
                                 DWORD timeout_ms = 2000);
     static bool DecodeTabTransfer(const COPYDATASTRUCT* data, std::wstring& path);
+    // The same hand-off carrying the selection. Both shapes are accepted on the
+    // receiving side: a window of an older build sends the path-only message.
+    static bool SendTabTransfer(HWND target, const TabTransfer& transfer,
+                                DWORD timeout_ms = 2000);
+    static bool DecodeTabTransfer(const COPYDATASTRUCT* data, TabTransfer& transfer);
 
     static bool DecodeOpenPath(const COPYDATASTRUCT* data, std::wstring& path);
     static ULONG_PTR OpenPathMessageId() noexcept;

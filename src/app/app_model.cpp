@@ -446,9 +446,20 @@ void Tab::RemapSelection(const std::vector<std::wstring>& names, const std::wstr
     }
     std::unordered_set<std::wstring> want(names.begin(), names.end());
     for (int i = 0; i < n; ++i) {
-        if (!EntryVisible(i) || !want.contains(EntryAt(static_cast<size_t>(i)).name)) continue;
+        if (!EntryVisible(i)) continue;
+        const fs::DirEntry& entry = EntryAt(static_cast<size_t>(i));
+        // Entry names for a real folder; full paths for a virtual view (Recent, starred, a
+        // tag): those rows have no folder to join a leaf name onto, and two of them may share
+        // one. A hand-off from another window lands here, so both keys are accepted.
+        if (!want.contains(entry.name) &&
+            (entry.full_path.empty() || !want.contains(entry.full_path))) {
+            continue;
+        }
         selected.insert(i);
-        if (EntryAt(static_cast<size_t>(i)).name == focus_name) selected_index = i;
+        if (entry.name == focus_name ||
+            (!entry.full_path.empty() && entry.full_path == focus_name)) {
+            selected_index = i;
+        }
     }
     if (selected.empty()) {
         SelectOnly(0);
