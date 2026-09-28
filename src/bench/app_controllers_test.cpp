@@ -48,6 +48,7 @@ bool Report(const char* name, bool passed) {
 // shows that folder. The sink records what the sender put on the wire.
 struct TabTransferSink {
     std::wstring path;
+    pulse::app::SingleInstanceCoordinator::TabTransfer transfer;
     ULONG_PTR message_id = 0;
     bool decoded = false;
 };
@@ -58,6 +59,12 @@ LRESULT CALLBACK TabTransferSinkProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
         auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lparam);
         std::wstring path;
         if (sink) sink->message_id = data->dwData;
+        if (sink &&
+            pulse::app::SingleInstanceCoordinator::DecodeTabTransfer(data, sink->transfer)) {
+            sink->decoded = true;
+            sink->path = sink->transfer.path;
+            return TRUE;
+        }
         if (sink && pulse::app::SingleInstanceCoordinator::DecodeTabTransfer(data, path)) {
             sink->decoded = true;
             sink->path = path;
@@ -303,6 +310,21 @@ int wmain(int argc, wchar_t** argv) {
         SingleInstanceCoordinator::SendTabTransfer(sink_hwnd, transferred);
     passed &= Report("tab transfer reaches the window that takes the tab",
         delivered && sink.decoded && sink.path == transferred);
+
+    // The same hand-off with what the user had selected in the tab it left: the
+    // receiving window restores those rows (and previews the same file) instead of
+    // parking on the first entry of the folder.
+    const std::wstring handoff_focus = L"万事达冷链定制CAD插件问题反馈.pdf";
+    SingleInstanceCoordinator::TabTransfer with_selection;
+    with_selection.path = transferred;
+    with_selection.focus_name = handoff_focus;
+    with_selection.selected_names = { L"pipeline_article", handoff_focus };
+    passed &= Report("tab transfer carries the selection the tab had",
+        SingleInstanceCoordinator::SendTabTransfer(sink_hwnd, with_selection) &&
+        sink.decoded && sink.path == transferred &&
+        sink.transfer.focus_name == handoff_focus &&
+        sink.transfer.selected_names.size() == 2 &&
+        sink.transfer.selected_names[1] == handoff_focus);
     COPYDATASTRUCT forwarded{};
     forwarded.dwData = SingleInstanceCoordinator::OpenPathMessageId();
     forwarded.cbData = static_cast<DWORD>((transferred.size() + 1) * sizeof(wchar_t));

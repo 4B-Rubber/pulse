@@ -263,6 +263,10 @@ struct AppState {
     // its own session snapshot must not be written any more, and closing it must
     // not hide it in the tray (there is nothing left to hide).
     bool mergedAway = false;
+    // `--entry` / `--focus` from a tear-off: the rows the tab had selected in the
+    // window it left. Handed to the tab this window creates.
+    std::vector<std::wstring> pending_handoff_names;
+    std::wstring pending_handoff_focus;
     // Taking over the singleton resources (mutex, tray, hotkey, session) from a
     // sibling that is closing. Retried from the UI tick until it succeeds.
     bool adoptPending = false;

@@ -417,14 +417,38 @@ bool HandOffTabUnderCursor(AppState& s, HWND hwnd) {
     // left to show afterwards, so it closes and the window that took the tab
     // takes over the tray, the hotkey and the session from it.
     const bool last_tab = s.window_tabs.items.size() <= 1;
+    // What the user had selected travels with the tab: the receiving window loads
+    // the folder on its own and would otherwise park the selection on the first
+    // row - and preview that file. Keys, not indices: the target sorts and filters
+    // for itself. A real folder hands over entry names; a virtual view (Recent,
+    // starred, a tag, a search) has no folder to join a name onto, so it hands over
+    // the rows' full paths instead. Both are matched back in Tab::RemapSelection.
+    app::SingleInstanceCoordinator::TabTransfer transfer;
+    transfer.path = folder->current_path;
+    const bool virtual_view = fs::IsVirtualPath(folder->current_path);
+    for (const int index : folder->SelectedIndices()) {
+        if (index < 0 || index >= static_cast<int>(folder->EntryCount())) continue;
+        const fs::DirEntry& entry = folder->EntryAt(static_cast<size_t>(index));
+        if (entry.change_record_only) continue;
+        std::wstring key = virtual_view ? EntryFullPath(*folder, index) : entry.name;
+        if (key.empty()) continue;
+        transfer.selected_names.push_back(std::move(key));
+        if (index == folder->selected_index) transfer.focus_name = transfer.selected_names.back();
+    }
+    // The payload has a limit; a huge selection still hands the folder over.
+    if (transfer.selected_names.size() > 512) {
+        transfer.selected_names.resize(512);
+        if (transfer.focus_name.empty()) transfer.focus_name = transfer.selected_names.front();
+    }
     // Every hand-off uses the transfer message: the target always opens a tab of
     // its own, even when it already shows that folder. (The "open path" message
     // is for shell forwards, where activating an existing tab is what the user
     // means by double-clicking a folder.) The takeover it triggers is moot while
     // this window stays alive, and it simply gives up after a moment.
     const bool sent = torn_out
-        ? app::LaunchNewWindow(folder->current_path)
-        : app::SingleInstanceCoordinator::SendTabTransfer(target, folder->current_path);
+        ? app::LaunchNewWindow(transfer.path, transfer.selected_names, transfer.focus_name)
+        : (app::SingleInstanceCoordinator::SendTabTransfer(target, transfer) ||
+           app::SingleInstanceCoordinator::SendTabTransfer(target, transfer.path));
     if (!sent) return false;
     if (last_tab) {
         s.mergedAway = true; // closing now: this window must not be persisted
