@@ -2041,8 +2041,20 @@ void TestMenuModel() {
     options.sort_direction = ui::SortDirection::Desc;
     options.details_panel = true;
     AppendBackgroundViewCommands(bg, options);
-    Check(bg[0].children.size() == 11 && bg[0].children[1].radio &&
-          bg[0].children[8].checked, L"menu: background reflects view and details pane");
+    Check(bg[0].children.size() == 12 && bg[0].children[1].radio &&
+          bg[0].children[8].checked && bg[0].children[9].command == CmdColumnLayout &&
+          !bg[0].children[9].checked, L"menu: background reflects view and details pane");
+    options.column_layout = true;
+    auto column_bg = BuildBackgroundMenu(false, false, L"");
+    AppendBackgroundViewCommands(column_bg, options);
+    bool column_checked = false;
+    for (const auto& top : column_bg) {
+        for (const auto& child : top.children) {
+            if (child.command == CmdColumnLayout && child.checked) column_checked = true;
+        }
+    }
+    Check(column_checked, L"menu: background shows column browsing when the pane is in it");
+    options.column_layout = false;
     const auto& sort = bg[1].children;
     Check(sort.size() == 6 && sort[3].command == CmdSortSize && sort[3].radio &&
           !sort[4].radio && sort[5].radio,
