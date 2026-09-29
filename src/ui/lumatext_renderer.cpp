@@ -389,10 +389,17 @@ struct LumaTextRenderer::Impl {
 
         auto profile_desc = LumaText::Descriptor<lt_render_profile_desc>();
         profile_desc.light = LumaText::Descriptor<lt_render_config>();
-        profile_desc.light.coverage_gamma = 0.85f;
+        // Crisp text: no raster resampling, outlines snapped to the pixel grid, and no coverage
+        // lift. Upstream ships Mitchell filtering with a 0.85 coverage gamma on purpose - it reads
+        // smoother and more uniform - but at list sizes that lift becomes a halo, which is what
+        // makes the UI look blurry next to the shell's own text. Dark keeps a small lift because
+        // light-on-dark strokes are optically thinner and would otherwise look faint.
+        profile_desc.light.coverage_gamma = 1.00f;
         profile_desc.light.coverage_contrast = 1.00f;
-        profile_desc.light.raster_filter = LT_RASTER_FILTER_MITCHELL;
+        profile_desc.light.raster_filter = LT_RASTER_FILTER_DIRECT;
+        profile_desc.light.flags = LT_RENDER_CONFIG_HINTED_OUTLINES;
         profile_desc.dark = profile_desc.light;
+        profile_desc.dark.coverage_gamma = 0.95f;
         profile_desc.regular_optical_weight = 0.0f;
         profile_desc.bold_optical_weight = 0.0f;
 #if defined(PULSE_TEST_LUMATEXT_INIT_FAILURE)
@@ -670,9 +677,13 @@ struct LumaTextRenderer::Impl {
         draw.background = {background.r, background.g, background.b, background.a};
         draw.background_type = LT_BACKGROUND_TRANSPARENT;
         draw.render_config = LumaText::Descriptor<lt_render_config>();
-        draw.render_config.coverage_gamma = 0.85f;
+        // The per-draw config wins over the profile, so the light/dark split has to be made here
+        // too; the text colour says which background it sits on.
+        const float text_luma = 0.299f * foreground.r + 0.587f * foreground.g + 0.114f * foreground.b;
+        draw.render_config.coverage_gamma = text_luma > 0.5f ? 0.95f : 1.00f;
         draw.render_config.coverage_contrast = 1.00f;
-        draw.render_config.raster_filter = LT_RASTER_FILTER_MITCHELL;
+        draw.render_config.raster_filter = LT_RASTER_FILTER_DIRECT;
+        draw.render_config.flags = LT_RENDER_CONFIG_HINTED_OUTLINES;
         draw.profile = profile.get();
 
         const lt_result result = lt_frame_draw_text_layout(frame.get(), layout->get(), &draw);
