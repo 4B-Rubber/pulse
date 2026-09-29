@@ -75,6 +75,7 @@ void Compositor::Shutdown() {
     text_params_monitor_ = nullptr;
     typography::InvalidateCaches();
     textFormat_.reset();
+    fileNameFormat_.reset();
     smallFormat_.reset();
     headerFormat_.reset();
     tabFormat_.reset();
@@ -427,6 +428,7 @@ void Compositor::RecreateTextFormats(float scale) {
     UpdateTextRenderingParams(hwnd_
         ? MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST) : nullptr);
     textFormat_.reset();
+    fileNameFormat_.reset();
     smallFormat_.reset();
     headerFormat_.reset();
     tabFormat_.reset();
@@ -435,6 +437,9 @@ void Compositor::RecreateTextFormats(float scale) {
     CreateFormat(dwriteFactory_.get(), 14.0f * scale, DWRITE_FONT_WEIGHT_NORMAL,
         typography::FontRole::Text, textFormat_);
     if (textFormat_.get()) textFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    CreateFormat(dwriteFactory_.get(), 13.0f * scale, DWRITE_FONT_WEIGHT_NORMAL,
+        typography::FontRole::Text, fileNameFormat_);
+    if (fileNameFormat_.get()) fileNameFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     CreateFormat(dwriteFactory_.get(), 12.0f * scale, DWRITE_FONT_WEIGHT_NORMAL,
         typography::FontRole::Text, smallFormat_);
     if (smallFormat_.get()) smallFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);

@@ -87,8 +87,12 @@ foreach ($mode in @('--service-start-only', '--shutdown-only', '--live-dedup-onl
     if ($LASTEXITCODE -ne 0) { throw "Index lifecycle check $mode failed" }
 }
 $selftestCases = @('rename-editor', 'rename-editor-native', 'operation-toast',
-    'filter-controls', 'rename-outside', 'address-editor', 'address-editor-native', 'release-panels-hidden', 'pr-shell', 'pin-reorder', 'snapshot-patch', 'list-columns')
+    'filter-controls', 'rename-outside', 'address-editor', 'address-editor-native', 'release-panels-hidden', 'pr-shell', 'pin-reorder', 'snapshot-patch', 'list-columns',
+    'filename-render', 'filename-render-native', 'column-resize-ui')
 $selftestLogs = @{
+    'filename-render' = 'bench_data/filename-render/results.log'
+    'filename-render-native' = 'bench_data/filename-render/results.log'
+    'column-resize-ui' = 'bench_data/column-resize/results.log'
     'rename-editor' = 'bench_data/rename-editor/results.log'
     'rename-editor-native' = 'bench_data/rename-editor/results.log'
     'operation-toast' = 'bench_data/operation-toast/results.log'

@@ -777,6 +777,10 @@ struct HitTestResult {
 };
 
 class MainRenderer {
+    // The visual regression cases drive the real renderer end to end, so they need what the
+    // window has: the compositor, the icon cache, the brushes and the pane drawing entry points.
+    friend struct FilenameRenderTest;
+    friend struct ColumnResizeUiTest;
 public:
     MainRenderer();
 

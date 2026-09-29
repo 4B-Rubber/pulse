@@ -682,10 +682,10 @@ bool MainRenderer::PointInItemName(const PaneViewModel& vm, const D2D1_RECT_F& f
         available = std::max(24.0f * scale_, available - overlap_w - tag_gap);
 
     const std::wstring fitted = FitFileName(
-        compositor_, compositor_->DwriteFactory(), compositor_->TextFormat(),
+        compositor_, compositor_->DwriteFactory(), compositor_->FileNameFormat(),
         entry.name, available);
     const float text_width = MeasureLayoutText(
-        compositor_, compositor_->DwriteFactory(), compositor_->TextFormat(), fitted);
+        compositor_, compositor_->DwriteFactory(), compositor_->FileNameFormat(), fitted);
     float text_left = name.left;
     if (icon_grid) {
         const float leftover = std::max(0.0f, (name.right - name.left) - text_width - tag_gap);
@@ -1250,12 +1250,12 @@ void MainRenderer::DrawTruncatedName(const std::wstring& name, float x, float y,
                                      bool dim_extension) {
     (void)selected;
     if (!compositor_ || !compositor_->Dc() || !compositor_->DwriteFactory() ||
-        !compositor_->TextFormat() || name.empty() || w <= 1.0f) {
+        !compositor_->FileNameFormat() || name.empty() || w <= 1.0f) {
         return;
     }
     ID2D1DeviceContext* dc = compositor_->Dc();
     IDWriteFactory2* factory = compositor_->DwriteFactory();
-    IDWriteTextFormat* fmt = compositor_->TextFormat();
+    IDWriteTextFormat* fmt = compositor_->FileNameFormat();
     MakeBrush(dc, theme.text, brText_);
 
     const auto old_wrap = fmt->GetWordWrapping();
@@ -1275,8 +1275,13 @@ void MainRenderer::DrawTruncatedName(const std::wstring& name, float x, float y,
             ext_at = dot;
     }
     const D2D1_COLOR_F ext_color = WithAlpha(theme.text, (theme.bg.r < 0.5f) ? 0.58f : 0.62f);
+    // Shape colored filenames in one layout. Splitting at the extension gives
+    // each substring its own clipping/ellipsis and loses glyph positioning
+    // across the boundary (including the dot's ink and the stem's last glyph),
+    // which is what made long中文 names look chopped in the list.
     ComPtr<IDWriteTextLayout> highlighted;
-    if (!visible_matches.empty() && SUCCEEDED(factory->CreateTextLayout(shown.c_str(),
+    if ((!visible_matches.empty() || ext_at != std::wstring::npos) &&
+        SUCCEEDED(factory->CreateTextLayout(shown.c_str(),
         static_cast<UINT32>(shown.size()), fmt, w, h, &highlighted))) {
         highlighted->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         highlighted->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -1287,17 +1292,6 @@ void MainRenderer::DrawTruncatedName(const std::wstring& name, float x, float y,
                                                             static_cast<UINT32>(shown.size() - ext_at)});
         DrawNameHighlightBackground(compositor_, highlighted.get(), {x, y}, rc, visible_matches, theme, scale_);
         dc->DrawTextLayout({x, y}, highlighted.get(), brText_.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    } else if (ext_at != std::wstring::npos && !IsHighContrast()) {
-        const std::wstring stem = shown.substr(0, ext_at);
-        const std::wstring ext = shown.substr(ext_at);
-        const float stem_w = std::min(w, CellTextWidth(stem));
-        if (!compositor_->DrawLumaText(stem, fmt, D2D1::RectF(x, y, x + stem_w + 2.0f * scale_, y + h),
-                                       brText_->GetColor(), theme.bg, DWRITE_TEXT_ALIGNMENT_LEADING) ||
-            !compositor_->DrawLumaText(ext, fmt, D2D1::RectF(x + stem_w, y, x + w, y + h),
-                                       ext_color, theme.bg, DWRITE_TEXT_ALIGNMENT_LEADING)) {
-            dc->DrawText(shown.c_str(), (UINT32)shown.size(), fmt, &rc, brText_.get(),
-                         D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-        }
     } else if (IsHighContrast() || !compositor_->DrawLumaText(
             shown, fmt, rc, brText_->GetColor(), theme.bg,
             DWRITE_TEXT_ALIGNMENT_LEADING)) {
@@ -1316,7 +1310,7 @@ void MainRenderer::DrawCenteredIconName(const std::wstring& name, const D2D1_REC
     const float height = std::max(1.0f, bounds.bottom - bounds.top);
     ComPtr<IDWriteTextLayout> layout;
     if (FAILED(compositor_->DwriteFactory()->CreateTextLayout(
-            name.c_str(), static_cast<UINT32>(name.size()), compositor_->TextFormat(),
+            name.c_str(), static_cast<UINT32>(name.size()), compositor_->FileNameFormat(),
             width, height, &layout)) || !layout.get()) {
         return;
     }

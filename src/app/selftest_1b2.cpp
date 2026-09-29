@@ -7019,6 +7019,18 @@ int RunSelfTest1B2() {
         return passed ? 0 : 1;
     }
     if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"filename-render") == 0) {
+        const bool passed = RunFilenameRenderTest();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return passed ? 0 : 1;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"column-resize-ui") == 0) {
+        const bool passed = RunColumnResizeUiTest();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return passed ? 0 : 1;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
         wcscmp(test_case, L"folder-shortcut") == 0) {
         TestLinkResolve();
         if (g_log) { fclose(g_log); g_log = nullptr; }

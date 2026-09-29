@@ -249,7 +249,7 @@ void MainRenderer::DrawColumnStripColumn(const WindowViewModel& vm, const PaneVi
         MakeBrush(dc, dim ? WithAlpha(theme.text, 0.55f) : theme.text, brText_);
         const float tx = ix + icon + 8.0f * scale_;
         const float chevron_w = entry.is_dir ? 18.0f * scale_ : 0.0f;
-        DrawTextEndEllipsis(dc, factory, compositor_->TextFormat(), brText_.get(), entry.name,
+        DrawTextEndEllipsis(dc, factory, compositor_->FileNameFormat(), brText_.get(), entry.name,
                             tx, top, std::max(0.0f, cell.right - tx - chevron_w - 4.0f * scale_),
                             row_height_);
         if (entry.is_dir) {
