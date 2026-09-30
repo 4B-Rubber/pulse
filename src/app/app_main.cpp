@@ -679,7 +679,12 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // window that spawned it happened to be showing.
         else if (s->secondaryInstance) startPath = app::MakeRecentPath();
         s->pane->NewTab(startPath);
-        if (s->shot.active) s->pane->ActiveTab()->view_mode = s->shot.view_mode;
+        if (s->shot.active) {
+            s->pane->ActiveTab()->view_mode = s->shot.view_mode;
+            // An explicit --view is this window's decision for that folder. A shot run does not
+            // persist the store, so this stays a no-op there.
+            app::RememberFolderViewMode(*s, startPath, s->shot.view_mode);
+        }
         StartLoadingPath(*s, *s->pane->ActiveTab(), startPath,
             !s->shot.active && !s->session_path.empty()
                 ? PathLoadReason::RestoreSession : PathLoadReason::Navigate);
@@ -1022,6 +1027,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (now - session_autosave_tick >= kSessionAutosaveMs) {
                 session_autosave_tick = now;
                 if (!s->secondaryInstance && !s->mergedAway) SaveWindowSession(*s, s->hwnd);
+                // Entering a folder moved its entry in the view store; it writes only then.
+                s->folderViews.SaveIfVisited();
             }
             if (s->renderer.TickDetailsPreview(now)) dirty = true;
             if (s->detailsPreviewFoldStart) {

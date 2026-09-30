@@ -480,6 +480,8 @@ void ToggleColumnLayout(AppState& s, int pane_index) {
         s.renderer.SetDetailsPanelVisible(true);
     }
     SyncColumnStrips(s);
+    // The layout is part of what this folder was left in.
+    app::RememberFolderView(s, *tab);
     if (s.hwnd) InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 

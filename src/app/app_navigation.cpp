@@ -162,7 +162,12 @@ void OpenWorkspace(AppState& s, int index) {
                 Panes(s)[i]->NewTab(pth);
                 t = Panes(s)[i]->ActiveTab();
             }
-            if (t && i < w.pane_views.size()) t->view_mode = w.pane_views[i];
+            if (t && i < w.pane_views.size()) {
+                t->view_mode = w.pane_views[i];
+                // The workspace names a view for this pane: record it for that folder, or its
+                // own memory would put the old view back the moment the path loads.
+                app::RememberFolderViewMode(s, pth, w.pane_views[i]);
+            }
             if (t) StartLoadingPath(s, *t, pth);
         }
         RememberPath(s, w.root);

@@ -22,6 +22,7 @@ struct FolderView {
     ui::ViewMode view = ui::ViewMode::Details;
     ui::SortColumn sort = ui::SortColumn::Name;
     ui::SortDirection direction = ui::SortDirection::Asc;
+    bool columns = false; // the column (Miller) layout instead of the flat list
     std::array<float, 3> dividers{};
     uint64_t used = 0; // unix seconds; the save keeps the most recent kMaxEntries folders
 };
@@ -44,8 +45,14 @@ public:
 
     void Load();
     void Note(const std::wstring& path, const FolderView& view);
+    // Moves an existing entry to the front of the save order when the folder is entered again:
+    // the trimming is by visit, not by last change, so a folder looked at every day is not
+    // dropped in favour of one whose settings happened to be changed once.
+    void Touch(const std::wstring& path);
     const FolderView* Find(const std::wstring& path) const;
     void Save();
+    // Writes only when a visit moved an entry. The session autosave calls this.
+    void SaveIfVisited();
     size_t size() const noexcept { return views_.size(); }
 
 private:
@@ -53,11 +60,17 @@ private:
     // What the file held at Load(). An entry that still equals it was not touched here, so a
     // save takes the disk copy instead - that is what keeps another window's writes alive.
     Map loaded_;
+    bool visited_ = false;
 };
 
 // Records the view a tab shows for its folder. Virtual views (search, recycle, tags) are not
 // folders and are skipped.
 void RememberFolderView(AppState& s, const Tab& tab);
+
+// Records just the view mode for a folder. A window that names the view itself (a workspace, the
+// --view switch) calls this, so the folder's own memory cannot undo that explicit choice when the
+// path loads a moment later.
+void RememberFolderViewMode(AppState& s, const std::wstring& path, ui::ViewMode view);
 
 // Applies the folder's memory to a tab that just navigated there. The tab keeps what it has
 // when the folder has no memory; virtual views are never touched.

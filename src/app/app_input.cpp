@@ -2676,13 +2676,16 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
                    (PointInList(*s, mx, my) && hit.region == ui::HitTestResult::None))) {
             app::Tab* tab = ActiveTab(*s);
             const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            const bool had_selection = tab && tab->SelectedCount() > 0;
+            // Every freshly listed folder has a row selected, so the click that clears that
+            // selection is also the first half of "double-click empty space to go back" (the
+            // second half is the double-click message plus the release after it). Asking the
+            // click to start from an empty selection made the gesture need three clicks.
             if (tab && !ctrl) tab->ClearSelection();
             s->marqueePending = true;
             s->marqueeActive = false;
             s->marqueeAdditive = ctrl;
             s->blankClickPane = s->pane;
-            s->blankClickTab = s->appPrefs.blank_click_go_back && tab && !had_selection &&
+            s->blankClickTab = s->appPrefs.blank_click_go_back && tab &&
                 !IsAddressSearchResults(tab) && !ctrl && PointInList(*s, mx, my) &&
                 (GetKeyState(VK_SHIFT) & 0x8000) == 0 &&
                 (GetKeyState(VK_MENU) & 0x8000) == 0 ? tab : nullptr;
@@ -2758,6 +2761,8 @@ LRESULT HandleLButtonDblClk(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPA
                     fitTab->details_column_dividers, kind == L"search",
                     fitTab->search_column_dividers, hit.index);
                 if (s->renameIndex >= 0) LayoutRenameOverlay(*s);
+                // The auto-fit moved this folder's column edges: keep them for the next visit.
+                app::RememberFolderView(*s, *fitTab);
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -3119,6 +3124,16 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             s->scrollbarSidebar = false;
             s->splitterDragging = false;
             s->detailsPanelResizing = false;
+            if (s->columnResizing) {
+                // The drag ends here, not in the mouse-move that watches for the released
+                // button: this message is handled first and clears the flag below, so this is
+                // the only place that still knows whose column edges just changed. Keep them
+                // for that folder - the store skips virtual views on its own.
+                if (app::Pane* resizePane = PaneAtSlot(*s, s->columnResizePane)) {
+                    if (app::Tab* resizeTab = resizePane->ActiveTab())
+                        app::RememberFolderView(*s, *resizeTab);
+                }
+            }
             s->columnResizing = false;
             s->columnResizeIndex = -1;
             s->columnResizePane = -1;
@@ -3616,13 +3631,20 @@ LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             {
                 const int n = static_cast<int>(vm.pane.EntryCount());
                 if (n > 0) {
-                    int view = vm.pane.ViewIndex(tab->selected_index);
-                    if (view < 0) view = 0;
                     const int dx = wParam == VK_LEFT ? -1 : (wParam == VK_RIGHT ? 1 : 0);
                     const int dy = wParam == VK_UP ? -1 : (wParam == VK_DOWN ? 1 : 0);
-                    const int next = s->renderer.MoveViewIndex(vm.pane, FocusedPaneRect(*s),
-                                                                view, dx, dy);
-                    tab->MoveFocus(vm.pane.SourceIndex(next), shift);
+                    const int view = vm.pane.ViewIndex(tab->selected_index);
+                    if (view < 0) {
+                        // Nothing is selected yet: the first arrow key lands on the first row
+                        // (the last one when it points up or left), not one row past it.
+                        const bool towards_start = dy < 0 || (dy == 0 && dx < 0);
+                        tab->MoveFocus(vm.pane.SourceIndex(towards_start
+                            ? static_cast<int>(vm.pane.EntryCount()) - 1 : 0), shift);
+                    } else {
+                        const int next = s->renderer.MoveViewIndex(vm.pane, FocusedPaneRect(*s),
+                                                                    view, dx, dy);
+                        tab->MoveFocus(vm.pane.SourceIndex(next), shift);
+                    }
                     EnsureRowVisible(*s, *tab, tab->selected_index);
                 }
             }
@@ -3632,9 +3654,10 @@ LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 const int n = static_cast<int>(vm.pane.EntryCount());
                 const int page = s->renderer.PageDelta(vm.pane, FocusedPaneRect(*s));
                 if (n > 0) {
-                    int view = vm.pane.ViewIndex(tab->selected_index);
-                    if (view < 0) view = 0;
-                    const int next = std::min(n - 1, view + page);
+                    const int view = vm.pane.ViewIndex(tab->selected_index);
+                    // With nothing selected the first page key starts at the top of the list
+                    // instead of a page into it.
+                    const int next = view < 0 ? 0 : std::min(n - 1, view + page);
                     tab->MoveFocus(vm.pane.SourceIndex(next), shift);
                     EnsureRowVisible(*s, *tab, tab->selected_index);
                 }
@@ -3645,9 +3668,11 @@ LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 const int n = static_cast<int>(vm.pane.EntryCount());
                 const int page = s->renderer.PageDelta(vm.pane, FocusedPaneRect(*s));
                 if (n > 0) {
-                    int view = vm.pane.ViewIndex(tab->selected_index);
-                    if (view < 0) view = 0;
-                    const int next = std::max(0, view - page);
+                    const int view = vm.pane.ViewIndex(tab->selected_index);
+                    // Nothing selected yet: land on the last row, the way the arrow keys do.
+                    const int next = view < 0
+                        ? static_cast<int>(vm.pane.EntryCount()) - 1
+                        : std::max(0, view - page);
                     tab->MoveFocus(vm.pane.SourceIndex(next), shift);
                     EnsureRowVisible(*s, *tab, tab->selected_index);
                 }

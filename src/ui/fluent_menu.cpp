@@ -923,6 +923,24 @@ bool FluentMenu::EnsureFilterEdit() {
     return true;
 }
 
+bool FluentMenu::PresentFilterEdit(HWND edit) {
+    if (!edit || !compositor_ || !compositor_->LumaTextEnabled()) return false;
+    HideCaret(edit);
+    const D2D1_COLOR_F fg = dark_
+        ? D2D1::ColorF(1.0f, 1.0f, 1.0f)
+        : D2D1::ColorF(26.0f / 255.0f, 26.0f / 255.0f, 26.0f / 255.0f);
+    const D2D1_COLOR_F bg = dark_
+        ? D2D1::ColorF(30.0f / 255.0f, 30.0f / 255.0f, 30.0f / 255.0f)
+        : D2D1::ColorF(1.0f, 1.0f, 1.0f);
+    if (compositor_->PresentLumaEdit(edit, compositor_->TextFormat(), fg, bg)) return true;
+    // No compositor surface for this field - the same fallback the hosted editors make: stop
+    // blinking our own caret and let the control paint its text the system way, rather than
+    // leaving the characters typed into a control nobody draws.
+    KillTimer(edit, 71);
+    ShowCaret(edit);
+    return false;
+}
+
 void FluentMenu::PlaceFilterEdit(int y_offset_px) {
     if (!edit_ || !filter_fn_ || external_edit_) return;
     const float s = scale_;
@@ -1036,6 +1054,17 @@ LRESULT CALLBACK FluentMenu::FilterEditProc(HWND hwnd, UINT msg, WPARAM wParam, 
         {
             LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
             self->SyncFilterFromEdit();
+            // This field is painted by the compositor, so a keystroke has to re-present it: an
+            // EDIT that only invalidates itself would leave the typed text unpainted until
+            // something else repaints the whole menu.
+            if (!self->PresentFilterEdit(hwnd)) InvalidateRect(hwnd, nullptr, TRUE);
+            return lr;
+        }
+    case WM_IME_ENDCOMPOSITION:
+        {
+            const LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
+            self->SyncFilterFromEdit();
+            if (!self->PresentFilterEdit(hwnd)) InvalidateRect(hwnd, nullptr, TRUE);
             return lr;
         }
     case WM_PASTE:
@@ -1043,32 +1072,15 @@ LRESULT CALLBACK FluentMenu::FilterEditProc(HWND hwnd, UINT msg, WPARAM wParam, 
         {
             LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
             self->SyncFilterFromEdit();
-            InvalidateRect(hwnd, nullptr, FALSE);
+            if (!self->PresentFilterEdit(hwnd)) InvalidateRect(hwnd, nullptr, TRUE);
             return lr;
         }
     case WM_PAINT: {
         if (!self->compositor_ || !self->compositor_->LumaTextEnabled()) break;
-        HideCaret(hwnd);
-        const D2D1_COLOR_F fg = self->dark_
-            ? D2D1::ColorF(1.0f, 1.0f, 1.0f)
-            : D2D1::ColorF(26.0f / 255.0f, 26.0f / 255.0f, 26.0f / 255.0f);
-        const D2D1_COLOR_F bg = self->dark_
-            ? D2D1::ColorF(30.0f / 255.0f, 30.0f / 255.0f, 30.0f / 255.0f)
-            : D2D1::ColorF(1.0f, 1.0f, 1.0f);
-        if (!self->compositor_->PresentLumaEdit(hwnd, self->compositor_->TextFormat(),
-                                                fg, bg)) {
-            PAINTSTRUCT ps{};
-            HDC hdc = BeginPaint(hwnd, &ps);
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-            if (!self->edit_brush_) {
-                self->edit_brush_ = CreateSolidBrush(
-                    self->dark_ ? RGB(30, 30, 30) : RGB(255, 255, 255));
-            }
-            FillRect(hdc, &rc, self->edit_brush_);
-            EndPaint(hwnd, &ps);
-        }
-        return 0;
+        if (self->PresentFilterEdit(hwnd)) return 0;
+        // Without a compositor surface the control paints itself: leave the switch so the
+        // message reaches DefSubclassProc instead of filling the field with a blank rectangle.
+        break;
     }
     case WM_SETFOCUS: {
         LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);

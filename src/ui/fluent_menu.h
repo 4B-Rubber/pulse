@@ -175,6 +175,10 @@ private:
     void PlaceFilterEdit(int y_offset_px);
     void HideFilterEdit();
     void SyncFilterFromEdit();
+    // Paints the filter field through the compositor and keeps the caret in step. False when
+    // LumaText is off or the present failed: the caller then lets the EDIT paint itself, so a
+    // typed character can never end up as an empty rectangle.
+    bool PresentFilterEdit(HWND edit);
     bool IsPaletteHwnd(HWND hwnd) const;
     bool RenderSurface(const FluentMenuModel& model, int hover_row, int hover_swatch,
                        float header_px, bool draw_filter_field, Surface& s);

@@ -58,12 +58,25 @@ uint64_t ExtractUsed(const std::wstring& block) {
     return _wcstoui64(block.c_str() + pos, nullptr, 10);
 }
 
+// "This PC" lists the drives with an empty path: it is a location like any folder, so it gets a
+// key of its own instead of being skipped. Real virtual views (search, recent, a tag, recycle)
+// are not folders and keep being skipped. The store is ours, so a pulse: key is free to use.
+constexpr wchar_t kThisPcKey[] = L"pulse:this-pc";
+
+std::wstring StoreKey(const std::wstring& path) {
+    const std::wstring folder = fs::NormalizePath(path);
+    if (folder.empty()) return kThisPcKey;
+    if (fs::IsVirtualPath(folder)) return std::wstring();
+    return folder;
+}
+
 FolderView ParseEntry(const std::wstring& block) {
     FolderView view;
     view.view = ui::ParseViewMode(pulse::json::ExtractString(block, L"view"));
     view.sort = ParseColumn(pulse::json::ExtractString(block, L"sort"));
     view.direction = pulse::json::ExtractString(block, L"direction") == L"desc"
         ? ui::SortDirection::Desc : ui::SortDirection::Asc;
+    view.columns = pulse::json::ExtractBool(block, L"columns");
     view.dividers = ParseScaled3(pulse::json::ExtractString(block, L"cols"));
     view.used = ExtractUsed(block);
     return view;
@@ -72,9 +85,8 @@ FolderView ParseEntry(const std::wstring& block) {
 FolderViewStore::Map ParseStore(const std::wstring& json) {
     FolderViewStore::Map views;
     for (const auto& block : pulse::json::ExtractObjectArray(json, L"folder_views")) {
-        const std::wstring folder =
-            fs::NormalizePath(pulse::json::ExtractString(block, L"path"));
-        if (folder.empty() || fs::IsVirtualPath(folder)) continue;
+        const std::wstring folder = StoreKey(pulse::json::ExtractString(block, L"path"));
+        if (folder.empty()) continue;
         views[folder] = ParseEntry(block);
     }
     return views;
@@ -84,7 +96,7 @@ FolderViewStore::Map ParseStore(const std::wstring& json) {
 // two entries differing only in it count as the same view.
 bool SameView(const FolderView& a, const FolderView& b) {
     return a.view == b.view && a.sort == b.sort && a.direction == b.direction &&
-           a.dividers == b.dividers;
+           a.columns == b.columns && a.dividers == b.dividers;
 }
 
 void TrimOldest(FolderViewStore::Map& views) {
@@ -114,7 +126,8 @@ std::wstring Serialize(const FolderViewStore::Map& views) {
             << L"\",\"sort\":\"" << ColumnName(entry.second.sort)
             << L"\",\"direction\":\""
             << (entry.second.direction == ui::SortDirection::Desc ? L"desc" : L"asc")
-            << L"\",\"cols\":\"" << FormatScaled3(entry.second.dividers)
+            << L"\",\"columns\":" << (entry.second.columns ? L"true" : L"false")
+            << L",\"cols\":\"" << FormatScaled3(entry.second.dividers)
             << L"\",\"used\":" << entry.second.used << L"}";
     }
     out << L"]}";
@@ -145,8 +158,8 @@ void FolderViewStore::Load() {
 
 void FolderViewStore::Note(const std::wstring& path, const FolderView& view) {
     if (!persist) return;
-    const std::wstring folder = fs::NormalizePath(path);
-    if (folder.empty() || fs::IsVirtualPath(folder)) return;
+    const std::wstring folder = StoreKey(path);
+    if (folder.empty()) return;
     FolderView entry = view;
     // A caller that leaves `used` at zero means "now"; the self test sets it to stage a
     // sequence of visits that the trimming can then order.
@@ -155,10 +168,29 @@ void FolderViewStore::Note(const std::wstring& path, const FolderView& view) {
     Save();
 }
 
+void FolderViewStore::Touch(const std::wstring& path) {
+    if (!persist) return;
+    const std::wstring folder = StoreKey(path);
+    if (folder.empty()) return;
+    const auto it = views_.find(folder);
+    if (it == views_.end()) return;
+    const uint64_t now = NowUsed();
+    if (it->second.used == now) return;
+    it->second.used = now;
+    visited_ = true;
+}
+
+void FolderViewStore::SaveIfVisited() {
+    if (!visited_) return;
+    visited_ = false;
+    Save();
+}
+
 const FolderView* FolderViewStore::Find(const std::wstring& path) const {
-    if (path.empty() || fs::IsVirtualPath(path)) return nullptr;
-    // Stored keys went through NormalizePath, so the lookup has to as well.
-    const auto it = views_.find(fs::NormalizePath(path));
+    // Keys went through StoreKey, so the lookup has to as well ("This PC" included).
+    const std::wstring folder = StoreKey(path);
+    if (folder.empty()) return nullptr;
+    const auto it = views_.find(folder);
     return it == views_.end() ? nullptr : &it->second;
 }
 
@@ -201,13 +233,25 @@ void FolderViewStore::Save() {
 }
 
 void RememberFolderView(AppState& s, const Tab& tab) {
-    if (tab.current_path.empty() || fs::IsVirtualPath(tab.current_path)) return;
     FolderView view;
     view.view = tab.view_mode;
     view.sort = tab.sort_column;
     view.direction = tab.sort_direction;
+    view.columns = tab.column_layout;
     view.dividers = tab.details_column_dividers;
+    // The store maps the key itself: "This PC" has an empty path and is a location, while
+    // search results, recent, tags and recycle are not folders and are dropped there.
     s.folderViews.Note(tab.current_path, view);
+}
+
+void RememberFolderViewMode(AppState& s, const std::wstring& path, ui::ViewMode view) {
+    FolderView entry;
+    if (const FolderView* existing = s.folderViews.Find(path)) {
+        if (existing->view == view) return; // nothing new to record
+        entry = *existing;
+    }
+    entry.view = view;
+    s.folderViews.Note(path, entry);
 }
 
 void ApplyFolderView(AppState& s, Tab& tab) {
@@ -216,6 +260,18 @@ void ApplyFolderView(AppState& s, Tab& tab) {
         tab.sort_column = memory->sort;
         tab.sort_direction = memory->direction;
         tab.details_column_dividers = memory->dividers;
+        // The column layout brings the details panel with it, the way toggling it does.
+        if (tab.column_layout != memory->columns) {
+            tab.column_layout = memory->columns;
+            if (!tab.column_layout) {
+                tab.column_strip = {};
+            } else if (!s.showDetailsPanel) {
+                s.showDetailsPanel = true;
+                s.renderer.SetDetailsPanelVisible(true);
+            }
+        }
+        // The folder has just been entered: keep it at the front of the save order.
+        s.folderViews.Touch(tab.current_path);
     }
 }
 
