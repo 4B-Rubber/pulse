@@ -17,19 +17,30 @@ bool HandleDetailsPreviewPointer(AppState* s, HWND hwnd, UINT msg, WPARAM wParam
             s->dragPending = false;
             s->detailsPreviewPanning = true;
             SetCapture(hwnd);
-            SetCursor(ui::PreviewGrabCursor(s->renderer.DetailsPreviewDragging()));
+            if (!s->renderer.DetailsPreviewIsArchive())
+                SetCursor(ui::PreviewGrabCursor(s->renderer.DetailsPreviewDragging()));
         }
         return true;
     }
-    if (!s->detailsPreviewPanning) return false;
+    if (!s->detailsPreviewPanning) {
+        // Archive tree rows highlight under the pointer; never consumes the move.
+        if (msg == WM_MOUSEMOVE && s->showDetailsPanel && s->renderer.HoverDetailsPreview(x, y))
+            InvalidateRect(hwnd, nullptr, FALSE);
+        return false;
+    }
     if (!s->renderer.DetailsPreviewPointerActive() || msg == WM_LBUTTONUP || (msg == WM_MOUSEMOVE && !(wParam & MK_LBUTTON))) {
+        // A press that never became a drag is a click: archive folders toggle.
+        if (msg == WM_LBUTTONUP && s->renderer.DetailsPreviewPointerActive() &&
+            !s->renderer.DetailsPreviewDragging())
+            s->renderer.ClickDetailsPreview(x, y);
         s->detailsPreviewPanning = false;
         s->renderer.EndDetailsPreviewPan();
         SetCursor(ui::PreviewGrabCursor(false));
         if (GetCapture() == hwnd) ReleaseCapture();
     } else if (msg == WM_MOUSEMOVE) {
         s->renderer.MoveDetailsPreviewPan(x, y);
-        SetCursor(ui::PreviewGrabCursor(s->renderer.DetailsPreviewDragging()));
+        if (!s->renderer.DetailsPreviewIsArchive())
+            SetCursor(ui::PreviewGrabCursor(s->renderer.DetailsPreviewDragging()));
     }
     InvalidateRect(hwnd, nullptr, FALSE);
     return true;

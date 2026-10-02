@@ -58,6 +58,7 @@
 #define IDS_LOCAL_DISK                  1054
 #define IDS_SIDEBAR_WORKSPACES          1055
 #define IDS_SIDEBAR_QUICK_ACCESS        1056
+#define IDS_SIDEBAR_SAVED_SEARCHES      1057
 #define IDS_SIDEBAR_DRIVES              1058
 #define IDS_SIDEBAR_TAGS                1059
 #define IDS_SIDEBAR_NETWORK_LOCATIONS   1060
@@ -617,9 +618,6 @@
 #define IDS_OP_CURRENT_SPEED 1666
 #define IDS_OP_SPEED_HISTORY 1667
 #define IDS_OP_PEAK 1668
-// Values are allocated, not grouped by neighbourhood: the item-speed unit arrived long
-// after the rest of the operation labels.
-#define IDS_OP_ITEMS_PER_SECOND 2026
 #define IDS_SETTINGS_ABORTED 1669
 #define IDS_SETTINGS_SERVICE_START_ERROR 1670
 #define IDS_SETTINGS_SERVICE_ERROR 1671
@@ -747,6 +745,7 @@
 #define IDS_SETTINGS_UI_1915 1915
 #define IDS_SETTINGS_UI_1916 1916
 #define IDS_SETTINGS_UI_1917 1917
+#define IDS_SETTINGS_UI_1918 1918
 #define IDS_SETTINGS_UI_1919 1919
 #define IDS_SETTINGS_UI_1920 1920
 
@@ -829,9 +828,6 @@
 #define IDS_UPDATE_VERIFYING 1995
 #define IDS_UPDATE_LAUNCHING 1996
 #define IDS_UPDATE_INSTALLING_STATUS 1997
-
-// Ids main allocated for its 1.0.39/1.0.40 list work. Dev-side ids always continue past
-// main's numbering: when a merge collides, renumber the dev side, never main's.
 #define IDS_DATE_WEEKDAYS 1998
 #define IDS_DATE_MONTH_DAY_FORMAT 1999
 #define IDS_LIST_SMART_DATE 2000
@@ -843,55 +839,160 @@
 
 #define IDS_COLUMN_LAYOUT 2006
 
-// Second window: tab menu entry and tray menu entry.
-#define IDS_TAB_OPEN_NEW_WINDOW 2007
-#define IDS_TRAY_NEW_WINDOW 2008
-#define IDS_JUMPLIST_PINNED 2009
-// Tab-group hover card.
-#define IDS_TAB_GROUP_EDIT 2010
-// Recent/starred item menu: reveal the row in its containing folder.
-#define IDS_OPEN_ITEM_LOCATION 2011
-// Settings: hover hints switch and delay.
-#define IDS_SETTINGS_TOOLTIPS 2012
-#define IDS_SETTINGS_TOOLTIPS_DESC 2013
-#define IDS_SETTINGS_TOOLTIP_DELAY 2014
-#define IDS_SETTINGS_TOOLTIP_DELAY_DESC 2015
-#define IDS_TOOLTIP_DELAY_SHORT 2016
-#define IDS_TOOLTIP_DELAY_STANDARD 2017
-#define IDS_TOOLTIP_DELAY_LONG 2018
-// Item menu: drop the mark-of-the-web stream and checksum a file.
-#define IDS_UNBLOCK_FILE 2019
-#define IDS_HASH_FILE 2020
-#define IDS_HASH_COPIED 2021
-#define IDS_UNBLOCK_DONE 2022
-// Settings: the on-disk preview cache and its clear button.
-#define IDS_SETTINGS_THUMB_CACHE 2023
-#define IDS_SETTINGS_FILE_HASH 2024
-#define IDS_SETTINGS_FILE_HASH_DESC 2025
-#define IDS_TOOLTIP_DELAY_CUSTOM 2027
-#define IDS_SETTINGS_TITLE_BRAND 2028
-#define IDS_SETTINGS_TITLE_BRAND_DESC 2029
-// Settings: the background update check (and its install prompt) can be turned off.
-#define IDS_SETTINGS_AUTO_UPDATE 2030
-#define IDS_SETTINGS_AUTO_UPDATE_DESC 2031
-// Two buttons read "添加文件夹" in the same page; name what they add.
-#define IDS_ADD_EXCLUDE_FOLDER 2032
-#define IDS_ADD_SERVER_FOLDER 2033
-// The two "移除" buttons on that page get the same treatment: one drops a path from
-// the exclusion list, the other one a server folder.
-#define IDS_REMOVE_EXCLUDE_FOLDER 2034
-#define IDS_REMOVE_SERVER_FOLDER 2035
-
-// Shortcut help card (upstream's numbering, so the id table keeps merging cleanly).
+// File list: folder ordering against files.
+#define IDS_SETTINGS_FOLDER_SORT 2007
+#define IDS_SETTINGS_FOLDER_SORT_DESC 2008
+#define IDS_FOLDER_SORT_TOP 2009
+#define IDS_FOLDER_SORT_FOLLOW 2010
+#define IDS_FOLDER_SORT_MIXED 2011
+#define IDS_SETTINGS_WALLPAPER_LOOK 2012
+#define IDS_SETTINGS_WALLPAPER_LOOK_DESC 2013
+#define IDS_WALLPAPER_LOOK_SUBTLE 2014
+#define IDS_WALLPAPER_LOOK_BALANCED 2015
+#define IDS_WALLPAPER_LOOK_VIVID 2016
+#define IDS_SETTINGS_WALLPAPER_BLUR 2017
+#define IDS_SETTINGS_WALLPAPER_BLUR_DESC 2018
+#define IDS_WALLPAPER_BLUR_OFF 2019
+#define IDS_WALLPAPER_BLUR_LIGHT 2020
+#define IDS_WALLPAPER_BLUR_STRONG 2021
+#define IDS_FOLDER_SIZE_CALCULATE 2022
+#define IDS_FOLDER_SIZE_UPDATING 2023
+#define IDS_FOLDER_SIZE_PARTIAL 2024
+#define IDS_FOLDER_SIZE_UNAVAILABLE 2025
+#define IDS_FOLDER_SIZE_CACHED 2026
+#define IDS_FOLDER_SIZE_INDEXED 2027
+#define IDS_STAGING_TRAY_EMPTY 2028
+#define IDS_TRAY_PREV 2029
+#define IDS_TRAY_NEXT 2030
+#define IDS_TRAY_FLING_HINT 2031
+#define IDS_APP_DESCRIPTION 2034
+#define IDS_TOOLBAR_SORT 2035
+#define IDS_TOOLBAR_FILTER 2036
 #define IDS_SHORTCUT_HINTS 2037
 #define IDS_SELECTION_HINT 2038
 #define IDS_SELECTION_KEYS 2039
+
 #define IDS_HELP_TITLE 2040
 #define IDS_HELP_DESCRIPTION 2041
 #define IDS_HELP_OPEN 2042
 #define IDS_HELP_CLIPBOARD 2043
 #define IDS_HELP_TIP 2044
-// View menu: the Miller column browsing toggle. Not upstream's "分栏" (IDS_COLUMN_LAYOUT),
-// because on this branch "左右分栏 / 四宫格" are the pane layouts and the two entries share a
+
+#define IDS_ABOUT_TAGLINE 2045
+#define IDS_ABOUT_VERSION 2046
+#define IDS_ABOUT_BUILT 2047
+#define IDS_ABOUT_BUILD_ID 2048
+#define IDS_ABOUT_OS 2049
+#define IDS_ABOUT_LOCATION 2050
+#define IDS_ABOUT_INDEX 2051
+#define IDS_ABOUT_DISPLAY 2052
+#define IDS_ABOUT_DISPLAY_FORMAT 2053
+#define IDS_ABOUT_INDEX_SERVICE 2054
+#define IDS_ABOUT_INDEX_WAITING 2055
+#define IDS_ABOUT_INDEX_USER 2056
+#define IDS_ABOUT_COPY_INFO 2057
+#define IDS_ABOUT_HOMEPAGE 2058
+#define IDS_ABOUT_COPIED 2059
+#define IDS_RELEASE_NOTES 2060
+#define IDS_RELEASE_NOTES_DESC 2061
+#define IDS_RELEASE_CURRENT 2062
+#define IDS_RELEASE_ALL 2063
+#define IDS_UPDATED_TITLE_FORMAT 2064
+#define IDS_UPDATED_CLICK 2065
+#define IDS_COPIED_SHORT 2066
+#define IDS_SETTINGS_WIN_E 2067
+#define IDS_SETTINGS_WIN_E_DESC 2068
+#define IDS_SETTINGS_SHELL_TAGS 2069
+#define IDS_SETTINGS_SHELL_TAGS_DESC 2070
+#define IDS_SHELL_TAG_MENU 2071
+#define IDS_SHELL_TAG_ADDED 2072
+#define IDS_SHELL_TAG_REMOVED 2073
+#define IDS_LIST_TAG_NAME_COLOR 2074
+#define IDS_LIST_TAG_NAME_COLOR_DESC 2075
+#define IDS_QA_ADD_CURRENT 2076
+#define IDS_QA_CHOOSE_FOLDER 2077
+#define IDS_QA_FILES_HINT 2078
+#define IDS_WORKSPACE_UPDATE_LAYOUT 2079
+#define IDS_WORKSPACE_LAYOUT_UPDATED 2080
+#define IDS_WORKSPACE_PANES 2081
+#define IDS_SETTINGS_VERTICAL_TABS 2082
+#define IDS_SETTINGS_VERTICAL_TABS_DESC 2083
+#define IDS_SIDEBAR_TABS 2084
+#define IDS_TOGGLE_SIDEBAR 2085
+#define IDS_ARC_FILES 2086
+#define IDS_ARC_FOLDERS 2087
+#define IDS_ARC_UNPACKED 2088
+#define IDS_ARC_RATIO 2089
+#define IDS_ARC_ENCRYPTED 2090
+#define IDS_ARC_BIGGEST 2091
+#define IDS_ARC_ITEMS 2092
+#define IDS_ARC_COL_NAME 2093
+#define IDS_ARC_COL_SIZE 2094
+#define IDS_ARC_COL_PACKED 2095
+#define IDS_ARC_COL_MODIFIED 2096
+#define IDS_ARC_INCOMPLETE 2097
+#define IDS_ARC_EMPTY 2098
+#define IDS_ARC_MATCHES 2099
+#define IDS_ARC_ARCHIVE 2100
+#define IDS_ARC_SEARCH_HINT 2101
+#define IDS_ARC_NO_MATCH 2102
+#define IDS_ARC_FAM_CODE 2103
+#define IDS_ARC_FAM_IMAGE 2104
+#define IDS_ARC_FAM_DOC 2105
+#define IDS_ARC_FAM_CAD 2106
+#define IDS_ARC_FAM_3D 2107
+#define IDS_ARC_FAM_VIDEO 2108
+#define IDS_ARC_FAM_AUDIO 2109
+#define IDS_ARC_FAM_ARCHIVE 2110
+#define IDS_ARC_FAM_PROGRAM 2111
+#define IDS_ARC_FAM_OTHER 2112
+#define IDS_ABOUT_MORE_APPS 2113
+#define IDS_ABOUT_MORE_APPS_DESC 2114
+#define IDS_ABOUT_LUMENPDF_DESC 2115
+#define IDS_ABOUT_LUMASHOT_DESC 2116
+
+// ---------------------------------------------------------------------------
+// This branch's own strings. Upstream owns the numbers below these; ours moved
+// past the highest one it defines so the two tables keep merging cleanly.
+// ---------------------------------------------------------------------------
+// after the rest of the operation labels.
+#define IDS_OP_ITEMS_PER_SECOND 2136
+// Second window: tab menu entry and tray menu entry.
+#define IDS_TAB_OPEN_NEW_WINDOW 2117
+#define IDS_TRAY_NEW_WINDOW 2118
+#define IDS_JUMPLIST_PINNED 2119
+// Tab-group hover card.
+#define IDS_TAB_GROUP_EDIT 2120
+// Recent/starred item menu: reveal the row in its containing folder.
+#define IDS_OPEN_ITEM_LOCATION 2121
+// Settings: hover hints switch and delay.
+#define IDS_SETTINGS_TOOLTIPS 2122
+#define IDS_SETTINGS_TOOLTIPS_DESC 2123
+#define IDS_SETTINGS_TOOLTIP_DELAY 2124
+#define IDS_SETTINGS_TOOLTIP_DELAY_DESC 2125
+#define IDS_TOOLTIP_DELAY_SHORT 2126
+#define IDS_TOOLTIP_DELAY_STANDARD 2127
+#define IDS_TOOLTIP_DELAY_LONG 2128
+// Item menu: drop the mark-of-the-web stream and checksum a file.
+#define IDS_UNBLOCK_FILE 2129
+#define IDS_HASH_FILE 2130
+#define IDS_HASH_COPIED 2131
+#define IDS_UNBLOCK_DONE 2132
+// Settings: the on-disk preview cache and its clear button.
+#define IDS_SETTINGS_THUMB_CACHE 2133
+#define IDS_SETTINGS_FILE_HASH 2134
+#define IDS_SETTINGS_FILE_HASH_DESC 2135
+#define IDS_TOOLTIP_DELAY_CUSTOM 2137
+#define IDS_SETTINGS_TITLE_BRAND 2138
+#define IDS_SETTINGS_TITLE_BRAND_DESC 2139
+// Settings: the background update check (and its install prompt) can be turned off.
+#define IDS_SETTINGS_AUTO_UPDATE 2140
+#define IDS_SETTINGS_AUTO_UPDATE_DESC 2141
+// Two buttons read "添加文件夹" in the same page; name what they add.
+#define IDS_ADD_EXCLUDE_FOLDER 2142
+#define IDS_ADD_SERVER_FOLDER 2143
+// the exclusion list, the other one a server folder.
+#define IDS_REMOVE_EXCLUDE_FOLDER 2144
+#define IDS_REMOVE_SERVER_FOLDER 2145
 // menu - the reader cannot tell them apart otherwise.
-#define IDS_COLUMN_VIEW 2045
+#define IDS_COLUMN_VIEW 2146

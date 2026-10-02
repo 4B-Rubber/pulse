@@ -2,6 +2,7 @@
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
 #include <algorithm>
+#include <atomic>
 #include <cwctype>
 #include <string_view>
 
@@ -34,13 +35,34 @@ int NameCompare(const std::wstring& a, const std::wstring& b) {
     return cmp;
 }
 
+std::atomic<FolderSortMode> g_folder_sort_mode{FolderSortMode::FoldersFirst};
+
 } // namespace
+
+void SetFolderSortMode(FolderSortMode mode) noexcept {
+    g_folder_sort_mode.store(mode, std::memory_order_relaxed);
+}
+
+FolderSortMode CurrentFolderSortMode() noexcept {
+    return g_folder_sort_mode.load(std::memory_order_relaxed);
+}
 
 bool EntryLess(const fs::DirEntry& a, const fs::DirEntry& b,
                ui::SortColumn col, ui::SortDirection dir) {
+    return EntryLess(a, b, col, dir, CurrentFolderSortMode());
+}
+
+bool EntryLess(const fs::DirEntry& a, const fs::DirEntry& b,
+               ui::SortColumn col, ui::SortDirection dir, FolderSortMode folders) {
     const bool a_folder = a.is_dir || (!a.link_target.empty() && a.link_target_is_dir);
     const bool b_folder = b.is_dir || (!b.link_target.empty() && b.link_target_is_dir);
-    if (a_folder != b_folder) return a_folder;
+    // FoldersFirst pins folders above the direction flip below; FollowDirection
+    // feeds the group through it so descending order sends folders down.
+    if (a_folder != b_folder) {
+        if (folders == FolderSortMode::FoldersFirst) return a_folder;
+        if (folders == FolderSortMode::FollowDirection)
+            return (dir == ui::SortDirection::Desc) ? !a_folder : a_folder;
+    }
     int cmp = 0;
     switch (col) {
     case ui::SortColumn::Name:

@@ -8,6 +8,8 @@
 #include "usn_stream.h"
 #include "filename_timing.h"
 #include "index_feed.h"
+#include "folder_size_index.h"
+#include "folder_size_protocol.h"
 #include "index_config.h"
 #include "index_query.h"
 #include "index_delta.h"
@@ -141,6 +143,7 @@ public:
     bool PinyinReady() const { return pinyin_ready_.load(); }
     uint64_t Revision() const { return revision_.load(); }
     FileFeedPage ReadFeed(bool changes, const std::wstring& root, uint64_t epoch, uint64_t cursor) const;
+    std::vector<IndexedFolderSize> FolderSizes(const std::vector<std::wstring>& paths);
     std::wstring Status() const;
     std::vector<VolumeInfo> Volumes() const;
     void RequestRebuild();
@@ -151,6 +154,10 @@ public:
                     uint64_t size = 0, uint64_t mtime = 0);
 
 private:
+    FolderSizeIndex folder_sizes_;
+    bool folder_size_usn_update_ = false;
+    std::atomic<bool> folder_size_gap_{false};
+    FolderSizeIndex::Item FolderSizeItem(int32_t id) const;
     ChangeTracker changes_;
     std::mutex change_seed_mutex_;
     std::unordered_set<std::wstring> change_seed_owners_;
@@ -225,6 +232,7 @@ private:
         std::wstring volume_id;
         uint64_t item_count = 0;
         uint64_t journal_id = 0;
+        bool folder_size_current = false;
         int64_t next_usn = 0;
         int32_t root_idx = -1;
         int32_t first_idx = 0;
@@ -285,7 +293,7 @@ private:
     ChangeFeedHistory feed_changes_;
     void RecordFeed(const ChangeRecord& record);
     void CaptureMemoryState();
-    void GapFeed() { changes_.Gap(); ++feed_epoch_; }
+    void GapFeed() { changes_.Gap(); ++feed_epoch_; folder_size_gap_ = true; }
     void PinyinWorker();
     void RequestPinyinBuildLocked();
     void StopPinyinWorker();
@@ -367,7 +375,7 @@ private:
     bool MatchNodeLocked(int32_t i, const CompiledQuery& q, int32_t prefix_node,
                          bool folders_only, bool use_attrs) const;
     void UpdateVolumeVisibilityLocked(const std::vector<VolumeInfo>& active, bool only_hide = false);
-    void InvalidateFilterLocked() { ++filter_epoch_; }
+    void InvalidateFilterLocked() { ++filter_epoch_; if (!folder_size_usn_update_) folder_sizes_.Reset(); }
     void SetStatus(std::wstring s);
     bool IsExcludedPath(std::wstring_view path) const;
     static bool ShouldSkipName(std::wstring_view name);

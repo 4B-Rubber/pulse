@@ -14,7 +14,7 @@ inline AddressSearchLayout LayoutAddressSearch(D2D1_RECT_F field, float scale) {
     const float top = field.top + 3 * scale, bottom = field.bottom - 3 * scale;
     const float button = (width < 140 ? 14.0f : 24.0f) * scale;
     out.scope_label = width >= 440;
-    out.mode_label = width >= 300;
+    out.mode_label = width >= 440;
     float x = field.left + 4 * scale;
     const float scope_width = (out.scope_label ? 128.0f : width >= 380 ? 28.0f : 0.0f) * scale;
     out.scope = D2D1::RectF(x, top, x + scope_width, bottom);

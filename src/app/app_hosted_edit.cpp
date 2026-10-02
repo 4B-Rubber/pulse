@@ -117,7 +117,7 @@ HWND CreateHostedEdit(AppState& s, SUBCLASSPROC proc) {
 
 void LayoutAddressEditor(AppState& s) {
     if (!s.hwndAddressEdit || !s.hwnd) return;
-    D2D1_RECT_F addr = s.renderer.AddressBarRect((float)s.compositor.Width());
+    D2D1_RECT_F addr = s.addressSearching ? s.renderer.SearchBarRect((float)s.compositor.Width()) : s.renderer.AddressBarRect((float)s.compositor.Width());
     if (s.addressSearching) {
         PlaceHostedEdit(s.hwndAddressEdit, s.hwnd, ui::LayoutAddressSearch(addr, s.scale).input,
                         s.scale, 0, 0);
@@ -204,6 +204,14 @@ void HideAddressEditor(AppState& s, bool navigate) {
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
+void DismissPathEditorOutside(AppState& s, int x, int y) {
+    if (!s.addressEditing || s.addressSearching) return;
+    const auto bounds = s.renderer.AddressBarRect(static_cast<float>(s.compositor.Width()));
+    if (x >= bounds.left && x < bounds.right && y >= bounds.top && y < bounds.bottom) return;
+    // Owner-drawn controls need not transfer keyboard focus from the native edit.
+    HideAddressEditor(s, false);
+}
+
 void ApplyFilterCue(AppState& s) {
     if (!s.hwndFilterEdit) return;
     s.filterCue = l10n::Get(s.filterSelectMode
@@ -217,7 +225,8 @@ void LayoutFilterEditor(AppState& s) {
     if (!s.hwndFilterEdit || !s.hwnd || !s.filterEditing) return;
     const float expand = s.pane ? s.pane->filter_expand : 0.0f;
     PlaceHostedEdit(s.hwndFilterEdit, s.hwnd,
-                    s.renderer.FilterEditRect(FocusedPaneRect(s), expand,
+                    s.renderer.FilterEditRect(D2D1::RectF(0,0,static_cast<float>(s.compositor.Width()),
+                        static_cast<float>(s.compositor.Height())), expand,
                         ActiveTab(s) && !ActiveTab(s)->filter_text.empty()),
                     s.scale, 0, 0);
 }
@@ -631,8 +640,12 @@ LRESULT CALLBACK AddressEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             ShowAddressSearchHistory(*s);
             return 0;
         }
-        if (s->addressSearching && (GetKeyState(VK_CONTROL) & 0x8000) &&
+        if ((GetKeyState(VK_CONTROL) & 0x8000) &&
             (wParam == L'K' || wParam == L'L')) {
+            if (wParam == L'K' && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+                ShowAddressSearch(*s);
+                return 0;
+            }
             HideAddressEditor(*s, false);
             ShowOmnibar(*s, wParam == L'K' ? OmnibarMode::Mixed : OmnibarMode::Path);
             return 0;

@@ -97,11 +97,10 @@ int wmain(int argc, wchar_t** argv) {
         loaded.ResetToDefaults();
         ok &= Report("reset restores sidebar width", loaded.sidebar_width == 224);
         {
-            // The panes are limited by the window, not by a fixed cap: whatever the
-            // user drags, the file list keeps its minimum width.
+            // The sidebar must leave room for both the file list and the shared toolbar.
             using namespace pulse::ui;
-            ok &= Report("panel limit: without the details panel the list minimum is all that is reserved",
-                std::abs(MaxSidebarWidthDip(1600.0f, 340.0f, false, 8.0f) - 1480.0f) < 0.5f);
+            ok &= Report("panel limit: without details the shared toolbar retains 360 DIP",
+                std::abs(MaxSidebarWidthDip(1600.0f, 340.0f, false, 8.0f) - 1240.0f) < 0.5f);
             ok &= Report("panel limit: an open details panel is reserved by the sidebar",
                 std::abs(MaxSidebarWidthDip(1600.0f, 340.0f, true, 8.0f) - 1140.0f) < 0.5f);
             ok &= Report("panel limit: the details panel keeps the sidebar and the list",

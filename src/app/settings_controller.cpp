@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cwchar>
 #include <thread>
 
@@ -263,17 +264,15 @@ void SettingsController::WindowEffect(std::wstring_view effect_id) {
 
 void SettingsController::AccentChoice(bool system_choice, uint32_t rgb) {
     if (!prefs_) return;
-    uint32_t current = 0;
-    const bool following = !ParseAccentRgb(prefs_->accent_rgb, current);
-    if (system_choice && following) return;
     std::wstring next;
-    if (!system_choice && (following || current != rgb)) {
+    if (!system_choice) {
         wchar_t hex[8]{};
         swprintf_s(hex, L"%06X", rgb & 0xFFFFFFu);
         next = hex;
     }
-    if (prefs_->accent_rgb == next) return;
+    if (prefs_->accent_rgb == next && prefs_->accent_follow_system == system_choice) return;
     prefs_->accent_rgb = std::move(next);
+    prefs_->accent_follow_system = system_choice;
     SaveAndApply(SettingsEffect::Accent);
 }
 
@@ -283,10 +282,43 @@ void SettingsController::RowHeight(int index) {
         SaveAndApply(SettingsEffect::RowHeight);
 }
 
+void SettingsController::FolderSort(int index) {
+    static constexpr int values[] = {0, 1, 2};
+    if (prefs_ && SelectValue(index, values, prefs_->folder_sort_mode))
+        SaveAndApply(SettingsEffect::FolderSort);
+}
+
 void SettingsController::TrayIconSize(int index) {
     static constexpr int values[] = {40, 48, 56};
     if (prefs_ && SelectValue(index, values, prefs_->tray_icon_size))
         SaveAndApply(SettingsEffect::TrayDeckIcon);
+}
+
+// Both only change how the next frame is painted; the caller invalidates.
+// Values snap to the former preset levels unless Shift is held.
+bool SettingsController::SliderValue(int which, int value) {
+    if (!prefs_ || which < 0 || which > 1) return false;
+    const bool snap = GetKeyState(VK_SHIFT) >= 0;
+    int& target = which == 0 ? prefs_->wallpaper_look : prefs_->wallpaper_blur;
+    value = std::clamp(value, 0, which == 0 ? 90 : 40);
+    if (snap) {
+        static constexpr int kLook[] = {25, 50, 75};
+        static constexpr int kBlur[] = {14, 28};
+        if (which == 0) {
+            for (int level : kLook) if (std::abs(value - level) <= 2) value = level;
+        } else {
+            for (int level : kBlur) if (std::abs(value - level) <= 1) value = level;
+        }
+    }
+    if (target == value) return false;
+    target = value;
+    return true;
+}
+
+void SettingsController::EndSlider() {
+    if (slider_drag_ < 0) return;
+    slider_drag_ = -1;
+    if (prefs_) prefs_->Save();
 }
 
 void SettingsController::Language(std::wstring_view language_id) {
@@ -407,6 +439,14 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 6) {
         prefs_->show_pinned_tab_names = !prefs_->show_pinned_tab_names;
         SaveAndApply(SettingsEffect::None);
+    } else if (index == 25) {
+        // Upstream's newer switches sit after this branch's ids (24+), see ui_hit_test.cpp.
+        prefs_->ApplyWinE(!prefs_->take_over_win_e);
+        SaveAndApply(SettingsEffect::None);
+    } else if (index == 26) {
+        // shell_tag_menu.cpp installs/removes the HKCU verbs on the next UI tick.
+        prefs_->shell_tag_menu = !prefs_->shell_tag_menu;
+        SaveAndApply(SettingsEffect::None);
     } else if (index == 7) {
         prefs_->blank_click_go_back = !prefs_->blank_click_go_back;
         SaveAndApply(SettingsEffect::None);
@@ -427,6 +467,12 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 23) {
         prefs_->list_size_bar = !prefs_->list_size_bar;
         SaveAndApply(SettingsEffect::ListStyle);
+    } else if (index == 24) {
+        prefs_->list_tag_name_color = !prefs_->list_tag_name_color;
+        SaveAndApply(SettingsEffect::ListStyle);
+    } else if (index == 27) {
+        prefs_->vertical_tabs = !prefs_->vertical_tabs;
+        SaveAndApply(SettingsEffect::None);
     } else if (index == 15) {
         prefs_->global_search_enabled = !prefs_->global_search_enabled;
         if (!prefs_->Save()) {

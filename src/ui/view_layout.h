@@ -24,6 +24,7 @@ int ViewModeIndex(ViewMode mode) noexcept;
 ViewMode ViewModeFromIndex(int index) noexcept;
 bool ShowsColumnHeader(ViewMode mode) noexcept;
 bool UsesThumbnails(ViewMode mode) noexcept;
+bool ShowsFolderSize(ViewMode mode) noexcept;
 
 // Reserve a marquee gutter before the name and before the scrollbar.
 D2D1_RECT_F DetailsContentRect(D2D1_RECT_F bounds, float scale) noexcept;
@@ -54,6 +55,7 @@ public:
     D2D1_RECT_F ItemRect(int view_index) const noexcept;
     D2D1_RECT_F IconRect(int view_index) const noexcept;
     D2D1_RECT_F NameRect(int view_index) const noexcept;
+    D2D1_RECT_F FolderSizeRect(int view_index) const noexcept;
     int HitTest(float x, float y) const noexcept;
     std::pair<int, int> VisibleRange() const noexcept;
     int MoveIndex(int current, int dx, int dy) const noexcept;

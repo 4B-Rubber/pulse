@@ -1,5 +1,6 @@
 // app_prefs.h — General app settings (startup, close-to-tray).
 #pragma once
+#include "folder_view_prefs.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -13,6 +14,8 @@ struct AppPrefsValues {
     bool launch_on_startup = false;
     bool keep_running_on_close = false;
     bool open_folders_in_pulse = false;
+    bool take_over_win_e = false;
+    bool shell_tag_menu = false;    // File Explorer "Pulse tags" submenu (shell_tag_menu.cpp syncs HKCU)   // registry is the source of truth (not in app.json)
     bool verify_copies = false;
     bool show_status_performance = false;
     bool show_pinned_tab_names = true;
@@ -20,6 +23,12 @@ struct AppPrefsValues {
     bool list_smart_date = true;
     bool list_zebra_rows = true;
     bool list_size_bar = false;
+    bool list_tag_name_color = false; // tint tagged names with their first tag's color
+    bool vertical_tabs = false;       // tabs as the first sidebar section
+    bool sidebar_collapsed = false;   // sidebar folded to its icon rail (Ctrl+B)
+    // 0 folders first, 1 follow the sort direction, 2 mixed with files
+    int folder_sort_mode = 0;
+    FolderViewPrefs folder_views;
     bool search_pinyin = true;
     bool global_search_enabled = false;
     uint32_t global_search_modifiers = 1; // MOD_ALT
@@ -48,23 +57,31 @@ struct AppPrefsValues {
     // none / acrylic-material / mica / mica-alt  (legacy dwm-blur → acrylic)
     std::wstring window_effect = L"mica-alt";
     std::wstring background_image;
+    // Interface transparency 0..90 (json panel_transparency). 25/50/75 match the
+    // former subtle/balanced/vivid levels; applies to image, Acrylic and Mica.
+    int wallpaper_look = 50;
+    int wallpaper_blur = 14; // wallpaper blur in DIPs 0..40 (json wallpaper_blur_px)
     int row_height = 34; // file-list row height in DIPs (24..48)
     int sidebar_width = 224; // DIPs
     bool address_search_current = false;
     bool address_search_content = false;
     int tray_icon_size = 48; // staging-tray deck icon edge in DIPs (32..64)
-    // Empty = follow Windows accent; otherwise "RRGGBB".
+    // Empty = theme default, or Windows when explicitly selected.
     std::wstring accent_rgb;
+    bool accent_follow_system = false;
     // Tag colors the user added via the custom color dialog (0xRRGGBB),
     // appended after the seven Finder defaults in the swatch strip.
     std::vector<uint32_t> custom_tag_colors;
     int duplicate_scan_scope = 0; // 0 folder, 1 drive, 2 all local disks
     std::wstring duplicate_scan_folder;
     std::wstring duplicate_scan_drive;
+    // Version that last ran with these prefs; drives the one-time "updated" toast.
+    std::wstring last_seen_version;
 };
 
 struct AppPrefs : AppPrefsValues {
     bool persist = true;
+    bool had_file = false; // runtime only: app.json existed when Load() ran
 
     void ResetToDefaults();
     bool Load();
@@ -90,6 +107,12 @@ struct AppPrefs : AppPrefsValues {
     // its own) is deliberately left alone.
     bool ReadFolderOpen() const;
     bool ApplyFolderOpen(bool on);
+
+    // HKCU "File Explorer" launch verb used by Win+E and the taskbar Explorer
+    // pin ({52205fd8-...}\shell\opennewwindow). A user's previous custom
+    // command is kept as PulseBackup and restored when turned off.
+    bool ReadWinE() const;
+    bool ApplyWinE(bool on);
 
     bool StoreBackgroundImage(const std::wstring& source_path);
     void ClearBackgroundImage();

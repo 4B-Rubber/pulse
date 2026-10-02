@@ -1,0 +1,912 @@
+#include "preview_decoders.h"
+#include "../ipc/preview_protocol.h"
+#include "../common/preview_extensions.h"
+#include "archive_listing.h"
+#include "content_sniff.h"
+#include "dwg_thumb.h"
+#include "font_raster.h"
+#include "metafile_raster.h"
+#include "office_doc_model.h"
+#include "office_sketch.h"
+#include "pdf_raster.h"
+#include "preview_file_utils.h"
+#include "psd_raster.h"
+#include "svg_raster.h"
+#include "zip_entry.h"
+#include <shobjidl.h>
+#include <shlobj.h>
+#include <shlguid.h>
+#include <shellapi.h>
+#include <shlwapi.h>
+#include <thumbcache.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+#include <algorithm>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+using namespace pulse;
+using Microsoft::WRL::ComPtr;
+using preview::ExtensionOf;
+using preview::IsOfflinePlaceholder;
+using preview::ShellPath;
+
+namespace {
+
+bool IsOneOf(std::wstring_view extension,
+             std::initializer_list<std::wstring_view> values) {
+    return std::find(values.begin(), values.end(), extension) != values.end();
+}
+
+bool IsKnownText(std::wstring_view extension) {
+    return pulse::preview::IsTextExtension(extension);
+}
+
+bool IsDirectImage(std::wstring_view extension) {
+    return pulse::preview::IsImageExtension(extension);
+}
+
+bool IsKnownShellPreview(std::wstring_view extension) {
+    return IsOneOf(extension, {
+        L".pdf", L".doc", L".docx", L".xls",
+        L".xlsx", L".ppt", L".pptx", L".odt", L".ods", L".odp", L".mp4",
+        L".mkv", L".mov", L".avi", L".webm", L".wmv", L".m4v", L".dwg",
+        L".dxf", L".step", L".stp", L".iges", L".igs",
+        // Office variants and WPS / OpenDocument: shell provider when one is
+        // installed, otherwise the sketch.
+        L".docm", L".xlsm", L".pptm", L".ppsx", L".pps", L".wps", L".et", L".dps", L".odg"
+    });
+}
+
+// Formats outside the built-in lists (PSD, AI, RAW, fonts...) get a thumbnail
+// when a shell handler is registered for them, exactly as Explorer decides:
+// IThumbnailProvider, or the legacy IExtractImage many third-party packs use.
+// Looked up once per extension; the host serves requests on one thread.
+bool HasShellThumbnailHandler(const std::wstring& extension) {
+    static std::unordered_map<std::wstring, bool> cache;
+    if (extension.empty()) return false;
+    if (const auto it = cache.find(extension); it != cache.end()) return it->second;
+    static constexpr const wchar_t* kHandlers[] = {
+        L"{e357fccd-a995-4576-b01f-234630154e96}", // IThumbnailProvider
+        L"{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}", // IExtractImage
+    };
+    bool found = false;
+    for (const wchar_t* handler : kHandlers) {
+        wchar_t clsid[128]{};
+        DWORD chars = ARRAYSIZE(clsid);
+        if (SUCCEEDED(AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_SHELLEXTENSION,
+                                        extension.c_str(), handler, clsid, &chars)) &&
+            clsid[0] != L'\0') {
+            found = true;
+            break;
+        }
+    }
+    cache.emplace(extension, found);
+    return found;
+}
+
+bool ReadPrefix(const std::wstring& path, DWORD limit, std::vector<uint8_t>& bytes,
+                uint64_t& file_size) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    const bool sized = GetFileSizeEx(file, &size) != 0;
+    file_size = sized ? static_cast<uint64_t>(size.QuadPart) : 0;
+    bytes.resize(static_cast<size_t>((std::min)(file_size, static_cast<uint64_t>(limit))));
+    DWORD read = 0;
+    const bool ok = bytes.empty() ||
+        (ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) != 0);
+    CloseHandle(file);
+    if (!ok) { bytes.clear(); return false; }
+    bytes.resize(read);
+    return true;
+}
+
+bool LooksBinary(const std::vector<uint8_t>& bytes) {
+    if (bytes.size() >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0xFE) ||
+                             (bytes[0] == 0xFE && bytes[1] == 0xFF))) return false;
+    size_t controls = 0;
+    for (uint8_t c : bytes) {
+        if (c == 0) return true;
+        if (c < 0x09 || (c > 0x0D && c < 0x20)) ++controls;
+    }
+    return !bytes.empty() && controls * 20 > bytes.size();
+}
+
+bool DecodeText(const std::vector<uint8_t>& bytes, std::wstring& text) {
+    if (bytes.empty()) { text.clear(); return true; }
+    size_t offset = 0;
+    if (bytes.size() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
+        offset = 2;
+        text.reserve((bytes.size() - offset) / 2);
+        for (size_t i = offset; i + 1 < bytes.size(); i += 2)
+            text.push_back(static_cast<wchar_t>(bytes[i] | (bytes[i + 1] << 8)));
+    } else if (bytes.size() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
+        offset = 2;
+        text.reserve((bytes.size() - offset) / 2);
+        for (size_t i = offset; i + 1 < bytes.size(); i += 2)
+            text.push_back(static_cast<wchar_t>((bytes[i] << 8) | bytes[i + 1]));
+    } else {
+        if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            offset = 3;
+        const char* raw = reinterpret_cast<const char*>(bytes.data() + offset);
+        const int raw_size = static_cast<int>(bytes.size() - offset);
+        int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw, raw_size,
+                                        nullptr, 0);
+        UINT code_page = CP_UTF8;
+        DWORD flags = MB_ERR_INVALID_CHARS;
+        if (chars <= 0) {
+            code_page = CP_ACP;
+            flags = 0;
+            chars = MultiByteToWideChar(code_page, flags, raw, raw_size, nullptr, 0);
+        }
+        if (chars <= 0) return false;
+        text.resize(chars);
+        MultiByteToWideChar(code_page, flags, raw, raw_size, text.data(), chars);
+    }
+    for (wchar_t& c : text) {
+        if (c < 0x20 && c != L'\r' && c != L'\n' && c != L'\t') c = L'\xFFFD';
+    }
+    constexpr size_t kMaxChars = 12000;
+    if (text.size() > kMaxChars) text.resize(kMaxChars);
+    return true;
+}
+
+std::wstring MakeHex(const std::vector<uint8_t>& bytes) {
+    std::wstring out;
+    wchar_t line[128]{};
+    for (size_t base = 0; base < bytes.size(); base += 16) {
+        int pos = swprintf_s(line, L"%08llX  ", static_cast<unsigned long long>(base));
+        for (size_t i = 0; i < 16; ++i) {
+            if (base + i < bytes.size())
+                pos += swprintf_s(line + pos, std::size(line) - pos, L"%02X ", bytes[base + i]);
+            else
+                pos += swprintf_s(line + pos, std::size(line) - pos, L"   ");
+        }
+        pos += swprintf_s(line + pos, std::size(line) - pos, L" ");
+        for (size_t i = 0; i < 16 && base + i < bytes.size(); ++i) {
+            const uint8_t c = bytes[base + i];
+            line[pos++] = c >= 0x20 && c < 0x7F ? static_cast<wchar_t>(c) : L'.';
+        }
+        line[pos++] = L'\n';
+        line[pos] = 0;
+        out += line;
+    }
+    return out;
+}
+
+bool MakeTextOrHex(const std::wstring& path, DWORD attrs, ipc::PreviewContentKind& kind,
+                   std::wstring& text, uint32_t& bytes_read, bool& truncated) {
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) || IsOfflinePlaceholder(attrs)) return false;
+    const bool known_text = IsKnownText(ExtensionOf(path));
+    std::vector<uint8_t> bytes;
+    uint64_t file_size = 0;
+    const DWORD initial = known_text ? 32u * 1024u : 256u;
+    if (!ReadPrefix(path, initial, bytes, file_size)) return false;
+    if (!known_text && LooksBinary(bytes)) {
+        kind = ipc::PreviewContentKind::Hex;
+        text = MakeHex(bytes);
+        bytes_read = static_cast<uint32_t>(bytes.size());
+        truncated = file_size > bytes.size();
+        return true;
+    }
+    if (!known_text && file_size > bytes.size()) {
+        if (!ReadPrefix(path, 32u * 1024u, bytes, file_size)) return false;
+    }
+    if (LooksBinary(bytes) || !DecodeText(bytes, text)) return false;
+    kind = ipc::PreviewContentKind::Text;
+    bytes_read = static_cast<uint32_t>(bytes.size());
+    truncated = file_size > bytes.size();
+    return true;
+}
+
+} // namespace
+
+static bool DecodeImage(const std::wstring& path, DWORD attrs, UINT pixels,
+                        std::vector<uint8_t>& out, UINT& width, UINT& height, UINT& stride,
+                        UINT& source_width, UINT& source_height,
+                        const std::vector<unsigned char>* embedded = nullptr) {
+    if (IsOfflinePlaceholder(attrs)) return false;
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICBitmapScaler> scaler;
+    ComPtr<IWICFormatConverter> converter;
+    ComPtr<IWICStream> stream;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&factory)))) return false;
+    if (embedded) {
+        if (embedded->empty() || embedded->size() > MAXDWORD || FAILED(factory->CreateStream(&stream)) ||
+            FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(embedded->data()), static_cast<DWORD>(embedded->size()))) ||
+            FAILED(factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder))) return false;
+    } else if (FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                         WICDecodeMetadataCacheOnDemand, &decoder))) return false;
+    if (FAILED(decoder->GetFrame(0, &frame))) return false;
+
+    UINT sourceWidth = 0, sourceHeight = 0;
+    if (FAILED(frame->GetSize(&sourceWidth, &sourceHeight)) ||
+        sourceWidth == 0 || sourceHeight == 0) return false;
+    source_width = sourceWidth;
+    source_height = sourceHeight;
+
+    IWICBitmapSource* source = frame.Get();
+    const UINT longest = (std::max)(sourceWidth, sourceHeight);
+    if (longest > pixels) {
+        const double ratio = static_cast<double>(pixels) / longest;
+        const UINT scaledWidth = (std::max)(1u, static_cast<UINT>(sourceWidth * ratio + 0.5));
+        const UINT scaledHeight = (std::max)(1u, static_cast<UINT>(sourceHeight * ratio + 0.5));
+        if (FAILED(factory->CreateBitmapScaler(&scaler)) ||
+            FAILED(scaler->Initialize(frame.Get(), scaledWidth, scaledHeight,
+                                      WICBitmapInterpolationModeFant))) return false;
+        source = scaler.Get();
+    }
+    if (FAILED(factory->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(source, GUID_WICPixelFormat32bppPBGRA,
+                                     WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeCustom)) ||
+        FAILED(converter->GetSize(&width, &height)) || width == 0 || height == 0) return false;
+    stride = width * 4;
+    out.resize(static_cast<size_t>(stride) * height);
+    if (FAILED(converter->CopyPixels(nullptr, stride, static_cast<UINT>(out.size()),
+                                     out.data()))) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+static bool MetadataUInt(IWICMetadataQueryReader* reader, const wchar_t* name,
+                         uint32_t& value) {
+    if (!reader) return false;
+    PROPVARIANT pv{}; PropVariantInit(&pv);
+    const HRESULT hr = reader->GetMetadataByName(name, &pv);
+    bool ok = SUCCEEDED(hr);
+    if (ok) {
+        if (pv.vt == VT_UI1) value = pv.bVal;
+        else if (pv.vt == VT_UI2) value = pv.uiVal;
+        else if (pv.vt == VT_UI4) value = pv.ulVal;
+        else if (pv.vt == VT_I4 && pv.lVal >= 0) value = static_cast<uint32_t>(pv.lVal);
+        else ok = false;
+    }
+    PropVariantClear(&pv);
+    return ok;
+}
+
+static void GifFrameMetadata(IWICBitmapFrameDecode* frame, uint32_t& left,
+                             uint32_t& top, uint32_t& width, uint32_t& height,
+                             uint32_t& disposal, uint32_t& delay_ms) {
+    left = top = 0; width = height = 0; disposal = 0; delay_ms = 100;
+    ComPtr<IWICMetadataQueryReader> reader;
+    if (FAILED(frame->GetMetadataQueryReader(&reader)) || !reader) {
+        frame->GetSize(&width, &height); return;
+    }
+    MetadataUInt(reader.Get(), L"/imgdesc/Left", left);
+    MetadataUInt(reader.Get(), L"/imgdesc/Top", top);
+    MetadataUInt(reader.Get(), L"/imgdesc/Width", width);
+    MetadataUInt(reader.Get(), L"/imgdesc/Height", height);
+    MetadataUInt(reader.Get(), L"/grctlext/Disposal", disposal);
+    uint32_t delay = 0;
+    if (MetadataUInt(reader.Get(), L"/grctlext/Delay", delay) && delay > 0)
+        delay_ms = std::clamp(delay * 10u, 20u, 2000u);
+    if (!width || !height) frame->GetSize(&width, &height);
+}
+
+static void AlphaBlendPbgra(uint8_t* dst, const uint8_t* src) {
+    const uint32_t sa = src[3];
+    if (sa == 255) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 255; return; }
+    if (sa == 0) return;
+    const uint32_t inv = 255u - sa;
+    dst[0] = static_cast<uint8_t>(src[0] + (dst[0] * inv + 127u) / 255u);
+    dst[1] = static_cast<uint8_t>(src[1] + (dst[1] * inv + 127u) / 255u);
+    dst[2] = static_cast<uint8_t>(src[2] + (dst[2] * inv + 127u) / 255u);
+    dst[3] = static_cast<uint8_t>(sa + (dst[3] * inv + 127u) / 255u);
+}
+
+static bool DecodeGifFrame(const std::wstring& path, DWORD attrs, UINT pixels,
+                           uint32_t frame_index, std::vector<uint8_t>& out,
+                           UINT& width, UINT& height, UINT& stride,
+                           uint32_t& frame_count, uint32_t& delay_ms,
+                           uint32_t& loop_count, UINT& source_width, UINT& source_height) {
+    if (IsOfflinePlaceholder(attrs)) return false;
+    ComPtr<IWICImagingFactory> factory; ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                   WICDecodeMetadataCacheOnLoad, &decoder))) return false;
+    UINT count = 0; if (FAILED(decoder->GetFrameCount(&count)) || !count) return false;
+    frame_count = count; frame_index = (std::min)(frame_index, count - 1);
+    loop_count = 0;
+    ComPtr<IWICMetadataQueryReader> decoder_reader;
+    if (SUCCEEDED(decoder->GetMetadataQueryReader(&decoder_reader)) && decoder_reader) {
+        PROPVARIANT pv{}; PropVariantInit(&pv);
+        if (SUCCEEDED(decoder_reader->GetMetadataByName(L"/appext/Data", &pv)) &&
+            ((pv.vt & VT_VECTOR) != 0) && ((pv.vt & VT_TYPEMASK) == VT_UI1) &&
+            pv.caub.cElems >= 16) {
+            const auto* b = pv.caub.pElems;
+            for (ULONG i = 0; i + 4 < pv.caub.cElems; ++i)
+                if (b[i] == 'N' && b[i + 1] == 'E' && b[i + 2] == 'T' &&
+                    b[i + 3] == 'S' && b[i + 4] == 'C') {
+                    for (ULONG j = i; j + 15 < pv.caub.cElems; ++j)
+                        if (b[j] == 0x03 && b[j + 1] == 0x01) {
+                            loop_count = b[j + 2] | (static_cast<uint32_t>(b[j + 3]) << 8); break;
+                        }
+                    break;
+                }
+        }
+        PropVariantClear(&pv);
+    }
+    ComPtr<IWICBitmapFrameDecode> first; if (FAILED(decoder->GetFrame(0, &first))) return false;
+    UINT canvas_w = 0, canvas_h = 0; first->GetSize(&canvas_w, &canvas_h);
+    ComPtr<IWICMetadataQueryReader> first_reader;
+    if (SUCCEEDED(decoder->GetMetadataQueryReader(&first_reader)) && first_reader) {
+        uint32_t v = 0;
+        if (MetadataUInt(first_reader.Get(), L"/logscrdesc/Width", v) && v) canvas_w = v;
+        if (MetadataUInt(first_reader.Get(), L"/logscrdesc/Height", v) && v) canvas_h = v;
+    }
+    if (!canvas_w || !canvas_h || canvas_w > 16384 || canvas_h > 16384) return false;
+    source_width = canvas_w;
+    source_height = canvas_h;
+    std::vector<uint8_t> canvas(static_cast<size_t>(canvas_w) * canvas_h * 4, 0);
+    std::vector<uint8_t> saved;
+    uint32_t prev_left = 0, prev_top = 0, prev_w = 0, prev_h = 0, prev_disposal = 0;
+    for (uint32_t i = 0; i <= frame_index; ++i) {
+        if (i > 0) {
+            if (prev_disposal == 2) {
+                const uint32_t x0 = (std::min)(prev_left, canvas_w);
+                const uint32_t x1 = (std::min)(canvas_w, prev_left + prev_w);
+                for (uint32_t y = (std::min)(prev_top, canvas_h);
+                     y < (std::min)(canvas_h, prev_top + prev_h); ++y)
+                    std::fill(canvas.begin() + (static_cast<size_t>(y) * canvas_w + x0) * 4,
+                              canvas.begin() + (static_cast<size_t>(y) * canvas_w + x1) * 4, uint8_t{0});
+            } else if (prev_disposal == 3 && saved.size() == canvas.size()) canvas = saved;
+        }
+        ComPtr<IWICBitmapFrameDecode> frame; if (FAILED(decoder->GetFrame(i, &frame))) return false;
+        uint32_t left, top, fw, fh, disposal, current_delay;
+        GifFrameMetadata(frame.Get(), left, top, fw, fh, disposal, current_delay);
+        if (i == frame_index) delay_ms = current_delay;
+        if (disposal == 3) saved = canvas;
+        ComPtr<IWICFormatConverter> converter;
+        if (FAILED(factory->CreateFormatConverter(&converter)) ||
+            FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA,
+                                         WICBitmapDitherTypeNone, nullptr, 0.0,
+                                         WICBitmapPaletteTypeCustom))) return false;
+        UINT rw = 0, rh = 0; converter->GetSize(&rw, &rh);
+        const UINT copy_w = (std::min)(fw, rw), copy_h = (std::min)(fh, rh);
+        std::vector<uint8_t> pixels_data(static_cast<size_t>(rw) * rh * 4);
+        if (FAILED(converter->CopyPixels(nullptr, rw * 4, static_cast<UINT>(pixels_data.size()), pixels_data.data()))) return false;
+        for (UINT y = 0; y < copy_h && top + y < canvas_h; ++y)
+            for (UINT x = 0; x < copy_w && left + x < canvas_w; ++x)
+                AlphaBlendPbgra(&canvas[(static_cast<size_t>(top + y) * canvas_w + left + x) * 4],
+                                &pixels_data[(static_cast<size_t>(y) * rw + x) * 4]);
+        prev_left = left; prev_top = top; prev_w = fw; prev_h = fh; prev_disposal = disposal;
+    }
+    width = canvas_w; height = canvas_h; stride = canvas_w * 4;
+    const UINT longest = (std::max)(canvas_w, canvas_h);
+    if (longest > pixels) {
+        const double ratio = static_cast<double>(pixels) / longest;
+        width = (std::max)(1u, static_cast<UINT>(canvas_w * ratio + 0.5));
+        height = (std::max)(1u, static_cast<UINT>(canvas_h * ratio + 0.5));
+        ComPtr<IWICBitmap> bitmap;
+        if (FAILED(factory->CreateBitmapFromMemory(canvas_w, canvas_h, GUID_WICPixelFormat32bppPBGRA,
+                                                   canvas_w * 4, static_cast<UINT>(canvas.size()), canvas.data(), &bitmap))) return false;
+        ComPtr<IWICBitmapScaler> scaler;
+        if (FAILED(factory->CreateBitmapScaler(&scaler)) ||
+            FAILED(scaler->Initialize(bitmap.Get(), width, height, WICBitmapInterpolationModeFant))) return false;
+        out.resize(static_cast<size_t>(width) * height * 4); stride = width * 4;
+        return SUCCEEDED(scaler->CopyPixels(nullptr, stride, static_cast<UINT>(out.size()), out.data()));
+    }
+    out = std::move(canvas); return true;
+}
+
+static bool HbitmapToBgra(HBITMAP bitmap, bool own, std::vector<uint8_t>& out,
+                          UINT& width, UINT& height, UINT& stride) {
+    ComPtr<IWICImagingFactory> wicFactory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&wicFactory)))) {
+        if (own) DeleteObject(bitmap);
+        return false;
+    }
+    const WICBitmapAlphaChannelOption options[] = {
+        WICBitmapUsePremultipliedAlpha, WICBitmapIgnoreAlpha
+    };
+    bool ok = false;
+    for (const auto option : options) {
+        ComPtr<IWICBitmap> source;
+        ComPtr<IWICFormatConverter> converter;
+        if (FAILED(wicFactory->CreateBitmapFromHBITMAP(bitmap, nullptr, option, &source)))
+            continue;
+        if (FAILED(wicFactory->CreateFormatConverter(&converter)) ||
+            FAILED(converter->Initialize(source.Get(), GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) ||
+            FAILED(converter->GetSize(&width, &height)) || width == 0 || height == 0)
+            continue;
+        stride = width * 4;
+        out.resize(static_cast<size_t>(stride) * height);
+        if (SUCCEEDED(converter->CopyPixels(nullptr, stride,
+                static_cast<UINT>(out.size()), out.data()))) {
+            ok = true;
+            break;
+        }
+        out.clear();
+    }
+    if (own) DeleteObject(bitmap);
+    if (!ok) out.clear();
+    return ok;
+}
+
+static bool FromThumbnailProvider(IShellItem* item, UINT pixels, HBITMAP& bitmap) {
+    ComPtr<IThumbnailProvider> provider;
+    if (FAILED(item->BindToHandler(nullptr, BHID_ThumbnailHandler, IID_PPV_ARGS(&provider))))
+        return false;
+    WTS_ALPHATYPE alpha = WTSAT_UNKNOWN;
+    return SUCCEEDED(provider->GetThumbnail(pixels, &bitmap, &alpha)) && bitmap;
+}
+
+static bool FromThumbnailCache(IShellItem* item, UINT pixels, bool cache_only, HBITMAP& bitmap) {
+    ComPtr<IThumbnailCache> cache;
+    if (FAILED(CoCreateInstance(CLSID_LocalThumbnailCache, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&cache))))
+        return false;
+    const WTS_FLAGS flags = cache_only
+        ? static_cast<WTS_FLAGS>(WTS_INCACHEONLY | WTS_SCALETOREQUESTEDSIZE)
+        : static_cast<WTS_FLAGS>(WTS_EXTRACT | WTS_SCALETOREQUESTEDSIZE);
+    ComPtr<ISharedBitmap> shared;
+    WTS_CACHEFLAGS cacheFlags{};
+    if (FAILED(cache->GetThumbnail(item, pixels, flags, &shared, &cacheFlags, nullptr)) || !shared)
+        return false;
+    HBITMAP shared_bitmap = nullptr;
+    if (FAILED(shared->GetSharedBitmap(&shared_bitmap)) || !shared_bitmap) return false;
+    bitmap = static_cast<HBITMAP>(CopyImage(shared_bitmap, IMAGE_BITMAP, 0, 0, 0));
+    return bitmap != nullptr;
+}
+
+// cache_only: answer from Explorer's thumbnail cache or not at all - never
+// runs a provider, so it cannot stall the host.
+static bool MakeShellThumbnail(const std::wstring& path, DWORD attrs, UINT pixels,
+                               std::vector<uint8_t>& out, UINT& width, UINT& height,
+                               UINT& stride, bool cache_only = false) {
+    if (IsOfflinePlaceholder(attrs)) return false;
+    const std::wstring shell_path = ShellPath(path);
+    ComPtr<IShellItem> item;
+    if (FAILED(SHCreateItemFromParsingName(shell_path.c_str(), nullptr, IID_PPV_ARGS(&item))))
+        return false;
+    const bool isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    HBITMAP bitmap = nullptr;
+
+    if (isDirectory) {
+        ComPtr<IShellItemImageFactory> factory;
+        if (FAILED(item.As(&factory))) return false;
+        const SIZE size{static_cast<LONG>(pixels), static_cast<LONG>(pixels)};
+        if (FAILED(factory->GetImage(size,
+                SIIGBF_BIGGERSIZEOK | SIIGBF_ICONONLY, &bitmap)) || !bitmap)
+            return false;
+        return HbitmapToBgra(bitmap, true, out, width, height, stride);
+    }
+
+    if (!FromThumbnailCache(item.Get(), pixels, true, bitmap) || !bitmap)
+        bitmap = nullptr;
+    if (cache_only) {
+        if (!bitmap) return false;
+        return HbitmapToBgra(bitmap, true, out, width, height, stride);
+    }
+    if (!bitmap && !FromThumbnailProvider(item.Get(), pixels, bitmap))
+        bitmap = nullptr;
+    if (!bitmap && (!FromThumbnailCache(item.Get(), pixels, false, bitmap) || !bitmap))
+        bitmap = nullptr;
+    if (!bitmap) {
+        ComPtr<IShellItemImageFactory> factory;
+        if (SUCCEEDED(item.As(&factory))) {
+            const SIZE size{static_cast<LONG>(pixels), static_cast<LONG>(pixels)};
+            const SIIGBF flags = static_cast<SIIGBF>(
+                SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT | SIIGBF_THUMBNAILONLY);
+            if (FAILED(factory->GetImage(size, flags, &bitmap))) bitmap = nullptr;
+        }
+    }
+    if (!bitmap) return false;
+    return HbitmapToBgra(bitmap, true, out, width, height, stride);
+}
+
+// ---- Content decoders -------------------------------------------------------
+// One entry per format family, tried in kDecoders order (see preview_router.h).
+// accepts() holds the cheap checks; run() returns Next when the file could not
+// be read natively so the shell thumbnail and text/hex paths still get it.
+
+using preview::DecodeRequest;
+using preview::DecodeResult;
+using preview::DecodeStep;
+
+static DecodeStep MadeBitmap(DecodeResult& r) {
+    r.kind = ipc::PreviewContentKind::Bitmap;
+    return DecodeStep::Made;
+}
+
+static bool ShellThumbnailInto(const DecodeRequest& q, DecodeResult& r) {
+    return MakeShellThumbnail(q.path, q.request.attrs, q.cap, r.pixels, r.width, r.height,
+                              r.stride);
+}
+
+static bool CachedShellThumbnailInto(const DecodeRequest& q, DecodeResult& r) {
+    return MakeShellThumbnail(q.path, q.request.attrs, q.cap, r.pixels, r.width, r.height,
+                              r.stride, true);
+}
+
+static void ClearBitmap(DecodeResult& r) {
+    r.pixels.clear();
+    r.width = r.height = r.stride = r.source_width = r.source_height = 0;
+}
+
+static bool DwgHeaderThumbnailInto(const DecodeRequest& q, DecodeResult& r) {
+    ClearBitmap(r);
+    return preview::ExtractDwgThumbnail(q.path, q.cap, r.pixels, r.width, r.height,
+        r.stride, r.source_width, r.source_height, nullptr);
+}
+
+static bool TextOrHexInto(const DecodeRequest& q, DecodeResult& r) {
+    return MakeTextOrHex(q.path, q.request.attrs, r.kind, r.text, r.bytes_read, r.truncated);
+}
+
+// WIC images (animated GIF frames included).
+static bool AcceptsImage(const DecodeRequest& q) { return IsDirectImage(q.extension); }
+static DecodeStep RunImage(const DecodeRequest& q, DecodeResult& r) {
+    uint32_t frame_count = 1, frame_delay = 0, loop_count = 0;
+    const bool gif = q.extension == L".gif";
+    const UINT cap = ipc::ClampPreviewPixelSize(q.request.pixel_size, gif);
+    bool made = false;
+    if (gif) {
+        made = DecodeGifFrame(q.path, q.request.attrs, cap, q.request.frame_index,
+            r.pixels, r.width, r.height, r.stride, frame_count, frame_delay, loop_count,
+            r.source_width, r.source_height);
+    } else {
+        made = DecodeImage(q.path, q.request.attrs, cap, r.pixels, r.width, r.height,
+                           r.stride, r.source_width, r.source_height);
+    }
+    r.frame_count = frame_count;
+    r.frame_delay_ms = frame_delay;
+    r.loop_count = loop_count;
+    if (made) return MadeBitmap(r);
+    if (!q.offline) {
+        // WIC has no decoder for every format in the list on every machine:
+        // AVIF/HEIC need the store extension. Fall back to the shell thumbnail
+        // - the path Explorer itself uses - before reporting the preview as
+        // unavailable.
+        r.pixels.clear();
+        r.width = r.height = r.stride = 0;
+        if (ShellThumbnailInto(q, r)) return MadeBitmap(r);
+    }
+    r.error = L"image-decode-failed";
+    return DecodeStep::Failed;
+}
+
+// SVG through Direct2D; markup that does not render is shown as text.
+static bool AcceptsVector(const DecodeRequest& q) {
+    return preview::IsVectorExtension(q.extension);
+}
+static DecodeStep RunVector(const DecodeRequest& q, DecodeResult& r) {
+    // WIC has no SVG decoder, so these render through Direct2D into the same
+    // premultiplied BGRA pixels the raster path returns.
+    if (!q.offline && preview::RasterizeSvgFile(q.path, q.cap, r.pixels, r.width, r.height,
+            r.stride, r.source_width, r.source_height, &r.error))
+        return MadeBitmap(r);
+    if (q.offline) return DecodeStep::Failed;
+    // No Direct2D SVG support (Windows before 1703), a document too large to
+    // parse, or damaged markup: show the file as text instead of an empty
+    // placeholder.
+    r.error.clear();
+    if (TextOrHexInto(q, r)) return DecodeStep::Made;
+    r.error = L"svg-render-failed";
+    return DecodeStep::Failed;
+}
+
+// WMF/EMF: WIC decodes them only when its codec is installed, and the shell has
+// no thumbnail provider, so GDI renders them.
+static bool AcceptsMetaFile(const DecodeRequest& q) {
+    return preview::IsMetaFileExtension(q.extension);
+}
+static DecodeStep RunMetaFile(const DecodeRequest& q, DecodeResult& r) {
+    if (!q.offline && preview::RasterizeMetaFile(q.path, q.cap, r.pixels, r.width, r.height,
+            r.stride, r.source_width, r.source_height, &r.error))
+        return MadeBitmap(r);
+    return DecodeStep::Failed;
+}
+
+// PDF / PDF-compatible AI: PDFium renders page 1 at the requested size. Legacy
+// PostScript AI, encrypted PDFs or a missing DLL fall back to whatever shell
+// thumbnail provider is registered.
+static bool AcceptsPdf(const DecodeRequest& q) {
+    return !q.is_directory && preview::IsPdfRasterExtension(q.extension);
+}
+static DecodeStep RunPdf(const DecodeRequest& q, DecodeResult& r) {
+    bool made = false;
+    if (!q.offline) {
+        made = preview::RasterizePdfFile(q.path, q.cap, r.pixels, r.width, r.height, r.stride,
+                                         r.source_width, r.source_height, &r.error);
+        if (!made) {
+            r.pixels.clear();
+            r.width = r.height = r.stride = r.source_width = r.source_height = 0;
+            made = ShellThumbnailInto(q, r);
+            if (made) r.error.clear();
+        }
+    }
+    if (made) return MadeBitmap(r);
+    if (r.error.empty()) r.error = L"provider-failed";
+    return DecodeStep::Failed;
+}
+
+// Archives: contents tree instead of a hex dump. A file that is not a readable
+// archive falls through to the entries below.
+static bool AcceptsArchive(const DecodeRequest& q) {
+    return !q.is_directory && preview::IsArchiveExtension(q.extension) && !q.offline;
+}
+static DecodeStep RunArchive(const DecodeRequest& q, DecodeResult& r) {
+    if (!preview::MakeArchiveListing(q.path, r.text, r.bytes_read, nullptr))
+        return DecodeStep::Next;
+    r.kind = ipc::PreviewContentKind::Archive;
+    return DecodeStep::Made;
+}
+
+// PSD/PSB: large previews show the merged composite; grid thumbnails keep an
+// installed shell provider, else the embedded JPEG thumbnail.
+static bool AcceptsPsd(const DecodeRequest& q) {
+    return !q.is_directory && !q.offline && preview::IsPsdExtension(q.extension) &&
+        (!q.grid || !HasShellThumbnailHandler(q.extension));
+}
+static DecodeStep RunPsd(const DecodeRequest& q, DecodeResult& r) {
+    if (!preview::RasterizePsdFile(q.path, q.cap, q.grid, r.pixels, r.width, r.height,
+            r.stride, r.source_width, r.source_height, nullptr))
+        return DecodeStep::Next;
+    return MadeBitmap(r);
+}
+
+// Fonts: specimen page for the details pane and Quick Look; grid thumbnails
+// keep the Windows font thumbnail ("Abg").
+static bool AcceptsFont(const DecodeRequest& q) {
+    return !q.is_directory && !q.offline && preview::IsFontExtension(q.extension) && !q.grid;
+}
+static DecodeStep RunFont(const DecodeRequest& q, DecodeResult& r) {
+    if (!preview::RasterizeFontFile(q.path, q.cap, r.pixels, r.width, r.height, r.stride,
+                                    nullptr))
+        return DecodeStep::Next;
+    return MadeBitmap(r);
+}
+
+// RTF: grid thumbnails get the first-page sketch; the details pane and Quick
+// Look get the body text, not the markup the text view would otherwise show.
+static bool RtfInto(const DecodeRequest& q, DecodeResult& r) {
+    if (q.grid) {
+        if (q.cap < preview::kOfficeSketchMinEdge) return false;
+        ClearBitmap(r);
+        if (!preview::RenderOfficeSketch(q.path, L".rtf", q.cap, r.pixels, r.width, r.height, r.stride,
+                                         nullptr)) {
+            ClearBitmap(r);
+            return false;
+        }
+        r.kind = ipc::PreviewContentKind::Bitmap;
+        return true;
+    }
+    std::wstring text;
+    bool truncated = false;
+    if (!preview::ReadRtfText(q.path, text, &truncated, nullptr)) return false;
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    const uint64_t size = GetFileAttributesExW(q.path.c_str(), GetFileExInfoStandard, &data)
+        ? (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow : 0;
+    r.kind = ipc::PreviewContentKind::Text;
+    r.text = std::move(text);
+    r.truncated = truncated;
+    r.bytes_read = static_cast<uint32_t>((std::min<uint64_t>)(size, UINT32_MAX));
+    return true;
+}
+static bool AcceptsRtf(const DecodeRequest& q) {
+    return !q.is_directory && !q.offline && q.extension == L".rtf";
+}
+static DecodeStep RunRtf(const DecodeRequest& q, DecodeResult& r) {
+    return RtfInto(q, r) ? DecodeStep::Made : DecodeStep::Next;
+}
+
+// Folders and the formats Windows previews well (Office, video, CAD).
+static bool AcceptsShellPreview(const DecodeRequest& q) {
+    return q.is_directory || IsKnownShellPreview(q.extension);
+}
+static DecodeStep RunShellPreview(const DecodeRequest& q, DecodeResult& r) {
+    // Grid thumbnails only, except for formats Windows cannot preview at all
+    // (WPS, OpenDocument), where the sketch beats an empty details pane.
+    const bool sketchable = !q.is_directory && !q.offline &&
+        (q.grid || preview::IsSketchOnlyExtension(q.extension)) &&
+        q.cap >= preview::kOfficeSketchMinEdge && preview::IsOfficeSketchExtension(q.extension);
+    const bool dwg = !q.is_directory && !q.offline && q.extension == L".dwg";
+    bool made = false;
+    if (dwg && q.grid) {
+        // Grid thumbnails must be stable more than sharp: a CAD provider may
+        // take seconds or fail intermittently (licence checks, cold start),
+        // which made thumbnails flip between picture and icon. Explorer's
+        // cache is instant; the preview AutoCAD embeds in the header is a
+        // plain file read; only files with neither wake the provider.
+        made = CachedShellThumbnailInto(q, r);
+        if (!made) made = DwgHeaderThumbnailInto(q, r);
+        if (!made) {
+            ClearBitmap(r);
+            made = ShellThumbnailInto(q, r);
+        }
+        if (made) return MadeBitmap(r);
+        r.error = L"provider-failed";
+        return DecodeStep::Failed;
+    }
+    if (sketchable) {
+        // OOXML previews remain available without an installed Office Shell provider.
+        for (const char* member : {"docProps/thumbnail.jpeg", "docProps/thumbnail.jpg", "docProps/thumbnail.png"}) {
+            std::vector<unsigned char> bytes;
+            if (preview::ReadZipEntry(q.path, member, 8u * 1024u * 1024u, bytes, nullptr) &&
+                DecodeImage(q.path, q.request.attrs, q.cap, r.pixels, r.width, r.height, r.stride,
+                            r.source_width, r.source_height, &bytes) &&
+                !preview::IsBlankThumbnail(r.pixels, r.width, r.height, r.stride)) {
+                made = true;
+                break;
+            }
+        }
+    }
+    if (!made) made = ShellThumbnailInto(q, r);
+    if (made && sketchable && preview::IsBlankThumbnail(r.pixels, r.width, r.height, r.stride)) {
+        // A blank embedded thumbnail (Mac Word writes all-white ones) says
+        // less than the sketch below.
+        made = false;
+    }
+    if (!made && dwg) {
+        // Large previews: an installed CAD thumbnail provider renders
+        // sharper, so it wins; without one, fall back to the small preview
+        // AutoCAD embeds in the drawing header.
+        made = DwgHeaderThumbnailInto(q, r);
+    }
+    if (!made && sketchable) {
+        // Word / Excel files rarely embed a (non-blank) thumbnail; grid
+        // thumbnails then get a sketch of the first page drawn from the
+        // document's own text. source_width/height stay 0: the sketch has no
+        // pixel size of its own to report.
+        r.pixels.clear();
+        r.width = r.height = r.stride = r.source_width = r.source_height = 0;
+        made = preview::RenderOfficeSketch(q.path, q.extension, q.cap, r.pixels, r.width, r.height,
+            r.stride, nullptr);
+    }
+    if (made) return MadeBitmap(r);
+    r.error = L"provider-failed";
+    return DecodeStep::Failed;
+}
+
+// Any other format with a registered shell thumbnail handler.
+static bool AcceptsShellHandler(const DecodeRequest& q) {
+    return !IsKnownText(q.extension) && !q.offline && HasShellThumbnailHandler(q.extension);
+}
+static DecodeStep RunShellHandler(const DecodeRequest& q, DecodeResult& r) {
+    if (ShellThumbnailInto(q, r)) return MadeBitmap(r);
+    // Handler present but it declined this file: keep the old view.
+    if (TextOrHexInto(q, r)) return DecodeStep::Made;
+    r.error = L"content-read-failed";
+    return DecodeStep::Failed;
+}
+
+// Files whose extension names nothing we or the shell can preview - AutoCAD
+// backups (.bak / .sv$), renamed fonts, images or PDFs - are recognised by
+// their signature and previewed as what they really are. Unrecognised content
+// continues to the text / hex view.
+static bool AcceptsSniffed(const DecodeRequest& q) {
+    return !q.is_directory && !q.offline && !IsKnownText(q.extension) &&
+        !preview::IsNativeExtension(q.extension) && !IsKnownShellPreview(q.extension) &&
+        !preview::IsOfficeSketchExtension(q.extension) && !HasShellThumbnailHandler(q.extension);
+}
+static DecodeStep RunSniffed(const DecodeRequest& q, DecodeResult& r) {
+    bool made = false;
+    switch (preview::SniffContent(q.path)) {
+    case preview::SniffedFormat::Dwg:
+        if (DwgHeaderThumbnailInto(q, r)) return MadeBitmap(r);
+        // A drawing saved without a preview: nothing readable to show, and a
+        // hex dump of DWG says less than the file icon.
+        ClearBitmap(r);
+        r.error = L"dwg-no-preview";
+        return DecodeStep::Failed;
+    case preview::SniffedFormat::Font:
+        made = preview::RasterizeFontFile(q.path, q.cap, r.pixels, r.width, r.height, r.stride, nullptr);
+        break;
+    case preview::SniffedFormat::Rtf:
+        return RtfInto(q, r) ? DecodeStep::Made : DecodeStep::Next;
+    case preview::SniffedFormat::Pdf:
+        made = preview::RasterizePdfFile(q.path, q.cap, r.pixels, r.width, r.height, r.stride,
+                                         r.source_width, r.source_height, nullptr);
+        break;
+    case preview::SniffedFormat::Archive:
+        if (!preview::MakeArchiveListing(q.path, r.text, r.bytes_read, nullptr)) {
+            r.text.clear();
+            r.bytes_read = 0;
+            return DecodeStep::Next;
+        }
+        r.kind = ipc::PreviewContentKind::Archive;
+        return DecodeStep::Made;
+    case preview::SniffedFormat::Image:
+        made = DecodeImage(q.path, q.request.attrs, q.cap, r.pixels, r.width, r.height, r.stride,
+                           r.source_width, r.source_height);
+        break;
+    default:
+        return DecodeStep::Next;
+    }
+    if (made) return MadeBitmap(r);
+    ClearBitmap(r);
+    return DecodeStep::Next;
+}
+
+// Last resort for everything: text, or a hex dump of binary data.
+static bool AcceptsAny(const DecodeRequest&) { return true; }
+static DecodeStep RunTextOrHex(const DecodeRequest& q, DecodeResult& r) {
+    if (TextOrHexInto(q, r)) return DecodeStep::Made;
+    r.error = L"content-read-failed";
+    return DecodeStep::Failed;
+}
+
+// Shortcuts (.lnk): the preview of the file they point to, as Explorer shows
+// it. The link is read, never resolved (Resolve may search the disk or wake a
+// network share); network targets, folders and programs keep the link icon.
+static bool AcceptsShortcut(const DecodeRequest& q) {
+    return !q.is_directory && !q.offline && q.extension == L".lnk";
+}
+static bool ShortcutTarget(const std::wstring& link, std::wstring& target) {
+    ComPtr<IShellLinkW> shell_link;
+    ComPtr<IPersistFile> file;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shell_link))) ||
+        FAILED(shell_link.As(&file)) || FAILED(file->Load(link.c_str(), STGM_READ)))
+        return false;
+    wchar_t raw[MAX_PATH]{};
+    if (FAILED(shell_link->GetPath(raw, ARRAYSIZE(raw), nullptr, SLGP_RAWPATH)) || !raw[0]) return false;
+    wchar_t expanded[MAX_PATH]{};
+    const DWORD n = ExpandEnvironmentStringsW(raw, expanded, ARRAYSIZE(expanded));
+    target = n > 0 && n <= ARRAYSIZE(expanded) ? expanded : raw;
+    return true;
+}
+static DecodeStep RunShortcut(const DecodeRequest& q, DecodeResult& r) {
+    std::wstring target;
+    if (!ShortcutTarget(q.path, target)) {
+        r.error = L"shortcut-no-target";     // shell namespace targets (Control Panel, apps...)
+        return DecodeStep::Failed;
+    }
+    if (PathIsNetworkPathW(target.c_str())) {
+        r.error = L"shortcut-network-target";
+        return DecodeStep::Failed;
+    }
+    const DWORD attrs = GetFileAttributesW(target.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        r.error = L"shortcut-target-missing";
+        return DecodeStep::Failed;
+    }
+    const std::wstring extension = ExtensionOf(target);
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 || IsOneOf(extension, {
+            L".lnk", L".exe", L".dll", L".com", L".scr", L".msc", L".cpl", L".sys", L".url", L".appref-ms"})) {
+        r.error = L"shortcut-to-program";
+        return DecodeStep::Failed;
+    }
+    ipc::PreviewRequest inner = q.request;
+    inner.attrs = attrs;
+    const DecodeRequest target_request{inner, target, extension, false, IsOfflinePlaceholder(attrs), q.cap, q.grid};
+    return preview::DecodeContent(target_request, r) ? DecodeStep::Made : DecodeStep::Failed;
+}
+
+// Order is behaviour: it is the order the formats were tested in before the
+// table existed. New families go before "shell-preview" unless the shell
+// provider must win.
+static const preview::DecoderEntry kDecoders[] = {
+    { "shortcut",        AcceptsShortcut,     RunShortcut },
+    { "image",           AcceptsImage,        RunImage },
+    { "svg",             AcceptsVector,       RunVector },
+    { "metafile",        AcceptsMetaFile,     RunMetaFile },
+    { "pdf",             AcceptsPdf,          RunPdf },
+    { "archive",         AcceptsArchive,      RunArchive },
+    { "psd",             AcceptsPsd,          RunPsd },
+    { "font",            AcceptsFont,         RunFont },
+    { "rtf",             AcceptsRtf,          RunRtf },
+    { "shell-preview",   AcceptsShellPreview, RunShellPreview },
+    { "content-sniff",   AcceptsSniffed,      RunSniffed },
+    { "shell-thumbnail", AcceptsShellHandler, RunShellHandler },
+    { "text-or-hex",     AcceptsAny,          RunTextOrHex },
+};
+
+bool pulse::preview::DecodeContent(const DecodeRequest& request, DecodeResult& result) {
+    return RunDecoders(kDecoders, request, result);
+}

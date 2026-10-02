@@ -85,6 +85,15 @@ int TrayItemTotalCount(const app::StagingTray& tray);
 std::wstring TrayDisplayPath(const std::wstring& path);
 std::wstring TrayItemName(const std::wstring& path);
 int TrayDeckHoverIndex(const AppState& s);
+// Staging tray card stack (cyclic): index of the top card, throw the top card
+// to the back (dir ±1, release offset in DIPs), bring the last card back on
+// top, smoke burst for a dismiss, and exit hints for the next tick.
+int TrayStackTop(const AppState& s);
+void ThrowTrayTop(AppState& s, float dir, float dx, float dy);
+void TrayStepBack(AppState& s);
+void ReleaseTrayDrag(AppState& s, bool commit);
+void SpawnTrayPuffs(AppState& s);
+void MarkTrayExit(AppState& s, const std::vector<std::wstring>& paths, bool stagger);
 void RefreshStarredViews(AppState& s);
 void RefreshRecentViews(AppState& s);
 bool IsRecycleTab(const app::Tab* tab);

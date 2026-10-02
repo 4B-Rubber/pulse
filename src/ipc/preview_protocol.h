@@ -11,12 +11,21 @@ enum class PreviewContentKind : uint32_t {
     Text = 2,
     Hex = 3,
     Unsupported = 4,
+    // Archive contents: a tab-separated tree (see archive_listing.h) that the
+    // UI draws itself - summary, type mix and an expandable folder tree.
+    Archive = 5,
 };
 enum class PreviewRequestKind : uint32_t {
     Content = 0,
     Properties = 1,
 };
 constexpr uint32_t kPreviewFlagTruncated = 1u << 0;
+// PreviewRequest::flags. Grid: a list/grid/sidebar thumbnail (as opposed to
+// the details pane or Quick Look), whatever its pixel size - extra large icons
+// on high-DPI screens ask for more than kGridThumbnailEdge.
+constexpr uint32_t kPreviewRequestFlagGrid = 1u << 0;
+constexpr uint32_t kPreviewMaxTextChars = 32768;
+constexpr uint32_t kPreviewMaxArchiveChars = 512u * 1024u;
 constexpr uint32_t kPreviewMinPixelSize = 32;
 constexpr uint32_t kPreviewDefaultPixelSize = 512;
 constexpr uint32_t kPreviewMaxPixelSize = 1024;
@@ -45,6 +54,7 @@ struct PreviewRequest {
     uint32_t attrs = 0;
     uint32_t path_chars = 0;
     uint32_t frame_index = 0;
+    uint32_t flags = 0;
 };
 struct PreviewResponse {
     uint32_t magic = kPreviewMagic;

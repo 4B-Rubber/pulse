@@ -950,7 +950,9 @@ void Engine::UpdateVolumeVisibilityLocked(const std::vector<VolumeInfo>& active,
     } else {
         inactive_volume_roots_ = std::move(inactive);
     }
-    InvalidateFilterLocked();
+    // Visibility is checked at query time; it does not change file lengths or
+    // parent links. Keep the size aggregates across routine topology polling.
+    ++filter_epoch_;
 }
 
 void Engine::CollectMatchesLocked(const CompiledQuery& cq, int32_t prefix_node,
@@ -2583,6 +2585,16 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
     const uint64_t frn = rec->FileReferenceNumber;
     const bool is_dir = (rec->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     int32_t idx = FindByFrnLocked(v, frn);
+    const auto size_before = FolderSizeItem(idx);
+    folder_size_usn_update_ = true;
+    struct SizeUpdate {
+        std::function<void()> finish;
+        ~SizeUpdate() { finish(); }
+    } size_update{[&] {
+        folder_size_usn_update_ = false;
+        if (idx >= 0) folder_sizes_.Replace(idx, size_before, FolderSizeItem(idx),
+            [this](int32_t id) { return FolderSizeItem(id); });
+    }};
     // NTFS reports the volume root with its own FRN as parent.
     if (idx == v.root_idx) return UsnApply::None;
     const auto tracked_path = v.tracking_paths.find(frn);
@@ -2773,7 +2785,8 @@ bool Engine::CatchUpVolume(VolState& v, bool* changed, bool* structural) {
     int64_t start_usn = 0;
     wchar_t letter = 0;
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        v.folder_size_current = false;
         if (v.journal_id == 0) {
             filename_timing_.End(FilenameStage::Journal, timing, 0, ERROR_JOURNAL_NOT_ACTIVE, "journal_unavailable", v.letter);
             return false;
@@ -2837,6 +2850,8 @@ bool Engine::CatchUpVolume(VolState& v, bool* changed, bool* structural) {
         return false;
     }
     if (blob.empty() && last == start_usn) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        v.folder_size_current = true;
         filename_timing_.End(FilenameStage::Journal, timing, 0, ERROR_SUCCESS, "no_changes", letter);
         return true;
     }
@@ -2866,6 +2881,7 @@ bool Engine::CatchUpVolume(VolState& v, bool* changed, bool* structural) {
         p += hdr->RecordLength;
     }
     v.next_usn = last;
+    v.folder_size_current = true;
     if (DeltaLog* delta = DeltaFor(v.letter)) delta->QueueUsn(v.journal_id, v.next_usn);
     indexed_.store(static_cast<size_t>(LiveCount()) > deleted_ ? LiveCount() - deleted_ : 0);
     if (any_struct) {
@@ -3329,6 +3345,7 @@ void Engine::FullRebuild(const char* reason) {
                       : L"索引可用，但保存失败，请检查索引目录权限及磁盘空间");
             ready_ = true;
             building_ = false;
+            folder_size_gap_ = false;
         }
         if (used_mft) StopWalkWatches();
         else StartWalkWatches(walk_roots_);
@@ -3392,6 +3409,7 @@ void Engine::RecoverFailedVolumes(const std::vector<VolumeInfo>& volumes, ULONGL
             journal_streams_[state->volume_id] = std::make_unique<UsnStream>(
                 state->letter, state->journal_id, state->next_usn, change_signal_);
     }
+    if (volume_retry_after_.empty()) folder_size_gap_ = false;
     filename_timing_.Flush();
 }
 void Engine::Worker() {

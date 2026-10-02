@@ -2,6 +2,7 @@
 #include "app_input.h"
 #include "search_query.h"
 #include "../ui/address_search_layout.h"
+#include "../ui/toolbar_layout.h"
 #include "../common/localization.h"
 #include <fstream>
 #include <filesystem>
@@ -251,7 +252,7 @@ int RunSearchExitTest(AppState& s, const wchar_t* output) {
     const auto filename_generation = static_cast<uint32_t>(tab->pending_generation);
     s.addressSearchAnimation = 1.0f;
     auto vm = BuildVm(s, false);
-    const auto layout = ui::LayoutAddressSearch(s.renderer.AddressBarRect(static_cast<float>(s.compositor.Width())), s.scale);
+    const auto layout = ui::LayoutAddressSearch(s.renderer.SearchBarRect(static_cast<float>(s.compositor.Width())), s.scale);
     const auto bounds = D2D1::RectF(0, 0, static_cast<float>(s.compositor.Width()), static_cast<float>(s.compositor.Height()));
     const int x = static_cast<int>((layout.close.left + layout.close.right) * 0.5f);
     const int y = static_cast<int>((layout.close.top + layout.close.bottom) * 0.5f);
@@ -578,7 +579,118 @@ int RunContentLiveSelectionTest(AppState& s,const wchar_t* output) {
     log<<"failures="<<failures<<std::endl;return failures ? 1:0;
 }
 
+namespace {
+AppState* toolbar_test_state = nullptr;
+bool toolbar_path_opened = false;
+void CALLBACK CloseToolbarPathMenu(HWND, UINT, UINT_PTR timer, DWORD) {
+    auto* s = toolbar_test_state;
+    if (s && s->menu && s->menu->IsOpen()) {
+        toolbar_path_opened = s->addressEditing && !s->addressSearching;
+        s->menu->Dismiss();
+        KillTimer(nullptr, timer);
+    }
+}
+}
+int RunToolbarLayoutTest(AppState& s, const wchar_t* output) {
+    std::ofstream log{std::filesystem::path(output)};
+    int failures = 0;
+    auto check = [&](bool ok, const char* label) { log << (ok ? "[PASS] " : "[FAIL] ") << label << '\n'; if (!ok) ++failures; };
+    s.appPrefs.persist = false;
+    auto* tab = ActiveTab(s);
+    s.appPrefs.address_search_current = true;
+    ui::WindowViewModel hint;
+    FillAddressSearchView(s,hint);
+    check(hint.address_search_placeholder.find(app::TabTitle(tab->current_path)) != std::wstring::npos,
+        "search placeholder includes current directory");
+    const auto original_path=tab->current_path;
+    tab->current_path=L"C:\\Other folder";
+    FillAddressSearchView(s,hint);
+    check(hint.address_search_placeholder.find(L"Other folder") != std::wstring::npos,
+        "search placeholder follows directory changes");
+    s.appPrefs.address_search_current=false;
+    FillAddressSearchView(s,hint);
+    check(hint.address_search_placeholder.find(l10n::Get(l10n::StringId::SearchScopeAll)) != std::wstring::npos,
+        "all-disk search placeholder reports actual scope");
+    tab->current_path=original_path;
+    s.appPrefs.address_search_current=true;
+    tab->search_input_path = tab->current_path;
+    tab->search_input_text = L"report";
+    tab->search_input_current=true;
+    tab->search_input_root=tab->current_path;
+    BYTE keys[256]{}, control[256]{};
+    GetKeyboardState(keys);
+    control[VK_CONTROL]=0x80;
+    SetKeyboardState(control);
+    SendMessageW(s.hwnd,WM_KEYDOWN,L'K',0);
+    SetKeyboardState(keys);
+    check(s.addressSearching && s.addressEditing,"Ctrl+K focuses the toolbar search field");
+    const auto vm = BuildVm(s, false);
+    const float width = static_cast<float>(s.compositor.Width());
+    for (float sidebar_width : {224.0f, 1200.0f}) {
+    s.renderer.SetSidebarWidthDip(sidebar_width);
+    for (float scale : {1.0f, 1.5f, 2.0f}) {
+        s.renderer.SetScale(scale);
+        for (float dip_width : {480.0f, 640.0f, 900.0f, 1280.0f}) {
+            const float w = dip_width * scale;
+            const auto bounds = D2D1::RectF(0, 0, w, 900 * scale);
+            const auto address = s.renderer.AddressBarRect(w);
+            const auto search = s.renderer.SearchBarRect(w);
+            const auto sidebar = s.renderer.SidebarRect(w, bounds.bottom);
+            const auto bar = s.renderer.ToolbarRect(w);
+            const auto controls = ui::LayoutAddressSearch(search, scale);
+            auto region = [&](D2D1_RECT_F r) {
+                return s.renderer.HitTest(vm, bounds, (r.left+r.right)/2, (r.top+r.bottom)/2).region;
+            };
+            check(address.right < search.left && controls.input.right > controls.input.left,
+                "separate address and search fields fit narrow windows and DPI");
+            check(bar.left == sidebar.right && sidebar.top < bar.bottom && address.left > sidebar.right,
+                "toolbar starts after full-height sidebar");
+            const auto toolbar = ui::MakeToolbarLayout(w,scale,s.renderer.TitleBarHeight(),s.renderer.Margin(),
+                s.renderer.NewCommandRect(w).right-s.renderer.NewCommandRect(w).left,sidebar.right);
+            const ui::HitTestResult::Region navigation[]={ui::HitTestResult::NavBack,ui::HitTestResult::NavForward,
+                ui::HitTestResult::NavUp,ui::HitTestResult::NavRefresh};
+            bool navigation_ok=true;
+            for(int i=0;i<4;++i) navigation_ok &= toolbar.navigation[i].left >= sidebar.right &&
+                region(toolbar.navigation[i]) == navigation[i];
+            check(navigation_ok,"all four navigation icons remain clickable to right of sidebar");
+            const auto sidebar_hit=s.renderer.HitTest(vm,bounds,16*scale,sidebar.top+18*scale);
+            check(sidebar_hit.region == ui::HitTestResult::SidebarItem,
+                "sidebar first item above file area is not intercepted by toolbar");
+            check(region(address) == ui::HitTestResult::AddressBar &&
+                  region(controls.input) == ui::HitTestResult::AddressSearchInput,
+                "address and search input have independent hit targets");
+            check(region(controls.name) == ui::HitTestResult::AddressSearchMode &&
+                  region(controls.content) == ui::HitTestResult::AddressSearchContent &&
+                  region(controls.close) == ui::HitTestResult::AddressSearchClose,
+                "search controls remain reachable across window sizes");
+            const auto create = s.renderer.NewCommandRect(w);
+            const auto split = s.renderer.SplitCommandRect(w);
+            check(create.top > address.bottom && split.right < w &&
+                  region(create) == ui::HitTestResult::NewButton && region(split) == ui::HitTestResult::SplitButton,
+                "second toolbar row and popup anchors match hit targets");
+        }
+    }
+    }
+    s.renderer.SetSidebarWidthDip(static_cast<float>(s.appPrefs.sidebar_width));
+    s.renderer.SetScale(s.scale);
+    Render(s);
+    check(s.compositor.SaveSnapshot((std::filesystem::path(output).parent_path()/L"search-separated.png").c_str()),
+        "separate search screenshot captured");
+    const auto address = s.renderer.AddressBarRect(width);
+    toolbar_test_state = &s;
+    toolbar_path_opened = false;
+    const auto timer = SetTimer(nullptr, 0, 50, CloseToolbarPathMenu);
+    SendMessageW(s.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(
+        static_cast<int>(address.right-8*s.scale), static_cast<int>((address.top+address.bottom)/2)));
+    KillTimer(nullptr, timer);
+    toolbar_test_state = nullptr;
+    check(toolbar_path_opened, "click address while searching opens path menu");
+    log << "failures=" << failures << '\n';
+    return failures ? 1 : 0;
+}
+
 int RunSearchFlowTest(AppState& s, const wchar_t* output) {
+    if (GetEnvironmentVariableW(L"PULSE_TEST_TOOLBAR_LAYOUT", nullptr, 0)) return RunToolbarLayoutTest(s, output);
     if(GetEnvironmentVariableW(L"PULSE_TEST_CONTENT_LIVE_SELECTION",nullptr,0)) return RunContentLiveSelectionTest(s,output);
     if(GetEnvironmentVariableW(L"PULSE_TEST_CONTENT_PAGING",nullptr,0)) return RunContentPagingUiTest(s,output);
     if(GetEnvironmentVariableW(L"PULSE_TEST_CONTENT_HISTORY",nullptr,0)) return RunContentHistoryTest(s,output);
@@ -657,7 +769,7 @@ int RunSearchFlowTest(AppState& s, const wchar_t* output) {
     check(!app::SplitSearchQueryText(mode_query).content.present(), "mode query applies after IME completion");
     auto vm = BuildVm(s, false);
     const float width = static_cast<float>(s.compositor.Width());
-    const auto layout = ui::LayoutAddressSearch(s.renderer.AddressBarRect(width), s.scale);
+    const auto layout = ui::LayoutAddressSearch(s.renderer.SearchBarRect(width), s.scale);
     const auto window = D2D1::RectF(0, 0, width, static_cast<float>(s.compositor.Height()));
     auto hit = [&](D2D1_RECT_F rect) {
         return s.renderer.HitTest(vm, window, (rect.left + rect.right) * 0.5f, (rect.top + rect.bottom) * 0.5f).region;

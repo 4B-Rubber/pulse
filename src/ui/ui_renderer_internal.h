@@ -9,6 +9,7 @@
 #include "../app/places.h"
 #include "../app/search_query.h"
 #include "../common/text_format.h"
+#include "../common/display_path.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -82,6 +83,75 @@ void ClearTextWidthCache() {
 
     // Transparent fill: button resting state (hover fill drawn on interaction).
     constexpr D2D1_COLOR_F kTransparent{0.0f, 0.0f, 0.0f, 0.0f};
+    // Split panes reserve room before the title for the focused-pane dot, in
+    // every pane so titles do not shift when focus moves.
+
+    // Opacity of the three window layers: title strip, the sheet shared by the
+    // active tab/toolbar/sidebar/status bar, and the pane/details cards. The
+    // active tab and the sheet must use the same value so they read as one.
+    struct LayerAlphas { float title = 1.0f, sheet = 1.0f, card = 1.0f; };
+    // Piecewise-linear lookup at t = 0, .25, .5, .75, 1.
+    inline float LerpStops(float t, const float (&v)[5]) noexcept {
+        t = std::clamp(t, 0.0f, 1.0f) * 4.0f;
+        const int i = (std::min)(3, static_cast<int>(t));
+        return v[i] + (v[i + 1] - v[i]) * (t - static_cast<float>(i));
+    }
+    // transparency: 0..90 slider; 25/50/75 reproduce the former
+    // subtle/balanced/vivid tables exactly.
+    inline LayerAlphas ComputeLayerAlphas(bool image_mode, bool backdrop_drawn,
+                                          bool backdrop_enabled, bool dark,
+                                          int transparency, int wallpaper_blur) noexcept {
+        LayerAlphas a;
+        const float t = static_cast<float>(std::clamp(transparency, 0, 90)) / 100.0f;
+        if (image_mode) {
+            // Decode failure stays opaque rather than exposing the desktop.
+            if (!backdrop_drawn) return a;
+            // Dark wallpaper uses the legacy single scrim. Balanced restores
+            // its 55% cover; blur affects image detail, not the tint strength.
+            if (dark) {
+                static constexpr float cover[5] = {0.85f, 0.70f, 0.55f, 0.40f, 0.25f};
+                return {LerpStops(t, cover), 0.0f, 0.0f};
+            }
+            static constexpr float kTitle[5] = {0.70f, 0.60f, 0.50f, 0.40f, 0.30f};
+            static constexpr float kSheet[5] = {0.80f, 0.68f, 0.55f, 0.45f, 0.35f};
+            static constexpr float kCard[5] = {0.97f, 0.94f, 0.90f, 0.85f, 0.78f};
+            a.title = LerpStops(t, kTitle);
+            a.sheet = LerpStops(t, kSheet);
+            a.card = LerpStops(t, kCard);
+            // Sidebar text sits directly on the sheet; unblurred detail needs more cover.
+            if (wallpaper_blur <= 0) {
+                a.title = (std::min)(1.0f, a.title + 0.10f);
+                a.sheet = (std::min)(1.0f, a.sheet + 0.12f);
+            }
+            return a;
+        }
+        if (backdrop_drawn) a.title = 0.0f;
+        else if (backdrop_enabled) a.title = dark ? 0.72f : 0.78f;
+        if (backdrop_enabled) {
+            // Acrylic / Mica: the slider scales the default (t = .5) opacities.
+            static constexpr float kScale[5] = {1.40f, 1.20f, 1.0f, 0.80f, 0.60f};
+            const float k = LerpStops(t, kScale);
+            a.sheet = (std::min)(1.0f, (dark ? 0.55f : 0.60f) * k);
+            a.card = (std::min)(1.0f, (dark ? 0.72f : 0.78f) * k);
+        }
+        return a;
+    }
+    inline float WallpaperBlurDip(int wallpaper_blur) noexcept {
+        return static_cast<float>(std::clamp(wallpaper_blur, 0, 40));
+    }
+    constexpr int kPanelTransparencyMax = 90;
+    constexpr int kWallpaperBlurMax = 40;
+    // Settings slider track inside the three segment cells the layout reserves;
+    // the right 50 DIPs hold the value label.
+    struct SettingsSliderGeom { float left = 0.0f, right = 0.0f, cy = 0.0f; };
+    inline SettingsSliderGeom SettingsSlider(const D2D1_RECT_F* cells, float scale) noexcept {
+        return {cells[0].left + 9.0f * scale, cells[2].right - 50.0f * scale,
+                (cells[0].top + cells[0].bottom) * 0.5f - 5.0f * scale};
+    }
+    inline int SettingsSliderValue(const SettingsSliderGeom& g, float x, int max_value) noexcept {
+        const float t = std::clamp((x - g.left) / (std::max)(1.0f, g.right - g.left), 0.0f, 1.0f);
+        return static_cast<int>(t * static_cast<float>(max_value) + 0.5f);
+    }
     constexpr float kTabMinW = 72.0f;
     constexpr float kTabMaxW = 240.0f;
     constexpr float kTabPinnedW = 36.0f; // Chrome pinned tab: icon-only square
@@ -284,6 +354,9 @@ void ClearTextWidthCache() {
         return m;
     }
 
+    // Extra space under the vertical-tabs block; its divider sits mid-gap.
+    constexpr float kSidebarTabsDividerGapDip = 8.0f;
+
     float SidebarItemHeight(const SidebarItem& item, const SidebarMetrics& m) {
         if (item.is_drive) return m.driveH;
         if (item.is_tag) return m.tagH;
@@ -292,12 +365,19 @@ void ClearTextWidthCache() {
 
     int TrayTotalCount(const WindowViewModel& vm) { return vm.tray_deck.total_count; }
 
+    // Staging tray card metrics (DIPs): thumbnail follows the "staging tray
+    // icon" setting (32..64), the card adds 10 dip of padding above/below.
+    inline float TrayThumbDip(float thumb_dip) {
+        return std::clamp(thumb_dip + 2.0f, 40.0f, 66.0f);
+    }
+    inline float TrayCardHeightDip(float thumb_dip) { return TrayThumbDip(thumb_dip) + 20.0f; }
+
     float ExpandedTrayHeight(const WindowViewModel& vm, const SidebarMetrics& m) {
-        const float base = m.trayInner * 2.0f + m.trayHeaderH;
         if (vm.tray_deck.cards.empty())
-            return std::max(base + m.trayHelperH + 8.0f * m.scale, 112.0f * m.scale);
-        // Card deck: header + icon lane + footer (totals + clear action).
-        return base + 4.0f * m.scale + m.trayDeckH + 18.0f * m.scale;
+            return 112.0f * m.scale; // header + dashed empty state
+        // Card stack: header (38) + top card + peeking layers when fanned
+        // out (25) + gap + footer row (31).
+        return (TrayCardHeightDip(vm.tray_deck.thumb_dip) + 94.0f) * m.scale;
     }
 
     float SidebarContentHeight(const WindowViewModel& vm, const SidebarMetrics& m) {
@@ -314,6 +394,8 @@ void ClearTextWidthCache() {
                     height += SidebarItemHeight(item, m) + m.itemGap;
                 height += m.groupGap - m.itemGap;
             }
+            // Same extra gap LayoutSidebar leaves under the vertical-tabs well.
+            if (group.tabs_section) height += kSidebarTabsDividerGapDip * m.scale;
         }
         return height + m.pad;
     }
@@ -420,6 +502,7 @@ void ClearTextWidthCache() {
                 y += m.headerH + 4.0f * scale;
             }
             if (has_header && group.collapsed) {
+                if (group.tabs_section) y += kSidebarTabsDividerGapDip * scale;
                 if (bands) bands->push_back(
                     { g, band_top, std::min(y + m.groupGap - m.itemGap, contentBottom) });
                 continue;
@@ -450,6 +533,7 @@ void ClearTextWidthCache() {
                 y += h + m.itemGap;
             }
             y += m.groupGap - m.itemGap;
+            if (group.tabs_section) y += kSidebarTabsDividerGapDip * scale;
             if (bands) bands->push_back({ g, band_top, std::min(y, contentBottom) });
         }
 
@@ -662,7 +746,7 @@ void ClearTextWidthCache() {
     }
 
     bool SidebarItemHasUnpin(const SidebarItem& item) {
-        return item.indent == 0 && item.path.starts_with(L"pulse:workspace:");
+        return item.tab_row || (item.indent == 0 && item.path.starts_with(L"pulse:workspace:"));
     }
 
     D2D1_RECT_F WorkspaceUnpinRect(const D2D1_RECT_F& row, float scale) {
@@ -680,7 +764,12 @@ void ClearTextWidthCache() {
         return D2D1::RectF(right - size, top, right, top + size);
     }
 
-    bool PathIsSelfOrChild(const std::wstring& root, const std::wstring& path) {
+    bool PathIsSelfOrChild(const std::wstring& root_in, const std::wstring& path_in) {
+        // Sidebar items hold normalized paths (\\?\C:\..., \\?\UNC\...), while the
+        // pane path is display text without that prefix; compare both as display
+        // text or file-system rows never match.
+        const std::wstring root = pulse::path::FriendlyPathText(root_in);
+        const std::wstring path = pulse::path::FriendlyPathText(path_in);
         if (root.empty() || path.empty()) return false;
         if (_wcsicmp(root.c_str(), path.c_str()) == 0) return true;
         std::wstring prefix = root;
@@ -690,129 +779,156 @@ void ClearTextWidthCache() {
     }
 
     // ---------------------------------------------------------------------
-    // Tray scatter deck geometry. Shared by DrawTrayDeck and HitTest so the
-    // two can never disagree about where an icon is. Cards sit on eased
-    // slots but each gets a deterministic per-card offset/rotation/size
-    // jitter (keyed by path) for an irregular stacked look; slot spacing
-    // never closes past half an icon, so every card keeps >=50% of its face
-    // visible and clickable.
+    // Staging tray card stack. Shared by DrawTrayDeck and HitTest so the two
+    // can never disagree about where a card is. The top card sits at the
+    // resting rect; up to two cards peek out underneath (shifted down,
+    // scaled around their bottom centre, dimmed). Poses (depth, drag/throw
+    // offsets, tumble) come pre-animated from the app side.
     // ---------------------------------------------------------------------
-    struct TrayFanGeom {
-        float icon = 0.0f;     // icon edge, DIPs
-        float cx = 0.0f;       // deck center
-        float cy = 0.0f;       // resting center y of slot 0
-        float step_x = 0.0f;   // horizontal spacing per slot
-        float tilt = 0.0f;     // max per-card rotation, degrees
-        float hjit = 0.0f;     // horizontal jitter amplitude
-        float vjit = 0.0f;     // vertical jitter amplitude
-        float spread = 1.0f;   // 1 + drag-over scatter boost
+    struct TrayStackGeom {
+        D2D1_RECT_F card{};     // resting rect of the top card (px)
+        float thumb = 0.0f;     // thumbnail edge (px)
+        float radius = 0.0f;    // card corner radius (px)
+        float scale = 1.0f;
     };
 
-    TrayFanGeom TrayFanGeometry(const D2D1_RECT_F& panel, int live_count, float open,
-                                float scale, float icon_dip) {
-        TrayFanGeom g;
-        const bool single = live_count <= 1;
-        g.icon = (single ? icon_dip + 8.0f : icon_dip) * scale;
-        const float deckTop = panel.top + 4.0f * scale + 22.0f * scale + 4.0f * scale;
-        // The footer row (totals + clear) reserves the bottom 18px.
-        const float deckBottom = panel.bottom - 8.0f * scale - 18.0f * scale - 4.0f * scale;
-        g.cx = (panel.left + panel.right) * 0.5f;
-        g.cy = deckTop + (deckBottom - deckTop) * 0.5f + (single ? -18.0f * scale : 0.0f);
-        const float avail = (panel.right - panel.left) - 24.0f * scale - g.icon;
-        g.step_x = live_count > 1
-            ? std::min(g.icon * 0.72f, avail / static_cast<float>(live_count - 1)) : 0.0f;
-        // Worst-case center distance is step_x - 2*hjit; clamp hjit so it
-        // stays >= icon/2 (max 50% overlap between neighbors).
-        g.hjit = std::clamp((g.step_x - g.icon * 0.5f) * 0.5f, 0.0f, g.icon * 0.08f);
-        g.vjit = std::max(0.0f, (deckBottom - deckTop) * 0.5f - g.icon * 0.62f);
-        g.spread = 1.0f + 0.25f * std::clamp(open, 0.0f, 1.0f);
-        g.tilt = 13.0f;
+    TrayStackGeom TrayStackGeometry(const D2D1_RECT_F& panel, float scale, float thumb_dip) {
+        TrayStackGeom g;
+        g.scale = scale;
+        g.thumb = TrayThumbDip(thumb_dip) * scale;
+        g.radius = 12.0f * scale;
+        const float top = panel.top + 38.0f * scale;
+        g.card = D2D1::RectF(panel.left + 10.0f * scale, top, panel.right - 10.0f * scale,
+                             top + TrayCardHeightDip(thumb_dip) * scale);
         return g;
     }
 
-    // Deterministic per-card scatter seed: keyed by path so a card keeps its
-    // jitter for its whole lifetime (eased slot changes and ghosts included).
-    uint32_t TrayCardSeed(const std::wstring& path) {
-        uint32_t h = 2166136261u; // FNV-1a
-        for (const wchar_t c : path) {
-            h ^= static_cast<uint32_t>(c);
-            h *= 16777619u;
-        }
-        return h;
-    }
-
-    // Independent hash stream -> [0, 1).
-    float TraySeedFrac(uint32_t seed, uint32_t stream) {
-        uint32_t x = seed + stream * 0x9E3779B9u;
-        x ^= x >> 16; x *= 0x7FEB352Du; x ^= x >> 15; x *= 0x846CA68Bu; x ^= x >> 16;
-        return static_cast<float>(x >> 8) * (1.0f / 16777216.0f);
+    // Peeking layer pose for a (fractional) depth: vertical shift in DIPs,
+    // scale, dim overlay strength and opacity. depth 2..3 fades out.
+    struct TrayLayer { float dy = 0.0f; float scale = 1.0f; float dim = 0.0f; float opacity = 1.0f; };
+    TrayLayer TrayLayerAt(float depth, float spread) {
+        static constexpr float kDy[4] = {0.0f, 9.0f, 17.0f, 17.0f};
+        static constexpr float kDySpread[4] = {0.0f, 4.0f, 8.0f, 8.0f};
+        static constexpr float kScale[4] = {1.0f, 0.94f, 0.88f, 0.88f};
+        static constexpr float kScaleSpread[4] = {0.0f, 0.01f, 0.02f, 0.02f};
+        static constexpr float kDim[4] = {0.0f, 1.0f, 1.8f, 1.8f};
+        const float d = std::clamp(depth, 0.0f, 3.0f);
+        const int i = std::min(2, static_cast<int>(std::floor(d)));
+        const float f = d - static_cast<float>(i);
+        const float s = std::clamp(spread, 0.0f, 1.0f);
+        auto lerp = [f](float a, float b) { return a + (b - a) * f; };
+        TrayLayer l;
+        l.dy = lerp(kDy[i] + kDySpread[i] * s, kDy[i + 1] + kDySpread[i + 1] * s);
+        l.scale = lerp(kScale[i] + kScaleSpread[i] * s, kScale[i + 1] + kScaleSpread[i + 1] * s);
+        l.dim = lerp(kDim[i], kDim[i + 1]);
+        l.opacity = d <= 2.0f ? 1.0f : std::clamp(3.0f - d, 0.0f, 1.0f);
+        return l;
     }
 
     struct TrayCardPose {
-        D2D1_POINT_2F center{};
-        float angle = 0.0f;
-        float scale_f = 1.0f;
+        D2D1_MATRIX_3X2_F m = D2D1::Matrix3x2F::Identity(); // card-rest space -> panel space
+        float dim = 0.0f;       // 0..~1.8 layer dimming (renderer maps per theme)
+        float opacity = 1.0f;
     };
 
-    // Current visual pose of one deck entry; scale_f folds in enter/hover zoom.
-    TrayCardPose TrayCardPoseOf(const TrayFanGeom& g, const TrayCardView& card, float scale) {
-        const float hover = std::clamp(card.hover, 0.0f, 1.0f);
+    TrayCardPose TrayCardPoseOf(const TrayStackGeom& g, const TrayCardView& card, float spread) {
+        const TrayLayer layer = TrayLayerAt(card.depth, spread);
         const float appear = std::clamp(card.appear, 0.0f, 1.0f);
-        const float opacity = std::clamp(card.opacity, 0.0f, 1.0f);
-        const uint32_t seed = TrayCardSeed(card.path);
-        const float jx = (TraySeedFrac(seed, 1) * 2.0f - 1.0f) * g.hjit;
-        const float jy = (TraySeedFrac(seed, 2) * 2.0f - 1.0f) * g.vjit * g.spread;
-        const float ja = (TraySeedFrac(seed, 3) * 2.0f - 1.0f) * g.tilt * g.spread;
-        const float js = 0.94f + 0.12f * TraySeedFrac(seed, 4); // 0.94..1.06
+        const float hover = std::clamp(card.hover, 0.0f, 1.0f);
+        const float w = g.card.right - g.card.left;
+        const float s = layer.scale * card.shrink * (1.0f + 0.05f * (1.0f - appear));
+        const D2D1_POINT_2F pivot = D2D1::Point2F((g.card.left + g.card.right) * 0.5f, g.card.bottom);
+        const D2D1_POINT_2F centre = D2D1::Point2F((g.card.left + g.card.right) * 0.5f,
+                                                   (g.card.top + g.card.bottom) * 0.5f);
+        const float tx = card.fly * w + card.dx * g.scale;
+        const float ty = (layer.dy + card.dy - 2.0f * hover - 34.0f * (1.0f - appear)) * g.scale;
         TrayCardPose p;
-        p.center = D2D1::Point2F(
-            g.cx + card.slot * g.step_x + jx,
-            g.cy + jy - hover * 10.0f * scale
-                 + (1.0f - opacity) * 14.0f * scale); // ghosts sink while fading
-        p.angle = ja * (1.0f - 0.9f * hover); // straighten on hover
-        p.scale_f = (0.55f + 0.45f * appear) * js * (1.0f + 0.10f * hover);
+        p.m = D2D1::Matrix3x2F::Scale(s, s, pivot) *
+              D2D1::Matrix3x2F::Rotation(card.angle, centre) *
+              D2D1::Matrix3x2F::Translation(tx, ty);
+        p.dim = layer.dim;
+        p.opacity = std::clamp(card.opacity, 0.0f, 1.0f) * layer.opacity * (0.15f + 0.85f * appear);
         return p;
     }
 
-    // Back-to-front paint order: ghosts underneath, then by resting y so a
-    // lower card overlaps the ones above it; the hovered card draws last.
-    std::vector<int> TrayCardPaintOrder(const TrayDeckView& deck, const TrayFanGeom& g,
-                                        float scale) {
+    // Back-to-front paint order: deeper layers first, ghosts under live cards
+    // at the same depth, then anything flagged on_top (dragged / flying out).
+    std::vector<int> TrayCardPaintOrder(const TrayDeckView& deck) {
         std::vector<int> order(deck.cards.size());
-        std::vector<float> ys(deck.cards.size());
-        for (int i = 0; i < static_cast<int>(order.size()); ++i) {
-            order[static_cast<size_t>(i)] = i;
-            ys[static_cast<size_t>(i)] =
-                TrayCardPoseOf(g, deck.cards[static_cast<size_t>(i)], scale).center.y;
-        }
+        for (int i = 0; i < static_cast<int>(order.size()); ++i) order[static_cast<size_t>(i)] = i;
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
             const TrayCardView& ca = deck.cards[static_cast<size_t>(a)];
             const TrayCardView& cb = deck.cards[static_cast<size_t>(b)];
-            if (ca.ghost != cb.ghost) return ca.ghost && !cb.ghost;
-            const bool ha = a == deck.hovered, hb = b == deck.hovered;
-            if (ha != hb) return hb;
-            return ys[static_cast<size_t>(a)] < ys[static_cast<size_t>(b)];
+            if (ca.on_top != cb.on_top) return cb.on_top;
+            if (std::abs(ca.depth - cb.depth) > 0.001f) return ca.depth > cb.depth;
+            if (ca.ghost != cb.ghost) return ca.ghost;
+            return a > b;
         });
         return order;
     }
 
-    // Hit test a point against a posed icon (inverse-rotate around center).
-    bool TrayCardHit(const TrayFanGeom& g, const TrayCardView& card, float scale,
+    // Close badge centre in card-rest space.
+    D2D1_POINT_2F TrayCloseCentre(const TrayStackGeom& g) {
+        return D2D1::Point2F(g.card.right - 17.0f * g.scale, g.card.top + 17.0f * g.scale);
+    }
+
+    // Hit test a point against a posed card (inverse transform into rest space).
+    bool TrayCardHit(const TrayStackGeom& g, const TrayCardView& card, float spread,
                      float x, float y, bool* close_zone) {
-        const TrayCardPose p = TrayCardPoseOf(g, card, scale);
-        const float rad = -p.angle * 3.14159265f / 180.0f;
-        const float dx = x - p.center.x, dy = y - p.center.y;
-        const float lx = dx * std::cos(rad) - dy * std::sin(rad);
-        const float ly = dx * std::sin(rad) + dy * std::cos(rad);
-        const float half = g.icon * p.scale_f * 0.5f;
-        if (std::abs(lx) > half || std::abs(ly) > half) return false;
+        TrayCardPose pose = TrayCardPoseOf(g, card, spread);
+        D2D1::Matrix3x2F m = *D2D1::Matrix3x2F::ReinterpretBaseType(&pose.m);
+        if (!m.Invert()) return false;
+        const D2D1_POINT_2F local = m.TransformPoint(D2D1::Point2F(x, y));
+        if (local.x < g.card.left || local.x >= g.card.right ||
+            local.y < g.card.top || local.y >= g.card.bottom) return false;
         if (close_zone) {
-            // × badge circle at the icon's top-right corner (local space).
-            const float bx = half * 0.85f, by = -half * 0.85f;
-            const float cx = lx - bx, cy = ly - by;
-            *close_zone = (cx * cx + cy * cy) <= (11.0f * scale) * (11.0f * scale);
+            const D2D1_POINT_2F c = TrayCloseCentre(g);
+            const float dx = local.x - c.x, dy = local.y - c.y;
+            *close_zone = dx * dx + dy * dy <= (11.0f * g.scale) * (11.0f * g.scale);
         }
         return true;
+    }
+
+    // "2 / 5": position of the top card in the cyclic stack.
+    std::wstring TrayIndexText(const TrayDeckView& deck) {
+        if (deck.total_count <= 0) return L"";
+        wchar_t buf[32];
+        swprintf_s(buf, L"%d / %d", (deck.offset % deck.total_count) + 1, deck.total_count);
+        return buf;
+    }
+
+    // Footer row: pager (‹ n / N ›) on the left when there is more than one
+    // card, totals after it, 清空 on the right (TrayClear slot).
+    struct TrayFooterGeom {
+        D2D1_RECT_F row{};
+        D2D1_RECT_F prev{};
+        D2D1_RECT_F index{};
+        D2D1_RECT_F next{};
+        D2D1_RECT_F totals{};
+        bool pager = false;
+    };
+    TrayFooterGeom TrayFooterGeometry(const D2D1_RECT_F& panel, float scale, int total,
+                                      float index_text_w) {
+        TrayFooterGeom f;
+        const float h = 22.0f * scale;
+        const float bottom = panel.bottom - 8.0f * scale;
+        f.row = D2D1::RectF(panel.left + 10.0f * scale, bottom - h,
+                            panel.right - 10.0f * scale, bottom);
+        float x = f.row.left - 4.0f * scale;
+        f.pager = total > 1;
+        if (f.pager) {
+            const float b = 22.0f * scale;
+            f.prev = D2D1::RectF(x, f.row.top, x + b, f.row.bottom);
+            x += b;
+            f.index = D2D1::RectF(x, f.row.top, x + index_text_w + 4.0f * scale, f.row.bottom);
+            x = f.index.right;
+            f.next = D2D1::RectF(x, f.row.top, x + b, f.row.bottom);
+            x += b + 4.0f * scale;
+        } else {
+            x = f.row.left;
+        }
+        f.totals = D2D1::RectF(x, f.row.top, f.row.right - 76.0f * scale, f.row.bottom);
+        return f;
     }
 
     // ---------------------------------------------------------------------
@@ -941,23 +1057,50 @@ void ClearTextWidthCache() {
         return ext;
     }
 
-    uint32_t TypeChipRgb(const std::wstring& chip) {
-        std::wstring e = chip;
-        for (auto& c : e) c = static_cast<wchar_t>(std::towlower(c));
-        auto in = [&](std::initializer_list<const wchar_t*> list) {
+    // Extension chip colors grouped by format family so neighbouring kinds stay
+    // distinguishable (CAD vs PDF vs Office ...). Hues are mid-tone; the list
+    // painter derives theme-specific ink/fill/edge from them.
+    namespace type_chip_detail {
+        inline std::wstring Lower(const std::wstring& chip) {
+            std::wstring e = chip;
+            for (auto& c : e) c = static_cast<wchar_t>(std::towlower(c));
+            return e;
+        }
+        inline bool In(const std::wstring& e, std::initializer_list<const wchar_t*> list) {
             for (const wchar_t* x : list) if (e == x) return true;
             return false;
-        };
-        if (in({L"exe", L"msi", L"appx", L"msix", L"bat", L"cmd", L"com", L"lnk"})) return 0x22C55E;
-        if (in({L"dll", L"sys", L"ocx", L"drv", L"cpl", L"mui", L"efi"})) return 0x3B82F6;
-        if (in({L"png", L"jpg", L"jpeg", L"gif", L"bmp", L"webp", L"svg", L"ico", L"heic", L"tif", L"tiff", L"psd"})) return 0xA855F7;
-        if (in({L"mp4", L"mkv", L"avi", L"mov", L"wmv", L"webm", L"flv"})) return 0xEC4899;
-        if (in({L"mp3", L"wav", L"flac", L"aac", L"ogg", L"m4a", L"wma"})) return 0x14B8A6;
-        if (in({L"zip", L"rar", L"7z", L"tar", L"gz", L"xz", L"cab", L"iso", L"zst"})) return 0xEAB308;
-        if (in({L"pdf", L"doc", L"docx", L"xls", L"xlsx", L"ppt", L"pptx", L"rtf", L"odt", L"dwg", L"dxf"})) return 0xEF4444;
-        if (in({L"txt", L"md", L"log", L"csv"})) return 0x94A3B8;
-        if (in({L"ps1", L"py", L"js", L"ts", L"cpp", L"c", L"h", L"hpp", L"cs", L"java", L"go", L"rs", L"sh",
-                L"json", L"xml", L"yaml", L"yml", L"ini", L"toml", L"cmake", L"html", L"css", L"inf", L"reg"})) return 0xF97316;
+        }
+    }
+
+    // Backup / lock / temp companions (e.g. AutoCAD .bak/.dwl/.dwl2): drawn neutral and quiet.
+    bool TypeChipIsAux(const std::wstring& chip) {
+        using namespace type_chip_detail;
+        const std::wstring e = Lower(chip);
+        return In(e, {L"bak", L"dwl", L"dwl2", L"tmp", L"temp", L"old", L"lck", L"lock", L"sv$", L"ac$",
+                      L"bk1", L"bk2", L"bk3", L"swp", L"crdownload", L"part"});
+    }
+
+    uint32_t TypeChipRgb(const std::wstring& chip) {
+        using namespace type_chip_detail;
+        const std::wstring e = Lower(chip);
+        if (In(e, {L"dwg", L"dxf", L"dwf", L"dwfx", L"dwt", L"dws", L"dgn"})) return 0x0891B2;      // CAD: blueprint cyan
+        if (In(e, {L"rvt", L"rfa", L"rte", L"skp", L"3dm", L"ifc", L"nwd", L"nwc", L"max", L"fbx",
+                   L"obj", L"stp", L"step", L"igs", L"iges", L"stl"})) return 0x6366F1;                  // BIM / 3D: indigo
+        if (e == L"pdf") return 0xDC2626;                                                              // PDF: red
+        if (In(e, {L"doc", L"docx", L"docm", L"rtf", L"odt", L"wps"})) return 0x2563EB;               // Word: blue
+        if (In(e, {L"xls", L"xlsx", L"xlsm", L"xlsb", L"ods", L"csv", L"et"})) return 0x16A34A;       // Excel: green
+        if (In(e, {L"ppt", L"pptx", L"pptm", L"odp", L"dps"})) return 0xEA580C;                       // PowerPoint: orange
+        if (In(e, {L"png", L"jpg", L"jpeg", L"gif", L"bmp", L"webp", L"svg", L"ico", L"heic", L"tif",
+                   L"tiff", L"psd", L"ai", L"raw"})) return 0xA855F7;                                   // image: purple
+        if (In(e, {L"mp4", L"mkv", L"avi", L"mov", L"wmv", L"webm", L"flv", L"m4v"})) return 0xDB2777; // video: pink
+        if (In(e, {L"mp3", L"wav", L"flac", L"aac", L"ogg", L"m4a", L"wma"})) return 0x0D9488;         // audio: teal
+        if (In(e, {L"zip", L"rar", L"7z", L"tar", L"gz", L"xz", L"cab", L"iso", L"zst"})) return 0xCA8A04; // archive: amber
+        if (In(e, {L"exe", L"msi", L"appx", L"msix", L"bat", L"cmd", L"com", L"lnk"})) return 0x65A30D; // program: lime
+        if (In(e, {L"dll", L"sys", L"ocx", L"drv", L"cpl", L"mui", L"efi"})) return 0x3B82F6;         // system
+        if (In(e, {L"ps1", L"py", L"js", L"ts", L"cpp", L"c", L"h", L"hpp", L"cs", L"java", L"go", L"rs",
+                   L"sh", L"json", L"xml", L"yaml", L"yml", L"ini", L"toml", L"cmake", L"html", L"css",
+                   L"inf", L"reg"})) return 0xD97706;                                                   // code / config
+        if (In(e, {L"txt", L"md", L"log"})) return 0x64748B;                                           // text
         return 0x64748B;
     }
 
@@ -1390,8 +1533,10 @@ struct SettingsLayout {
     D2D1_RECT_F effect_card{};
     D2D1_RECT_F effect_row[kWindowEffectCount]{};
     D2D1_RECT_F density_card{};
-    D2D1_RECT_F list_style_row[3]{};
+    D2D1_RECT_F list_style_row[4]{};
     D2D1_RECT_F density_row[3]{};
+    D2D1_RECT_F folder_sort_card{};
+    D2D1_RECT_F folder_sort_row[3]{};
     D2D1_RECT_F tray_icon_card{};
     D2D1_RECT_F tray_icon_row[3]{};
     D2D1_RECT_F language_card{};
@@ -1400,6 +1545,10 @@ struct SettingsLayout {
     D2D1_RECT_F wallpaper_preview{};
     D2D1_RECT_F wallpaper_choose{};
     D2D1_RECT_F wallpaper_clear{};
+    D2D1_RECT_F wallpaper_look_card{};
+    D2D1_RECT_F wallpaper_look_row[3]{};
+    D2D1_RECT_F wallpaper_blur_card{};
+    D2D1_RECT_F wallpaper_blur_row[3]{};
     D2D1_RECT_F startup_row[3]{};
     D2D1_RECT_F hidden_files_row{};
     D2D1_RECT_F protected_files_row{};
@@ -1410,7 +1559,10 @@ struct SettingsLayout {
     D2D1_RECT_F thumb_cache_row{}, thumb_cache_button{};
     D2D1_RECT_F file_hash_row{};
     D2D1_RECT_F title_brand_row{};
+    D2D1_RECT_F vertical_tabs_row{};
     D2D1_RECT_F blank_click_row{};
+    D2D1_RECT_F win_e_row{};
+    D2D1_RECT_F shell_tags_row{};
     D2D1_RECT_F change_tracking_row{}, change_days_row{}, change_days[3]{};
     D2D1_RECT_F search_pinyin_row{};
     D2D1_RECT_F global_search_row{}, global_search_hotkey_row{}, global_search_hotkey_button{};
@@ -1428,11 +1580,18 @@ struct SettingsLayout {
     std::vector<D2D1_RECT_F> network_rows;
     std::vector<D2D1_RECT_F> network_remove;
     D2D1_RECT_F about_card{};
+    D2D1_RECT_F apps_card{};
+    D2D1_RECT_F apps_row[2]{};  // LumenPDF, LumaShot
     D2D1_RECT_F diagnostics_card{};
     D2D1_RECT_F diagnostics_perf{};
     D2D1_RECT_F diagnostics_action[3]{};
     D2D1_RECT_F update_card{};
     D2D1_RECT_F update_action[2]{};
+    D2D1_RECT_F about_action[2]{};
+    D2D1_RECT_F release_card{};
+    D2D1_RECT_F release_all{};
+    std::vector<D2D1_RECT_F> release_rows;
+    D2D1_RECT_F release_body{};
     D2D1_RECT_F dup_scope[3]{};
     D2D1_RECT_F dup_browse{};
     D2D1_RECT_F dup_scan{};
@@ -1462,7 +1621,32 @@ bool VisibleInContent(const D2D1_RECT_F& rc, const D2D1_RECT_F& content, float p
     return rc.bottom > content.top - pad && rc.top < content.bottom + pad;
 }
 
+// Settings > About: label/value rows fill column-major into two columns on wide cards.
+constexpr float kAboutTwoColumnMinDip = 680.0f;
+constexpr float kAboutRowDip = 26.0f;
+bool AboutTwoColumns(float card_w, float scale) {
+    return card_w >= kAboutTwoColumnMinDip * scale;
+}
+size_t AboutRowLines(const WindowViewModel& vm, float card_w, float scale) {
+    const size_t n = vm.settings_about_rows.size();
+    return AboutTwoColumns(card_w, scale) ? (n + 1) / 2 : n;
+}
+
+// Release-note body text starts 30 DIP into the row and keeps 16 DIP on the right.
+constexpr float kReleaseTextInsetDip = 30.0f;
+constexpr float kReleaseTextRightDip = 16.0f;
+constexpr float kReleaseLineGapDip = 6.0f;
+float ReleaseTextWidth(float row_w, float scale) {
+    return (std::max)(40.0f * scale, row_w - (kReleaseTextInsetDip + kReleaseTextRightDip) * scale);
+}
+float ReleaseLineHeight(const fluent::Painter* painter, const std::wstring& line, float width,
+                        float scale) {
+    const float h = painter ? painter->MeasureWrappedCaptionHeight(line, width) : 0.0f;
+    return h > 0.0f ? h : 20.0f * scale;
+}
+
 #include "settings_layout_sections.h"
+
 
 SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& rect,
                                   float scale, float title_h, float status_h,
@@ -1625,8 +1809,32 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
     } else if (vm.settings_page == 3) {
         const float card_left = l.content.left + pad;
         const float card_right = l.content.right - pad;
-        l.about_card = D2D1::RectF(card_left, y, card_right, y + 104.0f * scale);
-        y += 116.0f * scale;
+        {
+            const float lines = static_cast<float>(AboutRowLines(vm, card_right - card_left, scale));
+            const float actions_y = y + 66.0f * scale + lines * kAboutRowDip * scale + 10.0f * scale;
+            static constexpr pulse::l10n::StringId kAboutLabels[] = {
+                pulse::l10n::StringId::AboutCopyInfo,
+                pulse::l10n::StringId::AboutHomepage,
+            };
+            float ax = card_left + 16.0f * scale;
+            for (int i = 0; i < 2; ++i) {
+                const float w = label_btn_w(pulse::l10n::Get(kAboutLabels[i]));
+                l.about_action[i] = D2D1::RectF(ax, actions_y, ax + w, actions_y + 32.0f * scale);
+                ax += w + 8.0f * scale;
+            }
+            l.about_card = D2D1::RectF(card_left, y, card_right, actions_y + 48.0f * scale);
+            y = l.about_card.bottom + 12.0f * scale;
+        }
+        {
+            // Recommended apps: title + subtitle, then one full-width link row per app.
+            float ry = y + 64.0f * scale;
+            for (auto& row : l.apps_row) {
+                row = D2D1::RectF(card_left + 8.0f * scale, ry, card_right - 8.0f * scale, ry + 52.0f * scale);
+                ry += 52.0f * scale;
+            }
+            l.apps_card = D2D1::RectF(card_left, y, card_right, ry + 8.0f * scale);
+            y = l.apps_card.bottom + 12.0f * scale;
+        }
 
         // The card holds a title, one line of description and the action row - the status-bar
         // performance switch that used to sit in the middle is on the general page now, so the
@@ -1688,7 +1896,33 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         const float download_y = check_y + (stack_updates ? 40.0f * scale : 0.0f);
         l.update_action[1] = D2D1::RectF(download_x, download_y,
                                          download_x + download_w, download_y + 32.0f * scale);
-        y += update_h + 24.0f * scale;
+        y += update_h + 12.0f * scale;
+        if (!vm.settings_index_error.empty()) y += 44.0f * scale; // error text under the update card
+
+        // Release notes: a header row per embedded version; the expanded one gets a body.
+        const float release_top = y;
+        const float all_w = label_btn_w(pulse::l10n::Get(pulse::l10n::StringId::ReleaseAll));
+        l.release_all = D2D1::RectF(card_right - 16.0f * scale - all_w, release_top + 14.0f * scale,
+                                    card_right - 16.0f * scale, release_top + 46.0f * scale);
+        float ry = release_top + 70.0f * scale;
+        if (vm.settings_release_notes) {
+            const auto& notes = *vm.settings_release_notes;
+            const float row_left = card_left + 8.0f * scale;
+            const float row_right = card_right - 8.0f * scale;
+            const float text_w = ReleaseTextWidth(row_right - row_left, scale);
+            for (size_t i = 0; i < notes.size(); ++i) {
+                l.release_rows.push_back(D2D1::RectF(row_left, ry, row_right, ry + 36.0f * scale));
+                ry += 36.0f * scale;
+                if (static_cast<int>(i) != vm.settings_release_expanded) continue;
+                float body = 4.0f * scale;
+                for (const auto& line : notes[i].lines)
+                    body += ReleaseLineHeight(painter, line, text_w, scale) + kReleaseLineGapDip * scale;
+                l.release_body = D2D1::RectF(row_left, ry, row_right, ry + body);
+                ry += body + 4.0f * scale;
+            }
+        }
+        l.release_card = D2D1::RectF(card_left, release_top, card_right, ry + 10.0f * scale);
+        y = l.release_card.bottom + 24.0f * scale;
     } else if (vm.settings_page == 4) {
         const float card_left = l.content.left + pad;
         const float card_right = l.content.right - pad;
@@ -1837,9 +2071,6 @@ bool TabCloseVisible(const WindowViewModel& vm, int index, float tab_w, float sc
            IsHovered(vm, HitTestResult::TabClose, index);
 }
 
-bool TitleBarCompact(float window_w, float scale, size_t tab_count) {
-    return window_w < 900.0f * scale || tab_count >= 4;
-}
 std::wstring FitFileName(Compositor* compositor, IDWriteFactory2* factory,
                                 IDWriteTextFormat* fmt, const std::wstring& name, float max_w) {
     if (name.empty() || max_w <= 1.0f) return {};
@@ -2095,11 +2326,12 @@ float ChangeBadgeWidth(const ChangeBadge& badge, float scale, Compositor* compos
         compositor->SmallFormat(), badge.label) + (badge.has_deleted ? 48.0f : 34.0f) * scale;
 }
 D2D1_RECT_F ChangeTitleRect(const D2D1_RECT_F& bounds, float text_right, float height,
-                          const ChangeBadge& badge, float scale, Compositor* compositor, const std::wstring& title) {
+                          const ChangeBadge& badge, float scale, Compositor* compositor, const std::wstring& title,
+                          float title_inset = 0.0f) {
     const float width = ChangeBadgeWidth(badge, scale, compositor);
     if (width <= 0 || text_right - bounds.left < width + 64.0f * scale) return {};
     const float title_width = MeasureLayoutText(compositor, compositor->DwriteFactory(), compositor->HeaderFormat(), title);
-    const float left = std::min(text_right - width, bounds.left + 14.0f * scale + title_width);
+    const float left = std::min(text_right - width, bounds.left + 14.0f * scale + title_inset + title_width);
     return D2D1::RectF(left, bounds.top, left + width, bounds.top + height);
 }
 void DrawChangeBadge(Compositor* compositor, fluent::Painter&, const ChangeBadge& badge,

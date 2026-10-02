@@ -84,6 +84,7 @@ struct TextFieldSpec {
     bool compact_leading_glyph = false;
     // Opaque hosted EDIT/Luma overlay sits on the frame; rest fill must match it.
     bool hosted_edit = false;
+    bool suppress_leading_glyph = false; // Reserve space for a caller-drawn vector icon.
 };
 
 struct TabSpec {
@@ -404,6 +405,10 @@ public:
                              std::wstring_view glyph = {},
                              bool drop_down = false) const;
     float MeasureButtonHeight() const;
+    // Word-wrapped caption text (release notes): height for a width, and drawing.
+    float MeasureWrappedCaptionHeight(std::wstring_view text, float width) const;
+    void DrawWrappedCaption(std::wstring_view text, D2D1_POINT_2F origin, float width,
+                            const D2D1_COLOR_F& color);
     D2D1_RECT_F FitButtonBounds(D2D1_RECT_F bounds, std::wstring_view text,
                                 std::wstring_view glyph = {},
                                 bool drop_down = false) const;

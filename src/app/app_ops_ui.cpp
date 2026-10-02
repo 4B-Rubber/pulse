@@ -244,13 +244,8 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
     }
 
     if (status.active) {
-        if (status.phase == ops::OpPhase::WaitingForConflict) return;
-        const bool show_now = status.type == ops::OpType::EmptyRecycle;
-        if (!s.operationAutoShown &&
-            (show_now || now - s.operationStartedAt >= std::chrono::milliseconds(2000))) {
-            s.operationWindow->Show(false);
-            s.operationAutoShown = true;
-        }
+        // Progress lives in the status-bar pill; the details window opens only
+        // when the pill is clicked (conflicts and failures still surface).
         return;
     }
 

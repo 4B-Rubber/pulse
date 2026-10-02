@@ -57,9 +57,15 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
         details_viewport_ = {};
         details_preview_ready_ = false;
     }
-    // Same surface as the list; a left rule separates the column.
+    // The inspector stays an independent right-hand card, with its own scroll
+    // and splitter. File-pane opacity must not fade these controls.
+    const float cardRadius = theme.radius_control * s;
+    // Share the sidebar sheet so both sides retain the same transparency.
     MakeBrush(dc, theme.stroke_card, brStrokeCard_);
-    FillRect(dc, brStrokeCard_.get(), panel.left, panel.top, 1.0f, panel.bottom - panel.top);
+    dc->DrawRoundedRectangle(D2D1::RoundedRect(
+        D2D1::RectF(panel.left + 0.5f * s, panel.top + 0.5f * s,
+                    panel.right - 0.5f * s, panel.bottom - 0.5f * s),
+        cardRadius, cardRadius), brStrokeCard_.get(), 1.0f * s);
 
     fluent::SplitterSpec resizeSplitter;
     resizeSplitter.bounds = D2D1::RectF(panel.left - 4.0f * s, panel.top,
@@ -203,10 +209,10 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
         PreviewDrawResult previewResult = PreviewDrawResult::Failed;
         if (preview_on && !d.is_dir && d.multi_count <= 1) {
             std::vector<PreviewProperty> ignored;
-            thumbnail_cache_.Properties(d.path, d.attrs, d.view_generation,
+            details_cache_.Properties(d.path, d.attrs, d.view_generation,
                                         d.modified_value, d.size_value, ignored);
             if (!handlerPreview) {
-                previewResult = thumbnail_cache_.Draw(dc, contentRc, d.path, d.attrs, 2048u,
+                previewResult = details_cache_.Draw(dc, contentRc, d.path, d.attrs, 2048u,
                     d.view_generation, d.modified_value, d.size_value, 1.0f,
                     &previewText, &truncated, &bytesRead, true, &previewError,
                     nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr,
@@ -216,7 +222,7 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
 
         details_preview_ready_ = !placeholderOnly && !handlerPreview &&
             (previewResult == PreviewDrawResult::Bitmap || previewResult == PreviewDrawResult::Text ||
-             previewResult == PreviewDrawResult::Hex);
+             previewResult == PreviewDrawResult::Hex || previewResult == PreviewDrawResult::Archive);
         if (!details_preview_ready_) EndDetailsPreviewPan();
         preview_handler_.Sync(notify_hwnd_, overlayRc, d.path, d.attrs, d.view_generation,
                               d.modified_value, d.size_value, vm.dark, theme.bg, theme.text,
@@ -234,8 +240,14 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
             }
         }
 
-        if (!handlerPreview && (previewResult == PreviewDrawResult::Text ||
-            previewResult == PreviewDrawResult::Hex)) {
+        details_preview_archive_ = false;
+        if (!handlerPreview && previewResult == PreviewDrawResult::Archive &&
+            details_archive_.SetPayload(previewText, d.name, d.size_value)) {
+            details_preview_archive_ = true;
+            details_viewport_.SetContent(contentRc, 0, 0, false);
+            details_archive_.Draw(dc, compositor_, contentRc, theme, s, false);
+        } else if (!handlerPreview && (previewResult == PreviewDrawResult::Text ||
+            previewResult == PreviewDrawResult::Hex || previewResult == PreviewDrawResult::Archive)) {
             if (!preview_mono_format_.get() && compositor_->DwriteFactory()) {
                 typography::CreateTextFormat(compositor_->DwriteFactory(),
                     {typography::FontRole::Monospace, 11.0f * s},
@@ -438,7 +450,7 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
     if (d.multi_count <= 1) {
         auto rowButton = [&](const D2D1_RECT_F& rc, const wchar_t* glyph,
                              const wchar_t* fallback, const wchar_t* label, bool hovered,
-                             bool primary) {
+                             bool primary, int64_t copied_ms = -1) {
             if (primary) {
                 MakeBrush(dc, hovered ? theme.accent_hover : theme.accent, brAccent_);
                 FillRoundedRect(dc, brAccent_.get(), rc.left, rc.top, rc.right - rc.left,
@@ -454,9 +466,28 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
                                          brStrokeCard_.get(), 1.0f);
             }
             const D2D1_COLOR_F fg = primary ? theme.accent_text : theme.text;
-            DrawIconText(rc.left, rc.top + 5.0f * s, rc.right - rc.left, 18.0f * s,
-                         glyph, fallback, primary ? theme.accent_text
-                                                  : theme.text_secondary, 1.0f);
+            if (copied_ms >= 0) {
+                // Copy confirmation: the icon pops into a check mark in place.
+                const float pop = motion::SystemAnimationsEnabled()
+                    ? motion::EaseOutBack(static_cast<float>(copied_ms) /
+                                          static_cast<float>(motion::CopyFeedback::kPopMs))
+                    : 1.0f;
+                const float cx = (rc.left + rc.right) * 0.5f;
+                const float cy = rc.top + 14.0f * s;
+                const float half = 9.0f * s;
+                D2D1_MATRIX_3X2_F saved{};
+                dc->GetTransform(&saved);
+                dc->SetTransform(D2D1::Matrix3x2F::Scale(std::max(0.05f, pop), std::max(0.05f, pop),
+                                                         D2D1::Point2F(cx, cy)) * saved);
+                (void)half;
+                DrawIconText(rc.left, rc.top + 5.0f * s, rc.right - rc.left, 18.0f * s,
+                             L"\xE73E", L"\x2713", theme.accent, 1.0f);
+                dc->SetTransform(saved);
+            } else {
+                DrawIconText(rc.left, rc.top + 5.0f * s, rc.right - rc.left, 18.0f * s,
+                             glyph, fallback, primary ? theme.accent_text
+                                                      : theme.text_secondary, 1.0f);
+            }
             IDWriteTextFormat* fmt = compositor_->SmallFormat();
             if (!fmt) return;
             // Draw through a private text layout so the shared format is never
@@ -481,8 +512,12 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
                   IsHovered(vm, HitTestResult::DetailsOpen), true);
         rowButton(hit.new_tab, L"\xE8A7", L"\x2197", pulse::l10n::Get(kDetailsButtonLabels[1]).c_str(),
                   IsHovered(vm, HitTestResult::DetailsNewTab), false);
-        rowButton(hit.copy_path, L"\xE8C8", L"C", pulse::l10n::Get(kDetailsButtonLabels[2]).c_str(),
-                  IsHovered(vm, HitTestResult::DetailsCopyPath), false);
+        const int64_t copied_ms = copy_feedback_.Elapsed(
+            static_cast<int>(HitTestResult::DetailsCopyPath), 0, GetTickCount64());
+        rowButton(hit.copy_path, L"\xE8C8", L"C",
+                  copied_ms >= 0 ? pulse::l10n::Get(pulse::l10n::StringId::CopiedShort).c_str()
+                                 : pulse::l10n::Get(kDetailsButtonLabels[2]).c_str(),
+                  IsHovered(vm, HitTestResult::DetailsCopyPath), false, copied_ms);
         rowButton(hit.more, L"\xE712", L"...", pulse::l10n::Get(kDetailsButtonLabels[3]).c_str(),
                   IsHovered(vm, HitTestResult::DetailsMore), false);
         y += 48.0f * s + 4.0f * s;
@@ -665,12 +700,18 @@ void MainRenderer::MoveDetailsPreviewPan(float x, float y) {
         details_preview_dragging_ = true;
     }
     if (!details_preview_dragging_) return;
-    details_viewport_.Pan(x - details_preview_pointer_.x, y - details_preview_pointer_.y);
+    if (details_preview_archive_)
+        details_archive_.ScrollPixels(details_preview_pointer_.y - y);
+    else
+        details_viewport_.Pan(x - details_preview_pointer_.x, y - details_preview_pointer_.y);
     details_preview_pointer_ = POINT{static_cast<LONG>(x), static_cast<LONG>(y)};
 }
 void MainRenderer::ScrollDetailsPreview(float steps, float x, float y, bool horizontal) {
     if (!details_preview_ready_) return;
-    if (details_viewport_.image) {
+    if (details_preview_archive_) {
+        details_archive_.Scroll(horizontal ? 0.0f : steps);
+        details_archive_.Hover(x, y);
+    } else if (details_viewport_.image) {
         details_viewport_.ZoomAt(details_viewport_.zoom * std::pow(1.15f, steps), x, y);
         details_zoom_label_until_ = GetTickCount64() + 1200;
     } else {
@@ -678,7 +719,15 @@ void MainRenderer::ScrollDetailsPreview(float steps, float x, float y, bool hori
                               horizontal ? 0 : steps * 48 * scale_);
     }
 }
+bool MainRenderer::ClickDetailsPreview(float x, float y) {
+    return DetailsPreviewIsArchive() && details_archive_.Click(x, y);
+}
+bool MainRenderer::HoverDetailsPreview(float x, float y) {
+    if (!DetailsPreviewIsArchive()) return false;
+    return details_archive_.Contains(x, y) ? details_archive_.Hover(x, y) : details_archive_.Leave();
+}
 void MainRenderer::ToggleDetailsPreviewFit(float x, float y) {
+    if (DetailsPreviewIsArchive()) { details_archive_.Click(x, y); return; }
     if (details_preview_ready_) details_viewport_.ToggleFit(x, y);
     details_zoom_label_until_ = GetTickCount64() + 1200;
 }

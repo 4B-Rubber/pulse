@@ -6,6 +6,7 @@
 #include "../ui/ui_renderer.h"
 #include "places.h"
 #include "column_view_model.h"
+#include "pane_header_animation.h"
 #include "../index/content_result_store.h"
 #include <map>
 #include <memory>
@@ -21,6 +22,7 @@
 
 namespace pulse { struct ContentSizeSummary; struct ContentSelectionRestore; }
 namespace pulse::app {
+struct ContentNavigationState;
 
 // When navigating from a descendant to one of its ancestors, returns the
 // immediate child of the destination that the user just left. Empty means the
@@ -82,6 +84,7 @@ struct Tab {
     std::wstring git_root;
     std::shared_ptr<std::vector<fs::DirEntry>> search_entries;
     std::shared_ptr<index::ContentResultStore> content_results;
+    std::vector<std::shared_ptr<ContentNavigationState>> content_navigation;
     uint64_t content_revision = 0;
     bool content_count_final = false;
     DWORD content_scan_error = ERROR_SUCCESS;
@@ -247,6 +250,7 @@ struct Pane {
     bool focused = false;
     bool target = false;
     float filter_expand = 0.0f;
+    PaneHeaderAnimation header_animation;
     float filter_animation_from = 0.0f;
     float filter_animation_target = 0.0f;
     uint64_t filter_animation_start = 0;
@@ -352,6 +356,7 @@ std::unique_ptr<LayoutTab> MakeSingleLayoutTab(const std::wstring& path,
                                                const Tab* source = nullptr);
 void RebuildLayoutRoot(LayoutTab& tab);
 std::wstring LayoutTabTitle(const LayoutTab& tab);
+std::wstring TabTitle(const std::wstring& path);
 void FillWindowTabStrip(ui::WindowViewModel& vm, const WindowTabs& tabs);
 // Rows of the group-chip hover card: one row per member tab (collapsed groups
 // only, separated from the actions) followed by "New tab in group" and

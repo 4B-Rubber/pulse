@@ -939,16 +939,22 @@ void FileOperationWindow::SetTheme(bool dark, D2D1_COLOR_F accent) {
 
 void FileOperationWindow::Update(const ops::OpStatus& status) {
     const bool new_task = status.task_id != status_.task_id;
+    const bool was_active = status_.active;
     status_ = ops::PresentOperationStatus(status);
     if (new_task) {
         speed_history_.clear();
         speed_sample_tick_ = 0;
     }
-    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    if (!hwnd_) return;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    // The render timer stops once an operation ends; restart it for the next.
+    if (status_.active && !was_active && IsWindowVisible(hwnd_))
+        SetTimer(hwnd_, kRenderTimer, 33, nullptr);
 }
 
 void FileOperationWindow::Show(bool activate) {
     if (!hwnd_) return;
+    const bool was_visible = IsWindowVisible(hwnd_) != FALSE;
     if (!positioned_) {
         RECT rect{};
         GetWindowRect(hwnd_, &rect);
@@ -959,6 +965,8 @@ void FileOperationWindow::Show(bool activate) {
     SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER |
                  (activate ? 0 : SWP_NOACTIVATE) | SWP_SHOWWINDOW);
+    // SWP_SHOWWINDOW sends no WM_SHOWWINDOW; start the animation timer here.
+    if (!was_visible) SetTimer(hwnd_, kRenderTimer, 33, nullptr);
     if (activate) SetForegroundWindow(hwnd_);
 }
 
@@ -1290,8 +1298,13 @@ LRESULT FileOperationWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM l
         compositor_.RecreateTextFormats(scale_);
         painter_.SetCompositor(&compositor_);
         painter_.SetScale(scale_);
-        SetTimer(hwnd_, kRenderTimer, 33, nullptr);
+        // The window is created hidden and kept for reuse; its 33 ms
+        // animation timer only runs while it is shown.
         return 0;
+    case WM_SHOWWINDOW:
+        if (wparam) SetTimer(hwnd_, kRenderTimer, 33, nullptr);
+        else KillTimer(hwnd_, kRenderTimer);
+        break;
     case WM_NCCALCSIZE:
         return 0;
     case WM_NCHITTEST: {
@@ -1322,24 +1335,32 @@ LRESULT FileOperationWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM l
         return 0;
     }
     case WM_TIMER:
-        if (wparam == kRenderTimer && IsWindowVisible(hwnd_)) {
-            if (status_.active) {
-                const ULONGLONG now = GetTickCount64();
-                if (speed_sample_tick_ == 0 || now - speed_sample_tick_ >= 250) {
-                    speed_sample_tick_ = now;
-                    const bool running = status_.phase == ops::OpPhase::Running;
-                    // Sample whichever unit this task tracks: byte transfers and
-                    // empty-recycle feed the byte rate, delete and restore the item rate.
-                    double sample = 0.0;
-                    if (running) {
-                        if (status_.speed_basis == ops::OpSpeedBasis::Bytes)
-                            sample = status_.bytes_per_second;
-                        else if (status_.speed_basis == ops::OpSpeedBasis::Items)
-                            sample = status_.items_per_second;
-                    }
-                    speed_history_.push_back((std::max)(0.0, sample));
-                    while (speed_history_.size() > 120) speed_history_.pop_front();
+        if (wparam == kRenderTimer && !IsWindowVisible(hwnd_)) {
+            KillTimer(hwnd_, kRenderTimer);
+            return 0;
+        }
+        if (wparam == kRenderTimer) {
+            // Only a running operation animates (indeterminate bar, speed graph); a finished one
+            // is redrawn by Update and input alone.
+            if (!status_.active) {
+                KillTimer(hwnd_, kRenderTimer);
+                return 0;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (speed_sample_tick_ == 0 || now - speed_sample_tick_ >= 250) {
+                speed_sample_tick_ = now;
+                const bool running = status_.phase == ops::OpPhase::Running;
+                // Sample whichever unit this task tracks: byte transfers and
+                // empty-recycle feed the byte rate, delete and restore the item rate.
+                double sample = 0.0;
+                if (running) {
+                    if (status_.speed_basis == ops::OpSpeedBasis::Bytes)
+                        sample = status_.bytes_per_second;
+                    else if (status_.speed_basis == ops::OpSpeedBasis::Items)
+                        sample = status_.items_per_second;
                 }
+                speed_history_.push_back((std::max)(0.0, sample));
+                while (speed_history_.size() > 120) speed_history_.pop_front();
             }
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;

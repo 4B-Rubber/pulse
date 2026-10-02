@@ -61,23 +61,25 @@ bool NetworkAgentClient::EnsureAgent(bool force) {
         // An agent that outlived the retry window died of something other than a
         // spawn loop, so the next poll may start a fresh one right away; a process
         // that died in the same breath as its creation keeps the delay.
-        if (last_spawn_try_ != 0 && GetTickCount64() - last_spawn_try_ >= kSpawnRetryDelayMs)
-            last_spawn_try_ = 0;
+        if (last_spawn_tick_ != 0 && GetTickCount64() - last_spawn_tick_ >= kSpawnRetryDelayMs)
+            last_spawn_tick_ = 0;
     }
-    // Another Pulse window (or one that has just exited) may already own the
-    // singleton and serve the pipe. A second agent would lose that race and exit
-    // at once, so reuse the running instance instead of creating one process per
-    // status poll.
-    if (HANDLE serving = OpenMutexW(SYNCHRONIZE, FALSE, agent::kAgentSingletonName)) {
-        CloseHandle(serving);
+    // The agent is a per-session singleton (see RunAgent in network_agent_main.cpp). It may be
+    // owned by another Pulse window or outlive the Pulse instance that started it. Spawning a
+    // duplicate would exit immediately and cause a respawn loop on every request (and a
+    // flickering AppStarting cursor), so reuse whichever agent currently holds the singleton.
+    if (HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, kAgentSingletonName)) {
+        CloseHandle(existing);
         return true;
     }
-    // Starting the agent is what paints the shell's "starting" cursor, so it is
-    // worth a process only once the user has server folders to index.
+    if (GetLastError() == ERROR_ACCESS_DENIED) return true; // exists, owned by an elevated agent
+    // Starting the agent is what paints the shell's "starting" cursor, so it is worth a process
+    // only once the user has server folders to index.
     if (!force && !server_folders_configured_.load()) return false;
+    // A crashing agent must not be relaunched on every 1 s status poll.
     const ULONGLONG now = GetTickCount64();
-    if (last_spawn_try_ != 0 && now - last_spawn_try_ < kSpawnRetryDelayMs) return false;
-    last_spawn_try_ = now;
+    if (last_spawn_tick_ && now - last_spawn_tick_ < kRespawnBackoffMs) return false;
+    last_spawn_tick_ = now;
     if (!EnsureAgentJob()) return false;
     const std::wstring exe = ExePath();
     if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
@@ -85,6 +87,7 @@ bool NetworkAgentClient::EnsureAgent(bool force) {
     startup.dwFlags = STARTF_FORCEOFFFEEDBACK; // background agent: no AppStarting cursor
     PROCESS_INFORMATION process{};
     std::wstring command = L"\"" + exe + L"\" --network-agent";
+    last_spawn_tick_ = now;
     if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE,
                         CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &process))
         return false;

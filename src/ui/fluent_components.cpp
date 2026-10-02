@@ -1,4 +1,5 @@
 #include "legacy_icons.h"
+#include "command_icons.h"
 #include "../common/localization.h"
 #include "fluent_components.h"
 #include "tab_shape.h"
@@ -108,9 +109,13 @@ struct TextLayoutKeyHash {
 thread_local std::unordered_map<TextLayoutKey, ComPtr<IDWriteTextLayout>, TextLayoutKeyHash>
     g_text_layout_cache;
 constexpr size_t kTextLayoutCacheLimit = 1024;
+thread_local std::unordered_map<TextLayoutKey, ComPtr<IDWriteTextLayout>, TextLayoutKeyHash>
+    g_wrapped_layout_cache;
+constexpr size_t kWrappedLayoutCacheLimit = 256;
 
 void ClearTextLayoutCache() {
     g_text_layout_cache.clear();
+    g_wrapped_layout_cache.clear();
 }
 
 IDWriteTextLayout* GetTextLayout(Compositor* compositor, IDWriteTextFormat* format,
@@ -138,6 +143,37 @@ IDWriteTextLayout* GetTextLayout(Compositor* compositor, IDWriteTextFormat* form
     if (g_text_layout_cache.size() >= kTextLayoutCacheLimit) g_text_layout_cache.clear();
     IDWriteTextLayout* result = layout.get();
     g_text_layout_cache.emplace(std::move(key), std::move(layout));
+    return result;
+}
+
+// Unbounded-height, word-wrapped layout; height_64 = 0 marks it in the key.
+IDWriteTextLayout* GetWrappedTextLayout(Compositor* compositor, IDWriteTextFormat* format,
+                                        std::wstring_view text, float width) {
+    if (!compositor || !compositor->DwriteFactory() || !format || text.empty() || width <= 0.0f)
+        return nullptr;
+    TextLayoutKey key{
+        format,
+        std::wstring(text),
+        static_cast<int>(std::lround(width * 64.0f)),
+        0,
+        DWRITE_TEXT_ALIGNMENT_LEADING,
+        typography::Generation(),
+    };
+    if (const auto found = g_wrapped_layout_cache.find(key); found != g_wrapped_layout_cache.end()) {
+        return found->second.get();
+    }
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(compositor->DwriteFactory()->CreateTextLayout(
+            text.data(), static_cast<UINT32>(text.size()), format,
+            width, 100000.0f, &layout)) || !layout.get()) return nullptr;
+    layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    const DWRITE_TRIMMING no_trimming{DWRITE_TRIMMING_GRANULARITY_NONE, 0, 0};
+    layout->SetTrimming(&no_trimming, nullptr);
+    if (g_wrapped_layout_cache.size() >= kWrappedLayoutCacheLimit) g_wrapped_layout_cache.clear();
+    IDWriteTextLayout* result = layout.get();
+    g_wrapped_layout_cache.emplace(std::move(key), std::move(layout));
     return result;
 }
 
@@ -490,12 +526,27 @@ void Painter::DrawTextWithBrush(std::wstring_view text, const D2D1_RECT_F& bound
                         text_brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
+float Painter::MeasureWrappedCaptionHeight(std::wstring_view text, float width) const {
+    IDWriteTextLayout* layout = GetWrappedTextLayout(compositor_, CaptionFormat(), text, width);
+    DWRITE_TEXT_METRICS metrics{};
+    if (!layout || FAILED(layout->GetMetrics(&metrics))) return 0.0f;
+    return std::ceil(metrics.height);
+}
+
+void Painter::DrawWrappedCaption(std::wstring_view text, D2D1_POINT_2F origin, float width,
+                                 const D2D1_COLOR_F& color) {
+    if (!dc_) return;
+    IDWriteTextLayout* layout = GetWrappedTextLayout(compositor_, CaptionFormat(), text, width);
+    ID2D1SolidColorBrush* brush = ScratchBrush(color);
+    if (layout && brush) dc_->DrawTextLayout(origin, layout, brush);
+}
+
 void Painter::DrawGlyph(std::wstring_view glyph, const D2D1_RECT_F& bounds,
                         const D2D1_COLOR_F& color) {
     if (!compositor_) {
         return;
     }
-    DrawText(glyph, bounds, compositor_->IconFormat(), color, HorizontalAlignment::Center);
+    DrawGlyphWithFormat(glyph, bounds, color, compositor_->IconFormat());
 }
 
 void Painter::DrawGlyphWithBrush(std::wstring_view glyph, const D2D1_RECT_F& bounds,
@@ -503,12 +554,25 @@ void Painter::DrawGlyphWithBrush(std::wstring_view glyph, const D2D1_RECT_F& bou
     if (!compositor_) {
         return;
     }
+    const auto command = command_icons::FromGlyph(glyph);
+    if (command != command_icons::Icon::None) {
+        EnsureStrokeStyle();
+        const auto icon_bounds = command_icons::CenteredBounds(bounds, Px(20.0f));
+        if (command_icons::Draw(dc_, Brush(brush), round_stroke_.get(), command, icon_bounds)) return;
+    }
     DrawTextWithBrush(glyph, bounds, compositor_->IconFormat(), brush,
                       HorizontalAlignment::Center);
 }
 
 void Painter::DrawGlyphWithFormat(std::wstring_view glyph, const D2D1_RECT_F& bounds,
                                   const D2D1_COLOR_F& color, IDWriteTextFormat* format) {
+    const auto command = command_icons::FromGlyph(glyph);
+    if (command != command_icons::Icon::None) {
+        EnsureStrokeStyle();
+        const float size = format ? (std::min)(Px(20.0f), format->GetFontSize() * 1.2f) : Px(18.0f);
+        if (command_icons::Draw(dc_, ScratchBrush(color), round_stroke_.get(), command,
+                                command_icons::CenteredBounds(bounds, size))) return;
+    }
     DrawText(glyph, bounds, format, color, HorizontalAlignment::Center);
 }
 
@@ -725,6 +789,17 @@ void Painter::DrawButton(const ButtonSpec& spec) {
                      : state.pressed ? RgbaF(0x000000, 0.63f) : HexColor(0x000000);
     }
 
+    if (!high_contrast_) {
+        if (primary && state.enabled) {
+            foreground = state.pressed ? MultiplyAlpha(theme_->accent_text, 0.63f)
+                                       : theme_->accent_text;
+        } else if (danger && state.enabled) {
+            foreground = AutoAccentText(fill);
+        } else if (!primary && !danger) {
+            foreground = !state.enabled ? theme_->text_disabled
+                : state.pressed ? MultiplyAlpha(theme_->text, 0.72f) : theme_->text;
+        }
+    }
     if (draw_fill) {
         FillRoundedRect(spec.bounds, radius, fill);
     }
@@ -839,25 +914,15 @@ void Painter::DrawTextField(const TextFieldSpec& spec) {
 
     DrawTextFieldFrame(spec.bounds, spec.state, spec.hosted_edit);
 
-    D2D1_COLOR_F foreground;
-    D2D1_COLOR_F placeholder_color;
-    if (high_contrast_) {
-        foreground = spec.state.enabled ? theme_->text : theme_->text_disabled;
-        placeholder_color = theme_->text_secondary;
-    } else if (dark_) {
-        foreground = spec.state.enabled ? HexColor(0xFFFFFF) : Rgba(0xFFFFFF, 92);
-        placeholder_color = RgbaF(0xFFFFFF, 0.6063f);
-    } else {
-        foreground = spec.state.enabled ? HexColor(0x000000) : Rgba(0x000000, 92);
-        placeholder_color = RgbaF(0x000000, 0.6063f);
-    }
+    const D2D1_COLOR_F foreground = spec.state.enabled ? theme_->text : theme_->text_disabled;
+    const D2D1_COLOR_F placeholder_color = theme_->text_secondary;
 
     auto content = Inset(spec.bounds, Px(10.0f));
     content.top = spec.bounds.top;
     content.bottom = spec.bounds.bottom;
     if (!spec.leading_glyph.empty()) {
         const float icon_width = Px(18.0f);
-        DrawGlyphWithFormat(
+        if (!spec.suppress_leading_glyph) DrawGlyphWithFormat(
             spec.leading_glyph,
             D2D1::RectF(content.left, content.top,
                         content.left + icon_width, content.bottom),
@@ -1854,8 +1919,7 @@ void Painter::DrawSplitButton(const SplitButtonSpec& spec) {
 
 void Painter::DrawSegmentedTrack(const D2D1_RECT_F& bounds) {
     if (!theme_ || !dc_) return;
-    auto fill = theme_->bg;
-    fill.a = high_contrast_ ? 1.0f : 0.55f;
+    auto fill = high_contrast_ ? theme_->bg : dark_ ? HexColor(0x2B2B2B) : HexColor(0xEDF1EA);
     FillRoundedRect(bounds, Px(8.0f), fill);
     StrokeRoundedRect(bounds, Px(8.0f), theme_->stroke_divider);
 }
@@ -1873,19 +1937,20 @@ void Painter::DrawSegmentedItem(const SegmentedItemSpec& spec) {
     } else if (spec.state.enabled && (spec.state.hovered || spec.state.pressed)) {
         fill = spec.state.pressed ? theme_->fill_pressed : theme_->fill_hover;
     }
+    const auto plate = spec.shared_track ? Inset(spec.bounds, Px(3.0f)) : spec.bounds;
     if (fill.a > 0.0f) {
         if (radius > 0.0f) {
-            FillRoundedRect(spec.bounds, radius, fill);
+            FillRoundedRect(plate, radius, fill);
         } else {
-            dc_->FillRectangle(spec.bounds, ScratchBrush(fill));
+            dc_->FillRectangle(plate, ScratchBrush(fill));
         }
     }
     if (!spec.shared_track || spec.state.selected || spec.state.checked) {
-        StrokeRoundedRect(spec.bounds, radius,
+        StrokeRoundedRect(plate, radius,
                           high_contrast_ ? theme_->stroke_card : theme_->stroke_divider);
     }
 
-    const D2D1_COLOR_F foreground = spec.state.enabled ? theme_->text
+    const D2D1_COLOR_F foreground = spec.state.enabled ? ((spec.state.selected || spec.state.checked) ? theme_->accent : theme_->text_secondary)
                                                         : theme_->text_disabled;
     auto content = Inset(spec.bounds, Px(spec.shared_track ? 3.0f : 6.0f));
     if (!spec.glyph.empty()) {
@@ -2408,6 +2473,17 @@ void Painter::DrawStagingTrayPanel(const StagingTrayPanelSpec& spec) {
     if (!count_text.empty()) {
         // Size the badge to the text instead of fixed widths (CJK labels
         // like "4 项" used to clip). Sits left of the action button.
+        const float text_w = MeasureTextWidth(
+            compositor_ ? compositor_->DwriteFactory() : nullptr, CaptionFormat(), count_text);
+        const float badge_width = std::max(Px(28.0f), std::ceil(text_w) + Px(14.0f));
+        // The title wins: in a narrow sidebar the count badge is dropped
+        // (the stack footer shows "n / N") instead of clipping the title.
+        const float title_w = MeasureTextWidth(
+            compositor_ ? compositor_->DwriteFactory() : nullptr, BodyFormat(),
+            std::wstring(spec.title));
+        if (right - badge_width - Px(6.0f) - header.left < title_w + Px(2.0f)) count_text.clear();
+    }
+    if (!count_text.empty()) {
         const float text_w = MeasureTextWidth(
             compositor_ ? compositor_->DwriteFactory() : nullptr, CaptionFormat(), count_text);
         const float badge_width = std::max(Px(28.0f), std::ceil(text_w) + Px(14.0f));

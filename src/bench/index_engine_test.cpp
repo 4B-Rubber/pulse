@@ -20,6 +20,102 @@ struct UsnStreamTestAccess {
 };
 
 struct EngineTestAccess {
+    static bool FolderSizesFixture() {
+        bool ok = true;
+        auto check = [&](bool value, const char* name) {
+            std::cout << (value ? "[PASS] " : "[FAIL] ") << name << '\n'; ok &= value;
+        };
+        const auto fixture = std::filesystem::absolute(std::filesystem::path(L"bench_data") /
+            (L"folder-index-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64())));
+        const auto a = fixture / L"A", b = fixture / L"B";
+        std::filesystem::create_directories(a); std::filesystem::create_directories(b);
+        auto write = [](const std::filesystem::path& p, size_t n) { std::ofstream f(p, std::ios::binary | std::ios::trunc); f << std::string(n, 'x'); };
+        write(a / L"one.bin", 100);
+        Engine e;
+        e.AddForTest((a / L"one.bin").wstring(), L"one.bin", false, 100);
+        e.AddForTest(b.wstring(), L"B", true);
+        Engine::VolState volume;
+        volume.letter = fixture.wstring()[0]; volume.root_idx = e.ResolvePathLocked(fixture.root_path().wstring());
+        volume.journal_id = 1; volume.folder_size_current = true;
+        for (const auto& pair : std::vector<std::pair<uint64_t, std::wstring>>{
+            {1, fixture.root_path().wstring()}, {2, fixture.wstring()}, {3, a.wstring()}, {4, b.wstring()}, {5, (a / L"one.bin").wstring()}})
+            volume.frn_new.push_back({pair.first, e.ResolvePathLocked(pair.second), 0});
+        e.vols_.push_back(std::move(volume)); e.running_ = true; e.ready_ = true;
+        auto size = [&](const std::filesystem::path& path) { return e.FolderSizes({path.wstring()})[0]; };
+        check(size(a).available && size(a).bytes == 100 && size(b).available && size(b).bytes == 0,
+            "MFT metadata aggregates nested folders and known empty zero");
+        const auto builds = e.folder_sizes_.Builds();
+        VolumeInfo active; active.id = e.vols_[0].volume_id;
+        e.UpdateVolumeVisibilityLocked({active});
+        check(size(a).bytes == 100 && e.folder_sizes_.Builds() == builds,
+            "routine volume visibility polling preserves size aggregates");
+        auto usn = [&](uint64_t id, uint64_t parent, const wchar_t* name, DWORD reason, bool directory = false) {
+            const auto length = static_cast<WORD>(wcslen(name) * sizeof(wchar_t));
+            std::vector<BYTE> bytes(sizeof(USN_RECORD_V2) + length);
+            auto* record = reinterpret_cast<USN_RECORD_V2*>(bytes.data());
+            record->RecordLength = static_cast<DWORD>(bytes.size()); record->MajorVersion = 2;
+            record->FileReferenceNumber = id; record->ParentFileReferenceNumber = parent;
+            record->Reason = reason; record->FileAttributes = directory ? FILE_ATTRIBUTE_DIRECTORY : 0;
+            record->FileNameOffset = static_cast<WORD>(offsetof(USN_RECORD_V2, FileName)); record->FileNameLength = length;
+            memcpy(bytes.data() + record->FileNameOffset, name, length);
+            e.ApplyUsnLocked(e.vols_.front(), record);
+        };
+        write(a / L"one.bin", 350); usn(5, 3, L"one.bin", USN_REASON_DATA_EXTEND);
+        check(size(a).bytes == 350 && size(fixture).bytes == 350, "real USN data extension updates ancestors");
+        write(a / L"one.bin", 25); usn(5, 3, L"one.bin", USN_REASON_DATA_TRUNCATION);
+        check(size(a).bytes == 25, "USN truncation subtracts old logical size");
+        write(a / L"two.bin", 75); usn(6, 3, L"two.bin", USN_REASON_FILE_CREATE);
+        check(size(a).bytes == 100, "USN creation adds file size without index rebuild");
+        std::filesystem::rename(a / L"two.bin", b / L"two.bin");
+        usn(6, 4, L"two.bin", USN_REASON_RENAME_NEW_NAME);
+        check(size(a).bytes == 25 && size(b).bytes == 75 && size(fixture).bytes == 100,
+            "USN file move updates both ancestor chains exactly once");
+        std::filesystem::rename(a, b / L"A"); usn(3, 4, L"A", USN_REASON_RENAME_NEW_NAME, true);
+        check(!size(a).available && size(b).bytes == 100 && size(b / L"A").bytes == 25,
+            "USN subtree move transfers its cached total");
+        std::filesystem::remove(b / L"A" / L"one.bin"); usn(5, 3, L"one.bin", USN_REASON_FILE_DELETE);
+        check(size(b / L"A").bytes == 0 && size(b).bytes == 75, "USN deletion subtracts previous file metadata");
+        usn(5, 3, L"one.bin", USN_REASON_FILE_DELETE);
+        check(size(b).bytes == 75 && e.folder_sizes_.Builds() == builds,
+            "duplicate deletion is harmless and all USN edits avoid aggregate rebuilds");
+        e.building_ = true; check(!size(b).available, "unfinished index never returns a complete size"); e.building_ = false;
+        e.vols_[0].folder_size_current = false; check(!size(b).available, "startup cache waits for journal catch-up"); e.vols_[0].folder_size_current = true;
+        e.inactive_volume_roots_.push_back(e.vols_[0].root_idx);
+        check(!size(b).available, "offline volume declines cached totals"); e.inactive_volume_roots_.clear();
+        e.GapFeed(); check(!size(b).available, "journal gap declines stale aggregation until recovery");
+        e.folder_size_gap_ = false; e.InvalidateFilterLocked();
+        check(size(b).available && size(b).bytes == 75 && e.folder_sizes_.Builds() == builds + 1,
+            "replacement snapshot rebuilds aggregation from current metadata");
+        check(!size(L"\\\\server\\share").available && !size(fixture / L"absent").available, "uncovered UNC and missing paths never return false zero");
+        e.excluded_paths_.push_back(b.wstring()); check(!size(b).available, "excluded root falls back to filesystem statistics");
+        check(!size(L"\\\\?\\" + b.wstring()).available, "extended-length client path cannot bypass index exclusion");
+        std::error_code ec; std::filesystem::remove_all(fixture, ec); check(!ec, "isolated folder-index fixture cleanup");
+
+        FolderSizeIndex index;
+        using Item = FolderSizeIndex::Item;
+        std::vector<Item> nodes{{-1, 0, true, true}, {0, UINT64_MAX, false, true}, {0, 1, false, true}};
+        check(!index.Build(3, [&](int32_t i) { return nodes[i]; }), "aggregate overflow rejected without wrapped sizes");
+        nodes = {{1, 0, true, true}, {0, 0, true, true}};
+        check(!index.Build(2, [&](int32_t i) { return nodes[i]; }), "cyclic metadata terminates without false totals");
+        nodes = {{-1, 0, true, true}};
+        index = FolderSizeIndex{};
+        for (int32_t i = 1; i <= 200000; ++i) nodes.push_back({0, 1, false, true});
+        const auto start = std::chrono::steady_clock::now();
+        check(index.Build(static_cast<int32_t>(nodes.size()), [&](int32_t i) { return nodes[i]; }) && index.Get(0) == 200000,
+            "large metadata baseline sums 200000 files without filesystem enumeration");
+        const auto built = std::chrono::steady_clock::now();
+        for (int32_t i = 1; i <= 10000; ++i) { const auto before = nodes[i]; nodes[i].bytes = 2; index.Replace(i, before, nodes[i], [&](int32_t id) { return nodes[id]; }); }
+        check(index.Get(0) == 210000 && index.Builds() == 1, "10000 incremental edits reuse a single metadata baseline");
+        std::cout << "[TIME] baseline_200000_ms=" << std::chrono::duration<double, std::milli>(built - start).count()
+            << " updates_10000_ms=" << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - built).count() << '\n';
+        ipc::PayloadWriter writer; PutFolderSizes(writer, {{true, 0}, {true, UINT64_MAX}, {false, 0}});
+        ipc::PayloadReader reader(writer.data().data(), writer.data().size()); std::vector<IndexedFolderSize> values;
+        check(ReadFolderSizes(reader, 3, values) && values[0].available && values[1].bytes == UINT64_MAX && !values[2].available,
+            "versioned IPC preserves zero, 64-bit size and unavailable distinctly");
+        ipc::PayloadReader truncated(writer.data().data(), writer.data().size() - 1);
+        check(!ReadFolderSizes(truncated, 3, values), "truncated folder-size IPC rejected");
+        return ok;
+    }
     static bool NamePoolFixture();
     static bool QuietDiagnosticsFixture();
     static bool UsnQueueFixture() {
@@ -617,6 +713,7 @@ int wmain(int argc, wchar_t** argv) {
     if (!SetEnvironmentVariableW(L"PULSE_INDEX_DIAGNOSTICS", quiet ? nullptr : L"1")) return 2;
     if (quiet) return EngineTestAccess::QuietDiagnosticsFixture() ? 0 : 1;
     if (argc > 1 && std::wstring_view(argv[1]) == L"--name-pool-only") return EngineTestAccess::NamePoolFixture() ? 0 : 1;
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--folder-sizes-only") return EngineTestAccess::FolderSizesFixture() ? 0 : 1;
     if (argc > 1 && std::wstring_view(argv[1]) == L"--usn-only") return EngineTestAccess::UsnQueueFixture() ? 0 : 1;
     if (argc > 1 && std::wstring_view(argv[1]) == L"--feed-only") return EngineTestAccess::FeedFixture() ? 0 : 1;
     if (argc > 1 && std::wstring_view(argv[1]) == L"--maintenance-only") return EngineTestAccess::MaintenanceFixture() ? 0 : 1;

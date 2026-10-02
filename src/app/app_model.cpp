@@ -797,7 +797,7 @@ std::wstring FindGitRoot(const std::wstring& path) {
     return FindGitRootImpl(path);
 }
 
-static std::wstring TabTitle(const std::wstring& path) {
+std::wstring TabTitle(const std::wstring& path) {
     if (path.empty()) return l10n::Get(l10n::StringId::ThisPc);
     std::wstring kind, rest;
     if (ParsePulsePath(path, &kind, &rest)) {
@@ -1403,6 +1403,7 @@ void FillPaneViewModel(ui::PaneViewModel& out, const Pane& pane, const PlacesCat
     out.header_text = PaneHeaderText(*tab);
     out.filter_text = tab->filter_text;
     out.filter_expand = pane.filter_expand;
+    out.header_controls_opacity = pane.header_animation.opacity;
     out.banner_title = tab->banner_title;
     out.banner_message = tab->banner_message;
     out.banner_kind = tab->net_readonly ? 2 : 0;
@@ -1666,6 +1667,18 @@ ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
             if (i == places->active_workspace)
                 it.badge = l10n::Get(unc ? l10n::StringId::CurrentServer
                                          : l10n::StringId::Current);
+            // The saved split is what sets a workspace apart from a Quick
+            // access link; show it when there is more than one pane.
+            const auto panes = std::count_if(w.pane_paths.begin(), w.pane_paths.end(),
+                [](const std::wstring& p) { return !p.empty(); });
+            if (panes > 1) {
+                wchar_t pane_text[64]{};
+                swprintf_s(pane_text, l10n::Get(l10n::StringId::WorkspacePanes).c_str(),
+                           static_cast<int>(panes));
+                if (it.badge.empty()) it.badge = pane_text;
+                it.detail += L" \x00B7 ";
+                it.detail += pane_text;
+            }
             workspaces.items.push_back(std::move(it));
             for (const auto& child : places->FrequentChildren(i, 8)) {
                 ui::SidebarItem sub;
@@ -1690,6 +1703,7 @@ ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
     }
     access = ConvertGroup(
         l10n::Get(l10n::StringId::SidebarQuickAccess), quick_access_visible, false);
+    access.add_action = ui::SidebarAddAction::AddQuickAccess;
     starred_section = ConvertGroup(l10n::Get(l10n::StringId::StarredItems),
                                    sidebar.starred, false);
     if (!starred_section.items.empty()) {

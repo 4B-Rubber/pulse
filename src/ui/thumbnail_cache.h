@@ -13,7 +13,8 @@
 #include <unordered_set>
 
 namespace pulse::ui {
-enum class PreviewDrawResult { Pending, Bitmap, Text, Hex, Failed };
+// Archive: `text` carries the archive tree payload for ArchivePreview.
+enum class PreviewDrawResult { Pending, Bitmap, Text, Hex, Failed, Archive };
 
 struct PreviewProperty {
     std::wstring label;
@@ -22,7 +23,13 @@ struct PreviewProperty {
 
 class ThumbnailCache {
 public:
-    ThumbnailCache();
+    // Defaults suit a single large preview (Quick Look); grid thumbnails and
+    // the details pane get their own instances and budgets (ui_renderer.h) so
+    // a 2048 px selection preview never evicts the visible grid.
+    static constexpr size_t kDefaultBudgetBytes = 16ull * 1024ull * 1024ull;
+    static constexpr size_t kDefaultMaxItems = 128;
+    explicit ThumbnailCache(size_t budget_bytes = kDefaultBudgetBytes,
+                            size_t max_items = kDefaultMaxItems);
     ~ThumbnailCache();
     void SetDeviceContext(ID2D1DeviceContext* dc);
     void SetNotifyWindow(HWND hwnd) { hwnd_ = hwnd; }
@@ -76,6 +83,10 @@ private:
         ipc::PreviewContentKind kind = ipc::PreviewContentKind::None;
         bool truncated = false;
         bool failed = false;
+        // Transport failure (host timeout / crash): retried with back-off
+        // instead of being remembered as "this file has no preview".
+        bool transient = false;
+        uint64_t retry_at = 0;
         size_t cost = 0;
         std::list<std::wstring>::iterator lru_position;
     };
@@ -88,8 +99,14 @@ private:
         uint32_t frame_index = 0;
         uint32_t epoch = 0;
         bool details = false;
+        uint32_t timeout_ms = 0;
         std::wstring path, key, identity;
     };
+    // Last decoded still bitmap of a file at any pixel size: drawn while a
+    // different size is pending or being retried, so a thumbnail never drops
+    // back to the file-type icon once it has been shown.
+    Item* StaleBitmap(const std::wstring& identity, const std::wstring& except_key);
+    static uint32_t ResponseTimeoutMs(const std::wstring& path, ipc::PreviewRequestKind kind);
     void Worker();
     bool LoadDiskResult(const Request& request, Item& result);
     void SaveDiskResult(const Request& request, const Item& result);
@@ -113,6 +130,10 @@ private:
     std::unordered_map<std::wstring, Item> items_;
     std::list<std::wstring> lru_;
     size_t cache_bytes_ = 0;
+    size_t budget_bytes_ = kDefaultBudgetBytes;
+    size_t max_items_ = kDefaultMaxItems;
+    std::unordered_map<std::wstring, std::wstring> still_by_identity_;
+    std::unordered_map<std::wstring, uint32_t> transient_failures_;
     std::wstring latest_details_identity_;
     std::atomic<uint32_t> epoch_{1};
     std::thread worker_;

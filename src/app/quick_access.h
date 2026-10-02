@@ -8,4 +8,8 @@ void AppendQuickAccessCommand(AppState& s, std::vector<ui::FluentMenuItem>& item
 bool HandleQuickAccessCommand(AppState& s, int command,
                               const std::vector<std::wstring>& paths);
 void ShowQuickAccessMenu(AppState& s, const std::wstring& path, POINT point);
+// Header "+" of Quick access: pin the current folder or a picked one.
+void ShowQuickAccessAddMenu(AppState& s, POINT point);
+// Right-click on a workspace row: open, refresh its saved layout, unpin.
+void ShowWorkspaceMenu(AppState& s, int index, POINT point);
 }

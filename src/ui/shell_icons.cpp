@@ -32,6 +32,51 @@ std::wstring ShellPath(const std::wstring& path) {
     return pulse::path::StripExtendedPathPrefix(path);
 }
 
+constexpr size_t kReadyPixelsLimit = 256;
+
+uint64_t IconKey(int list_id, int index) noexcept {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(list_id)) << 32) |
+        static_cast<uint32_t>(index);
+}
+
+// Worker thread: image-list icon -> 32bpp premultiplied BGRA pixels. The
+// thread owns its own image-list pointers and WIC factory.
+bool ConvertIconPixels(uint64_t key, std::unordered_map<int, IImageList*>& lists,
+                       ComPtr<IWICImagingFactory>& wic, UINT& width, UINT& height,
+                       std::vector<uint8_t>& data) {
+    const int list_id = static_cast<int>(static_cast<uint32_t>(key >> 32));
+    const int index = static_cast<int>(static_cast<uint32_t>(key & 0xffffffffu));
+    IImageList* list = nullptr;
+    if (const auto it = lists.find(list_id); it != lists.end()) {
+        list = it->second;
+    } else {
+        INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_WIN95_CLASSES };
+        InitCommonControlsEx(&icc);
+        if (FAILED(SHGetImageList(list_id, IID_IImageList, reinterpret_cast<void**>(&list)))) list = nullptr;
+        lists.emplace(list_id, list);
+    }
+    if (!list) return false;
+    if (!wic.get() && FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                              IID_PPV_ARGS(&wic)))) return false;
+    if (!wic.get()) return false;
+    HICON icon = nullptr;
+    if (FAILED(list->GetIcon(index, ILD_TRANSPARENT, &icon)) || !icon) return false;
+    ComPtr<IWICBitmap> source;
+    const HRESULT hr = wic->CreateBitmapFromHICON(icon, &source);
+    DestroyIcon(icon);
+    if (FAILED(hr) || !source.get()) return false;
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(wic->CreateFormatConverter(&converter)) || !converter.get()) return false;
+    if (FAILED(converter->Initialize(source.get(), GUID_WICPixelFormat32bppPBGRA,
+                                     WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeMedianCut))) return false;
+    if (FAILED(converter->GetSize(&width, &height)) || width == 0 || height == 0 ||
+        width > 1024 || height > 1024) return false;
+    data.resize(static_cast<size_t>(width) * height * 4u);
+    return SUCCEEDED(converter->CopyPixels(nullptr, width * 4u, static_cast<UINT>(data.size()),
+                                           data.data()));
+}
+
 } // namespace
 
 ShellIconCache::ShellIconCache() = default;
@@ -79,6 +124,9 @@ void ShellIconCache::Reset() {
     last_used_.clear();
     queued_.clear();
     while (!queue_.empty()) queue_.pop();
+    convert_queue_.clear();
+    convert_pending_.clear();
+    ready_pixels_.clear();
 }
 
 int ShellIconCache::ImageListId(float desired_pixels) noexcept {
@@ -144,25 +192,56 @@ void ShellIconCache::RequestExact(const std::wstring& path) {
             retry != retry_after_.end() && GetTickCount64() < retry->second) return;
         queued_.insert(path);
         queue_.push(path);
-        if (!running_) {
-            running_ = true;
-            if (worker_.joinable()) worker_.join();
-            worker_ = std::thread([this] { WorkerLoop(); });
-        }
+        StartWorkerLocked();
     }
     cv_.notify_one();
 }
 
+void ShellIconCache::StartWorkerLocked() {
+    if (running_) return;
+    running_ = true;
+    if (worker_.joinable()) worker_.join();
+    worker_ = std::thread([this] { WorkerLoop(); });
+}
+
 void ShellIconCache::WorkerLoop() {
     const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    std::unordered_map<int, IImageList*> worker_lists;
+    ComPtr<IWICImagingFactory> worker_wic;
     for (;;) {
         std::wstring path;
+        uint64_t convert_key = 0;
+        bool convert = false;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [&] { return !running_ || !queue_.empty(); });
+            cv_.wait(lock, [&] { return !running_ || !queue_.empty() || !convert_queue_.empty(); });
             if (!running_) break;
-            path = std::move(queue_.front());
-            queue_.pop();
+            if (!queue_.empty()) {
+                // Index lookups first: they are cheap and unlock conversions.
+                path = std::move(queue_.front());
+                queue_.pop();
+            } else {
+                convert_key = convert_queue_.front();
+                convert_queue_.pop_front();
+                convert = true;
+            }
+        }
+        if (convert) {
+            IconPixels pixels;
+            const bool ok = ConvertIconPixels(convert_key, worker_lists, worker_wic,
+                                              pixels.width, pixels.height, pixels.data);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                convert_pending_.erase(convert_key);
+                if (ok) {
+                    if (ready_pixels_.size() >= kReadyPixelsLimit) ready_pixels_.erase(ready_pixels_.begin());
+                    ready_pixels_[convert_key] = std::move(pixels);
+                }
+            }
+            if (ok) {
+                if (const HWND hwnd = hwnd_.load()) InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            continue;
         }
         SHFILEINFOW info{};
         int index = -1;
@@ -216,6 +295,9 @@ void ShellIconCache::WorkerLoop() {
         }
         if (const HWND hwnd = hwnd_.load()) InvalidateRect(hwnd, nullptr, FALSE);
     }
+    for (auto& [_, list] : worker_lists)
+        if (list) list->Release();
+    worker_wic.reset();
     if (SUCCEEDED(com_hr)) CoUninitialize();
 }
 
@@ -243,21 +325,66 @@ ID2D1Bitmap* ShellIconCache::BitmapForIndex(int index, int list_id) {
     if (index < 0 || !dc_) return nullptr;
     IImageList* image_list = EnsureImageList(list_id);
     if (!image_list) return nullptr;
-    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(list_id)) << 32) |
-        static_cast<uint32_t>(index);
+    const uint64_t key = IconKey(list_id, index);
     auto it = bitmaps_.find(key);
     if (it != bitmaps_.end()) return it->second.get();
+    if (ID2D1Bitmap* ready = UploadReady(key)) return ready;
     HICON icon = nullptr;
     if (FAILED(image_list->GetIcon(index, ILD_TRANSPARENT, &icon)) || !icon) {
         return nullptr;
     }
     ComPtr<ID2D1Bitmap> bitmap = BitmapFromIcon(icon);
     DestroyIcon(icon);
+    return StoreBitmap(key, std::move(bitmap));
+}
+
+ID2D1Bitmap* ShellIconCache::StoreBitmap(uint64_t key, ComPtr<ID2D1Bitmap> bitmap) {
     if (!bitmap.get()) return nullptr;
     ID2D1Bitmap* raw = bitmap.get();
     if (bitmaps_.size() >= kBitmapCacheLimit) bitmaps_.erase(bitmaps_.begin());
     bitmaps_[key] = std::move(bitmap);
     return raw;
+}
+
+ID2D1Bitmap* ShellIconCache::UploadReady(uint64_t key) {
+    if (!dc_) return nullptr;
+    IconPixels pixels;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = ready_pixels_.find(key);
+        if (it == ready_pixels_.end()) return nullptr;
+        pixels = std::move(it->second);
+        ready_pixels_.erase(it);
+    }
+    ComPtr<ID2D1Bitmap> bitmap;
+    const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    if (FAILED(dc_->CreateBitmap(D2D1::SizeU(pixels.width, pixels.height), pixels.data.data(),
+                                 pixels.width * 4u, props, &bitmap))) return nullptr;
+    return StoreBitmap(key, std::move(bitmap));
+}
+
+void ShellIconCache::Prefetch(const std::wstring& path, const std::wstring& name,
+                              bool is_dir, DWORD attrs, float desired_dips) {
+    int index = -1;
+    const bool exact = NeedsExactIcon(name, is_dir, path) && !path.empty();
+    if (exact) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = exact_index_.find(path); it != exact_index_.end()) index = it->second;
+    }
+    if (index < 0 && exact) RequestExact(path);  // converted on a later call
+    if (index < 0) index = GenericIndex(name, is_dir, attrs);
+    if (index < 0) return;
+    const uint64_t key = IconKey(ImageListId(desired_dips), index);
+    if (bitmaps_.contains(key)) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ready_pixels_.contains(key) || convert_pending_.contains(key)) return;
+        convert_pending_.insert(key);
+        convert_queue_.push_back(key);
+        StartWorkerLocked();
+    }
+    cv_.notify_one();
 }
 
 bool ShellIconCache::Draw(ID2D1DeviceContext* dc, const D2D1_RECT_F& dest,
@@ -290,5 +417,42 @@ ID2D1Bitmap* ShellIconCache::BitmapFor(const std::wstring& path, const std::wstr
     const int list_id = ImageListId(desired_dips);
     if (auto* bitmap = BitmapForIndex(index, list_id)) return bitmap;
     return BitmapForIndex(GenericIndex(L"", is_dir, attrs), list_id);
+}
+
+ID2D1Bitmap* ShellIconCache::CachedBitmapFor(const std::wstring& path, const std::wstring& name,
+                                             bool is_dir, DWORD attrs, float desired_dips) {
+    (void)attrs;  // generic icons are keyed by extension only (see GenericIndex)
+    int exact = -1;
+    if (NeedsExactIcon(name, is_dir, path) && !path.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = exact_index_.find(path); it != exact_index_.end()) exact = it->second;
+    }
+    int generic = -1;
+    {
+        std::wstring key = is_dir ? L"<dir>" : LowerExt(name);
+        if (key.empty()) key = L"<file>";
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = generic_index_.find(key); it != generic_index_.end()) generic = it->second;
+    }
+    // Requested size first, then larger sizes (scale down cleanly), then smaller.
+    const int wanted = ImageListId(desired_dips);
+    static constexpr int kOrder[] = { SHIL_SMALL, SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO };
+    int at = 0;
+    for (int i = 0; i < 4; ++i) if (kOrder[i] == wanted) at = i;
+    int lists[4];
+    int n = 0;
+    lists[n++] = wanted;
+    for (int i = at + 1; i < 4; ++i) lists[n++] = kOrder[i];
+    for (int i = at - 1; i >= 0; --i) lists[n++] = kOrder[i];
+    for (const int index : { exact, generic }) {
+        if (index < 0) continue;
+        for (int i = 0; i < n; ++i) {
+            const uint64_t key = IconKey(lists[i], index);
+            if (const auto it = bitmaps_.find(key); it != bitmaps_.end() && it->second.get())
+                return it->second.get();
+            if (ID2D1Bitmap* ready = UploadReady(key)) return ready;
+        }
+    }
+    return nullptr;
 }
 } // namespace pulse::ui

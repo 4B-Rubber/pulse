@@ -5,14 +5,24 @@
 namespace pulse::ui {
 
 D2D1_RECT_F MainRenderer::AddressSearchButtonRect(float w) const {
-    const auto field = AddressBarRect(w);
-    const float width = field.right - field.left >= 180.0f * scale_ ? 82.0f : 28.0f;
+    const auto field = SearchBarRect(w);
+    const float width = (field.right - field.left) / scale_ - 8.0f;
     return D2D1::RectF(field.right - (width + 4.0f) * scale_, field.top + 3.0f * scale_,
                       field.right - 4.0f * scale_, field.bottom - 3.0f * scale_);
 }
 
 void MainRenderer::DrawAddressSearchChrome(const WindowViewModel& vm, float w, const Theme& theme) {
-    const auto field = AddressBarRect(w);
+    const auto field = SearchBarRect(w);
+    if (!vm.address_searching && w-EffectiveSidebarWidth(w)<480*scale_) {
+        const auto button=D2D1::RectF(field.right-32*scale_,field.top,field.right,field.bottom);
+        DrawButton(button,theme,IsHovered(vm,HitTestResult::AddressSearch) ? theme.fill_hover : kTransparent,
+            kIconSearch,L"",theme.text_secondary,true,true);
+        return;
+    }
+    fluent::ControlState state{};
+    state.focused = vm.address_searching;
+    state.hovered = IsHovered(vm, HitTestResult::AddressSearch);
+    if (vm.address_searching) painter_.DrawTextFieldFrame(field, state);
     auto button = [&](D2D1_RECT_F bounds, const std::wstring& text, const wchar_t* glyph,
                       HitTestResult::Region region, bool dropdown = false) {
         fluent::ButtonSpec spec;
@@ -69,10 +79,14 @@ void MainRenderer::DrawAddressSearchChrome(const WindowViewModel& vm, float w, c
             spec.text = layout.mode_label ? l10n::Get(content ? l10n::StringId::SearchModeContent : l10n::StringId::SearchModeName) : L"";
             spec.glyph = layout.mode_label ? L"" : content ? L"\xE8A5" : L"\xE8B7";
             spec.icon_only = !layout.mode_label;
+            spec.skip_glyph = !layout.mode_label;
             spec.kind = fluent::ButtonKind::TransparentToggle;
             spec.state.checked = vm.address_search_content == content;
             spec.state.hovered = IsHovered(vm, content ? HitTestResult::AddressSearchContent : HitTestResult::AddressSearchMode);
             painter_.DrawButton(spec);
+            if (!layout.mode_label) DrawIconText(bounds.left, bounds.top,
+                bounds.right-bounds.left, bounds.bottom-bounds.top, content ? L"\xE8A5" : L"\xE8B7", L"",
+                theme.text, 0.8f);
         };
         segment(layout.name, false);
         segment(layout.content, true);
@@ -81,10 +95,22 @@ void MainRenderer::DrawAddressSearchChrome(const WindowViewModel& vm, float w, c
             button(layout.clear, L"", L"\xE711", HitTestResult::AddressSearchClear);
         if (layout.close.right > layout.close.left)
             button(layout.close, L"", L"\xE72B", HitTestResult::AddressSearchClose);
-    } else if (!vm.address_editing) {
-        const auto bounds = AddressSearchButtonRect(w);
-        button(bounds, bounds.right - bounds.left > 40.0f * scale_
-            ? l10n::Get(l10n::StringId::Search) : L"", L"\xE721", HitTestResult::AddressSearch);
+    } else {
+        fluent::TextFieldSpec search;
+        search.bounds = field;
+        search.state = state;
+        search.placeholder = vm.address_search_placeholder.empty()
+            ? l10n::Get(l10n::StringId::Search) : vm.address_search_placeholder;
+        search.leading_glyph = L"\xE721";
+        search.trailing_keycap = L"Ctrl+K";
+        search.suppress_text = true;
+        painter_.DrawTextField(search);
+        MakeBrush(compositor_->Dc(),theme.text_secondary,brTextSecondary_);
+        const float text_left=field.left+36*scale_;
+        const float text_right=field.right-14*scale_-painter_.MeasureBadgeWidth(search.trailing_keycap);
+        DrawTextEndEllipsis(compositor_->Dc(),compositor_->DwriteFactory(),compositor_->TextFormat(),
+            brTextSecondary_.get(),std::wstring(search.placeholder),text_left,field.top,
+            std::max(0.0f,text_right-text_left),field.bottom-field.top);
     }
     if (vm.address_search_animation > 0.0f) {
         auto color = theme.accent;

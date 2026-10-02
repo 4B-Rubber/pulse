@@ -39,7 +39,7 @@ inline constexpr float kDetailsVisibleWindowDip = 1000.0f;
 inline float MaxSidebarWidthDip(float window_dip, float details_dip, bool details_visible,
                                 float chrome_dip) {
     const float reserved = (details_visible ? details_dip : 0.0f) + chrome_dip + kListMinWidthDip;
-    return (std::max)(kSidebarMinWidthDip, window_dip - reserved);
+    return (std::max)(kSidebarMinWidthDip, (std::min)(window_dip - reserved, window_dip - 360.0f));
 }
 
 // Widest the details panel may become: window minus the sidebar (or its rail),

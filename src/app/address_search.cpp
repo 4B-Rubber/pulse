@@ -67,6 +67,21 @@ void FillAddressSearchView(AppState& s, ui::WindowViewModel& vm) {
         vm.address_search_text = tab->search_input_text;
         vm.address_search_has_text = !vm.address_search_text.empty();
     }
+    std::wstring root;
+    bool current = false;
+    if (s.addressSearching) {
+        root = s.addressSearchRoot;
+        current = s.addressSearchCurrent;
+    } else if (tab && tab->search_input_path == tab->current_path) {
+        root = tab->search_input_root;
+        current = tab->search_input_current;
+    } else if (tab && !fs::IsVirtualPath(tab->current_path)) {
+        root = tab->current_path;
+        current = s.appPrefs.address_search_current;
+    }
+    const auto scope = current && !root.empty() ? app::TabTitle(root) : l10n::Get(l10n::StringId::SearchScopeAll);
+    vm.address_search_placeholder = l10n::Get(l10n::StringId::Search) +
+        (std::wstring(l10n::LocaleName()).starts_with(L"zh") ? L"" : L" ") + scope;
 }
 
 void ExitAddressSearch(AppState& s) {
@@ -280,7 +295,7 @@ void ShowAddressSearchScope(AppState& s) {
     items[2].command = 3;
     items[2].text = l10n::Get(l10n::StringId::SearchChooseScope);
     const auto layout = ui::LayoutAddressSearch(
-        s.renderer.AddressBarRect(static_cast<float>(s.compositor.Width())), s.scale);
+        s.renderer.SearchBarRect(static_cast<float>(s.compositor.Width())), s.scale);
     POINT anchor{static_cast<LONG>(layout.scope.left), static_cast<LONG>(layout.scope.bottom)};
     ClientToScreen(s.hwnd, &anchor);
     anchor.x -= ui::FluentMenu::kShadowMargin;

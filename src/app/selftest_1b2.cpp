@@ -203,6 +203,9 @@ struct FluentMenuTestPeer {
 } // namespace pulse::ui
 
 namespace pulse::app {
+bool RunPaneHeaderIconTest();
+bool RunFolderSizesTest();
+bool RunColumnResizeUiTest();
 
 namespace {
 
@@ -650,7 +653,7 @@ void TestFilterControls() {
     for (float scale : {1.0f, 1.5f, 2.0f}) {
         ui::MainRenderer renderer;
         renderer.SetScale(scale);
-        const auto bounds = D2D1::RectF(0, 0, 240 * scale, 500 * scale);
+        const auto bounds = D2D1::RectF(0, 0, 320 * scale, 500 * scale);
         const auto edit = renderer.FilterEditRect(bounds, 1, true);
         const auto clear = renderer.FilterClearRect(bounds, 1);
         Check(edit.right < clear.left && edit.right - edit.left >= 40 * scale,
@@ -710,7 +713,8 @@ void TestFilterControls() {
         Check(tab->filter_text == L"11", L"filter: outside click preserves filter");
         state->pane->filter_expand = 1;
         auto vm = BuildVm(*state);
-        const auto bounds = vm.pane_slots.front().rect;
+        const auto bounds = D2D1::RectF(0,0,static_cast<float>(state->compositor.Width()),
+            static_cast<float>(state->compositor.Height()));
         const auto clear = state->renderer.FilterClearRect(bounds, 1);
         const auto edit = state->renderer.FilterEditRect(bounds, 1, true);
         Check(edit.right < clear.left, L"filter: edit and clear hit areas do not overlap");
@@ -1057,12 +1061,20 @@ void TestBlankPaneClickNavigation() {
               L"blank pane: disabled single and double click preserve location");
         state->appPrefs.blank_click_go_back = true;
         tab->selected.insert(0);
+        tab->back_stack = {};
+        tab->back_stack.push(L"C:\\PulseBlankClickSelection");
         press();
+        Check(tab->SelectedCount() == 0 && state->blankClickTab == tab,
+              L"blank pane: first click clears the selection and still arms back");
         release();
+        Check(tab->current_path == initial_folder,
+              L"blank pane: clearing a selection with one click stays put");
         SendMessageW(hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, point);
         release();
-        Check(tab->SelectedCount() == 0 && tab->current_path == initial_folder,
-              L"blank pane: double click that clears a selection does not navigate");
+        Check(tab->current_path == fs::NormalizePath(L"C:\\PulseBlankClickSelection"),
+              L"blank pane: double click that clears a selection goes back");
+        tab->current_path = initial_folder;
+        tab->back_stack = {};
         press();
         state->appPrefs.blank_click_go_back = false;
         release();
@@ -1311,7 +1323,7 @@ void CALLBACK DriveHistoryInteractionTimer(HWND, UINT, UINT_PTR timer, DWORD) {
             return;
         }
         if (state.searchHistoryOpen || !state.menu->IsOpen()) return;
-        const auto scope = ui::LayoutAddressSearch(state.renderer.AddressBarRect(
+        const auto scope = ui::LayoutAddressSearch(state.renderer.SearchBarRect(
             static_cast<float>(state.compositor.Width())), state.scale).scope;
         POINT expected{static_cast<LONG>(scope.left), static_cast<LONG>(scope.bottom)};
         ClientToScreen(state.hwnd, &expected);
@@ -2056,8 +2068,10 @@ void TestMenuModel() {
     Check(column_checked, L"menu: background shows column browsing when the pane is in it");
     options.column_layout = false;
     const auto& sort = bg[1].children;
-    Check(sort.size() == 6 && sort[3].command == CmdSortSize && sort[3].radio &&
-          !sort[4].radio && sort[5].radio,
+    Check(sort.size() == 9 && sort[3].command == CmdSortSize && sort[3].radio &&
+          !sort[4].radio && sort[5].radio && sort[5].separator_after &&
+          sort[6].command == CmdFolderSortTop && sort[6].radio &&
+          !sort[7].radio && !sort[8].radio,
           L"menu: background reflects size descending with separate radio groups");
     Check(bg[2].command == CmdRefresh && bg[2].shortcut == L"F5" &&
           bg.back().command == CmdFolderProperties,
@@ -2067,7 +2081,7 @@ void TestMenuModel() {
     options.sort_column = ui::SortColumn::Path;
     auto virtual_bg = BuildBackgroundMenu(false, false, L"");
     AppendBackgroundViewCommands(virtual_bg, options);
-    Check(virtual_bg[1].children.size() == 7 && virtual_bg[1].children[4].radio &&
+    Check(virtual_bg[1].children.size() == 10 && virtual_bg[1].children[4].radio &&
           virtual_bg.back().command != CmdFolderProperties,
           L"menu: search offers path sorting without folder properties");
     options.indexed_search = true;
@@ -2635,7 +2649,7 @@ void TestAppPrefsAndSettingsPath() {
     AppPrefs follow;
     follow.persist = false;
     Check(follow.FromJson(L"{}") && follow.accent_rgb.empty(),
-          L"appprefs: missing accent_rgb follows Windows");
+          L"appprefs: missing accent_rgb uses theme default");
     AppPrefs custom;
     custom.persist = false;
     Check(custom.FromJson(L"{\"accent_rgb\":\"2FDFF1\"}") &&
@@ -2649,7 +2663,7 @@ void TestAppPrefsAndSettingsPath() {
     AppPrefs bad_accent;
     bad_accent.persist = false;
     Check(bad_accent.FromJson(L"{\"accent_rgb\":\"gggggg\"}") && bad_accent.accent_rgb.empty(),
-          L"appprefs: invalid accent_rgb falls back to follow");
+          L"appprefs: invalid accent_rgb falls back to theme default");
 }
 
 // The folder-open overrides live in HKCU and AppPrefs::Load() repairs them, so a
@@ -3470,6 +3484,113 @@ bool SnapshotHasName(const fs::SnapshotPtr& snap, const wchar_t* name) {
         if (_wcsicmp(entry.name.c_str(), name) == 0) return true;
     }
     return false;
+}
+
+void TestFolderViews() {
+    using ui::ViewMode;
+    AppPrefs prefs;
+    prefs.persist = false;
+    prefs.folder_views.Set(L"C:\\Pictures", ViewMode::LargeIcons);
+    prefs.folder_views.Set(L"C:\\Pictures\\Work", ViewMode::Details);
+    prefs.folder_views.Set(L"C:\\Pictures\\Work\\Draft", ViewMode::List);
+    Check(prefs.folder_views.Find(L"C:\\Pictures") == ViewMode::LargeIcons &&
+          prefs.folder_views.Find(L"C:\\Pictures\\Work") == ViewMode::Details &&
+          prefs.folder_views.Find(L"C:\\Pictures\\Work\\Draft") == ViewMode::List,
+          L"folder views: three levels keep independent choices");
+    Check(!prefs.folder_views.Find(L"C:\\Pictures\\Other") &&
+          !prefs.folder_views.Find(L"C:\\Pictures2"),
+          L"folder views: children and siblings do not inherit");
+    Check(prefs.folder_views.Find(L"\\\\?\\c:\\PICTURES\\") == ViewMode::LargeIcons &&
+          prefs.folder_views.Find(L"C:/Pictures/") == ViewMode::LargeIcons,
+          L"folder views: case, separators, trailing slash and extended prefix agree");
+    const std::wstring unc = L"\\\\server\\share\\图片";
+    const std::wstring long_path = L"C:\\" + std::wstring(280, L'x');
+    prefs.folder_views.Set(unc, ViewMode::Tiles);
+    prefs.folder_views.Set(long_path, ViewMode::Content);
+    Check(prefs.folder_views.Find(L"\\\\?\\UNC\\SERVER\\share\\图片\\") == ViewMode::Tiles,
+          L"folder views: UNC aliases agree");
+    Check(!prefs.folder_views.Set(L"pulse:settings", ViewMode::List) &&
+          !prefs.folder_views.Set(L"", ViewMode::List) &&
+          !prefs.folder_views.Set(L"relative", ViewMode::List),
+          L"folder views: virtual and nonabsolute paths are not persisted");
+    AppPrefs reloaded;
+    reloaded.persist = false;
+    reloaded.FromJson(prefs.ToJson());
+    Check(reloaded.folder_views.Find(unc) == ViewMode::Tiles &&
+          reloaded.folder_views.Find(long_path) == ViewMode::Content &&
+          reloaded.folder_views.Find(L"C:\\Pictures\\Work") == ViewMode::Details,
+          L"folder views: preferences round trip including UNC, Unicode and long paths");
+    for (int i = 0; i < 8; ++i) {
+        const auto mode = ui::ViewModeFromIndex(i);
+        prefs.folder_views.Set(L"C:\\AllModes", mode);
+        reloaded.FromJson(prefs.ToJson());
+        Check(reloaded.folder_views.Find(L"C:\\AllModes") == mode,
+              L"folder views: every display mode survives reload");
+    }
+    reloaded.FromJson(L"{}");
+    Check(!reloaded.folder_views.Find(unc), L"folder views: old preferences load without stale choices");
+    prefs.ResetToDefaults();
+    Check(!prefs.folder_views.Find(long_path), L"folder views: reset clears saved choices");
+
+    auto state = std::make_unique<AppState>();
+    state->places.persist = false;
+    state->appPrefs.persist = false;
+    state->isolatedTest = true;
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"", WS_POPUP,
+        0, 0, 1000, 700, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Check(hwnd != nullptr, L"folder views: isolated owner created");
+    if (!hwnd) return;
+    state->hwnd = hwnd;
+    const bool ready = state->compositor.Init(hwnd);
+    Check(ready, L"folder views: renderer initialized");
+    if (ready) {
+        state->renderer.SetCompositor(&state->compositor);
+        const auto parent = WorkspacePath(L"bench_data/folder-view-fixture");
+        const auto child = parent + L"\\child";
+        const auto grandchild = child + L"\\grandchild";
+        state->window_tabs.NewTab(parent);
+        state->pane = state->window_tabs.Active()->panes.front().get();
+        auto* tab = state->pane->ActiveTab();
+        StartLoadingPath(*state, *tab, parent);
+        SetViewMode(*state, ViewMode::LargeIcons);
+        tab->NavigateTo(child);
+        StartLoadingPath(*state, *tab, child);
+        Check(tab->view_mode == ViewMode::Details, L"folder views: navigating into child resets inherited large icons");
+        SetViewMode(*state, ViewMode::List);
+        tab->NavigateTo(grandchild);
+        StartLoadingPath(*state, *tab, grandchild);
+        Check(tab->view_mode == ViewMode::Details, L"folder views: third level starts independently");
+        SetViewMode(*state, ViewMode::Details);
+        Check(state->appPrefs.folder_views.Find(grandchild) == ViewMode::Details,
+              L"folder views: explicitly choosing the current mode also saves it");
+        StartLoadingPath(*state, *tab, tab->GoBack());
+        Check(tab->view_mode == ViewMode::List, L"folder views: back restores child mode");
+        StartLoadingPath(*state, *tab, tab->GoBack());
+        Check(tab->view_mode == ViewMode::LargeIcons, L"folder views: back restores parent mode");
+        StartLoadingPath(*state, *tab, tab->GoForward());
+        Check(tab->view_mode == ViewMode::List, L"folder views: forward restores child mode");
+        state->appPrefs.FromJson(state->appPrefs.ToJson());
+        tab->view_mode = ViewMode::SmallIcons;
+        StartLoadingPath(*state, *tab, parent, PathLoadReason::RestoreSession);
+        Check(tab->view_mode == ViewMode::LargeIcons, L"folder views: saved folder choice wins over session mode");
+        tab->view_mode = ViewMode::Tiles;
+        StartLoadingPath(*state, *tab, parent + L"\\legacy", PathLoadReason::RestoreSession);
+        Check(tab->view_mode == ViewMode::Tiles, L"folder views: legacy session without folder preference keeps its mode");
+        StartLoadingPath(*state, *tab, parent);
+        StartLoadingPath(*state, *tab, parent + L"\\legacy");
+        Check(tab->view_mode == ViewMode::Tiles, L"folder views: returning to migrated legacy folder preserves its mode");
+        state->shot.active = true;
+        tab->view_mode = ViewMode::Content;
+        StartLoadingPath(*state, *tab, parent);
+        Check(tab->view_mode == ViewMode::Content, L"folder views: explicit screenshot mode is respected");
+        state->shot.active = false;
+        NewTab(*state, parent);
+        Check(ActiveTab(*state)->view_mode == ViewMode::LargeIcons,
+              L"folder views: opening a new tab restores saved mode");
+    }
+    state->watches.Stop();
+    DestroyWindow(hwnd);
+    state->hwnd = nullptr;
 }
 
 void TestNavigateAlwaysEnumerates() {
@@ -5760,8 +5881,9 @@ void TestListColumns() {
               L"columns: dragging the name divider resizes Date and keeps its right edge");
         dividers = r.ResizeDetailsColumnDivider(pane(1200.0f), dividers, 1, grown.DividerX(1) + 20.0f * scale);
         const auto moved = r.DetailsColumns(pane(1200.0f), dividers, false);
-        Check(close_to(moved.Width(K::Date), 200.0f) && close_to(moved.Width(K::Type), 128.0f),
-              L"columns: dragging between metadata columns resizes the left one only");
+        Check(close_to(moved.Width(K::Date), 200.0f) && close_to(moved.Width(K::Type), 108.0f) &&
+              std::abs(moved.DividerX(1) - grown.DividerX(1) - 20.0f * scale) < 0.05f,
+              L"columns: dragging metadata divider transfers width between its neighbors");
         std::array<float, 4> unused{};
         r.AutoFitColumnDivider(pane(1200.0f), dividers, false, unused, 1);
         const auto refit = r.DetailsColumns(pane(1200.0f), dividers, false);
@@ -5786,10 +5908,285 @@ void TestListColumns() {
         const auto search_moved = r.DetailsColumns(pane(1000.0f), {}, true, search_dividers);
         Check(std::abs(search_moved.widths[1] - search_wide.widths[1] - 60.0f * scale) < 0.05f,
               L"columns: the name/folder divider keeps the requested width");
+        for (bool search : {false, true}) for (float width : {400.0f, 540.0f, 650.0f, 700.0f, 1000.0f, 1200.0f}) {
+            const auto initial = r.DetailsColumns(pane(width), {}, search);
+            bool stable = true, tracks = true;
+            for (int divider = 0; divider < initial.count - 1; ++divider) for (int direction : {-1, 1}) {
+                std::array<float, 3> normal{};
+                std::array<float, 4> searching{};
+                // The real mouse-down handler captures the rendered widths.
+                for (int i = 0; i < initial.count; ++i) {
+                    const auto kind = initial.kinds[i];
+                    const int slot = kind == K::Date ? 0 : kind == K::Type ? 1 : kind == K::Size ? 2 : -1;
+                    if (slot >= 0) {
+                        normal[slot] = initial.widths[i] / scale;
+                        searching[slot + 1] = normal[slot];
+                    } else if (kind == K::Name && initial.Has(K::Path)) searching[0] = initial.widths[i] / scale;
+                }
+                auto current = r.DetailsColumns(pane(width), normal, search, searching);
+                stable &= current.count == initial.count && current.kinds == initial.kinds;
+                const float start = initial.DividerX(divider);
+                for (int step = 0; step < 160; ++step) {
+                    const float cursor = start + direction * (step < 80 ? step : 159 - step) * 4.0f * scale;
+                    const float before = current.DividerX(divider);
+                    const float left = divider == 0 ? current.left : current.DividerX(divider - 1);
+                    const float right = before + current.widths[divider + 1];
+                    const bool metadata = current.kinds[divider] != K::Name && current.kinds[divider] != K::Path;
+                    if (search) searching = r.ResizeSearchColumnDivider(pane(width), searching, divider, cursor);
+                    else normal = r.ResizeDetailsColumnDivider(pane(width), normal, divider, cursor);
+                    current = r.DetailsColumns(pane(width), normal, search, searching);
+                    stable &= current.count == initial.count && current.kinds == initial.kinds && fills(current);
+                    if (metadata && cursor >= left + 48 * scale && cursor <= right - 48 * scale)
+                        tracks &= std::abs(current.DividerX(divider) - cursor) < 0.1f;
+                }
+            }
+            Check(stable, L"columns: repeated drags retain visible columns across widths and search layouts");
+            Check(tracks, L"columns: metadata divider follows the pointer instead of consuming name width");
+        }
     }
 }
 
 } // namespace
+
+// Staging tray card stack (v1.0.40): cyclic window, top-card-only hit
+// testing, hold-and-fling to the back, spring back on a short drag, wheel and
+// footer paging, dismiss tumble + smoke, clear.
+void TrayStackSettle(AppState& s, int ms) {
+    const ULONGLONG until = GetTickCount64() + static_cast<ULONGLONG>(ms);
+    while (GetTickCount64() < until) {
+        TickTrayDeck(s);
+        Sleep(16);
+    }
+    TickTrayDeck(s);
+}
+
+void TestTrayStack() {
+    Check(!l10n::Get(l10n::StringId::StagingTrayEmpty).empty() &&
+          !l10n::Get(l10n::StringId::TrayPrev).empty() &&
+          !l10n::Get(l10n::StringId::TrayNext).empty() &&
+          !l10n::Get(l10n::StringId::TrayFlingHint).empty(),
+          L"tray stack: new strings resolve (localization range covers them)");
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, temp);
+    const std::wstring dir = std::wstring(temp) + L"PulseTrayStackSelftest-" +
+        std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::vector<std::wstring> files;
+    for (int i = 0; i < 5; ++i) {
+        const std::wstring p = dir + L"\\card" + std::to_wstring(i) + L".txt";
+        HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(h, "pulse", 5, &written, nullptr);
+            CloseHandle(h);
+        }
+        files.push_back(p);
+    }
+
+    auto state = std::make_unique<AppState>();
+    state->places.persist = false;
+    state->appPrefs.persist = false;
+    state->isolatedTest = true;
+    state->tray.Collect(files, false);
+    Check(TrayItemTotalCount(state->tray) == 5, L"tray stack: five staged items");
+    {
+        const auto all = TrayDeckEntries(state->tray, 0, 5);
+        const auto wrap = TrayDeckEntries(state->tray, 3, 4);
+        bool cyclic = all.size() == 5 && wrap.size() == 4;
+        for (size_t k = 0; cyclic && k < wrap.size(); ++k)
+            cyclic = wrap[k].item && all[(3 + k) % 5].item &&
+                     wrap[k].item->path == all[(3 + k) % 5].item->path;
+        Check(cyclic, L"tray stack: window wraps around the end of the stack");
+    }
+
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = BlankPaneTestProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"PulseTrayStackSelftest";
+    RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP,
+        0, 0, 1000, 700, nullptr, nullptr, wc.hInstance, nullptr);
+    Check(hwnd != nullptr, L"tray stack: hidden test window created");
+    if (!hwnd) return;
+    state->hwnd = hwnd;
+    if (state->compositor.Init(hwnd)) {
+        state->compositor.RecreateTextFormats(1.0f);
+        state->renderer.SetCompositor(&state->compositor);
+        state->renderer.SetScale(1.0f);
+        state->window_tabs.NewTab(L"C:\\PulseTrayStackFixture");
+        state->pane = state->window_tabs.Active()->panes.front().get();
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state.get()));
+        TrayStackSettle(*state, 900);
+        auto vm = BuildVm(*state, false);
+        const auto& deck = vm.tray_deck;
+        Check(deck.total_count == 5 && deck.live_count >= 3,
+              L"tray stack: view model carries the visible window");
+        const auto first = TrayDeckEntries(state->tray, 0, 1);
+        Check(deck.live_count >= 3 && !first.empty() &&
+              deck.cards[0].path == first.front().item->path &&
+              deck.cards[0].depth < 0.05f && std::abs(deck.cards[1].depth - 1.0f) < 0.05f &&
+              std::abs(deck.cards[2].depth - 2.0f) < 0.05f,
+              L"tray stack: top card first, two layers peek underneath");
+
+        // Scan the panel: only the top card is interactive, the close zone
+        // addresses its batch item, and the footer pager is present.
+        const D2D1_RECT_F panel = state->renderer.StagingTrayRect(vm, 1000.0f, 700.0f);
+        Check(panel.bottom - panel.top > 60.0f, L"tray stack: panel has room for the stack");
+        float cx0 = 1e9f, cy0 = 1e9f, cx1 = -1e9f, cy1 = -1e9f;
+        POINT close_pt{-1, -1}, prev_pt{-1, -1}, next_pt{-1, -1};
+        bool foreign_card = false, close_ok = true;
+        for (float y = panel.top; y < panel.bottom; y += 2.0f) {
+            for (float x = panel.left; x < panel.right; x += 2.0f) {
+                const auto hit = state->renderer.HitTest(vm, D2D1::RectF(0, 0, 1000, 700), x, y);
+                if (hit.region == ui::HitTestResult::TrayCard) {
+                    if (hit.index != 0) foreign_card = true;
+                    cx0 = std::min(cx0, x); cy0 = std::min(cy0, y);
+                    cx1 = std::max(cx1, x); cy1 = std::max(cy1, y);
+                } else if (hit.region == ui::HitTestResult::TrayItemRemove) {
+                    if (hit.index != deck.cards[0].batch || hit.sub_index != deck.cards[0].sub)
+                        close_ok = false;
+                    if (close_pt.x < 0) close_pt = POINT{ static_cast<LONG>(x + 3), static_cast<LONG>(y + 3) };
+                } else if (hit.region == ui::HitTestResult::TrayPrev && prev_pt.x < 0) {
+                    prev_pt = POINT{ static_cast<LONG>(x + 3), static_cast<LONG>(y + 3) };
+                } else if (hit.region == ui::HitTestResult::TrayNext && next_pt.x < 0) {
+                    next_pt = POINT{ static_cast<LONG>(x + 3), static_cast<LONG>(y + 3) };
+                }
+            }
+        }
+        Check(cx1 > cx0 + 100.0f && cy1 > cy0 + 30.0f && !foreign_card,
+              L"tray stack: only the top card hit-tests as a card");
+        Check(close_pt.x >= 0 && close_ok && close_pt.y < (cy0 + cy1) * 0.5f &&
+              close_pt.x > (cx0 + cx1) * 0.5f,
+              L"tray stack: close badge sits top-right and addresses the top item");
+        Check(prev_pt.x >= 0 && next_pt.x > prev_pt.x, L"tray stack: footer pager present");
+
+        const int mx = static_cast<int>((cx0 + cx1) * 0.5f);
+        const int my = static_cast<int>((cy0 + cy1) * 0.5f);
+        BYTE saved_keys[256]{};
+        GetKeyboardState(saved_keys);
+        BYTE drag_keys[256]{};
+        memcpy(drag_keys, saved_keys, sizeof(drag_keys));
+        drag_keys[VK_LBUTTON] |= 0x80;
+
+        // Short drag, then stop: springs home, order unchanged.
+        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(mx, my));
+        Check(state->trayDrag.pending && GetCapture() == hwnd,
+              L"tray stack: pressing the top card arms the gesture");
+        SetKeyboardState(drag_keys);
+        SendMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(mx + 20, my + 4));
+        Check(state->trayDrag.active && std::abs(state->trayDrag.dx - 20.0f) < 0.5f,
+              L"tray stack: card follows the pointer past the slop");
+        Sleep(120);
+        SetKeyboardState(saved_keys);
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(mx + 20, my + 4));
+        Check(TrayStackTop(*state) == 0 && !state->trayDrag.active && GetCapture() != hwnd &&
+              state->trayCards[deck.cards[0].path].motion == AppState::TrayMotion::Spring,
+              L"tray stack: a short drag springs back without reordering");
+        TrayStackSettle(*state, 500);
+
+        // Fling to the right: the top card goes to the back.
+        const std::wstring thrown = deck.cards[0].path;
+        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(mx, my));
+        SetKeyboardState(drag_keys);
+        for (int step = 1; step <= 6; ++step) {
+            Sleep(10);
+            SendMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(mx + step * 25, my + step * 2));
+        }
+        SetKeyboardState(saved_keys);
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(mx + 150, my + 12));
+        Check(TrayStackTop(*state) == 1 &&
+              state->trayCards[thrown].motion == AppState::TrayMotion::ThrowOut,
+              L"tray stack: fling sends the top card to the back");
+        Check(state->trayCards[thrown].to_fly > 1.0f, L"tray stack: fling direction follows the drag");
+        TrayStackSettle(*state, 900);
+        vm = BuildVm(*state, false);
+        const auto second = TrayDeckEntries(state->tray, 1, 1);
+        Check(!second.empty() && vm.tray_deck.cards[0].path == second.front().item->path &&
+              vm.tray_deck.cards[0].depth < 0.05f,
+              L"tray stack: next card rises into the top slot");
+
+        // Wheel: up brings the thrown card back, down throws again.
+        const LPARAM wheel_pt = MAKELPARAM(mx, my);
+        HandleMouseWheel(state.get(), hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), wheel_pt);
+        Check(TrayStackTop(*state) == 0 && state->trayRaisePath == thrown,
+              L"tray stack: wheel up brings the last card back on top");
+        TrayStackSettle(*state, 700);
+        HandleMouseWheel(state.get(), hwnd, WM_MOUSEWHEEL,
+                         MAKEWPARAM(0, static_cast<WORD>(-WHEEL_DELTA)), wheel_pt);
+        Check(TrayStackTop(*state) == 1, L"tray stack: wheel down throws the top card");
+        TrayStackSettle(*state, 900);
+
+        // Footer pager.
+        vm = BuildVm(*state, false);
+        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(prev_pt.x, prev_pt.y));
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(prev_pt.x, prev_pt.y));
+        Check(TrayStackTop(*state) == 0, L"tray stack: previous button steps back");
+        TrayStackSettle(*state, 700);
+        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(next_pt.x, next_pt.y));
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(next_pt.x, next_pt.y));
+        Check(TrayStackTop(*state) == 1, L"tray stack: next button throws the top card");
+        TrayStackSettle(*state, 900);
+        state->trayDeckOffset = 0;
+        TrayStackSettle(*state, 900);
+
+        // Dismiss with the close badge: item removed, tumbling ghost + smoke.
+        vm = BuildVm(*state, false);
+        const std::wstring dismissed = vm.tray_deck.cards[0].path;
+        state->hoverRegion = ui::HitTestResult::TrayCard;
+        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(close_pt.x, close_pt.y));
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(close_pt.x, close_pt.y));
+        Check(TrayItemTotalCount(state->tray) == 4 && state->trayPuffs.size() == 10,
+              L"tray stack: close badge dismisses the top item with smoke");
+        Sleep(70); // puffs start staggered over the first 60 ms
+        TickTrayDeck(*state);
+        vm = BuildVm(*state, false);
+        bool tumbling = false;
+        for (const auto& c : vm.tray_deck.cards)
+            if (c.ghost && c.path == dismissed) tumbling = true;
+        {
+            int ghost_n = 0;
+            for (const auto& c : vm.tray_deck.cards) if (c.ghost) ++ghost_n;
+            Check(tumbling, (L"tray stack: dismissed card leaves as a ghost (ghosts=" +
+                  std::to_wstring(ghost_n) + L" cards=" + std::to_wstring(vm.tray_deck.cards.size()) +
+                  L" anims=" + std::to_wstring(state->trayCards.size()) + L")").c_str());
+            Check(!vm.tray_deck.puffs.empty(), (L"tray stack: smoke plays (state puffs=" +
+                  std::to_wstring(state->trayPuffs.size()) + L")").c_str());
+            Check(vm.tray_deck.total_count == 4, L"tray stack: footer count drops to four");
+        }
+        TrayStackSettle(*state, 1000);
+        vm = BuildVm(*state, false);
+        bool lingering = false;
+        for (const auto& c : vm.tray_deck.cards)
+            if (c.ghost) lingering = true;
+        Check(!lingering && vm.tray_deck.puffs.empty(), L"tray stack: exit animations finish");
+
+        // Clear: every visible card tumbles off, staggered; nothing lingers.
+        std::vector<std::wstring> all;
+        for (const auto& b : state->tray.batches())
+            for (const auto& item : b.items) all.push_back(item.path);
+        MarkTrayExit(*state, all, true);
+        state->tray.Clear();
+        TickTrayDeck(*state);
+        vm = BuildVm(*state, false);
+        int ghosts = 0;
+        for (const auto& c : vm.tray_deck.cards) if (c.ghost) ++ghosts;
+        Check(vm.tray_deck.live_count == 0 && ghosts >= 3 && ghosts <= 8,
+              L"tray stack: clear tumbles the visible cards");
+        TrayStackSettle(*state, 1300);
+        vm = BuildVm(*state, false);
+        Check(vm.tray_deck.cards.empty() && state->trayCards.empty(),
+              L"tray stack: clear leaves no animation state behind");
+        SetKeyboardState(saved_keys);
+    } else Check(false, L"tray stack: graphics initialized");
+    if (GetCapture() == hwnd) ReleaseCapture();
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    DestroyWindow(hwnd);
+    state->hwnd = nullptr;
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    for (const auto& f : files) DeleteFileW(f.c_str());
+    RemoveDirectoryW(dir.c_str());
+}
 
 void TestLinkResolve() {
     Check(fs::StripLnkSuffix(L"计算图形.dwg.lnk") == L"计算图形.dwg",
@@ -5848,6 +6245,22 @@ void TestLinkResolve() {
                 L"link: folder shortcuts sort before files in both directions");
     }
     Check(!e2.is_dir, L"link: sorting preserves shortcut file identity for operations");
+    // Folder sort modes: the pref only changes how folders group, never the names.
+    Check(EntryLess(e2, e1, ui::SortColumn::Name, ui::SortDirection::Asc,
+                    FolderSortMode::FoldersFirst) &&
+          EntryLess(e2, e1, ui::SortColumn::Name, ui::SortDirection::Desc,
+                    FolderSortMode::FoldersFirst),
+        L"sort: folders-first keeps folders on top in both directions");
+    Check(EntryLess(e2, e1, ui::SortColumn::Name, ui::SortDirection::Asc,
+                    FolderSortMode::FollowDirection) &&
+          EntryLess(e1, e2, ui::SortColumn::Name, ui::SortDirection::Desc,
+                    FolderSortMode::FollowDirection),
+        L"sort: follow-direction sends folders to the bottom when reversed");
+    Check(!EntryLess(e2, e1, ui::SortColumn::Name, ui::SortDirection::Asc,
+                     FolderSortMode::Mixed) &&
+          EntryLess(e1, e2, ui::SortColumn::Name, ui::SortDirection::Asc,
+                    FolderSortMode::Mixed),
+        L"sort: mixed mode orders folders and files by name alone");
     wchar_t live_link[32768]{};
     if (GetEnvironmentVariableW(L"PULSE_SELFTEST_LINK", live_link, ARRAYSIZE(live_link))) {
         std::vector<fs::DirEntry> entries;
@@ -6488,8 +6901,8 @@ void TestDetailsPreviewInteraction() {
         Check(std::abs(renderer.SidebarMaxWidthDip(1600.0f) - 1000.0f) < 0.5f,
             L"panels: the open details panel is reserved by the sidebar limit");
         renderer.SetDetailsPanelVisible(false);
-        Check(std::abs(renderer.SidebarMaxWidthDip(1600.0f) - 1480.0f) < 0.5f,
-            L"panels: hiding the details panel frees the sidebar limit");
+        Check(std::abs(renderer.SidebarMaxWidthDip(1600.0f) - 1240.0f) < 0.5f,
+            L"panels: hiding details still reserves space for the shared toolbar");
         renderer.SetDetailsPanelVisible(true);
         renderer.SetSidebarWidthDip(700.0f);
         const float list_left = renderer.EffectiveSidebarWidth(1000.0f) + renderer.Margin();
@@ -6965,6 +7378,30 @@ int RunSelfTest1B2() {
     if (g_skip_visual) LogLine(L"[SKIP] Screenshot capture disabled\n");
     wchar_t test_case[64]{};
     if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"column-resize-ui") == 0) {
+        const bool passed = RunColumnResizeUiTest();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return passed ? 0 : 1;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"folder-sizes") == 0) {
+        const bool passed = RunFolderSizesTest();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return passed ? 0 : 1;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"pane-header-icons") == 0) {
+        const bool passed = RunPaneHeaderIconTest();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return passed ? 0 : 1;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"folder-views") == 0) {
+        TestFolderViews();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
         wcscmp(test_case, L"pr-shell") == 0) {
         TestMenuModel();
         TestShellMenuMerge();
@@ -7000,6 +7437,12 @@ int RunSelfTest1B2() {
         return g_fail ? 1 : 0;
     }
     if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"tray-stack") == 0) {
+        TestTrayStack();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
         wcscmp(test_case, L"list-columns") == 0) {
         TestListColumns();
         TestViewLayouts();
@@ -7011,6 +7454,12 @@ int RunSelfTest1B2() {
         TestFilterControls();
         if (g_log) { fclose(g_log); g_log = nullptr; }
         return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"filename-render") == 0) {
+        const bool passed = RunFilenameRenderTest();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return passed ? 0 : 1;
     }
     if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
         wcscmp(test_case, L"filter-search-ui") == 0) {
@@ -7176,6 +7625,7 @@ int RunSelfTest1B2() {
     TestAdvancedEditClicks();
     TestCtrlDragSelection();
     TestDirWatch();
+    TestFolderViews();
     TestNavigateAlwaysEnumerates();
     TestSnapshotPatch();
     TestSnapshotPatchBatch();
@@ -7187,6 +7637,7 @@ int RunSelfTest1B2() {
     TestSplitLayout();
     TestViewLayouts();
     TestListColumns();
+    TestTrayStack();
     TestHiddenFiles();
     TestQuickAccess();
     TestPlacesAndIndex();

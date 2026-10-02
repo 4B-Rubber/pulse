@@ -3,13 +3,76 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
+#include <iterator>
 
 namespace pulse::ui {
 namespace {
 std::atomic<uint32_t> g_preview_cache_sequence{1};
+
+// Transport failures retry after 1 s, 4 s, then 15 s; the fourth in a row is
+// kept as a real failure so a file that always hangs its provider settles.
+constexpr uint32_t kTransientRetryMs[] = {1000, 4000, 15000};
+
+bool UploadBitmap(ID2D1DeviceContext* dc, ComPtr<ID2D1Bitmap>& bitmap,
+                  std::vector<uint8_t>& pixels, uint32_t w, uint32_t h, uint32_t stride) {
+    if (bitmap.get()) return true;
+    if (!dc || pixels.empty() || !w || !h) return false;
+    auto props = D2D1::BitmapProperties(D2D1::PixelFormat(
+        DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    if (FAILED(dc->CreateBitmap(D2D1::SizeU(w, h), pixels.data(), stride, &props, &bitmap)))
+        return false;
+    pixels.clear();
+    pixels.shrink_to_fit();
+    return true;
 }
 
-ThumbnailCache::ThumbnailCache() {
+// Aspect-fit (contain) into dest, centred.
+void DrawContained(ID2D1DeviceContext* dc, ID2D1Bitmap* bitmap, uint32_t w, uint32_t h,
+                   const D2D1_RECT_F& dest, float opacity) {
+    const float destW = std::max(1.0f, dest.right - dest.left);
+    const float destH = std::max(1.0f, dest.bottom - dest.top);
+    D2D1_RECT_F fitted = dest;
+    const float sourceAspect = static_cast<float>(w) / static_cast<float>(std::max(1u, h));
+    const float destAspect = destW / destH;
+    if (sourceAspect > destAspect) {
+        const float height = destW / sourceAspect;
+        const float center = (dest.top + dest.bottom) * 0.5f;
+        fitted.top = center - height * 0.5f;
+        fitted.bottom = center + height * 0.5f;
+    } else if (sourceAspect < destAspect) {
+        const float width = destH * sourceAspect;
+        const float center = (dest.left + dest.right) * 0.5f;
+        fitted.left = center - width * 0.5f;
+        fitted.right = center + width * 0.5f;
+    }
+    dc->DrawBitmap(bitmap, &fitted, std::clamp(opacity, 0.0f, 1.0f),
+        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+}
+} // namespace
+
+// Shell thumbnail providers (Office, CAD, video) routinely need a few seconds
+// on a cold start; direct decoders answer well inside the short budget. A
+// timeout restarts the host, so the heavy formats get room to finish.
+uint32_t ThumbnailCache::ResponseTimeoutMs(const std::wstring& path,
+                                           ipc::PreviewRequestKind kind) {
+    if (kind == ipc::PreviewRequestKind::Properties) return 4000;
+    const size_t slash = path.find_last_of(L"\\/");
+    const size_t dot = path.find_last_of(L'.');
+    std::wstring ext = dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash)
+        ? std::wstring() : path.substr(dot);
+    for (auto& c : ext) c = static_cast<wchar_t>(std::towlower(c));
+    static const wchar_t* const kLight[] = {
+        L".jpg", L".jpeg", L".png", L".bmp", L".gif", L".ico", L".webp", L".tif", L".tiff",
+        L".txt", L".md", L".json", L".xml", L".csv", L".log", L".ini", L".svg"};
+    for (const wchar_t* light : kLight)
+        if (ext == light) return 2500;
+    return 8000;
+}
+
+ThumbnailCache::ThumbnailCache(size_t budget_bytes, size_t max_items)
+    : budget_bytes_(std::max<size_t>(budget_bytes, 1)),
+      max_items_(std::max<size_t>(max_items, 1)) {
     const uint32_t sequence = g_preview_cache_sequence.fetch_add(1);
     pipe_token_ = GetCurrentProcessId() ^ (sequence * 0x9E3779B9u);
     if (!pipe_token_) pipe_token_ = sequence ? sequence : 1;
@@ -37,6 +100,7 @@ void ThumbnailCache::Reset() {
     if (worker_.joinable()) worker_.join();
     StopChild();
     std::lock_guard lock(mutex_); queue_.clear(); pending_.clear(); items_.clear(); lru_.clear();
+    still_by_identity_.clear(); transient_failures_.clear();
     cache_bytes_ = 0; dc_ = nullptr; latest_details_identity_.clear();
     epoch_.fetch_add(1, std::memory_order_relaxed);
 }
@@ -44,8 +108,25 @@ void ThumbnailCache::Evict() {
     epoch_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(mutex_);
     queue_.clear(); pending_.clear(); items_.clear(); lru_.clear();
+    still_by_identity_.clear(); transient_failures_.clear();
     cache_bytes_ = 0;
     latest_details_identity_.clear();
+}
+
+ThumbnailCache::Item* ThumbnailCache::StaleBitmap(const std::wstring& identity,
+                                                  const std::wstring& except_key) {
+    const auto link = still_by_identity_.find(identity);
+    if (link == still_by_identity_.end()) return nullptr;
+    if (link->second == except_key) return nullptr;
+    const auto it = items_.find(link->second);
+    if (it == items_.end() || it->second.failed) {
+        still_by_identity_.erase(link);
+        return nullptr;
+    }
+    Item& item = it->second;
+    if (!UploadBitmap(dc_, item.bitmap, item.pixels, item.w, item.h, item.stride)) return nullptr;
+    Touch(item);
+    return &item;
 }
 bool ThumbnailCache::Connect() {
     if (pipe_ != INVALID_HANDLE_VALUE) return true;
@@ -114,6 +195,7 @@ PreviewDrawResult ThumbnailCache::Draw(ID2D1DeviceContext* dc, const D2D1_RECT_F
             request.kind = ipc::PreviewRequestKind::Content;
             request.details = direct_preview; request.frame_index = frame_index;
             request.epoch = epoch_.load(std::memory_order_relaxed);
+            request.timeout_ms = ResponseTimeoutMs(path, request.kind);
             request.path = path; request.key = key; request.identity = identity;
             queue_.push_front(std::move(request));
             if (queue_.size() > 128) { pending_.erase(queue_.back().key); queue_.pop_back(); }
@@ -135,20 +217,14 @@ PreviewDrawResult ThumbnailCache::Draw(ID2D1DeviceContext* dc, const D2D1_RECT_F
             if (source_width) *source_width = item.source_width;
             if (source_height) *source_height = item.source_height;
             if (item.kind == ipc::PreviewContentKind::Text ||
-                item.kind == ipc::PreviewContentKind::Hex) {
+                item.kind == ipc::PreviewContentKind::Hex ||
+                item.kind == ipc::PreviewContentKind::Archive) {
                 if (text) *text = item.text;
+                if (item.kind == ipc::PreviewContentKind::Archive) return PreviewDrawResult::Archive;
                 return item.kind == ipc::PreviewContentKind::Hex
                     ? PreviewDrawResult::Hex : PreviewDrawResult::Text;
             }
-            if (!item.bitmap.get() && !item.pixels.empty() && dc_) {
-                auto props = D2D1::BitmapProperties(D2D1::PixelFormat(
-                    DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-                if (SUCCEEDED(dc_->CreateBitmap(D2D1::SizeU(item.w, item.h),
-                        item.pixels.data(), item.stride, &props, &item.bitmap))) {
-                    item.pixels.clear();
-                    item.pixels.shrink_to_fit();
-                }
-            }
+            UploadBitmap(dc_, item.bitmap, item.pixels, item.w, item.h, item.stride);
             if (item.bitmap.get()) {
                 if (viewport) {
                     viewport->SetContent(dest, static_cast<float>(item.source_width ? item.source_width : item.w),
@@ -189,28 +265,29 @@ PreviewDrawResult ThumbnailCache::Draw(ID2D1DeviceContext* dc, const D2D1_RECT_F
                     dc->PopAxisAlignedClip();
                     return PreviewDrawResult::Bitmap;
                 }
-                D2D1_RECT_F fitted = dest;
-                const float sourceAspect = static_cast<float>(item.w) /
-                                           static_cast<float>(std::max(1u, item.h));
-                const float destAspect = destW / destH;
-                if (sourceAspect > destAspect) {
-                    const float height = destW / sourceAspect;
-                    const float center = (dest.top + dest.bottom) * 0.5f;
-                    fitted.top = center - height * 0.5f;
-                    fitted.bottom = center + height * 0.5f;
-                } else if (sourceAspect < destAspect) {
-                    const float width = destH * sourceAspect;
-                    const float center = (dest.left + dest.right) * 0.5f;
-                    fitted.left = center - width * 0.5f;
-                    fitted.right = center + width * 0.5f;
-                }
-                dc->DrawBitmap(item.bitmap.get(), &fitted, std::clamp(opacity, 0.0f, 1.0f),
-                    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+                DrawContained(dc, item.bitmap.get(), item.w, item.h, dest, opacity);
                 return PreviewDrawResult::Bitmap;
             }
-            if (item.failed) return PreviewDrawResult::Failed;
+            if (item.failed) {
+                if (item.transient && GetTickCount64() >= item.retry_at) queue_request();
+                if (!viewport && !(pan_x && pan_y)) {
+                    if (Item* stale = StaleBitmap(identity, key)) {
+                        DrawContained(dc, stale->bitmap.get(), stale->w, stale->h, dest, opacity);
+                        return PreviewDrawResult::Bitmap;
+                    }
+                }
+                return item.transient ? PreviewDrawResult::Pending : PreviewDrawResult::Failed;
+            }
         }
         queue_request();
+        // Another size of the same file (view switch, DPI change) or the
+        // previous decode stays on screen until this one arrives.
+        if (!viewport && !(pan_x && pan_y) && frame_index == 0) {
+            if (Item* stale = StaleBitmap(identity, key)) {
+                DrawContained(dc, stale->bitmap.get(), stale->w, stale->h, dest, opacity);
+                return PreviewDrawResult::Bitmap;
+            }
+        }
     }
     return PreviewDrawResult::Pending;
 }
@@ -235,6 +312,7 @@ bool ThumbnailCache::Properties(const std::wstring& path, DWORD attrs, uint64_t 
         request.attrs = attrs; request.kind = ipc::PreviewRequestKind::Properties;
         request.details = true; request.path = path; request.key = key;
         request.identity = identity;
+        request.timeout_ms = ResponseTimeoutMs(path, request.kind);
         request.epoch = epoch_.load(std::memory_order_relaxed);
         queue_.push_back(std::move(request));
         if (!running_.exchange(true)) worker_ = std::thread([this]{ Worker(); });
@@ -265,6 +343,21 @@ bool ThumbnailCache::StoreResult(const Request& req, Item result) {
     pending_.erase(req.key);
     if (req.details && req.identity != latest_details_identity_) return false;
 
+    if (result.failed && result.transient) {
+        const uint32_t attempts = ++transient_failures_[req.key];
+        if (attempts > std::size(kTransientRetryMs)) {
+            result.transient = false;
+            transient_failures_.erase(req.key);
+        } else {
+            result.retry_at = GetTickCount64() + kTransientRetryMs[attempts - 1];
+        }
+    } else {
+        transient_failures_.erase(req.key);
+        if (!result.failed && result.kind == ipc::PreviewContentKind::Bitmap &&
+            result.frame_count <= 1 && !req.identity.empty())
+            still_by_identity_[req.identity] = req.key;
+    }
+
     if (auto old = items_.find(req.key); old != items_.end()) {
         cache_bytes_ -= old->second.cost;
         lru_.erase(old->second.lru_position);
@@ -292,12 +385,17 @@ bool ThumbnailCache::StoreResult(const Request& req, Item result) {
     lru_.push_back(req.key);
     result.lru_position = std::prev(lru_.end());
     items_.emplace(req.key, std::move(result));
-    constexpr size_t kCacheBudget = 16ull * 1024ull * 1024ull;
-    while (!lru_.empty() && (lru_.size() > 128 || cache_bytes_ > kCacheBudget)) {
+    while (!lru_.empty() && (lru_.size() > max_items_ || cache_bytes_ > budget_bytes_)) {
         auto oldest = items_.find(lru_.front());
         cache_bytes_ -= oldest->second.cost;
         items_.erase(oldest);
         lru_.pop_front();
+    }
+    if (still_by_identity_.size() > max_items_ * 2) {
+        for (auto link = still_by_identity_.begin(); link != still_by_identity_.end();) {
+            if (items_.contains(link->second)) ++link;
+            else link = still_by_identity_.erase(link);
+        }
     }
     return true;
 }
@@ -695,12 +793,13 @@ void ThumbnailCache::Worker() {
         ipc::PreviewRequest wire; wire.request_id=req.id; wire.generation=req.generation;
         wire.kind=req.kind; wire.pixel_size=req.pixels; wire.attrs=req.attrs;
         wire.frame_index = req.frame_index;
+        if (!req.details) wire.flags |= ipc::kPreviewRequestFlagGrid;
         wire.path_chars=(uint32_t)req.path.size();
         if (ok) ok = ipc::WriteAll(pipe_, &wire, sizeof(wire)) &&
                      ipc::WriteAll(pipe_, req.path.data(), wire.path_chars * sizeof(wchar_t));
         ipc::PreviewResponse response{};
         if (ok) {
-            const ULONGLONG deadline = GetTickCount64() + 1000;
+            const ULONGLONG deadline = GetTickCount64() + (req.timeout_ms ? req.timeout_ms : 1000);
             DWORD available = 0;
             while (running_ && GetTickCount64() < deadline) {
                 if (!PeekNamedPipe(pipe_, nullptr, 0, nullptr, &available, nullptr)) { ok=false; break; }
@@ -717,7 +816,9 @@ void ThumbnailCache::Worker() {
             ok = ipc::ReadAll(pipe_, mapping.data(), response.mapping_chars * sizeof(wchar_t)); }
         std::wstring previewText;
         if (ok && response.text_chars) {
-            if (response.text_chars > 32768) ok = false;
+            const uint32_t limit = response.kind == ipc::PreviewContentKind::Archive
+                ? ipc::kPreviewMaxArchiveChars : ipc::kPreviewMaxTextChars;
+            if (response.text_chars > limit) ok = false;
             else {
                 previewText.resize(response.text_chars);
                 ok = ipc::ReadAll(pipe_, previewText.data(),
@@ -778,6 +879,9 @@ void ThumbnailCache::Worker() {
             + static_cast<size_t>(response.stride) * response.height;
         for (const auto& property : result.properties)
             result.cost += (property.label.size() + property.value.size()) * sizeof(wchar_t);
+        // !ok: the host timed out, crashed or broke the protocol - nothing is
+        // known about the file itself, so the result is retried later.
+        result.transient = !ok;
         result.failed = !ok || response.status != 0 ||
             (req.kind == ipc::PreviewRequestKind::Content &&
              result.kind == ipc::PreviewContentKind::Bitmap && result.pixels.empty());

@@ -12,6 +12,7 @@ void LayoutAddressEditor(AppState& s);
 void EnsureEditVisuals(AppState& s);
 void ShowAddressEditor(AppState& s);
 void HideAddressEditor(AppState& s, bool navigate);
+void DismissPathEditorOutside(AppState& s, int x, int y);
 void ShowAddressSearch(AppState& s);
 bool IsAddressSearchResults(const app::Tab* tab);
 void SaveAddressSearchDraft(AppState& s);

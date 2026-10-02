@@ -93,6 +93,15 @@ public:
     int Height() const { return height_; }
     bool UsesTransparentComposition() const { return transparentComposition_; }
 
+    // Whole-window zoom on the DirectComposition root visual (runs on the
+    // compositor thread, so no frames are pumped). origin is in client pixels.
+    // HideContent() makes the visual transparent until PlayZoom starts, so a
+    // re-shown window never flashes its previous frame. Return false when
+    // composition is unavailable; callers then show/hide without motion.
+    bool HideContent();
+    bool PlayZoom(float origin_x, float origin_y, bool opening, double duration_s);
+    void ClearZoom();
+
 private:
     bool CheckGraphics(HRESULT hr, const wchar_t* stage);
     std::wstring initialization_error_;

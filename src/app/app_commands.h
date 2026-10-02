@@ -54,6 +54,8 @@ void ShowCuratedItemMenu(AppState& s, const std::wstring& path,
                                 bool recent, POINT screen_pt);
 void SetViewMode(AppState& s, ui::ViewMode mode);
 void ShowViewDropdown(AppState& s, int pane_index);
+void ShowSortDropdown(AppState& s);
+void ShowToolbarMore(AppState& s);
 void ShowOmnibar(AppState& s, OmnibarMode mode);
 void ShowAdvancedSearch(AppState& s, bool require_scope = false);
 void ShowSearchFilterMenu(AppState& s, int chip, RECT control_rect);
@@ -72,7 +74,7 @@ void SetEverySidebarSectionCollapsed(AppState& s, bool collapsed);
 void ApplyAppWindowChrome(AppState& s);
 bool PickImageFile(HWND owner, std::wstring& path);
 bool PickFolder(HWND owner, std::wstring& path, const wchar_t* title);
-D2D1_COLOR_F ResolveAccentColor(const app::AppPrefs& prefs);
+D2D1_COLOR_F ResolveAccentColor(const app::AppPrefs& prefs, bool dark = false);
 void ApplyAccentFromPrefs(AppState& s, bool snap_picker);
 bool SelectedQuickPreviewItem(AppState& s, ui::QuickPreviewItem& item);
 void ToggleQuickPreview(AppState& s);

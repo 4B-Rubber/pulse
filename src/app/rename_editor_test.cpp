@@ -265,6 +265,20 @@ bool RunAddressEditorTest() {
         Pump();
         inspect(L"address.bmp", true);
         HideAddressEditor(*state, false);
+        const auto original_path = tab->current_path;
+        for (bool right_click : {false, true}) {
+            ShowAddressEditor(*state);
+            SetWindowTextW(state->hwndAddressEdit, L"C:\\unconfirmed-address");
+            const auto address = state->renderer.AddressBarRect(1000.0f);
+            DismissPathEditorOutside(*state, static_cast<int>(address.left + 16),
+                static_cast<int>((address.top + address.bottom) / 2));
+            check(state->addressEditing, "click inside address keeps path editing active");
+            if (right_click) HandleRButtonDown(state.get(), hwnd, WM_RBUTTONDOWN, 0, MAKELPARAM(900, 690));
+            else HandleLButtonDown(state.get(), hwnd, WM_LBUTTONDOWN, 0, MAKELPARAM(900, 690));
+            check(!state->addressEditing && !IsWindowVisible(state->hwndAddressEdit),
+                "outside click hides path editor without relying on focus loss");
+            check(tab->current_path == original_path, "outside click does not navigate to unconfirmed path");
+        }
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
     } else check(false, "search owner and graphics initialize");
     if (hwnd) DestroyWindow(hwnd);

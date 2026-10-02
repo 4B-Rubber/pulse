@@ -26,7 +26,14 @@ struct Agent {
     NetworkIndex index;
     std::atomic<bool> running{true};
     std::mutex write_mu;
+    std::atomic<int> clients{0};
+    std::atomic<ULONGLONG> last_activity{0};
 } g;
+
+// Every live Pulse window polls the agent once per second, so a long quiet
+// period means the Pulse instance(s) that used it are gone (e.g. it was
+// replaced by an update). Exit instead of lingering as an orphan forever.
+constexpr ULONGLONG kIdleExitMs = 10ull * 60ull * 1000ull;
 
 SECURITY_ATTRIBUTES* PipeSecurity() {
     static SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES) };
@@ -245,21 +252,45 @@ int RunAgent() {
         return 0;
     }
     g.index.Start(nullptr, 0, 0);
+    g.last_activity = GetTickCount64();
+    std::thread idle_watch([] {
+        while (g.running) {
+            Sleep(1000);
+            if (!g.running || g.clients.load() != 0 ||
+                GetTickCount64() - g.last_activity.load() < kIdleExitMs) continue;
+            g.running = false;
+            // Wake the synchronous ConnectNamedPipe below so the accept loop can exit.
+            HANDLE wake = CreateFileW(agent::kPipeName, GENERIC_READ | GENERIC_WRITE, 0,
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+            if (wake != INVALID_HANDLE_VALUE) CloseHandle(wake);
+        }
+    });
+    int exit_code = 0;
     while (g.running) {
         HANDLE pipe = CreateNamedPipeW(
             agent::kPipeName, PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES, 64 * 1024, 64 * 1024, 0, PipeSecurity());
-        if (pipe == INVALID_HANDLE_VALUE) return static_cast<int>(GetLastError());
+        if (pipe == INVALID_HANDLE_VALUE) { exit_code = static_cast<int>(GetLastError()); break; }
         const BOOL connected = ConnectNamedPipe(pipe, nullptr)
             ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED ? TRUE : FALSE);
-        if (connected) ClientLoop(pipe);
-        else CloseHandle(pipe);
+        if (!g.running) { CloseHandle(pipe); break; }
+        if (connected) {
+            ++g.clients;
+            g.last_activity = GetTickCount64();
+            ClientLoop(pipe);
+            g.last_activity = GetTickCount64();
+            --g.clients;
+        } else {
+            CloseHandle(pipe);
+        }
     }
+    g.running = false;
+    if (idle_watch.joinable()) idle_watch.join();
     g.index.Stop();
     ReleaseMutex(singleton);
     CloseHandle(singleton);
-    return 0;
+    return exit_code;
 }
 
 } // namespace

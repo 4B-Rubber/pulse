@@ -1,6 +1,8 @@
 #include "app_internal.h"
 #include "../common/windows_compat.h"
 #include "../common/localization.h"
+#include "about_info.h"
+#include <shellapi.h>
 #include <algorithm>
 #include <cwctype>
 #include <cmath>
@@ -43,9 +45,9 @@ constexpr SettingDestination destinations[]={
     // expanded bit any more.
     {I::SettingsTheme,0,0},{I::SettingsThemeColor,0,0},{I::SettingsWindowEffect,0,0},{I::SettingsLanguage,0,0},
     {I::SettingsLaunch,0,0},{I::SettingsKeepRunning,0,0},{I::SettingsRowHeight,0,0},{I::SettingsShowPerformance,0,0},
-    {I::SettingsWallpaper,0,0},{I::SettingsTrayIcon,0,0},{I::SettingsShowHidden,0,0},{I::SettingsShowProtected,0,0},{I::PinnedNames,0,0},
-    {I::ListSmartDate,0,0},{I::ListZebraRows,0,0},{I::ListSizeBar,0,0},
-    {I::SettingsBlankClickBack,0,0},{I::SettingsChangeTracking,0,0},{I::SettingsOpenFolders,0,0},
+    {I::ListSmartDate,0,0},{I::ListZebraRows,0,0},{I::ListSizeBar,0,0},{I::ListTagNameColor,0,0},{I::SettingsFolderSort,0,0},
+    {I::SettingsWallpaper,0,0},{I::SettingsWallpaperLook,0,0},{I::SettingsWallpaperBlur,0,0},{I::SettingsTrayIcon,0,0},{I::SettingsShowHidden,0,0},{I::SettingsShowProtected,0,0},{I::PinnedNames,0,0},{I::SettingsVerticalTabs,0,0},
+    {I::SettingsBlankClickBack,0,0},{I::SettingsChangeTracking,0,0},{I::SettingsOpenFolders,0,0},{I::SettingsWinE,0,0},{I::SettingsShellTags,0,0},
     {I::SettingsTooltips,0,0},{I::SettingsTooltipDelay,0,0},{I::SettingsThumbCache,0,0},{I::SettingsFileHash,0,0},
     {I::GlobalSearch,1,0},{I::GlobalSearchHotkey,1,0},{I::SearchPinyin,1,0},{I::ContentIndexManage,1,0},{I::IndexLocation,1,2},{I::LocalDrives,1,2},
     {I::Exclusions,1,2},{I::ServerFolders,1,2},{I::SettingsContextMenu,2,0},{I::SettingsDuplicates,4,0},{I::SettingsAboutDiagnostics,3,0},
@@ -151,6 +153,22 @@ bool HandleSettingsControl(AppState& s,const H& hit) {
         else if(hit.index==2) ContentOptions(s);
         else if(hit.index==3 && !s.contentSearch.InstantMode() && !s.contentSearch.GetConfig().roots.empty()) s.contentSearch.Rebuild();
         break;
+    case H::SettingsAboutAction:
+        if(hit.index==0) {
+            if(app::CopyTextToClipboard(s.hwnd,app::AboutRowsText(BuildVm(s,false).settings_about_rows)))
+                s.renderer.NotifyCopied(static_cast<int>(H::SettingsAboutAction),0);
+        } else if(hit.index>=1 && hit.index<=4) {
+            static constexpr const wchar_t* kPages[]={app::kPulseHomepage,app::kPulseReleasesPage,
+                                                      app::kLumenPdfHomepage,app::kLumaShotHomepage};
+            ShellExecuteW(s.hwnd,L"open",kPages[hit.index-1],nullptr,nullptr,SW_SHOWNORMAL);
+        }
+        break;
+    case H::SettingsReleaseNote: {
+        s.settingsReleaseExpanded=s.settingsReleaseExpanded==hit.index?-1:hit.index;
+        auto vm=BuildVm(s,false);
+        const float maximum=s.renderer.SettingsMaxScroll(vm,static_cast<float>(s.compositor.Width()),static_cast<float>(s.compositor.Height()));
+        s.settings.SetScroll(s.settings.scroll(),maximum);break;
+    }
     default: return false;
     }
     InvalidateRect(s.hwnd,nullptr,FALSE);return true;

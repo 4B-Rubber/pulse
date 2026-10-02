@@ -155,7 +155,7 @@ void ShowSearchOptions(AppState& s, bool management) {
             manage.glyph = L"\xE713";
             items.resize(tab ? 2 : 1);
             items.push_back(std::move(manage));
-            const auto layout = ui::LayoutAddressSearch(s.renderer.AddressBarRect(static_cast<float>(s.compositor.Width())), s.scale);
+            const auto layout = ui::LayoutAddressSearch(s.renderer.SearchBarRect(static_cast<float>(s.compositor.Width())), s.scale);
             if (layout.scope.left == layout.scope.right) {
                 ui::FluentMenuItem scope;
                 scope.text = l10n::Get(s.addressSearchCurrent ? I::LocationCurrent : I::LocationIndexed);
@@ -166,9 +166,13 @@ void ShowSearchOptions(AppState& s, bool management) {
                 items.insert(items.begin(), std::move(scope));
             }
         }
+        auto advanced = MenuItem(6, I::AdvancedSearch);
+        advanced.text += L"…";
+        advanced.shortcut = L"Ctrl+Shift+F";
+        items.insert(items.end() - 1, std::move(advanced));
         POINT anchor{};
         if (s.addressSearching) {
-            const auto layout = ui::LayoutAddressSearch(s.renderer.AddressBarRect(static_cast<float>(s.compositor.Width())), s.scale);
+            const auto layout = ui::LayoutAddressSearch(s.renderer.SearchBarRect(static_cast<float>(s.compositor.Width())), s.scale);
             ui::FluentMenuModel popup_layout;
             popup_layout.SetItems(items);
             popup_layout.Layout(s.compositor.DwriteFactory(), s.scale);
@@ -184,6 +188,7 @@ void ShowSearchOptions(AppState& s, bool management) {
             return;
         }
         const int command = s.menu->TrackPopup(anchor, std::move(items));
+        if (command == 6) { ShowAdvancedSearch(s, false); return; }
         if (command == 5) { OpenSettingsTab(s, 1); return; }
         bool search = false;
         if (command == 20 || command == 21) { s.addressSearchCurrent = command == 21; search = true; }

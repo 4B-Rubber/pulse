@@ -418,6 +418,23 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
     auto check=[&](bool ok,const char* label){log<<(ok ? "[PASS] " : "[FAIL] ")<<label<<'\n';if(!ok)++failures;};
     s.appPrefs.persist=false;
     app::AppPrefs prefs; prefs.persist=false;
+    const auto color_close=[](float a,float b) { return std::fabs(a-b)<0.001f; };
+    auto pine=ResolveAccentColor(prefs,false);
+    check(color_close(pine.r,82/255.0f) && color_close(pine.g,125/255.0f) && color_close(pine.b,112/255.0f),
+        "light theme defaults to concept pine green");
+    const auto charcoal=ui::MakeTheme(true,pine);
+    check(color_close(charcoal.bg.r,26/255.0f) && color_close(charcoal.bg.r,charcoal.bg.g) &&
+        color_close(charcoal.surface_sheet.r,charcoal.surface_sheet.b),"dark theme restores neutral charcoal backgrounds");
+    const auto warm=ui::MakeTheme(false,pine);
+    check(color_close(warm.bg.r,243/255.0f) && color_close(warm.bg.g,245/255.0f) && color_close(warm.bg.b,241/255.0f),
+        "light theme uses concept warm canvas");
+    prefs.accent_follow_system=true;
+    app::AppPrefs accent_roundtrip; accent_roundtrip.persist=false;
+    check(accent_roundtrip.FromJson(prefs.ToJson()) && accent_roundtrip.accent_follow_system,
+        "explicit Windows accent survives preference round trip");
+    prefs.accent_rgb=L"8861AA";
+    auto custom=ResolveAccentColor(prefs,false);
+    check(color_close(custom.r,136/255.0f) && color_close(custom.b,170/255.0f),"custom accent overrides theme palette");
     prefs.FromJson(L"{\"language\":\"en-US\"}");check(prefs.theme_mode==-1,"old profiles retain session theme");
     for(int mode=0;mode<3;++mode) {
         prefs.theme_mode=mode;const auto json=prefs.ToJson();app::AppPrefs loaded;loaded.persist=false;
@@ -435,6 +452,9 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
         check(TestSettingsFilter(l10n::Get(I::SettingsWallpaper),I::SettingsWallpaper),"settings search finds hidden advanced settings");
         check(TestSettingsFilter(l10n::Get(I::SettingsSearchIndex),I::IndexLocation),"settings search finds page and subsettings");
         check(!TestSettingsFilter(L"no-such-setting-123",I::SettingsTheme),"settings search has empty results");
+        bool apps_text=true;
+        for(I id:{I::AboutMoreApps,I::AboutMoreAppsDesc,I::AboutLumenPdfDesc,I::AboutLumaShotDesc}) apps_text &= !l10n::Get(id).empty();
+        check(apps_text,"recommended apps texts exist in both languages");
     }
     l10n::SetLanguage(L"zh-CN");
     const float original_scale=s.scale;
@@ -512,6 +532,15 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
                     bool hidden=true;for(const auto& r:layout.context_rows) hidden &= r.bottom==0;
                     check(hidden,"collapsed context entries do not receive clicks");
                 }
+                if(page==3) {
+                    bool apps=true;
+                    for(int i=0;i<2;++i) {auto h=hit(layout.apps_row[i]);apps &= h.region==H::SettingsAboutAction && h.index==3+i;}
+                    check(apps,"recommended app rows open their own project pages");
+                    check(layout.apps_card.top>=layout.about_card.bottom && layout.apps_card.bottom<=layout.diagnostics_card.top &&
+                          layout.apps_row[0].top>=layout.apps_card.top && layout.apps_row[0].bottom<=layout.apps_row[1].top &&
+                          layout.apps_row[1].bottom<=layout.apps_card.bottom,
+                          "recommended apps card sits between about and diagnostics without overlap");
+                }
                 if(page==1) {
                     check(layout.index_action[0].bottom==0 && layout.index_volume_rows.empty(),"collapsed maintenance has no invisible hit targets");
                     check(hit(layout.disclosure[1]).region==H::SettingsDisclosure,"maintenance disclosure hit target");
@@ -534,7 +563,10 @@ int RunSettingsFlowTest(AppState& s,const wchar_t* output) {
     click(layout().theme_tile[0]);check(!s.darkMode && s.appPrefs.theme_mode==1,"mouse click applies and saves light theme");
     click(layout().theme_tile[1]);check(s.darkMode && s.appPrefs.theme_mode==2,"mouse click applies and saves dark theme");
     click(layout().theme_tile[2]);check(s.themeOverride==ui::ThemeMode::Auto && s.appPrefs.theme_mode==0,"system theme is a persistent explicit selection");
+    s.settings.SetScroll(layout().density_card.top-layout().content.top,
+        s.renderer.SettingsMaxScroll(BuildVm(s,false),window.right,window.bottom));
     click(layout().density_row[0]);check(s.appPrefs.row_height==28,"mouse click changes density through existing controller");
+    s.settings.SetScroll(0,0);
     auto vm=BuildVm(s,false);
     const auto collapsed_max=s.renderer.SettingsMaxScroll(vm,window.right,window.bottom);
     H toggle;toggle.region=H::SettingsDisclosure;toggle.index=0;HandleSettingsControl(s,toggle);

@@ -111,10 +111,13 @@ uint32_t BloomDotRgb(int dot_index) noexcept {
 }
 
 D2D1_COLOR_F BloomDotColor(int dot_index) noexcept {
-    const BloomDotGeom g = BloomDotAt(dot_index);
-    if (g.ring == 0) return D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
-    if (g.ring == 1) return BloomHsl(g.hue, 0.60f, 0.85f);
-    return BloomHsl(g.hue, 0.90f, 0.60f);
+    // Muted, legible accents; the center still follows the Windows accent.
+    static constexpr uint32_t colors[kBloomDotCount] = {
+        0xFFFFFF, 0x5867C8, 0x527D70, 0x8861AA, 0x387F8C, 0xAF7E39, 0xAE6177,
+        0x4263A5, 0x6474C7, 0x8065AE, 0xA46594, 0xB56570, 0xB67653,
+        0x9B833F, 0x738750, 0x4D8B73, 0x3D8C91, 0x477FA8, 0x69788F
+    };
+    return HexColor(colors[std::clamp(dot_index, 0, kBloomDotCount-1)]);
 }
 
 bool BloomStepSpring(float& value, float& velocity, float target,

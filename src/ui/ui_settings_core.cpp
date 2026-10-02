@@ -15,7 +15,7 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
     };
     auto draw_card=[&](D2D1_RECT_F r) {
         if(r.bottom<=r.top) return;
-        MakeBrush(dc,theme.fill_input,brFillInput_); MakeBrush(dc,theme.stroke_card,brStrokeCard_);
+        MakeBrush(dc,WithAlpha(theme.surface_card,card_alpha_),brFillInput_); MakeBrush(dc,theme.stroke_card,brStrokeCard_);
         dc->FillRoundedRectangle(D2D1::RoundedRect(r,8*scale_,8*scale_),brFillInput_.get());
         dc->DrawRoundedRectangle(D2D1::RoundedRect(r,8*scale_,8*scale_),brStrokeCard_.get(),1);
     };
@@ -77,6 +77,43 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
             painter_.DrawSegmentedItem(item);
         }
     };
+    // Continuous slider in the segment cells: accent fill, Fluent thumb, preset
+    // ticks labelled with the former level names, value at the right.
+    auto slider=[&](D2D1_RECT_F card,D2D1_RECT_F const* cells,int value,int max_value,const int* ticks,const I* tick_labels,
+                    H::Region hit,I title,I desc,const wchar_t* unit) {
+        const bool stacked=cells[0].left<card.left+100*scale_;
+        label(card,l10n::Get(title),l10n::Get(desc),L"\xE8A4",stacked ? card.right-16*scale_ : cells[0].left-12*scale_);
+        const auto g=SettingsSlider(cells,scale_);
+        const bool hot=vm.hover_region==static_cast<int>(hit);
+        const float span=(std::max)(1.0f,g.right-g.left);
+        const auto x_of=[&](int v){return g.left+span*std::clamp(static_cast<float>(v)/static_cast<float>(max_value),0.0f,1.0f);};
+        const float x=x_of(value);
+        const float th=4*scale_;
+        MakeBrush(dc,WithAlpha(theme.text,0.16f),brFillHover_);
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(g.left,g.cy-th/2,g.right,g.cy+th/2),th/2,th/2),brFillHover_.get());
+        MakeBrush(dc,theme.accent,brAccent_);
+        if(x>g.left) dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(g.left,g.cy-th/2,x,g.cy+th/2),th/2,th/2),brAccent_.get());
+        for(int i=0;i<3;++i) {
+            if(ticks[i]<0) continue;
+            const float tx=x_of(ticks[i]);
+            MakeBrush(dc,WithAlpha(theme.text_secondary,value==ticks[i] ? 0.9f : 0.55f),brTextSecondary_);
+            if(ticks[i]>0) dc->FillRectangle(D2D1::RectF(tx-0.5f*scale_,g.cy+5*scale_,tx+0.5f*scale_,g.cy+8*scale_),brTextSecondary_.get());
+            const auto lr=ticks[i]==0 ? D2D1::RectF(g.left-9*scale_,g.cy+8*scale_,g.left+60*scale_,g.cy+22*scale_)
+                                      : D2D1::RectF(tx-34*scale_,g.cy+8*scale_,tx+34*scale_,g.cy+22*scale_);
+            painter_.DrawText(l10n::Get(tick_labels[i]),lr,compositor_->SmallFormat(),
+                value==ticks[i] ? theme.text : theme.text_secondary,
+                ticks[i]==0 ? fluent::HorizontalAlignment::Left : fluent::HorizontalAlignment::Center);
+        }
+        MakeBrush(dc,WithAlpha(theme.surface_card,1.0f),brFillInput_);
+        MakeBrush(dc,theme.stroke_card,brStrokeCard_);
+        const float outer=9*scale_;
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x,g.cy),outer,outer),brFillInput_.get());
+        dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,g.cy),outer,outer),brStrokeCard_.get(),1);
+        const float inner=(hot ? 6.0f : 5.0f)*scale_;
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x,g.cy),inner,inner),brAccent_.get());
+        painter_.DrawText(std::to_wstring(value)+unit,D2D1::RectF(g.right+10*scale_,g.cy-10*scale_,cells[2].right,g.cy+10*scale_),
+            compositor_->TextFormat(),theme.text,fluent::HorizontalAlignment::Right);
+    };
     if(vm.settings_page==0) {
         section(0,I::SettingsAppearance);section(1,I::SettingsStartupShutdown);section(2,I::SettingsFileList);
         for(const auto& group:lay.group) draw_card(group);
@@ -88,12 +125,12 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
         for(int i=0;i<3;++i) {
             const auto r=lay.theme_tile[i];auto preview=r;preview.bottom-=22*scale_;
             const bool selected=vm.settings_theme==theme_values[i];
-            MakeBrush(dc,i==0 ? D2D1::ColorF(0xe7ecf2) : D2D1::ColorF(0x20262e),brFillHover_);
+            MakeBrush(dc,i==0 ? HexColor(0xF1F3EE) : HexColor(0x1A1A1A),brFillHover_);
             dc->FillRoundedRectangle(D2D1::RoundedRect(preview,5*scale_,5*scale_),brFillHover_.get());
-            MakeBrush(dc,i==0 ? D2D1::ColorF(0xffffff) : D2D1::ColorF(0x39424d),brFillHover_);
+            MakeBrush(dc,i==0 ? HexColor(0xFFFFFF) : HexColor(0x333333),brFillHover_);
             FillRoundedRect(dc,brFillHover_.get(),preview.left+7*scale_,preview.top+8*scale_,preview.right-preview.left-14*scale_,8*scale_,2*scale_);
             FillRoundedRect(dc,brFillHover_.get(),preview.left+7*scale_,preview.top+21*scale_,14*scale_,preview.bottom-preview.top-28*scale_,2*scale_);
-            if(i==2) {MakeBrush(dc,D2D1::ColorF(0xe7ecf2),brFillHover_); FillRect(dc,brFillHover_.get(),preview.left+7*scale_,preview.top+8*scale_,(preview.right-preview.left)/2-7*scale_,preview.bottom-preview.top-15*scale_);}
+            if(i==2) {MakeBrush(dc,HexColor(0xF1F3EE),brFillHover_); FillRect(dc,brFillHover_.get(),preview.left+7*scale_,preview.top+8*scale_,(preview.right-preview.left)/2-7*scale_,preview.bottom-preview.top-15*scale_);}
             MakeBrush(dc,selected ? theme.accent : IsHovered(vm,H::SettingsTheme,theme_values[i]) ? theme.text_secondary : theme.stroke_card,brStrokeCard_);
             dc->DrawRoundedRectangle(D2D1::RoundedRect(preview,5*scale_,5*scale_),brStrokeCard_.get(),selected ? 2*scale_ : 1);
             if(selected) DrawIconText(preview.right-23*scale_,preview.top+3*scale_,20*scale_,20*scale_,L"\xE73E",L"",theme.accent,0.7f);
@@ -112,7 +149,51 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
             control.state.hovered=IsHovered(vm,H::SettingsDropdown,id);
             painter_.DrawButton(control);
         };
-        dropdown(lay.effect_card,lay.effect_choice,I::SettingsWindowEffect,compat::ModernWindows() ? I::SettingsWindowEffectDesc : I::EffectUnavailable,l10n::Get(effects[static_cast<int>(compat::ModernWindows() ? vm.window_effect : WindowEffect::None)]),0);
+        label(lay.effect_card,l10n::Get(I::SettingsWindowEffect),l10n::Get(compat::ModernWindows() ? I::SettingsWindowEffectDesc : I::EffectUnavailable),L"\xE790",lay.effect_card.right-16*scale_);
+        for(int i=0;i<kWindowEffectCount;++i) {
+            const auto r=lay.effect_row[i];
+            auto preview=r;preview.bottom-=22*scale_;
+            const bool enabled=i==0 || compat::ModernWindows();
+            const bool selected=i==static_cast<int>(compat::ModernWindows() ? vm.window_effect : WindowEffect::None);
+            const bool hovered=enabled && IsHovered(vm,H::SettingsEffect,i);
+            const float tint[]={0.0f,0.22f,0.065f,0.16f};
+            auto background=BlendOver(WithAlpha(theme.accent,tint[i]),theme.surface_title);
+            if(!enabled) background=BlendOver(WithAlpha(theme.surface_sheet,0.6f),background);
+            MakeBrush(dc,background,brFillHover_);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(preview,6*scale_,6*scale_),brFillHover_.get());
+            // A small window silhouette explains the material, not a fake DWM surface.
+            dc->PushAxisAlignedClip(preview,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            if(i==1 || i==3) {
+                MakeBrush(dc,WithAlpha(theme.accent,vm.dark ? 0.18f : 0.13f),brFillHover_);
+                dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(preview.right-18*scale_,preview.top+11*scale_),
+                    36*scale_,26*scale_),brFillHover_.get());
+            }
+            const float inset=10*scale_;
+            auto window=D2D1::RectF(preview.left+inset,preview.top+9*scale_,preview.right-inset,preview.bottom-9*scale_);
+            const float plate_alpha=i==1 ? 0.48f : i==3 ? 0.72f : 0.96f;
+            MakeBrush(dc,WithAlpha(theme.surface_card,plate_alpha),brFillInput_);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(window,3*scale_,3*scale_),brFillInput_.get());
+            MakeBrush(dc,WithAlpha(theme.text_secondary,0.30f),brTextSecondary_);
+            FillRoundedRect(dc,brTextSecondary_.get(),window.left+6*scale_,window.top+6*scale_,
+                (std::min)(18*scale_,(window.right-window.left)*0.18f),2*scale_,scale_);
+            MakeBrush(dc,WithAlpha(theme.accent,0.10f),brFillHover_);
+            FillRoundedRect(dc,brFillHover_.get(),window.right-22*scale_,window.top+5*scale_,
+                16*scale_,window.bottom-window.top-10*scale_,2*scale_);
+            dc->PopAxisAlignedClip();
+            MakeBrush(dc,selected ? theme.accent : hovered ? theme.text_secondary : theme.stroke_card,brStrokeCard_);
+            dc->DrawRoundedRectangle(D2D1::RoundedRect(preview,6*scale_,6*scale_),brStrokeCard_.get(),
+                selected ? 1.5f*scale_ : scale_);
+            if(selected) {
+                const auto center=D2D1::Point2F(preview.right-9*scale_,preview.bottom-9*scale_);
+                MakeBrush(dc,theme.accent,brAccent_);
+                dc->FillEllipse(D2D1::Ellipse(center,7*scale_,7*scale_),brAccent_.get());
+                DrawIconText(center.x-6*scale_,center.y-6*scale_,12*scale_,12*scale_,
+                    L"\xE73E",L"",theme.accent_text,0.6f);
+            }
+            painter_.DrawText(l10n::Get(effects[i]),D2D1::RectF(r.left,preview.bottom+3*scale_,r.right,r.bottom),
+                compositor_->SmallFormat(),!enabled ? theme.text_disabled : selected ? theme.accent : theme.text_secondary,
+                fluent::HorizontalAlignment::Center);
+        }
         divider(lay.effect_card);
         dropdown(lay.language_card,lay.language_choice,I::SettingsLanguage,I::SettingsLanguageDesc,l10n::Get(languages[vm.settings_language]),1);
         toggle(lay.startup_row[0],I::SettingsLaunch,I::SettingsLaunchDesc,L"\xE7E8",vm.settings_launch_on_startup,1);divider(lay.startup_row[0]);
@@ -122,7 +203,7 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
         toggle(lay.performance_row,I::SettingsShowPerformance,I::SettingsShowPerformanceDesc,L"\xE946",vm.settings_show_performance,4);
         // The general page is laid out as three visible cards now, so nothing hides behind a
         // disclosure here any more; main's three list-row switches are drawn with the other
-        // list rows further down.
+        // list rows further down (upstream's newer rows continue at ids 24-27).
         {
         const auto& preview = lay.wallpaper_preview;
         MakeBrush(dc, theme.fill_hover, brFillHover_);
@@ -164,6 +245,10 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
                               fluent::ButtonKind::Standard, clear });
 
 
+            const I looks[]={I::WallpaperLookSubtle,I::WallpaperLookBalanced,I::WallpaperLookVivid};const int look_ticks[]={25,50,75};
+            draw_card(lay.wallpaper_look_card);slider(lay.wallpaper_look_card,lay.wallpaper_look_row,vm.wallpaper_look,kPanelTransparencyMax,look_ticks,looks,H::SettingsWallpaperLook,I::SettingsWallpaperLook,I::SettingsWallpaperLookDesc,L"%");
+            const I blurs[]={I::WallpaperBlurOff,I::WallpaperBlurLight,I::WallpaperBlurStrong};const int blur_ticks[]={0,14,28};
+            draw_card(lay.wallpaper_blur_card);slider(lay.wallpaper_blur_card,lay.wallpaper_blur_row,vm.wallpaper_blur,kWallpaperBlurMax,blur_ticks,blurs,H::SettingsWallpaperBlur,I::SettingsWallpaperBlur,I::SettingsWallpaperBlurDesc,L" px");
             const I sizes[]={I::SettingsTraySmall,I::SettingsTrayStandard,I::SettingsTrayLarge};const int icons[]={40,48,56};
             segmented(lay.tray_icon_card,lay.tray_icon_row,sizes,icons,vm.settings_tray_icon,H::SettingsTrayIcon,I::SettingsTrayIcon,I::SettingsTrayIconDesc);
             toggle(lay.title_brand_row,I::SettingsTitleBrand,I::SettingsTitleBrandDesc,L"\xE8A9",vm.settings_show_title_brand,19);
@@ -173,10 +258,16 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
             toggle(lay.protected_files_row,I::SettingsShowProtected,I::SettingsShowProtectedDesc,L"\xE72E",vm.settings_show_protected_os_files,16);
             toggle(lay.pinned_names_row,I::PinnedNames,I::PinnedNamesDesc,L"\xE718",vm.show_pinned_tab_names,6);
             // List row rendering switches from main's 1.0.39 details rework. Ids 21-23 keep them
-            // clear of the ids the dev-side rows above already own.
+            // clear of the ids the dev-side rows above already own; upstream's later additions
+            // (tag-name colouring, Win+E, the shell tag menu, vertical tabs) continue at 24-27,
+            // and ui_hit_test.cpp / settings_controller.cpp carry the same table.
             toggle(lay.list_style_row[0],I::ListSmartDate,I::ListSmartDateDesc,L"\xE787",vm.settings_list_smart_date,21);
             toggle(lay.list_style_row[1],I::ListZebraRows,I::ListZebraRowsDesc,L"\xE8FD",vm.settings_list_zebra_rows,22);
             toggle(lay.list_style_row[2],I::ListSizeBar,I::ListSizeBarDesc,L"\xE9D2",vm.settings_list_size_bar,23);
+            toggle(lay.list_style_row[3],I::ListTagNameColor,I::ListTagNameColorDesc,L"\xE8EC",vm.settings_list_tag_names,24);
+            toggle(lay.win_e_row,I::SettingsWinE,I::SettingsWinEDesc,L"\xE765",vm.settings_win_e,25);
+            toggle(lay.shell_tags_row,I::SettingsShellTags,I::SettingsShellTagsDesc,L"\xE721",vm.settings_shell_tags,26);
+            toggle(lay.vertical_tabs_row,I::SettingsVerticalTabs,I::SettingsVerticalTabsDesc,L"\xE7C4",vm.settings_vertical_tabs,27);
             toggle(lay.blank_click_row,I::SettingsBlankClickBack,I::SettingsBlankClickBackDesc,L"\xE72B",vm.settings_blank_click_go_back,7);
             toggle(lay.change_tracking_row,I::SettingsChangeTracking,I::SettingsChangeTrackingDesc,L"\xE823",vm.settings_change_tracking,8);
             const I days[]={I::ChangeToday,I::ChangeLast3Days,I::ChangeLast7Days};const int day_values[]={1,3,7};

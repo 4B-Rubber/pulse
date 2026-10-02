@@ -2,6 +2,7 @@
 
 #include "ui_compositor.h"
 #include "thumbnail_cache.h"
+#include "archive_preview.h"
 #include "preview_handler_host.h"
 #include "window_material.h"
 #include "fluent_menu.h"
@@ -46,7 +47,10 @@ public:
 
     bool Initialize(HWND owner, UINT navigate_message, UINT open_message,
                     UINT command_message = 0);
-    void Show(const QuickPreviewItem& item, bool dark, WindowEffect effect, bool safe_mode);
+    // zoom_from: screen point of the previewed item's icon; the window grows
+    // out of it and shrinks back into it on Close (ui_motion.h rules).
+    void Show(const QuickPreviewItem& item, bool dark, WindowEffect effect, bool safe_mode,
+              const POINT* zoom_from = nullptr);
     void Update(const QuickPreviewItem& item);
     // A theme switched while the panel is open: the host passes its own answer down, so the
     // panel follows instead of keeping the colours it was opened with.
@@ -60,7 +64,7 @@ public:
 
 private:
     friend struct QuickPreviewPlaybackProbe;
-    enum class NativeKind { None, Bitmap, Text, Hex };
+    enum class NativeKind { None, Bitmap, Text, Hex, Archive };
     enum class ChromeButton { None, Prev, Next, More };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
@@ -109,6 +113,7 @@ private:
     void DrawHud(ID2D1DeviceContext* dc, const D2D1_RECT_F& content,
                  ID2D1SolidColorBrush* text_brush);
     void DrawFindBar(ID2D1DeviceContext* dc, const D2D1_RECT_F& bar);
+    Theme CurrentTheme() const;
     void EnsureTextLayout(const std::wstring& text, bool hex, float width);
     bool HitTestText(float x, float y, uint32_t& index);
     void CopyTextSelection(bool require_selection) const;
@@ -161,6 +166,12 @@ private:
     WindowEffect effect_ = WindowEffect::MicaAlt;
     bool safe_mode_ = false;
     bool handler_immediate_ = false;
+    // Open/close zoom (Compositor::PlayZoom).
+    bool zoom_enabled_ = false;
+    bool zoom_pending_ = false;
+    bool closing_ = false;
+    POINT zoom_origin_{};
+    void FinishClose(bool restore_focus);
     float scale_ = 1.0f;
     float text_scroll_ = 0.0f;
     float pan_x_ = 0.0f;
@@ -173,6 +184,7 @@ private:
     uint32_t source_w_ = 0;
     uint32_t source_h_ = 0;
     NativeKind native_kind_ = NativeKind::None;
+    ArchivePreview archive_;
     bool panning_ = false;
     POINT pan_anchor_{};
     float pan_start_x_ = 0.0f;

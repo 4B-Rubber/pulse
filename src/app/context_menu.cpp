@@ -205,12 +205,7 @@ std::vector<ui::FluentMenuItem> BuildBreadcrumbMenu(bool filesystem) {
     return items;
 }
 
-void AppendBackgroundViewCommands(std::vector<ui::FluentMenuItem>& items,
-                                  const BackgroundViewOptions& options) {
-    auto view = Item(CmdNone, l10n::Get(l10n::StringId::View).c_str(), L"\xE8A9");
-    view.children = BuildViewMenu(options.view_mode, options.details_panel,
-                                  options.show_hidden, options.show_protected,
-                                  options.column_layout);
+std::vector<ui::FluentMenuItem> BuildSortMenu(const BackgroundViewOptions& options) {
     auto sort = Item(CmdNone, l10n::Get(l10n::StringId::SortBy).c_str(), L"\xE8CB",
                      nullptr, options.can_sort);
     struct SortRow { int command; ui::SortColumn column; l10n::StringId label; };
@@ -241,6 +236,34 @@ void AppendBackgroundViewCommands(std::vector<ui::FluentMenuItem>& items,
             (options.sort_direction == ui::SortDirection::Asc) == ascending;
         sort.children.push_back(std::move(child));
     }
+    sort.children.back().separator_after = true;
+    struct FolderSortRow { int command; int value; l10n::StringId label; };
+    constexpr FolderSortRow folder_rows[] = {
+        { CmdFolderSortTop, 0, l10n::StringId::FolderSortTop },
+        { CmdFolderSortFollow, 1, l10n::StringId::FolderSortFollow },
+        { CmdFolderSortMixed, 2, l10n::StringId::FolderSortMixed },
+    };
+    for (const auto& row : folder_rows) {
+        auto child = Item(row.command, l10n::Get(row.label).c_str(), L"", nullptr, options.can_sort);
+        child.radio_group = true;
+        child.radio = options.can_sort && options.folder_sort == row.value;
+        sort.children.push_back(std::move(child));
+    }
+    return std::move(sort.children);
+}
+
+ui::FluentMenuItem BuildShortcutHints() {
+    return Item(CmdShortcutHelp, l10n::Get(l10n::StringId::ShortcutHints).c_str(), L"\xE946");
+}
+
+void AppendBackgroundViewCommands(std::vector<ui::FluentMenuItem>& items,
+                                  const BackgroundViewOptions& options) {
+    auto view = Item(CmdNone, l10n::Get(l10n::StringId::View).c_str(), L"\xE8A9");
+    view.children = BuildViewMenu(options.view_mode, options.details_panel,
+                                  options.show_hidden, options.show_protected,
+                                  options.column_layout);
+    auto sort = Item(CmdNone, l10n::Get(l10n::StringId::SortBy).c_str(), L"\xE8CB", nullptr, options.can_sort);
+    sort.children = BuildSortMenu(options);
     auto refresh = Item(CmdRefresh, l10n::Get(l10n::StringId::Refresh).c_str(), L"\xE72C", L"F5");
     refresh.separator_after = true;
     items.insert(items.begin(), { std::move(view), std::move(sort), std::move(refresh) });
@@ -331,10 +354,6 @@ std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode, bool de
     protected_files.checked = show_protected;
     items.push_back(std::move(protected_files));
     return items;
-}
-
-ui::FluentMenuItem BuildShortcutHints() {
-    return Item(CmdShortcutHelp, l10n::Get(l10n::StringId::ShortcutHints).c_str(), L"\xE946");
 }
 
 static std::wstring DisplayPath(const std::wstring& path) {

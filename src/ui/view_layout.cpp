@@ -41,6 +41,12 @@ ViewMode ViewModeFromIndex(int index) noexcept {
 
 bool ShowsColumnHeader(ViewMode mode) noexcept { return mode == ViewMode::Details; }
 
+bool ShowsFolderSize(ViewMode mode) noexcept {
+    return mode == ViewMode::Details || mode == ViewMode::Tiles || mode == ViewMode::Content ||
+        mode == ViewMode::MediumIcons || mode == ViewMode::LargeIcons ||
+        mode == ViewMode::ExtraLargeIcons;
+}
+
 bool UsesThumbnails(ViewMode mode) noexcept {
     return mode == ViewMode::ExtraLargeIcons || mode == ViewMode::LargeIcons ||
            mode == ViewMode::MediumIcons || mode == ViewMode::Tiles ||
@@ -78,9 +84,9 @@ ViewLayout::ViewLayout(ViewMode mode, D2D1_RECT_F viewport, size_t item_count,
         content_height_ = static_cast<float>(rows) * metrics_.cell_height;
     };
     switch (mode_) {
-    case ViewMode::ExtraLargeIcons: grid(280.0f, 304.0f, 240.0f, true); break;
-    case ViewMode::LargeIcons: grid(116.0f, 140.0f, 96.0f); break;
-    case ViewMode::MediumIcons: grid(112.0f, 92.0f, 48.0f); break;
+    case ViewMode::ExtraLargeIcons: grid(280.0f, 240.0f + 64.0f * scale_, 240.0f, true); break;
+    case ViewMode::LargeIcons: grid(116.0f, 160.0f, 96.0f); break;
+    case ViewMode::MediumIcons: grid(112.0f, 112.0f, 48.0f); break;
     case ViewMode::SmallIcons: grid(144.0f, 28.0f, 16.0f); break;
     case ViewMode::Tiles: grid(280.0f, 72.0f, 48.0f); break;
     case ViewMode::List: {
@@ -161,7 +167,7 @@ D2D1_RECT_F ViewLayout::NameRect(int index) const noexcept {
         const D2D1_RECT_F icon_rect = IconRect(index);
         const float top = std::min(cell.bottom - 4.0f * scale_,
                                    icon_rect.bottom + 4.0f * scale_);
-        return {cell.left + pad, top, cell.right - pad, cell.bottom - 4.0f * scale_};
+        return {cell.left + pad, top, cell.right - pad, top + 24.0f * scale_};
     }
     if (mode_ == ViewMode::Tiles || mode_ == ViewMode::Content) {
         const float left = cell.left + pad + icon + 10.0f * scale_;
@@ -171,6 +177,13 @@ D2D1_RECT_F ViewLayout::NameRect(int index) const noexcept {
     const float left = cell.left + pad + icon + 8.0f * scale_;
     return {left, cell.top + 1.0f * scale_, cell.right - pad,
             cell.bottom - 1.0f * scale_};
+}
+
+D2D1_RECT_F ViewLayout::FolderSizeRect(int index) const noexcept {
+    if (!ShowsFolderSize(mode_)) return {};
+    const auto name = NameRect(index);
+    const float top = name.top + 25.0f * scale_;
+    return {name.left, top, name.right, top + 22.0f * scale_};
 }
 
 int ViewLayout::HitTest(float x, float y) const noexcept {

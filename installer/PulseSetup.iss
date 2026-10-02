@@ -128,6 +128,12 @@ var
   UpgradeStartupPresent: Boolean;
   UpgradeStartupCommand, UpgradePreviousExe: String;
   UpgradeFolderCommands: array[0..1] of String;
+  UpgradeWinECommand, UpgradeWinEBackup: String;
+
+const
+  { Win+E / taskbar File Explorer launch verb (AppPrefs::ApplyWinE). }
+  WinEClsidKey = 'Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}';
+  WinEVerbKey = 'Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow';
 
 function FolderClass(Index: Integer): String;
 begin
@@ -153,6 +159,17 @@ begin
       RegQueryStringValue(HKCU, 'Software\Classes\' + FolderClass(I) +
         '\shell', '', DefaultVerb) and (CompareText(DefaultVerb, 'open') = 0) then
       UpgradeFolderCommands[I] := Command;
+  end;
+  { The old uninstaller may remove the Win+E override; its registry value is
+    the only record of that setting, so carry it across the upgrade. }
+  Command := '';
+  if RegQueryStringValue(HKCU, WinEVerbKey + '\command', '', Command) and
+    (Pos(Lowercase(PreviousExe), Lowercase(Command)) > 0) then
+  begin
+    UpgradeWinECommand := Command;
+    if not RegQueryStringValue(HKCU, WinEVerbKey + '\command', 'PulseBackup',
+      UpgradeWinEBackup) then
+      UpgradeWinEBackup := '';
   end;
   UpgradePrefsCaptured := True;
 end;
@@ -192,6 +209,14 @@ begin
       RegWriteStringValue(HKCU, Key + '\open', 'DelegateExecute', '');
       RegWriteStringValue(HKCU, Key, '', 'open');
     end;
+  if UpgradeWinECommand <> '' then
+  begin
+    RegWriteStringValue(HKCU, WinEVerbKey + '\command', '',
+      UpgradeCommand(UpgradeWinECommand));
+    RegWriteStringValue(HKCU, WinEVerbKey + '\command', 'DelegateExecute', '');
+    if UpgradeWinEBackup <> '' then
+      RegWriteStringValue(HKCU, WinEVerbKey + '\command', 'PulseBackup', UpgradeWinEBackup);
+  end;
 end;
 
 function IsChinese: Boolean;
@@ -454,6 +479,37 @@ begin
   end;
 end;
 
+{ Win+E: restore the user's earlier custom command, or drop our override so
+  Explorer falls back to its default. Never leave Win+E pointing at a removed
+  pulse.exe. }
+procedure DeleteWinEOverride;
+var
+  Cmd, Backup: String;
+begin
+  if not RegQueryStringValue(HKCU, WinEVerbKey + '\command', '', Cmd) then Exit;
+  if Pos(Lowercase(ExpandConstant('{app}\pulse.exe')), Lowercase(Cmd)) = 0 then Exit;
+  if RegQueryStringValue(HKCU, WinEVerbKey + '\command', 'PulseBackup', Backup) and
+    (Backup <> '') then
+  begin
+    RegWriteStringValue(HKCU, WinEVerbKey + '\command', '', Backup);
+    RegDeleteValue(HKCU, WinEVerbKey + '\command', 'PulseBackup');
+  end else
+  begin
+    RegDeleteKeyIncludingSubkeys(HKCU, WinEVerbKey);
+    RegDeleteKeyIfEmpty(HKCU, WinEClsidKey + '\shell');
+    RegDeleteKeyIfEmpty(HKCU, WinEClsidKey);
+  end;
+end;
+
+{ File Explorer "Pulse tags" submenu (shell_tag_menu.cpp) and its dot icons.
+  Pulse reinstalls it on the next launch after an upgrade (app.json pref). }
+procedure DeleteShellTagMenu;
+begin
+  RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\*\shell\PulseTags');
+  RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\Directory\shell\PulseTags');
+  DelTree(ExpandConstant('{localappdata}\Pulse\tagicons'), True, True, True);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
@@ -466,6 +522,9 @@ begin
     { The Folder class carries the explore verb too. }
     DeleteFolderOpenVerb('Folder', 'open');
     DeleteFolderOpenVerb('Folder', 'explore');
+    { Upstream's newer shell integrations have to be undone here as well. }
+    DeleteWinEOverride;
+    DeleteShellTagMenu;
     if CleanupUserData then
       CleanupPulseData;
   end;

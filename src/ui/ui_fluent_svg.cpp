@@ -1,5 +1,6 @@
-// ui_fluent_svg.cpp — Toolbar Fluent Color SVG load / draw (Direct2D SVG subset).
+// Unified command geometry, with the existing SVG loader retained for artwork.
 #include "ui_renderer.h"
+#include "command_icons.h"
 #include "../common/windows_compat.h"
 #include "../app/resource.h"
 #include <d2d1svg.h>
@@ -13,6 +14,33 @@
 
 namespace pulse::ui {
 namespace {
+
+command_icons::Icon CommandIconForResource(int resource_id) noexcept {
+    using I = command_icons::Icon;
+    switch (resource_id) {
+    case IDR_FLUENT_CUT_SVG: return I::Cut;
+    case IDR_FLUENT_COPY_SVG: return I::Copy;
+    case IDR_FLUENT_PASTE_SVG: return I::Paste;
+    case IDR_FLUENT_RENAME_SVG: return I::Rename;
+    case IDR_FLUENT_DELETE_SVG: return I::Delete;
+    case IDR_FLUENT_STAR_SVG: return I::Star;
+    case IDR_FLUENT_HISTORY_SVG: return I::History;
+    case IDR_FLUENT_DESKTOP_SVG: return I::Desktop;
+    case IDR_FLUENT_DOWNLOADS_SVG: return I::Download;
+    case IDR_FLUENT_RECYCLE_SVG: return I::Recycle;
+    case IDR_FLUENT_DRIVE_SVG: return I::Drive;
+    case IDR_FLUENT_FOLDER_SVG: return I::Folder;
+    case IDR_FLUENT_NETWORK_SVG: return I::Network;
+    case IDR_FLUENT_SEARCH_SVG: case IDR_FLUENT_OMNIBAR_SEARCH_SVG: return I::Search;
+    case IDR_FLUENT_APPS_SVG: return I::Grid;
+    case IDR_FLUENT_PANEL_SVG: return I::Panel;
+    case IDR_FLUENT_PANEL_CLOSE_SVG: return I::PanelClose;
+    case IDR_FLUENT_ADD_SVG: return I::Add;
+    case IDR_FLUENT_PC_SVG: return I::Computer;
+    case IDR_FLUENT_TAG_SVG: return I::Tag;
+    default: return I::None;
+    }
+}
 
 std::string_view QuotedAttr(std::string_view tag, std::string_view name) {
     const std::string needle = std::string(name) + "=";
@@ -147,7 +175,9 @@ bool CreateSvgFromBytes(ID2D1DeviceContext5* dc, const void* bytes, DWORD byte_c
 
 } // namespace
 
-bool MainRenderer::EnsureFluentSvg(int resource_id) {
+bool MainRenderer::EnsureFluentSvg(int resource_id, bool colorful) {
+    if (!colorful && CommandIconForResource(resource_id) != command_icons::Icon::None)
+        return compositor_ && compositor_->Dc();
     if (compat::LegacyMode()) return false;
     if (fluent_svg_failed_.count(resource_id)) return false;
     if (const auto it = fluent_svgs_.find(resource_id);
@@ -190,8 +220,21 @@ bool MainRenderer::EnsureFluentSvg(int resource_id) {
     return true;
 }
 
-bool MainRenderer::DrawFluentSvg(int resource_id, const D2D1_RECT_F& bounds, float opacity) {
-    if (!EnsureFluentSvg(resource_id)) return false;
+bool MainRenderer::DrawFluentSvg(int resource_id, const D2D1_RECT_F& bounds, float opacity,
+                                  const D2D1_COLOR_F* foreground, bool colorful) {
+    const auto command = CommandIconForResource(resource_id);
+    if (!colorful && command != command_icons::Icon::None) {
+        auto* dc = compositor_ ? compositor_->Dc() : nullptr;
+        if (!dc || !brTextSecondary_.get()) return false;
+        if (!paneHeaderStroke_.get()) command_icons::CreateStrokeStyle(dc, &paneHeaderStroke_);
+        const auto saved_color = brTextSecondary_->GetColor();
+        if (foreground) brTextSecondary_->SetColor(*foreground);
+        const bool drawn = command_icons::Draw(dc, brTextSecondary_.get(), paneHeaderStroke_.get(),
+                                                command, bounds, opacity);
+        brTextSecondary_->SetColor(saved_color);
+        return drawn;
+    }
+    if (!EnsureFluentSvg(resource_id, colorful)) return false;
     const auto it = fluent_svgs_.find(resource_id);
     if (it == fluent_svgs_.end() || !it->second.get() || !empty_state_svg_dc_.get()) return false;
 

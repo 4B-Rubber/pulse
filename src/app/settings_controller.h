@@ -29,6 +29,7 @@ enum class SettingsEffect : uint32_t {
     ChangeTracking = 1u << 8,
     GlobalSearch = 1u << 9,
     ListStyle = 1u << 10,
+    FolderSort = 1u << 11,
 };
 
 constexpr SettingsEffect operator|(SettingsEffect left, SettingsEffect right) noexcept {
@@ -132,7 +133,14 @@ public:
     void WindowEffect(std::wstring_view effect_id);
     void AccentChoice(bool system_choice, uint32_t rgb);
     void RowHeight(int index);
+    void FolderSort(int index);
     void TrayIconSize(int index);
+    // Settings sliders: 0 interface transparency (0..90), 1 wallpaper blur (0..40).
+    // Values apply live while dragging; EndSlider saves once.
+    void BeginSlider(int which) noexcept { slider_drag_ = which; }
+    int slider_drag() const noexcept { return slider_drag_; }
+    bool SliderValue(int which, int value);
+    void EndSlider();
     void Language(std::wstring_view language_id);
     void Wallpaper(int action);
     void ToggleUi(int index);
@@ -167,6 +175,7 @@ private:
     };
 
     bool global_search_capturing_ = false;
+    int slider_drag_ = -1;
     std::wstring global_search_error_;
     int page_ = 0;
     float scroll_ = 0.0f;

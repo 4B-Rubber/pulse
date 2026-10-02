@@ -81,7 +81,10 @@ private:
     HANDLE agent_process_ = nullptr;
     // Owns only the agent this client started; closing it ends that agent.
     HANDLE agent_job_ = nullptr;
-    ULONGLONG last_spawn_try_ = 0;
+    ULONGLONG last_spawn_tick_ = 0;  // guarded by request_mu_
+    static constexpr ULONGLONG kRespawnBackoffMs = 5000;
+    // Must match the mutex created by RunAgent() in network_agent_main.cpp.
+    static constexpr const wchar_t* kAgentSingletonName = L"Local\\Pulse.Index.NetworkAgent.Singleton";
 };
 
 } // namespace pulse::index

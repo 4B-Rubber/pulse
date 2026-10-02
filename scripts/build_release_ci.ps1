@@ -74,7 +74,7 @@ foreach ($mode in @('--startup-stop', '--shell-roundtrip')) {
 }
 $env:PULSE_SELFTEST_NO_SCREENSHOTS = '1'
 foreach ($mode in @('--parent-cycle-only', '--quiet-maintenance-only', '--name-pool-only',
-    '--maintenance-only', '--usn-only', '--feed-only')) {
+    '--maintenance-only', '--usn-only', '--feed-only', '--folder-sizes-only')) {
     & (Join-Path $build 'pulse_index_engine_test.exe') $mode
     if ($LASTEXITCODE -ne 0) { throw "Index regression $mode failed" }
 }
@@ -82,14 +82,17 @@ foreach ($mode in @('--parent-cycle-only', '--quiet-maintenance-only', '--name-p
 if ($LASTEXITCODE -ne 0) { throw 'Panel layout/preferences regression failed' }
 & (Join-Path $build 'pulse_change_feed_memory_test.exe') --probe
 if ($LASTEXITCODE -ne 0) { throw 'Opt-in memory probe regression failed' }
-foreach ($mode in @('--service-start-only', '--shutdown-only', '--live-dedup-only')) {
+foreach ($mode in @('--service-start-only', '--shutdown-only', '--live-dedup-only', '--folder-sizes-only')) {
     & (Join-Path $build 'pulse_index_host_stress.exe') $mode
     if ($LASTEXITCODE -ne 0) { throw "Index lifecycle check $mode failed" }
 }
 $selftestCases = @('rename-editor', 'rename-editor-native', 'operation-toast',
     'filter-controls', 'rename-outside', 'address-editor', 'address-editor-native', 'release-panels-hidden', 'pr-shell', 'pin-reorder', 'snapshot-patch', 'list-columns',
-    'filename-render', 'filename-render-native', 'column-resize-ui')
+    'filename-render', 'filename-render-native', 'folder-views', 'pane-header-icons', 'folder-sizes', 'tray-stack',
+    'column-resize-ui')
 $selftestLogs = @{
+    'folder-sizes' = 'bench_data/folder-sizes/results.log'
+    'pane-header-icons' = 'bench_data/pane-header-icons/results.log'
     'filename-render' = 'bench_data/filename-render/results.log'
     'filename-render-native' = 'bench_data/filename-render/results.log'
     'column-resize-ui' = 'bench_data/column-resize/results.log'

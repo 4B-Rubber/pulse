@@ -1,4 +1,5 @@
 #include "network_index.h"
+#include "network_crawl_schedule.h"
 #include "index_config.h"
 #include "index_query.h"
 #include "../common/utf8_file.h"
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <queue>
 #include <sstream>
+#include <unordered_map>
 #include <winnetwk.h>
 
 namespace pulse::index {
@@ -38,8 +40,14 @@ struct NetworkRecord {
 constexpr uint32_t kNetworkVersion = 1;
 constexpr uint16_t kRecordDirectory = 1;
 constexpr uint64_t kMaxConfigBytes = 4ull * 1024 * 1024;
-constexpr auto kReconcileInterval = std::chrono::minutes(5);
-constexpr auto kCrawlWakeInterval = std::chrono::milliseconds(250);
+// The crawl thread sleeps until the next crawl is due (network_crawl_schedule.h)
+// but wakes at least this often for the batched change-journal flush.
+constexpr auto kCrawlIdleWake = std::chrono::seconds(60);
+constexpr uint64_t kMaxShardAge100ns = 30ull * 24 * 3600 * 10000000;
+// Change overlay bounds. Past them the overlay stops growing and a (debounced)
+// crawl brings the shard up to date instead.
+constexpr size_t kOverlayLimit = 50000;
+constexpr size_t kSubtreeScanLimit = 20000;
 
 void SetError(std::wstring* error, const std::wstring& value) {
     if (error) *error = value;
@@ -241,6 +249,39 @@ uint64_t FileTimeValue(const FILETIME& value) {
     return (static_cast<uint64_t>(value.dwHighDateTime) << 32) | value.dwLowDateTime;
 }
 
+// Case-insensitive path keys for the change overlay. Lookups take a
+// wstring_view so the search thread does not allocate per record.
+wchar_t FoldPathChar(wchar_t c) {
+    if (c < 0x80) return c >= L'a' && c <= L'z' ? static_cast<wchar_t>(c - L'a' + L'A') : c;
+    return static_cast<wchar_t>(reinterpret_cast<uintptr_t>(
+        CharUpperW(reinterpret_cast<LPWSTR>(static_cast<uintptr_t>(c)))));
+}
+
+struct PathKeyHash {
+    using is_transparent = void;
+    size_t operator()(std::wstring_view value) const noexcept {
+        uint64_t hash = 1469598103934665603ull;
+        for (wchar_t c : value) {
+            hash ^= static_cast<uint16_t>(FoldPathChar(c));
+            hash *= 1099511628211ull;
+        }
+        return static_cast<size_t>(hash);
+    }
+};
+
+struct PathKeyEqual {
+    using is_transparent = void;
+    bool operator()(std::wstring_view a, std::wstring_view b) const noexcept {
+        return a.size() == b.size() &&
+               CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(),
+                                    static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
+    }
+};
+
+template <typename Value>
+using PathMap = std::unordered_map<std::wstring, Value, PathKeyHash, PathKeyEqual>;
+using PathSet = std::unordered_set<std::wstring, PathKeyHash, PathKeyEqual>;
+
 bool CopyHandle(HANDLE source, HANDLE destination) {
     LARGE_INTEGER zero{};
     if (!SetFilePointerEx(source, zero, nullptr, FILE_BEGIN)) return false;
@@ -423,6 +464,9 @@ struct NetworkIndex::Shard {
     size_t count = 0;
     int slot = -1;
     uint64_t modified = 0;
+    // Storage of in-memory shards (change overlay); empty for mapped files.
+    std::vector<NetworkRecord> owned_records;
+    std::vector<wchar_t> owned_pool;
 
     ~Shard() {
         if (view) UnmapViewOfFile(view);
@@ -463,6 +507,53 @@ struct NetworkIndex::Shard {
                 return {};
         }
         return shard;
+    }
+
+    static std::shared_ptr<Shard> FromMemory(std::vector<NetworkRecord> records,
+                                             std::vector<wchar_t> pool) {
+        auto shard = std::make_shared<Shard>();
+        shard->owned_records = std::move(records);
+        shard->owned_pool = std::move(pool);
+        shard->records = shard->owned_records.data();
+        shard->pool = shard->owned_pool.data();
+        shard->count = shard->owned_records.size();
+        return shard;
+    }
+};
+
+// Guarded by mu_. Entries and removals stamped before a successful crawl
+// started are dropped when its shard is published.
+struct NetworkIndex::Overlay {
+    struct Entry {
+        bool is_dir = false;
+        uint64_t size = 0;
+        uint64_t mtime = 0;
+        std::chrono::steady_clock::time_point seen{};
+    };
+    PathMap<Entry> entries;                                   // created or changed
+    PathMap<std::chrono::steady_clock::time_point> removed;   // deleted or renamed away
+    std::vector<std::wstring> pending_scans;
+    // Last change dropped because the overlay was full.
+    std::chrono::steady_clock::time_point last_skipped{};
+    std::shared_ptr<const OverlayView> view;
+
+    size_t Size() const { return entries.size() + removed.size(); }
+};
+
+struct NetworkIndex::OverlayView {
+    std::shared_ptr<Shard> added;   // live overlay entries as records
+    PathSet replaced;               // shard records superseded by an entry
+    PathSet removed;                // hides the shard record and its subtree
+
+    bool Hides(std::wstring_view path) const {
+        if (replaced.find(path) != replaced.end()) return true;
+        if (removed.empty()) return false;
+        if (removed.find(path) != removed.end()) return true;
+        for (size_t slash = path.rfind(L'\\'); slash != std::wstring_view::npos && slash > 2;
+             slash = path.rfind(L'\\', slash - 1)) {
+            if (removed.find(path.substr(0, slash)) != removed.end()) return true;
+        }
+        return false;
     }
 };
 
@@ -583,9 +674,12 @@ ChangeState NetworkIndex::ChangeCoverage(const std::wstring& path) const {
 
 void NetworkIndex::SetChangeLease(const std::wstring& owner, bool enabled) {
     const bool seed = changes_.Lease(owner, enabled);
-    std::lock_guard lock(change_seed_mutex_);
-    if (seed) change_seed_owners_.insert(owner);
-    if (!enabled) change_seed_owners_.erase(owner);
+    {
+        std::lock_guard lock(change_seed_mutex_);
+        if (seed) change_seed_owners_.insert(owner);
+        if (!enabled) change_seed_owners_.erase(owner);
+    }
+    if (seed) crawl_cv_.notify_one();
 }
 
 void NetworkIndex::SeedPendingChanges() {
@@ -618,29 +712,268 @@ void NetworkIndex::SeedChanges(const std::wstring& owner) {
 }
 
 void NetworkIndex::ObserveChanges(const std::wstring& root, const BYTE* data, DWORD bytes) {
+    struct Update {
+        std::wstring path;
+        bool removed = false;
+        bool scan = false;   // new directory: its children are not reported
+        Overlay::Entry entry;
+    };
+    std::vector<Update> updates;
+    bool gap = false;
     std::wstring old_path;
     size_t offset = 0;
     while (offset + offsetof(FILE_NOTIFY_INFORMATION, FileName) <= bytes) {
         const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(data + offset);
         if (info->FileNameLength % sizeof(wchar_t) ||
-            info->FileNameLength > bytes - offset - offsetof(FILE_NOTIFY_INFORMATION, FileName)) { changes_.Gap(); break; }
+            info->FileNameLength > bytes - offset - offsetof(FILE_NOTIFY_INFORMATION, FileName)) { gap = true; break; }
         ChangeRecord event;
         event.path = root + L"\\" + std::wstring(info->FileName, info->FileNameLength / sizeof(wchar_t));
-        if (info->Action == FILE_ACTION_RENAMED_OLD_NAME) old_path = event.path;
-        else {
-            const auto attributes = GetFileAttributesW(LongPath(event.path).c_str());
-            event.is_dir = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (info->Action == FILE_ACTION_RENAMED_OLD_NAME) {
+            old_path = event.path;
+            updates.push_back({event.path, true});
+        } else {
+            // A removed entry cannot be queried; skip the SMB round trip.
+            // Otherwise one query yields everything the overlay record needs.
+            WIN32_FILE_ATTRIBUTE_DATA attributes{};
+            const bool exists = info->Action != FILE_ACTION_REMOVED &&
+                GetFileAttributesExW(LongPath(event.path).c_str(), GetFileExInfoStandard, &attributes);
+            event.is_dir = exists && (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            Update update{event.path, !exists};
+            if (exists) {
+                update.entry.is_dir = event.is_dir;
+                update.entry.size = (static_cast<uint64_t>(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+                update.entry.mtime = FileTimeValue(attributes.ftLastWriteTime);
+                update.scan = event.is_dir && (info->Action == FILE_ACTION_ADDED ||
+                                               info->Action == FILE_ACTION_RENAMED_NEW_NAME);
+            }
+            updates.push_back(std::move(update));
             if (info->Action == FILE_ACTION_ADDED) event.kind = ChangeKind::Created;
             else if (info->Action == FILE_ACTION_REMOVED) event.kind = ChangeKind::Deleted;
             else if (info->Action == FILE_ACTION_RENAMED_NEW_NAME) { event.kind = ChangeKind::Renamed; event.old_path = std::move(old_path); }
             changes_.Record(std::move(event));
         }
         if (!info->NextEntryOffset) break;
-        if (info->NextEntryOffset > bytes - offset || info->NextEntryOffset < offsetof(FILE_NOTIFY_INFORMATION, FileName)) { changes_.Gap(); break; }
+        if (info->NextEntryOffset > bytes - offset || info->NextEntryOffset < offsetof(FILE_NOTIFY_INFORMATION, FileName)) { gap = true; break; }
         offset += info->NextEntryOffset;
     }
-    // The SMB watcher is rearmed after reconciliation; its gap is explicit.
-    changes_.Gap();
+    // WatchLoop re-arms the same handle after each read, so the redirector
+    // queues changes in between; lost events (overflow, failed reads) are
+    // reported as a gap by the caller.
+    if (gap) changes_.Gap();
+
+    bool scan_queued = false;
+    bool needs_crawl = gap;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& state : roots_) {
+            if (!EqualPath(state.info.path, root)) continue;
+            if (!state.overlay) state.overlay = std::make_shared<Overlay>();
+            Overlay& overlay = *state.overlay;
+            for (auto& update : updates) {
+                if (overlay.Size() >= kOverlayLimit) {
+                    overlay.last_skipped = now;
+                    needs_crawl = true;
+                    break;
+                }
+                if (update.removed) {
+                    if (const auto it = overlay.entries.find(update.path); it != overlay.entries.end())
+                        overlay.entries.erase(it);
+                    overlay.removed.insert_or_assign(update.path, now);
+                    continue;
+                }
+                update.entry.seen = now;
+                if (update.scan) {
+                    overlay.pending_scans.push_back(update.path);
+                    scan_queued = true;
+                }
+                overlay.entries.insert_or_assign(std::move(update.path), update.entry);
+            }
+            overlay.view.reset();
+            break;
+        }
+    }
+    if (scan_queued) crawl_cv_.notify_one();
+    if (needs_crawl) NoteRootChanged(root);
+}
+
+std::shared_ptr<const NetworkIndex::OverlayView> NetworkIndex::OverlayViewLocked(RootState& root) {
+    if (!root.overlay) return {};
+    Overlay& overlay = *root.overlay;
+    if (overlay.view || (overlay.entries.empty() && overlay.removed.empty())) return overlay.view;
+    auto view = std::make_shared<OverlayView>();
+    // An entry is gone if it, or a directory above it, was removed after the
+    // entry was last seen (deleted or renamed away together with its parent).
+    auto removed_since = [&](std::wstring_view path, std::chrono::steady_clock::time_point seen) {
+        for (size_t end = path.size(); end > 2 && end != std::wstring_view::npos;
+             end = path.rfind(L'\\', end - 1)) {
+            const auto it = overlay.removed.find(path.substr(0, end));
+            if (it != overlay.removed.end() && it->second > seen) return true;
+        }
+        return false;
+    };
+    std::vector<NetworkRecord> records;
+    std::vector<wchar_t> pool;
+    records.reserve(overlay.entries.size());
+    for (const auto& [path, entry] : overlay.entries) {
+        view->replaced.insert(path);
+        if (removed_since(path, entry.seen)) continue;
+        const size_t slash = path.rfind(L'\\');
+        const size_t name_length = slash == std::wstring::npos ? path.size() : path.size() - slash - 1;
+        if (path.size() > UINT32_MAX || name_length > UINT16_MAX ||
+            pool.size() > UINT32_MAX - path.size()) continue;
+        NetworkRecord record{};
+        record.path_off = static_cast<uint32_t>(pool.size());
+        record.path_len = static_cast<uint32_t>(path.size());
+        record.name_len = static_cast<uint16_t>(name_length);
+        record.name_off = record.path_len - record.name_len;
+        record.flags = entry.is_dir ? kRecordDirectory : 0;
+        record.size = entry.size;
+        record.mtime = entry.mtime;
+        pool.insert(pool.end(), path.begin(), path.end());
+        records.push_back(record);
+    }
+    for (const auto& item : overlay.removed) view->removed.insert(item.first);
+    view->added = Shard::FromMemory(std::move(records), std::move(pool));
+    overlay.view = view;
+    return overlay.view;
+}
+
+void NetworkIndex::ScanPendingSubtrees() {
+    struct Job {
+        std::wstring root;
+        std::wstring directory;
+    };
+    std::vector<Job> jobs;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto& root : roots_) {
+            if (!root.overlay) continue;
+            for (auto& directory : root.overlay->pending_scans)
+                jobs.push_back({root.info.path, std::move(directory)});
+            root.overlay->pending_scans.clear();
+        }
+    }
+    for (const auto& job : jobs) {
+        if (!running_) return;
+        const auto scan_start = std::chrono::steady_clock::now();
+        std::vector<std::pair<std::wstring, Overlay::Entry>> found;
+        bool truncated = false;
+        std::vector<std::wstring> stack{job.directory};
+        while (!stack.empty() && running_ && !truncated) {
+            const std::wstring directory = std::move(stack.back());
+            stack.pop_back();
+            const std::wstring pattern = LongPath(directory) + L"\\*";
+            WIN32_FIND_DATAW find{};
+            HANDLE handle = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &find,
+                                             FindExSearchNameMatch, nullptr,
+                                             FIND_FIRST_EX_LARGE_FETCH);
+            if (handle == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_PARAMETER) {
+                handle = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &find,
+                                          FindExSearchNameMatch, nullptr, 0);
+            }
+            if (handle == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (wcscmp(find.cFileName, L".") == 0 || wcscmp(find.cFileName, L"..") == 0)
+                    continue;
+                if (found.size() >= kSubtreeScanLimit) {
+                    truncated = true;
+                    break;
+                }
+                Overlay::Entry entry;
+                entry.is_dir = (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                entry.size = (static_cast<uint64_t>(find.nFileSizeHigh) << 32) | find.nFileSizeLow;
+                entry.mtime = FileTimeValue(find.ftLastWriteTime);
+                entry.seen = scan_start;
+                std::wstring full = directory + L"\\" + find.cFileName;
+                if (entry.is_dir && !(find.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                    stack.push_back(full);
+                found.emplace_back(std::move(full), entry);
+            } while (FindNextFileW(handle, &find));
+            FindClose(handle);
+        }
+        // A subtree too large for the overlay is left to a crawl.
+        bool needs_crawl = truncated;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            for (auto& root : roots_) {
+                if (!EqualPath(root.info.path, job.root)) continue;
+                if (!root.overlay) root.overlay = std::make_shared<Overlay>();
+                Overlay& overlay = *root.overlay;
+                for (auto& [path, entry] : found) {
+                    if (overlay.Size() >= kOverlayLimit) {
+                        overlay.last_skipped = scan_start;
+                        needs_crawl = true;
+                        break;
+                    }
+                    overlay.entries.insert_or_assign(std::move(path), entry);
+                }
+                overlay.view.reset();
+                break;
+            }
+        }
+        if (needs_crawl) NoteRootChanged(job.root);
+    }
+}
+
+void NetworkIndex::NoteRootChanged(const std::wstring& path) {
+    bool first = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& root : roots_) {
+            if (!EqualPath(root.info.path, path)) continue;
+            if (!root.change_pending) {
+                root.change_pending = true;
+                root.change_first = now;
+                first = true;
+            }
+            root.change_last = now;
+            break;
+        }
+    }
+    // Later changes only push the due time back; the crawl thread re-reads
+    // it when it wakes.
+    if (first) crawl_cv_.notify_one();
+}
+
+std::chrono::steady_clock::time_point NetworkIndex::CollectDueRootsLocked(
+        std::chrono::steady_clock::time_point now, std::vector<std::wstring>& due) {
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point unset{};
+    Clock::time_point next = Clock::time_point::max();
+    for (auto& root : roots_) {
+        if (root.info.building) continue;
+        Clock::time_point when = Clock::time_point::max();
+        if (dirty_roots_.count(root.info.path)) when = now;
+        if (root.startup_due != unset) when = (std::min)(when, root.startup_due);
+        if (root.change_pending) {
+            when = (std::min)(when, crawl_schedule::ChangeDue(root.change_first, root.change_last,
+                                                               root.last_crawl_end, root.last_crawl));
+        }
+        // Until the first crawl of this session the start-up rule applies;
+        // the watch may simply not be armed yet.
+        if (!root.info.watching && root.last_crawl_end != unset) {
+            when = (std::min)(when, crawl_schedule::UnwatchedDue(root.last_crawl_end, root.last_crawl,
+                                                                  root.last_crawl_failed));
+        }
+        if (when <= now) {
+            due.push_back(root.info.path);
+            dirty_roots_.erase(root.info.path);
+            root.startup_due = unset;
+            // Changes seen from here on belong to the next crawl.
+            root.change_pending = false;
+        } else {
+            next = (std::min)(next, when);
+        }
+    }
+    // Requests for roots that were removed meanwhile.
+    std::erase_if(dirty_roots_, [this](const std::wstring& path) {
+        return std::none_of(roots_.begin(), roots_.end(), [&](const RootState& root) {
+            return root.info.path == path;
+        });
+    });
+    return next;
 }
 
 void NetworkIndex::Start(HWND notify, UINT status_msg, UINT search_msg) {
@@ -656,6 +989,10 @@ void NetworkIndex::Start(HWND notify, UINT status_msg, UINT search_msg) {
         std::lock_guard<std::mutex> lock(mu_);
         roots_.clear();
         dirty_roots_.clear();
+        const auto started = std::chrono::steady_clock::now();
+        FILETIME now_time{};
+        GetSystemTimeAsFileTime(&now_time);
+        const uint64_t now_value = FileTimeValue(now_time);
         for (const auto& path : configured) {
             RootState state;
             state.info.path = path;
@@ -667,8 +1004,19 @@ void NetworkIndex::Start(HWND notify, UINT status_msg, UINT search_msg) {
             else state.shard = Shard::Open(ShardPath(path));
             state.info.indexed_items = state.shard ? state.shard->count : 0;
             state.info.state = state.shard ? L"等待服务器校验" : L"等待扫描";
+            if (state.shard) {
+                // Search the previous session's index right away; the watch
+                // covers changes from now on and a reconcile catches up on
+                // what happened while the agent was not running.
+                const uint64_t age = (std::min)(kMaxShardAge100ns,
+                    now_value > state.shard->modified ? now_value - state.shard->modified : 0);
+                state.startup_due = crawl_schedule::StartupDue(started,
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        std::chrono::duration<uint64_t, std::ratio<1, 10000000>>(age)));
+            } else {
+                dirty_roots_.insert(path);
+            }
             roots_.push_back(std::move(state));
-            dirty_roots_.insert(path);
         }
         ++generation_;
     }
@@ -682,6 +1030,9 @@ void NetworkIndex::Start(HWND notify, UINT status_msg, UINT search_msg) {
 void NetworkIndex::Stop() {
     running_ = false;
     if (watch_wake_event_) SetEvent(watch_wake_event_);
+    // The crawl thread checks running_ under mu_ before a long wait; taking
+    // the lock here orders this notification after that check.
+    { std::lock_guard<std::mutex> lock(mu_); }
     crawl_cv_.notify_all();
     search_cv_.notify_all();
     if (crawl_thread_.joinable()) CancelSynchronousIo(crawl_thread_.native_handle());
@@ -790,12 +1141,13 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
             break;
         }
     };
+    const auto crawl_start = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(mu_);
         for (auto& root : roots_) {
             if (!EqualPath(root.info.path, path)) continue;
+            // The directory watch stays armed during the crawl.
             root.info.building = true;
-            root.info.watching = false;
             root.info.progress = 0;
             root.info.state = L"正在扫描服务器文件夹";
             root.info.error.clear();
@@ -898,16 +1250,39 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
             if (!EqualPath(root.info.path, path)) continue;
             root.info.building = false;
             root.info.progress = failure == ERROR_SUCCESS ? 100 : 0;
+            root.last_crawl_end = std::chrono::steady_clock::now();
+            root.last_crawl_failed = failure != ERROR_SUCCESS;
             if (failure == ERROR_SUCCESS) {
+                root.last_crawl = root.last_crawl_end - crawl_start;
                 const auto old_shard = root.shard;
                 root.shard = std::move(shard);
                 root.info.online = true;
                 root.info.indexed_items = root.shard ? root.shard->count : 0;
-                root.info.state = L"已同步 · " + std::to_wstring(root.info.indexed_items) + L" 项";
+                root.info.state = (root.info.watching ? L"实时监视 · " : L"已同步 · ") +
+                    std::to_wstring(root.info.indexed_items) + L" 项";
                 root.info.error.clear();
                 if (old_shard && old_shard->slot != root.shard->slot)
                     DeleteFileW(ShardPath(path, old_shard->slot).c_str());
                 DeleteFileW(ShardPath(path).c_str());
+                if (root.overlay) {
+                    // The new shard already reflects everything seen before
+                    // the crawl started.
+                    Overlay& overlay = *root.overlay;
+                    std::erase_if(overlay.entries, [&](const auto& item) {
+                        return item.second.seen < crawl_start;
+                    });
+                    std::erase_if(overlay.removed, [&](const auto& item) {
+                        return item.second < crawl_start;
+                    });
+                    overlay.view.reset();
+                    // Changes dropped while the overlay was full may postdate
+                    // what this crawl saw.
+                    if (overlay.last_skipped >= crawl_start && !root.change_pending) {
+                        root.change_pending = true;
+                        root.change_first = root.change_last = root.last_crawl_end;
+                    }
+                    overlay.last_skipped = {};
+                }
             } else {
                 root.info.online = server_accessible && root.shard != nullptr;
                 root.info.indexed_items = root.shard ? root.shard->count : 0;
@@ -924,26 +1299,27 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
 }
 
 void NetworkIndex::CrawlLoop() {
-    auto next_reconcile = std::chrono::steady_clock::now() + kReconcileInterval;
     while (running_) {
         SeedPendingChanges();
         changes_.Flush(false);
+        ScanPendingSubtrees();
         std::vector<std::wstring> work;
         uint64_t generation = 0;
         {
             std::unique_lock<std::mutex> lock(mu_);
-            crawl_cv_.wait_for(lock, kCrawlWakeInterval, [this] {
-                return !running_ || !dirty_roots_.empty();
-            });
             if (!running_) return;
             const auto now = std::chrono::steady_clock::now();
-            if (dirty_roots_.empty() && now < next_reconcile) continue;
-            if (now >= next_reconcile) {
-                for (const auto& root : roots_) dirty_roots_.insert(root.info.path);
-                next_reconcile = now + kReconcileInterval;
+            const auto next = CollectDueRootsLocked(now, work);
+            const bool scans_pending = std::any_of(roots_.begin(), roots_.end(), [](const RootState& root) {
+                return root.overlay && !root.overlay->pending_scans.empty();
+            });
+            if (work.empty() && scans_pending) continue;
+            if (work.empty()) {
+                // Root edits, rebuilds, observed changes, lost watches and
+                // Stop notify; otherwise sleep until the next crawl is due.
+                crawl_cv_.wait_until(lock, (std::min)(next, now + kCrawlIdleWake));
+                continue;
             }
-            work.assign(dirty_roots_.begin(), dirty_roots_.end());
-            dirty_roots_.clear();
             generation = generation_;
         }
         for (const auto& root : work) {
@@ -954,6 +1330,10 @@ void NetworkIndex::CrawlLoop() {
 }
 
 void NetworkIndex::WatchLoop() {
+    constexpr DWORD kNotifyFilter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                                    FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
+    // Heap-allocated so the OVERLAPPED and buffer never move while a read is
+    // pending.
     struct Watch {
         std::wstring path;
         HANDLE directory = INVALID_HANDLE_VALUE;
@@ -964,13 +1344,6 @@ void NetworkIndex::WatchLoop() {
         Watch() = default;
         Watch(const Watch&) = delete;
         Watch& operator=(const Watch&) = delete;
-        Watch(Watch&& other) noexcept
-            : path(std::move(other.path)), directory(other.directory), event(other.event),
-              overlapped(other.overlapped), buffer(std::move(other.buffer)) {
-            other.directory = INVALID_HANDLE_VALUE;
-            other.event = nullptr;
-            overlapped.hEvent = event;
-        }
         ~Watch() {
             if (directory != INVALID_HANDLE_VALUE) {
                 CancelIoEx(directory, &overlapped);
@@ -980,85 +1353,110 @@ void NetworkIndex::WatchLoop() {
             }
             if (event) CloseHandle(event);
         }
-    };
-
-    while (running_) {
-        std::vector<std::wstring> paths;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            for (const auto& root : roots_) {
-                if (root.info.online && paths.size() + 1 < MAXIMUM_WAIT_OBJECTS)
-                    paths.push_back(root.info.path);
-            }
+        bool Arm() {
+            ResetEvent(event);
+            overlapped = OVERLAPPED{};
+            overlapped.hEvent = event;
+            return ReadDirectoryChangesW(directory, buffer.data(), static_cast<DWORD>(buffer.size()),
+                                         TRUE, kNotifyFilter, nullptr, &overlapped, nullptr) != FALSE;
         }
-        std::vector<Watch> watches;
-        std::vector<HANDLE> events;
-        if (watch_wake_event_) events.push_back(watch_wake_event_);
-        watches.reserve(paths.size());
-        for (const auto& path : paths) {
-            watches.emplace_back();
-            Watch& watch = watches.back();
-            watch.path = path;
-            watch.directory = CreateFileW(LongPath(path).c_str(), FILE_LIST_DIRECTORY,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
-            if (watch.directory == INVALID_HANDLE_VALUE) {
-                watches.pop_back();
-                continue;
-            }
-            watch.event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (!watch.event) {
-                watches.pop_back();
-                continue;
-            }
-            watch.overlapped.hEvent = watch.event;
-            if (!ReadDirectoryChangesW(watch.directory, watch.buffer.data(),
-                    static_cast<DWORD>(watch.buffer.size()), TRUE,
-                    FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
-                    FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
-                    nullptr, &watch.overlapped, nullptr)) {
-                watches.pop_back();
-                continue;
-            }
-            events.push_back(watch.event);
-            {
-                std::lock_guard<std::mutex> lock(mu_);
-                for (auto& root : roots_) {
-                    if (!EqualPath(root.info.path, path)) continue;
-                    root.info.watching = true;
+    };
+    auto set_watching = [this](const std::wstring& path, bool watching) {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto& root : roots_) {
+            if (!EqualPath(root.info.path, path)) continue;
+            root.info.watching = watching;
+            if (watching) {
+                // An open change notification proves the server is reachable.
+                root.info.online = true;
+                if (!root.info.building) {
                     root.info.state = L"实时监视 · " +
                         std::to_wstring(root.info.indexed_items) + L" 项";
-                    break;
                 }
             }
+            break;
         }
-        NotifyStatus();
+    };
+
+    std::vector<std::unique_ptr<Watch>> watches;
+    bool refresh = true;
+    while (running_) {
+        if (refresh) {
+            // Roots were added/removed or a crawl finished. Keep watches that
+            // are still wanted armed (no gap) and only open the new ones.
+            refresh = false;
+            std::vector<std::wstring> paths;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                for (const auto& root : roots_) {
+                    if ((root.info.online || root.shard) && paths.size() + 1 < MAXIMUM_WAIT_OBJECTS)
+                        paths.push_back(root.info.path);
+                }
+            }
+            std::erase_if(watches, [&](const std::unique_ptr<Watch>& watch) {
+                return std::none_of(paths.begin(), paths.end(), [&](const std::wstring& path) {
+                    return EqualPath(path, watch->path);
+                });
+            });
+            for (const auto& path : paths) {
+                if (std::any_of(watches.begin(), watches.end(), [&](const std::unique_ptr<Watch>& watch) {
+                        return EqualPath(path, watch->path);
+                    })) continue;
+                auto watch = std::make_unique<Watch>();
+                watch->path = path;
+                watch->directory = CreateFileW(LongPath(path).c_str(), FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+                if (watch->directory == INVALID_HANDLE_VALUE) continue;
+                watch->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (!watch->event || !watch->Arm()) continue;
+                set_watching(path, true);
+                watches.push_back(std::move(watch));
+            }
+            NotifyStatus();
+        }
+
+        std::vector<HANDLE> events;
+        if (watch_wake_event_) events.push_back(watch_wake_event_);
+        for (const auto& watch : watches) events.push_back(watch->event);
         if (events.empty()) return;
         const DWORD wait = WaitForMultipleObjects(static_cast<DWORD>(events.size()), events.data(),
                                                   FALSE, INFINITE);
         if (!running_) return;
-        if (wait > WAIT_OBJECT_0 && wait < WAIT_OBJECT_0 + events.size()) {
-            const size_t index = static_cast<size_t>(wait - WAIT_OBJECT_0 - 1);
-            if (index < watches.size()) {
-                DWORD bytes = 0;
-                if (GetOverlappedResult(watches[index].directory, &watches[index].overlapped, &bytes, FALSE) && bytes)
-                    ObserveChanges(watches[index].path, watches[index].buffer.data(), bytes);
-                else changes_.Gap();
-                {
-                    std::lock_guard<std::mutex> lock(mu_);
-                    dirty_roots_.insert(watches[index].path);
-                    for (auto& root : roots_) {
-                        if (EqualPath(root.info.path, watches[index].path)) {
-                            root.info.watching = false;
-                            break;
-                        }
-                    }
-                }
-                crawl_cv_.notify_one();
-            }
+        if (wait == WAIT_OBJECT_0 && watch_wake_event_) {
+            refresh = true;
+            continue;
         }
-        // A root changed, was added/removed, or completed its first crawl.
-        // Recreate all overlapped requests so the watched set stays coherent.
+        const size_t first_watch = watch_wake_event_ ? 1 : 0;
+        if (wait < WAIT_OBJECT_0 + first_watch || wait >= WAIT_OBJECT_0 + events.size()) {
+            // WAIT_FAILED: rebuild the set rather than spin on a bad handle.
+            Sleep(1000);
+            refresh = true;
+            continue;
+        }
+        const size_t index = static_cast<size_t>(wait - WAIT_OBJECT_0) - first_watch;
+        Watch& watch = *watches[index];
+        DWORD bytes = 0;
+        const bool read = GetOverlappedResult(watch.directory, &watch.overlapped, &bytes, FALSE) != FALSE;
+        const DWORD read_error = read ? ERROR_SUCCESS : GetLastError();
+        // Observed changes go to the overlay; only lost events (overflow with
+        // 0 bytes, failed read) need a crawl.
+        if (read && bytes) {
+            ObserveChanges(watch.path, watch.buffer.data(), bytes);
+        } else {
+            changes_.Gap();
+            NoteRootChanged(watch.path);
+        }
+        // Overflow keeps the handle usable; any other failure (server gone,
+        // session reset) retires the watch and the root falls back to
+        // scheduled reconciles until a crawl brings it back.
+        if ((!read && read_error != ERROR_NOTIFY_ENUM_DIR) || !watch.Arm()) {
+            const std::wstring path = watch.path;
+            watches.erase(watches.begin() + static_cast<std::ptrdiff_t>(index));
+            set_watching(path, false);
+            crawl_cv_.notify_one();
+            NotifyStatus();
+        }
     }
 }
 
@@ -1079,6 +1477,9 @@ void NetworkIndex::SearchLoop() {
         Query query;
         uint32_t id = 0;
         std::vector<std::shared_ptr<Shard>> shards;
+        // Parallel to shards: overlay whose changes supersede the shard's
+        // records (null for the overlay's own in-memory shard).
+        std::vector<std::shared_ptr<const OverlayView>> overlays;
         {
             std::unique_lock<std::mutex> lock(mu_);
             search_cv_.wait(lock, [this] { return !running_ || have_pending_search_; });
@@ -1086,8 +1487,16 @@ void NetworkIndex::SearchLoop() {
             query = pending_query_;
             id = pending_id_;
             have_pending_search_ = false;
-            for (const auto& root : roots_)
-                if (root.info.online && root.shard) shards.push_back(root.shard);
+            for (auto& root : roots_) {
+                if (!root.info.online || !root.shard) continue;
+                auto view = OverlayViewLocked(root);
+                shards.push_back(root.shard);
+                overlays.push_back(view);
+                if (view && view->added->count) {
+                    shards.push_back(view->added);
+                    overlays.push_back(nullptr);
+                }
+            }
         }
         SearchResult result;
         const CompiledQuery compiled = ParseQuery(query.needle);
@@ -1139,6 +1548,7 @@ void NetworkIndex::SearchLoop() {
         size_t total = 0;
         for (size_t shard_index = 0; shard_index < shards.size(); ++shard_index) {
             const auto& shard = shards[shard_index];
+            const OverlayView* overlay = overlays[shard_index].get();
             for (size_t i = 0; i < shard->count; ++i) {
                 if ((i & 4095u) == 0 && latest_search_id_.load() != id) break;
                 const auto& record = shard->records[i];
@@ -1146,6 +1556,7 @@ void NetworkIndex::SearchLoop() {
                 if (!StartsWithPath(path, query.path_prefix)) continue;
                 const std::wstring_view name(path.data() + record.name_off, record.name_len);
                 if (!MatchNetworkRecord(record, path, name, compiled, query.folders_only)) continue;
+                if (overlay && overlay->Hides(path)) continue;
                 Candidate candidate{shard.get(), &record, shard_index, i,
                     query.rank ? RankName(name.data(), static_cast<uint32_t>(name.size()),
                                           (record.flags & kRecordDirectory) != 0, compiled) : 0};

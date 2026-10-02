@@ -113,6 +113,9 @@ struct Theme {
     D2D1_COLOR_F fill_hover;
     D2D1_COLOR_F fill_pressed;
     D2D1_COLOR_F fill_selected;
+    // Selection in a split pane that does not have focus: neutral, so only the
+    // focused pane carries the accent.
+    D2D1_COLOR_F fill_selected_inactive;
     D2D1_COLOR_F fill_input;
     D2D1_COLOR_F fill_input_hover;
     D2D1_COLOR_F fill_input_focus;
@@ -124,6 +127,11 @@ struct Theme {
 
     D2D1_COLOR_F surface_flyout;
     D2D1_COLOR_F surface_pane_inactive;
+    // Window layers: the title strip, one sheet shared by the active tab,
+    // toolbar, sidebar and status bar, and cards for panes and details.
+    D2D1_COLOR_F surface_title;
+    D2D1_COLOR_F surface_sheet;
+    D2D1_COLOR_F surface_card;
 
     D2D1_COLOR_F accent;
     D2D1_COLOR_F accent_hover;
@@ -254,11 +262,12 @@ inline void UpdateWindowTheme(HWND hwnd, bool dark) noexcept {
 
 inline Theme MakeTheme(bool dark, D2D1_COLOR_F accent) noexcept {
     Theme t{};
-    AccentShades shades = DeriveAccentShades(accent);
+    // Keep the stored accent hue in both themes.
     t.accent = accent;
+    AccentShades shades = DeriveAccentShades(t.accent);
     t.accent_hover = shades.light1;
     t.accent_pressed = shades.dark1;
-    t.accent_text = AutoAccentText(accent);
+    t.accent_text = AutoAccentText(t.accent);
     t.danger = HexColor(0xC42B1C);
     t.danger_hover = WithAlpha(HexColor(0xC42B1C), 0.85f);
 
@@ -273,9 +282,10 @@ inline Theme MakeTheme(bool dark, D2D1_COLOR_F accent) noexcept {
         // Explorer weight: at 15% the accent wash sat too close to the hover fill to read as
         // a selection, especially on a row that already carries a hover or a stripe.
         t.fill_selected = WithAlpha(accent, 0.25f);
+        t.fill_selected_inactive = WithAlpha(HexColor(0xFFFFFF), 0.08f);
         t.fill_input = WithAlpha(HexColor(0xFFFFFF), 0.0605f);
         t.fill_input_hover = WithAlpha(HexColor(0xFFFFFF), 0.0837f);
-        t.fill_input_focus = WithAlpha(HexColor(0x1E1E1E), 0.70f);
+        t.fill_input_focus = HexColor(0x1E1E1E);
         t.fill_input_disabled = WithAlpha(HexColor(0xFFFFFF), 0.0419f);
 
         t.stroke_card = WithAlpha(HexColor(0xFFFFFF), 0.045f);
@@ -283,6 +293,9 @@ inline Theme MakeTheme(bool dark, D2D1_COLOR_F accent) noexcept {
         t.stroke_input_bottom = WithAlpha(HexColor(0xFFFFFF), 0.5442f);
 
         t.surface_flyout = HexColor(0x2B2B2B);
+        t.surface_title = HexColor(0x1A1A1A);
+        t.surface_sheet = HexColor(0x202020);
+        t.surface_card = HexColor(0x272727);
         t.surface_pane_inactive = WithAlpha(HexColor(0xFFFFFF), 0.72f);
 
         t.header_bg = HexColor(0x1E1E1E);
@@ -299,39 +312,44 @@ inline Theme MakeTheme(bool dark, D2D1_COLOR_F accent) noexcept {
         t.fps_bg = WithAlpha(HexColor(0x000000), 0.60f);
         t.fps_text = HexColor(0xFFFFFF);
     } else {
-        t.bg = HexColor(0xF5F5F5);
-        t.text = HexColor(0x1A1A1A);
-        t.text_secondary = WithAlpha(HexColor(0x000000), 0.6063f);
-        t.text_disabled = WithAlpha(HexColor(0x000000), 0.36f);
+        t.bg = HexColor(0xF3F5F1);
+        t.text = HexColor(0x303B50);
+        t.text_secondary = HexColor(0x66748A);
+        t.text_disabled = HexColor(0x929CAE);
 
-        t.fill_hover = WithAlpha(HexColor(0x000000), 0.05f);
-        t.fill_pressed = WithAlpha(HexColor(0x000000), 0.03f);
-        // Explorer weight, as in the dark theme: 12% read as a hint, not as "this row".
+        t.fill_hover = WithAlpha(HexColor(0x527D70), 0.055f);
+        t.fill_pressed = WithAlpha(HexColor(0x527D70), 0.09f);
+        // Explorer weight, as in the light theme: upstream's ~10% wash reads as a hint, not as
+        // "this row", so the selection keeps the stronger tint here too.
         t.fill_selected = WithAlpha(accent, 0.20f);
-        t.fill_input = WithAlpha(HexColor(0xFFFFFF), 0.70f);
-        t.fill_input_hover = WithAlpha(HexColor(0xF9F9F9), 0.50f);
+        t.fill_selected_inactive = WithAlpha(HexColor(0x71877B), 0.075f);
+        t.fill_input = WithAlpha(HexColor(0xFFFFFF), 0.90f);
+        t.fill_input_hover = HexColor(0xFFFFFF);
         t.fill_input_focus = HexColor(0xFFFFFF);
-        t.fill_input_disabled = WithAlpha(HexColor(0xF9F9F9), 0.30f);
+        t.fill_input_disabled = WithAlpha(HexColor(0xF2F5F0), 0.65f);
 
-        t.stroke_card = WithAlpha(HexColor(0x000000), 0.028f);
-        t.stroke_divider = WithAlpha(HexColor(0x000000), 0.045f);
-        t.stroke_input_bottom = WithAlpha(HexColor(0x000000), 0.392f);
+        t.stroke_card = HexColor(0xDCE3D9);
+        t.stroke_divider = HexColor(0xE5EAE3);
+        t.stroke_input_bottom = WithAlpha(HexColor(0xA6B5A9), 0.65f);
 
-        t.surface_flyout = HexColor(0xFBFBFB);
+        t.surface_flyout = HexColor(0xFFFFFF);
         t.surface_pane_inactive = WithAlpha(HexColor(0x000000), 0.61f);
+        t.surface_title = HexColor(0xF1F3EE);
+        t.surface_sheet = HexColor(0xF7F8F4);
+        t.surface_card = HexColor(0xFFFFFF);
 
-        t.header_bg = HexColor(0xFAFAFA);
-        t.header_sep = WithAlpha(HexColor(0x000000), 0.06f);
+        t.header_bg = HexColor(0xF7F8F4);
+        t.header_sep = t.stroke_divider;
         t.hover_bg = t.fill_hover;
         t.selection_bg = t.fill_selected;
-        t.scrollbar_thumb = WithAlpha(HexColor(0x000000), 0.30f);
-        t.tab_bg = HexColor(0xEEEEEE);
-        t.tab_active_bg = HexColor(0xFFFFFF);
+        t.scrollbar_thumb = WithAlpha(HexColor(0x9BAF9E), 0.48f);
+        t.tab_bg = t.surface_title;
+        t.tab_active_bg = t.surface_sheet;
         t.address_bg = HexColor(0xFFFFFF);
-        t.status_bg = HexColor(0xEEEEEE);
-        t.icon_folder = HexColor(0xF5B041);
-        t.icon_file = HexColor(0x2E86DE);
-        t.fps_bg = WithAlpha(HexColor(0x000000), 0.55f);
+        t.status_bg = t.surface_sheet;
+        t.icon_folder = HexColor(0xBCA270);
+        t.icon_file = HexColor(0x839FC4);
+        t.fps_bg = WithAlpha(HexColor(0x303B50), 0.85f);
         t.fps_text = HexColor(0xFFFFFF);
     }
     return t;
@@ -356,6 +374,7 @@ inline Theme MakeHighContrastTheme() noexcept {
     t.fill_hover = sys(COLOR_HIGHLIGHT);
     t.fill_pressed = sys(COLOR_HIGHLIGHT);
     t.fill_selected = sys(COLOR_HIGHLIGHT);
+    t.fill_selected_inactive = sys(COLOR_HIGHLIGHT);
     t.fill_input = sys(COLOR_WINDOW);
     t.fill_input_hover = sys(COLOR_WINDOW);
     t.fill_input_focus = sys(COLOR_WINDOW);
@@ -367,6 +386,9 @@ inline Theme MakeHighContrastTheme() noexcept {
 
     t.surface_flyout = sys(COLOR_WINDOW);
     t.surface_pane_inactive = sys(COLOR_GRAYTEXT);
+    t.surface_title = sys(COLOR_WINDOW);
+    t.surface_sheet = sys(COLOR_WINDOW);
+    t.surface_card = sys(COLOR_WINDOW);
 
     t.header_bg = sys(COLOR_WINDOW);
     t.header_sep = sys(COLOR_WINDOWFRAME);

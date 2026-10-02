@@ -96,7 +96,7 @@ void ShowAddressSearchHistory(AppState& s) {
             items.insert(items.begin(), std::move(header));
             return items;
         };
-        const auto field = ui::LayoutAddressSearch(s.renderer.AddressBarRect(
+        const auto field = ui::LayoutAddressSearch(s.renderer.SearchBarRect(
             static_cast<float>(s.compositor.Width())), s.scale).input;
         RECT anchor{static_cast<LONG>(field.left), static_cast<LONG>(field.top),
                     static_cast<LONG>(field.right), static_cast<LONG>(field.bottom)};

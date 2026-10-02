@@ -2,6 +2,7 @@
 
 #include "index_engine.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -63,11 +64,36 @@ private:
     void SeedChanges(const std::wstring& owner);
     void SeedPendingChanges();
     void ObserveChanges(const std::wstring& root, const BYTE* data, DWORD bytes);
+    void NoteRootChanged(const std::wstring& root);
     struct Shard;
+    // Changes seen by the directory watch since the shard was built; lets
+    // search stay current without re-crawling the share.
+    struct Overlay;
+    struct OverlayView;
     struct RootState {
         NetworkRootInfo info;
         std::shared_ptr<Shard> shard;
+        std::shared_ptr<Overlay> overlay;
+        // Crawl scheduling (network_crawl_schedule.h); epoch = not set.
+        std::chrono::steady_clock::time_point startup_due{};
+        std::chrono::steady_clock::time_point last_crawl_end{};
+        std::chrono::steady_clock::duration last_crawl{};
+        bool last_crawl_failed = false;
+        bool change_pending = false;
+        std::chrono::steady_clock::time_point change_first{};
+        std::chrono::steady_clock::time_point change_last{};
     };
+    // Roots whose crawl is due now go to `due`; returns the next future due
+    // time (time_point::max() when nothing is scheduled). Caller holds mu_.
+    std::chrono::steady_clock::time_point CollectDueRootsLocked(
+        std::chrono::steady_clock::time_point now, std::vector<std::wstring>& due);
+
+    // Immutable snapshot of root.overlay for the search thread (null when
+    // empty). Caller holds mu_.
+    std::shared_ptr<const OverlayView> OverlayViewLocked(RootState& root);
+    // Lists directories that appeared (created or renamed) since the shard
+    // was built; a directory watch reports only the directory itself.
+    void ScanPendingSubtrees();
 
     void CrawlLoop();
     void WatchLoop();

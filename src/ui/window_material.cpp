@@ -37,6 +37,8 @@ constexpr GUID kBlendClsid = { 0x81c5b77b, 0x13f8, 0x4cdd,
     { 0xad, 0x20, 0xc8, 0x90, 0x54, 0x7a, 0xc6, 0x5d } };
 constexpr GUID kOpacityClsid = { 0x811d79a4, 0xde28, 0x4454,
     { 0x80, 0x94, 0xc6, 0x46, 0x85, 0xf8, 0xbd, 0x4c } };
+constexpr GUID kBorderClsid = { 0x2a2d49c0, 0x4acf, 0x43c7,
+    { 0x8c, 0x6a, 0x7c, 0x4a, 0x27, 0x87, 0x4d, 0x27 } };
 
 constexpr UINT kMaxSource = 2048;
 constexpr float kSampleLongEdge = 1024.0f;
@@ -649,6 +651,11 @@ void WindowMaterial::ResetGpuResources() {
     sampled_dc_ = nullptr;
     sampled_w_ = 0;
     sampled_h_ = 0;
+    blurred_.reset();
+    blurred_path_.clear();
+    blurred_dc_ = nullptr;
+    blurred_w_ = 0;
+    blurred_h_ = 0;
 }
 
 void WindowMaterial::Invalidate() {
@@ -873,7 +880,14 @@ bool WindowMaterial::DecodeFailedForTesting(const std::wstring& path) {
 #endif
 
 bool WindowMaterial::DrawSourceCover(ID2D1DeviceContext* dc, const D2D1_RECT_F& dest,
-                                     const std::wstring& path) {
+                                     const std::wstring& path, float blur_px) {
+    if (blur_px > 0.5f) {
+        if (ID2D1Bitmap* blurred = EnsureBlurred(dc, dest, path, blur_px)) {
+            dc->DrawBitmap(blurred, dest, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR, nullptr, nullptr);
+            return true;
+        }
+        // Effect failure: fall through to the sharp cover rather than no wallpaper.
+    }
     ID2D1Bitmap* source = SourceBitmap(path);
     if (!dc || !source) return false;
     const D2D1_SIZE_F size = source->GetSize();
@@ -883,6 +897,84 @@ bool WindowMaterial::DrawSourceCover(ID2D1DeviceContext* dc, const D2D1_RECT_F& 
                    nullptr, nullptr);
     dc->PopAxisAlignedClip();
     return true;
+}
+
+// Blurred wallpaper for image mode. The cover crop is baked at sample size so
+// it matches the sharp cover exactly; Border(clamp) keeps the Gaussian from
+// pulling transparent pixels in at the window edges.
+ID2D1Bitmap* WindowMaterial::EnsureBlurred(ID2D1DeviceContext* dc, const D2D1_RECT_F& dest,
+                                           const std::wstring& path, float blur_px) {
+    ID2D1Bitmap* source = SourceBitmap(path);
+    if (!dc || !source) return nullptr;
+
+    const float dw = dest.right - dest.left;
+    const float dh = dest.bottom - dest.top;
+    if (dw < 2.0f || dh < 2.0f) return nullptr;
+    const float scale = (std::min)(1.0f, kSampleLongEdge / (std::max)(dw, dh));
+    const int sw = (std::max)(2, static_cast<int>(dw * scale + 0.5f));
+    const int sh = (std::max)(2, static_cast<int>(dh * scale + 0.5f));
+
+    if (blurred_.get() && blurred_dc_ == dc && blurred_path_ == path &&
+        std::abs(blurred_px_ - blur_px) < 0.5f) {
+        // Same resize tolerance as EnsureSampled: skip rebakes on every WM_SIZE tick.
+        if (std::abs(blurred_w_ - sw) <= (std::max)(16, sw / 8) &&
+            std::abs(blurred_h_ - sh) <= (std::max)(16, sh / 8)) {
+            return blurred_.get();
+        }
+    }
+
+    ComPtr<ID2D1Bitmap1> cover_bitmap;
+    if (FAILED(CreateTargetBitmap(dc, static_cast<UINT>(sw), static_cast<UINT>(sh), &cover_bitmap)))
+        return nullptr;
+    const D2D1_SIZE_F size = source->GetSize();
+    {
+        TargetGuard guard(dc);
+        dc->SetTarget(cover_bitmap.get());
+        dc->SetTransform(D2D1::Matrix3x2F::Identity());
+        dc->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f));
+        dc->DrawBitmap(source,
+                       CoverRect(size.width, size.height,
+                                 D2D1::RectF(0.0f, 0.0f, static_cast<float>(sw),
+                                             static_cast<float>(sh))),
+                       1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
+    }
+
+    ComPtr<ID2D1Effect> border;
+    ComPtr<ID2D1Effect> blur;
+    if (FAILED(dc->CreateEffect(kBorderClsid, &border)) ||
+        FAILED(dc->CreateEffect(kGaussianBlurClsid, &blur))) {
+        return nullptr;
+    }
+    border->SetInput(0, cover_bitmap.get());
+    border->SetValue(D2D1_BORDER_PROP_EDGE_MODE_X, D2D1_BORDER_EDGE_MODE_CLAMP);
+    border->SetValue(D2D1_BORDER_PROP_EDGE_MODE_Y, D2D1_BORDER_EDGE_MODE_CLAMP);
+    blur->SetInputEffect(0, border.get());
+    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, blur_px * scale);
+    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
+    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED);
+
+    ComPtr<ID2D1Bitmap1> baked;
+    if (FAILED(CreateTargetBitmap(dc, static_cast<UINT>(sw), static_cast<UINT>(sh), &baked)))
+        return nullptr;
+    {
+        TargetGuard guard(dc);
+        dc->SetTarget(baked.get());
+        dc->SetTransform(D2D1::Matrix3x2F::Identity());
+        dc->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f));
+        const D2D1_RECT_F area = D2D1::RectF(0.0f, 0.0f, static_cast<float>(sw),
+                                             static_cast<float>(sh));
+        dc->DrawImage(blur.get(), nullptr, &area, D2D1_INTERPOLATION_MODE_LINEAR);
+    }
+
+    blurred_.reset();
+    blurred_.p = baked.get();
+    if (blurred_.p) blurred_.p->AddRef();
+    blurred_path_ = path;
+    blurred_px_ = blur_px;
+    blurred_w_ = sw;
+    blurred_h_ = sh;
+    blurred_dc_ = dc;
+    return blurred_.get();
 }
 
 ID2D1Bitmap* WindowMaterial::EnsureSampled(ID2D1DeviceContext* dc, const D2D1_RECT_F& dest,

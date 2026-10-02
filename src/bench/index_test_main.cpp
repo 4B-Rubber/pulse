@@ -1,8 +1,10 @@
 #include "../index/index_config.h"
 #include "../index/index_query.h"
 #include "../index/network_index.h"
+#include "../index/network_crawl_schedule.h"
 #include "../index/index_shard.h"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 
@@ -94,6 +96,67 @@ void RunNetworkIntegration(const std::wstring& root) {
         DeleteFileW(watch_path.c_str());
     }
     Check(watched, L"network integration tracks SMB directory change");
+
+    // Polls a name search until `accept` holds for the matching hit paths.
+    uint32_t next_id = 1000;
+    auto wait_for_search = [&](const std::wstring& name, auto accept) {
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            Query query;
+            query.needle = name;
+            query.limit = 8;
+            const uint32_t id = next_id++;
+            network.SearchAsync(query, id);
+            SearchResult result;
+            bool answered = false;
+            for (int poll = 0; poll < 25 && !(answered = network.TakeResult(id, result)); ++poll) Sleep(20);
+            if (answered) {
+                std::vector<std::wstring> paths;
+                for (const auto& hit : result.hits)
+                    if (hit.name == name) paths.push_back(hit.path);
+                if (accept(paths)) return true;
+            }
+            Sleep(100);
+        }
+        return false;
+    };
+    auto only_path = [](const std::wstring& expected) {
+        return [expected](const std::vector<std::wstring>& paths) {
+            return paths.size() == 1 && _wcsicmp(paths[0].c_str(), expected.c_str()) == 0;
+        };
+    };
+    auto no_path = [](const std::vector<std::wstring>& paths) { return paths.empty(); };
+    if (watched) {
+        Check(wait_for_search(watch_name, no_path), L"network integration drops deleted SMB file");
+    }
+
+    // A directory created after the crawl, then renamed and removed: search
+    // must follow its contents without waiting for a re-crawl.
+    const std::wstring dir_before = root + L"\\pulse-network-dir-test";
+    const std::wstring dir_after = root + L"\\pulse-network-dir-renamed";
+    const std::wstring inner_name = L"pulse-network-inner-probe.tmp";
+    bool dir_tracked = false;
+    bool rename_tracked = false;
+    bool removal_tracked = false;
+    if (watched && CreateDirectoryW(dir_before.c_str(), nullptr)) {
+        HANDLE inner = CreateFileW((dir_before + L"\\" + inner_name).c_str(), GENERIC_WRITE, 0,
+                                   nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (inner != INVALID_HANDLE_VALUE) CloseHandle(inner);
+        dir_tracked = inner != INVALID_HANDLE_VALUE &&
+            wait_for_search(inner_name, only_path(dir_before + L"\\" + inner_name));
+        if (dir_tracked && MoveFileW(dir_before.c_str(), dir_after.c_str())) {
+            rename_tracked = wait_for_search(inner_name, only_path(dir_after + L"\\" + inner_name));
+            DeleteFileW((dir_after + L"\\" + inner_name).c_str());
+            if (RemoveDirectoryW(dir_after.c_str()))
+                removal_tracked = wait_for_search(inner_name, no_path);
+        }
+    }
+    DeleteFileW((dir_before + L"\\" + inner_name).c_str());
+    RemoveDirectoryW(dir_before.c_str());
+    DeleteFileW((dir_after + L"\\" + inner_name).c_str());
+    RemoveDirectoryW(dir_after.c_str());
+    Check(dir_tracked, L"network integration indexes new SMB directory contents");
+    Check(rename_tracked, L"network integration follows renamed SMB directory");
+    Check(removal_tracked, L"network integration drops removed SMB directory contents");
     Check(network.RemoveRoot(root, &error), L"network integration removes UNC root");
     network.Stop();
     if (!config_existed) DeleteFileW(config_path.c_str());
@@ -415,6 +478,32 @@ int wmain(int argc, wchar_t** argv) {
     DeleteFileW(v9_paths.base_b.c_str());
     RemoveDirectoryW(v9_paths.directory.c_str());
     RemoveDirectoryW(v9_root.c_str());
+
+    {
+        // Network re-crawl policy (network_crawl_schedule.h).
+        namespace cs = pulse::index::crawl_schedule;
+        using namespace std::chrono_literals;
+        const cs::Clock::time_point t0{std::chrono::hours(1)};
+        const cs::Clock::time_point never{};
+        Check(cs::ChangeDue(t0, t0 + 20s, never, 0s) == t0 + 20s + cs::kChangeQuiet,
+              L"network changes wait for a quiet period before a crawl");
+        Check(cs::ChangeDue(t0, t0 + 30min, never, 0s) == t0 + cs::kChangeMaxDelay,
+              L"continuous network changes still crawl within the maximum delay");
+        Check(cs::ChangeDue(t0, t0, t0 - 1min, 7min) == t0 - 1min + 28min,
+              L"change-triggered crawls keep 4x the last crawl time apart");
+        Check(cs::ChangeDue(t0, t0, t0 - 1min, 10s) == t0 - 1min + cs::kChangeMinSpacing,
+              L"short crawls are still spaced by the minimum change spacing");
+        Check(cs::ReconcileInterval(7min) == 70min && cs::ReconcileInterval(1min) == cs::kReconcileMin,
+              L"unwatched reconcile interval is 10x the crawl time, at least 30 minutes");
+        Check(cs::UnwatchedDue(t0, 7min, true) == t0 + cs::kOfflineRetry,
+              L"a failed network crawl retries after the offline delay");
+        Check(cs::StartupDue(t0, 5min) == t0 + 25min,
+              L"a fresh shard is reused until it reaches the reconcile age");
+        Check(cs::StartupDue(t0, 3h) == t0 + cs::kStartupMinDelay,
+              L"a stale shard is reconciled shortly after start, not immediately");
+        Check(cs::ChangeSpacing(7min) > 7min * 3,
+              L"crawl duty cycle stays below one third for a 7 minute crawl");
+    }
 
     if (argc == 3 && wcscmp(argv[1], L"--network-root") == 0)
         RunNetworkIntegration(argv[2]);

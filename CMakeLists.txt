@@ -276,6 +276,10 @@ target_link_libraries(pulse_fluent_gallery PRIVATE
     pulse_localization)
 pulse_enable_lumatext(pulse_fluent_gallery)
 
+# ---- Focused visual regression: offscreen commands and theme tokens ----
+add_executable(pulse_command_icon_test src/bench/command_icon_test.cpp)
+target_link_libraries(pulse_command_icon_test PRIVATE d2d1 dwrite dwmapi ole32 windowscodecs user32)
+
 # ---- Pulse.exe: main UI process ----
 file(GLOB_RECURSE PULSE_APP_SOURCES CONFIGURE_DEPENDS
     src/app/*.cpp src/ui/*.cpp src/fs/*.cpp src/ops/*.cpp src/ipc/*.cpp src/index/*.cpp)
@@ -294,7 +298,7 @@ list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "(document_(host_main|reader|filter)
 option(PULSE_WITH_SELFTEST "Embed the legacy --selftest suite in Pulse.exe" OFF)
 if(NOT PULSE_WITH_SELFTEST)
     list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "selftest_1b2\\.cpp$")
-    list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "index_(engine|engine_pinyin|visibility|mft|paths|delta)\\.cpp$")
+    list(FILTER PULSE_APP_SOURCES EXCLUDE REGEX "index_(engine|engine_pinyin|visibility|mft|paths|delta|folder_sizes)\\.cpp$")
 endif()
 list(APPEND PULSE_APP_SOURCES src/index/network_agent_client.cpp)
 if(PULSE_APP_SOURCES)
@@ -303,6 +307,8 @@ if(PULSE_APP_SOURCES)
         target_compile_definitions(pulse PRIVATE PULSE_WITH_SELFTEST=1)
     endif()
     target_sources(pulse PRIVATE src/app/pulse.rc)
+    include(cmake/release_notes.cmake)
+    pulse_embed_release_notes(pulse)
     set_property(SOURCE src/app/pulse.rc APPEND PROPERTY OBJECT_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/global-search-logo.png"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/app/pulse.ico"
@@ -393,21 +399,38 @@ endif()
 
 # ---- Pulse.Preview.exe: thumbnail decoding / Shell provider isolation ----
 add_executable(pulse_preview WIN32 src/preview_host/main.cpp src/preview_host/video_codec.cpp
-    src/preview_host/svg_raster.cpp src/preview_host/metafile_raster.cpp)
+    src/preview_host/svg_raster.cpp src/preview_host/metafile_raster.cpp
+    src/preview_host/pdf_raster.cpp src/preview_host/dwg_thumb.cpp
+    src/preview_host/archive_listing.cpp src/preview_host/psd_raster.cpp
+    src/preview_host/font_raster.cpp src/preview_host/preview_decoders.cpp
+    src/preview_host/preview_properties.cpp src/preview_host/preview_file_utils.cpp
+    src/preview_host/zip_entry.cpp src/preview_host/office_model.cpp src/preview_host/office_sketch.cpp
+    src/preview_host/office_doc_model.cpp src/preview_host/office_slide_model.cpp
+    src/preview_host/office_sheet_model.cpp
+    src/preview_host/content_sniff.cpp)
 set_target_properties(pulse_preview PROPERTIES OUTPUT_NAME "Pulse.Preview")
+# PDF / AI previews render with PDFium, loaded on demand (LoadLibraryExW) from
+# the executable's directory - the same pdfium.dll Pulse.Document.exe uses.
+add_custom_command(TARGET pulse_preview POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pdfium/bin/pdfium.dll" "$<TARGET_FILE_DIR:pulse_preview>/pdfium.dll")
 # gdiplus renders WMF/EMF, including the EMF+ records Office clip art uses.
-target_link_libraries(pulse_preview PRIVATE ole32 shell32 gdi32 uuid windowscodecs propsys advapi32 gdiplus)
+target_link_libraries(pulse_preview PRIVATE ole32 shell32 gdi32 uuid windowscodecs propsys advapi32 gdiplus shlwapi)
 # SVG previews are rasterized with Direct2D, but d2d1/d3d11/dxgi are
 # deliberately not linked: implicit imports would load them at every preview
 # host start-up (the first preview of any file type) while only SVG needs them.
-# svg_raster.cpp resolves them on demand with LoadLibraryW instead.
+# svg_raster.cpp resolves them on demand with LoadLibraryW instead; so do the
+# Office sketches (office_sketch.cpp: d2d1/dwrite, office_model.cpp: xmllite).
 target_link_libraries(pulse_preview PRIVATE pulse_crash_reporter)
 pulse_add_version_resource(pulse_preview "Pulse preview host" "Pulse.Preview" "Pulse.Preview.exe")
 
 # Preview protocol self test (console; drives Pulse.Preview.exe over the pipe)
-add_executable(pulse_preview_test src/bench/preview_test_main.cpp
-    src/bench/thumbnail_cache_test.cpp src/ui/thumbnail_cache.cpp src/preview_host/video_codec.cpp)
-target_link_libraries(pulse_preview_test PRIVATE ole32 gdi32 gdiplus shell32)
+add_executable(pulse_preview_test src/bench/preview_test_main.cpp src/bench/preview_coverage.cpp
+    src/bench/thumbnail_cache_test.cpp src/ui/thumbnail_cache.cpp src/preview_host/video_codec.cpp
+    src/preview_host/zip_entry.cpp src/preview_host/office_model.cpp
+    src/preview_host/office_doc_model.cpp src/preview_host/office_slide_model.cpp
+    src/preview_host/office_sheet_model.cpp
+    src/preview_host/content_sniff.cpp)
+target_link_libraries(pulse_preview_test PRIVATE ole32 gdi32 gdiplus shlwapi shell32 advapi32 uuid)
 add_dependencies(pulse_preview_test pulse_preview)
 
 add_executable(pulse_shell_icons_test src/bench/shell_icons_test.cpp src/ui/shell_icons.cpp)
@@ -450,6 +473,7 @@ add_executable(pulse_app_controllers_test
     src/app/single_instance_coordinator.cpp
     src/app/tray_controller.cpp
     src/app/app_prefs.cpp
+    src/app/folder_view_prefs.cpp
     src/app/context_menu_prefs.cpp
     src/ui/view_layout.cpp
     src/index/index_client.cpp
@@ -501,13 +525,25 @@ add_executable(pulse_usn_packet_queue_test src/bench/usn_packet_queue_test.cpp)
 add_executable(pulse_change_tracking_client_test src/bench/change_tracking_client_test.cpp)
 add_executable(pulse_global_search_hotkey_test src/bench/global_search_hotkey_test.cpp src/app/global_search_hotkey.cpp)
 target_link_libraries(pulse_global_search_hotkey_test PRIVATE user32)
+add_executable(pulse_frame_pump_test src/bench/frame_pump_test.cpp src/app/frame_pump.cpp)
+target_link_libraries(pulse_frame_pump_test PRIVATE dwmapi user32)
 
 # Search enhancement: native pinyin data and per-user full-text index.
-add_library(pulse_sqlite STATIC third_party/sqlite/sqlite3.c)
 # Mapping remains disabled by default. Only the short-lived task snapshot opts
 # into a RAM-budgeted mapping; the 2 GiB default cap cannot cover large caches.
-target_compile_definitions(pulse_sqlite PRIVATE SQLITE_ENABLE_FTS5 SQLITE_THREADSAFE=1 SQLITE_DQS=0 SQLITE_MAX_MMAP_SIZE=17179869184LL)
+# Size trims: no SQL JSON functions, extensions, shared cache, column decltype
+# or deprecated APIs are used anywhere.
+set(PULSE_SQLITE_DEFINITIONS SQLITE_THREADSAFE=1 SQLITE_DQS=0 SQLITE_MAX_MMAP_SIZE=17179869184LL
+    SQLITE_OMIT_JSON SQLITE_OMIT_LOAD_EXTENSION SQLITE_OMIT_SHARED_CACHE SQLITE_OMIT_DECLTYPE
+    SQLITE_OMIT_DEPRECATED)
+add_library(pulse_sqlite STATIC third_party/sqlite/sqlite3.c)
+target_compile_definitions(pulse_sqlite PRIVATE SQLITE_ENABLE_FTS5 ${PULSE_SQLITE_DEFINITIONS})
 target_include_directories(pulse_sqlite PUBLIC third_party/sqlite)
+# pulse.exe only spools content results and reads the legacy configuration
+# tables; the FTS5 index lives in Pulse.Index.exe.
+add_library(pulse_sqlite_core STATIC third_party/sqlite/sqlite3.c)
+target_compile_definitions(pulse_sqlite_core PRIVATE ${PULSE_SQLITE_DEFINITIONS})
+target_include_directories(pulse_sqlite_core PUBLIC third_party/sqlite)
 set_source_files_properties(third_party/sqlite/sqlite3.c PROPERTIES COMPILE_OPTIONS "/W0;/TC")
 
 add_executable(pulse_filename_pinyin_test
@@ -518,13 +554,15 @@ add_executable(pulse_index_pinyin_test
     src/index/index_query.cpp src/index/search_kinds.cpp src/index/index_mft.cpp
     src/index/index_paths.cpp src/index/index_delta.cpp src/index/index_shard.cpp src/fs/fs_enum.cpp)
 target_link_libraries(pulse_index_pinyin_test PRIVATE advapi32 shlwapi ole32 shell32 netapi32 mpr)
+foreach(folder_size_target pulse_index pulse_index_engine_test pulse_index_pinyin_test)
+    target_sources(${folder_size_target} PRIVATE src/index/index_folder_sizes.cpp)
+endforeach()
 
-foreach(search_target pulse pulse_index pulse_content_search_test)
-    if(NOT search_target STREQUAL "pulse")
-        target_sources(${search_target} PRIVATE src/index/content_index.cpp)
-    endif()
+foreach(search_target pulse_index pulse_content_search_test)
+    target_sources(${search_target} PRIVATE src/index/content_index.cpp)
     target_link_libraries(${search_target} PRIVATE pulse_sqlite)
 endforeach()
+target_link_libraries(pulse PRIVATE pulse_sqlite_core)
 target_sources(pulse_content_search_test PRIVATE src/index/index_query.cpp src/index/search_kinds.cpp)
 get_property(search_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 foreach(search_target IN LISTS search_targets)

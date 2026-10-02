@@ -29,7 +29,7 @@ void AcceptIndexProviderResult(AppState& s, uint32_t id,
                                       index::SearchResult&& result, bool network);
 void MaybePrefetchSearchPage(AppState& s);
 void CancelActiveContentSearch(AppState& s, app::Tab& tab);
-enum class PathLoadReason { Navigate, RestoreSession };
+enum class PathLoadReason { Navigate, RestoreSession, History };
 void MarkContentSearchStopped(app::Tab& tab);
 // quiet = false blanks the view and raises its loading state; a background refresh passes true
 // so the rows already on screen stay there while the new list is read.

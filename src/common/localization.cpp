@@ -10,12 +10,13 @@ namespace {
 
 constexpr UINT kFirstString = IDS_SETTINGS;
 // Must stay on the highest allocated string id, otherwise Get() returns empty.
-// The dev-side ids (hover hints, hash and unblock, the automatic update switch, the
-// four add/remove folder buttons) once sat past this bound and drew as blank text, so
-// raise it with every new batch in string_ids.h — it must match the highest id there.
+// This branch's own strings sit past upstream's table (see string_ids.h), so the bound follows
+// the highest id this branch defines - it is the id used to size the string table.
 constexpr UINT kLastString = IDS_COLUMN_VIEW;
 static_assert(static_cast<UINT>(StringId::SettingsChangeTracking) >= kFirstString &&
-              static_cast<UINT>(StringId::ChangeDisabled) <= kLastString);
+              static_cast<UINT>(StringId::ChangeDisabled) <= kLastString &&
+              static_cast<UINT>(StringId::FolderSortMixed) <= kLastString &&
+              static_cast<UINT>(StringId::WallpaperBlurStrong) <= kLastString);
 
 HINSTANCE g_module = nullptr;
 std::atomic<Language> g_preference{Language::System};

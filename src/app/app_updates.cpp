@@ -1,5 +1,7 @@
 #include "app_updates.h"
 #include "app_state.h"
+#include "app_internal.h"
+#include "pulse_version.h"
 #include "../common/localization.h"
 #include <cstdio>
 
@@ -41,9 +43,19 @@ void TickUpdates(AppState& state, unsigned long long now) {
         state.next_update_progress_paint = now + 100;
         InvalidateRect(state.hwnd, nullptr, FALSE);
     }
+    if (!state.whatsNewVersion.empty() && now >= state.whatsNewAt &&
+        IsWindowVisible(state.hwnd) && !IsIconic(state.hwnd)) {
+        wchar_t title[160]{};
+        swprintf_s(title, l10n::Get(l10n::StringId::UpdatedTitleFormat).c_str(),
+                   state.whatsNewVersion.c_str());
+        state.notification_toast.Show(state.hwnd, title, l10n::Get(l10n::StringId::UpdatedClick),
+                                      false, WM_SHOW_RELEASE_NOTES);
+        state.whatsNewVersion.clear();
+    }
     // The switch silences the background check and the "update available" reminder. It must not
     // cancel work the user started by hand: a manual check may still be in flight, and a download
-    // or install launched from the card is allowed to finish.
+    // or install launched from the card is allowed to finish. The "what's new" toast above is part
+    // of finishing an update, so it stays in front of this gate.
     if (!state.appPrefs.check_updates) {
         state.notified_update_version.clear();
         return;
@@ -52,6 +64,31 @@ void TickUpdates(AppState& state, unsigned long long now) {
     if (state.update_installer.downloading() || state.update_installer.installing() || state.update_checker.checking()) return;
     state.next_update_check = now + kCheckInterval;
     CheckForUpdates(state);
+}
+
+void NoteRunningVersion(AppState& state) {
+    auto& prefs = state.appPrefs;
+    if (!prefs.persist || state.shot.active || state.menushot) return;
+    if (prefs.last_seen_version == PULSE_VERSION_STRING) return;
+    // A fresh install has no app.json yet; only upgrades get the toast.
+    if (prefs.had_file) {
+        state.whatsNewVersion = PULSE_VERSION_STRING;
+        state.whatsNewAt = GetTickCount64() + 2500;
+    }
+    prefs.last_seen_version = PULSE_VERSION_STRING;
+    prefs.Save();
+}
+
+void ShowReleaseNotes(AppState& state) {
+    OpenSettingsTab(state, 3);
+    state.settingsReleaseExpanded = 0;
+    const auto vm = BuildVm(state, false);
+    const float w = static_cast<float>(state.compositor.Width());
+    const float h = static_cast<float>(state.compositor.Height());
+    state.settings.SetScroll(
+        state.renderer.SettingsDestinationOffset(vm, static_cast<int>(l10n::StringId::ReleaseNotes), w, h),
+        state.renderer.SettingsMaxScroll(vm, w, h));
+    InvalidateRect(state.hwnd, nullptr, FALSE);
 }
 
 void InstallUpdate(AppState& state) {

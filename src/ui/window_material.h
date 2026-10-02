@@ -40,8 +40,9 @@ public:
     void Invalidate();
 
     ID2D1Bitmap* SourceBitmap(const std::wstring& path);
+    // blur_px > 0 paints a Gaussian-blurred cover baked once per path/size/radius.
     bool DrawSourceCover(ID2D1DeviceContext* dc, const D2D1_RECT_F& dest,
-                         const std::wstring& path);
+                         const std::wstring& path, float blur_px = 0.0f);
 
     // Paints the sampled material. Returns false when there is nothing to sample
     // (no path, None, high contrast, or decode failure) so the caller can use DWM.
@@ -70,6 +71,8 @@ private:
     void TakeDecodeResult();
     void ResetGpuResources();
     static DWORD WINAPI DecodeWorkerMain(void* parameter);
+    ID2D1Bitmap* EnsureBlurred(ID2D1DeviceContext* dc, const D2D1_RECT_F& dest,
+                               const std::wstring& path, float blur_px);
     ID2D1Bitmap* EnsureSampled(ID2D1DeviceContext* dc, const D2D1_RECT_F& dest,
                                WindowEffect effect, bool dark, const std::wstring& path);
 
@@ -93,6 +96,12 @@ private:
     int sampled_w_ = 0;
     int sampled_h_ = 0;
     ID2D1DeviceContext* sampled_dc_ = nullptr;
+    ComPtr<ID2D1Bitmap> blurred_;
+    std::wstring blurred_path_;
+    float blurred_px_ = 0.0f;
+    int blurred_w_ = 0;
+    int blurred_h_ = 0;
+    ID2D1DeviceContext* blurred_dc_ = nullptr;
 };
 
 } // namespace pulse::ui

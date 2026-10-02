@@ -9,6 +9,8 @@
 #include "fluent_components.h"
 #include "lumatext_renderer.h"
 #include "typography.h"
+#include "ui_motion.h"
+#include <dwmapi.h>
 
 #include <commctrl.h>
 #include <d2d1helper.h>
@@ -34,6 +36,9 @@ constexpr float kFindBarHeight = 44.0f;
 constexpr float kHudHeight = 28.0f;
 constexpr UINT_PTR kAnimationTimer = 7;
 constexpr UINT_PTR kFindEditCaretTimer = 71;
+constexpr UINT_PTR kZoomCloseTimer = 72;
+constexpr double kZoomOpenSeconds = 0.22;
+constexpr double kZoomCloseSeconds = 0.15;
 constexpr float kMaxDecodedZoom = 4.0f;
 constexpr size_t kFindQueryLimit = 256;
 constexpr wchar_t kSearchGlyph[] = L"\xE721";
@@ -151,6 +156,7 @@ void QuickPreviewWindow::ResetView() {
     decoded_w_ = decoded_h_ = 0;
     source_w_ = source_h_ = 0;
     native_kind_ = NativeKind::None;
+    archive_.Clear();
     panning_ = false;
     ResetTextState();
 }
@@ -212,8 +218,14 @@ void QuickPreviewWindow::SetAppearance(bool dark, WindowEffect effect) {
 }
 
 void QuickPreviewWindow::Show(const QuickPreviewItem& item, bool dark, WindowEffect effect,
-                              bool safe_mode) {
+                              bool safe_mode, const POINT* zoom_from) {
     if (!hwnd_ || item.path.empty()) return;
+    if (closing_) {
+        // Re-opened while the close zoom is still running.
+        KillTimer(hwnd_, kZoomCloseTimer);
+        closing_ = false;
+        compositor_.ClearZoom();
+    }
     item_ = item;
     dark_ = dark;
     effect_ = effect;
@@ -238,7 +250,25 @@ void QuickPreviewWindow::Show(const QuickPreviewItem& item, bool dark, WindowEff
     const int y = owner_rect.top + (owner_height - height) / 2;
     SetWindowTextW(hwnd_, item_.name.empty()
         ? pulse::l10n::Get(pulse::l10n::StringId::QuickPreview).c_str() : item_.name.c_str());
-    SetWindowPos(hwnd_, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW);
+    // Zoom out of the item's icon. Only with a plain (None) window effect:
+    // a DWM system backdrop would pop in at full size around the zooming
+    // content. The DWM show transition is disabled while our zoom runs.
+    // The icon zoom read as two layers (DWM frame + zooming content); the
+    // user preferred the plain system show/hide animation, so it stays off.
+    (void)zoom_from;
+    zoom_enabled_ = false;
+    const BOOL no_dwm_transition = zoom_enabled_ ? TRUE : FALSE;
+    DwmSetWindowAttribute(hwnd_, DWMWA_TRANSITIONS_FORCEDISABLED, &no_dwm_transition,
+                          sizeof(no_dwm_transition));
+    zoom_pending_ = zoom_enabled_ && compositor_.HideContent();
+    if (zoom_pending_) zoom_origin_ = POINT{zoom_from->x - x, zoom_from->y - y};
+    else compositor_.ClearZoom();
+    // Size and draw the first frame while still hidden so the system show
+    // animation starts from real content instead of an empty (black) window.
+    const bool was_visible = IsWindowVisible(hwnd_) != FALSE;
+    SetWindowPos(hwnd_, HWND_TOP, x, y, width, height,
+                 was_visible ? 0u : static_cast<UINT>(SWP_NOACTIVATE));
+    if (!was_visible) Render();
     ShowWindow(hwnd_, SW_SHOW);
     SetForegroundWindow(hwnd_);
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -264,7 +294,7 @@ void QuickPreviewWindow::SetStarred(bool starred) {
 }
 
 void QuickPreviewWindow::Close() {
-    if (!hwnd_) return;
+    if (!hwnd_ || closing_) return;
     handler_.Hide();
     ResetAnimation();
     ResetView();
@@ -272,12 +302,35 @@ void QuickPreviewWindow::Close() {
     preview_pixels_ = 0;
     close_hover_ = false;
     chrome_hover_ = ChromeButton::None;
-    ShowWindow(hwnd_, SW_HIDE);
-    if (owner_) SetForegroundWindow(owner_);
+    zoom_pending_ = false;
+    // Shrink back into the item, then hide. Focus returns to the owner right
+    // away so keyboard input never waits for the animation.
+    if (zoom_enabled_ && IsWindowVisible(hwnd_) &&
+        compositor_.PlayZoom(static_cast<float>(zoom_origin_.x),
+                             static_cast<float>(zoom_origin_.y), false, kZoomCloseSeconds)) {
+        closing_ = true;
+        SetTimer(hwnd_, kZoomCloseTimer,
+                 static_cast<UINT>(kZoomCloseSeconds * 1000.0) + 20, nullptr);
+        if (owner_) SetForegroundWindow(owner_);
+        return;
+    }
+    FinishClose(true);
+}
+
+// restore_focus is false after the close zoom: focus already went back to the
+// owner when the close started, and the user may have switched apps since.
+void QuickPreviewWindow::FinishClose(bool restore_focus) {
+    closing_ = false;
+    if (hwnd_) {
+        KillTimer(hwnd_, kZoomCloseTimer);
+        ShowWindow(hwnd_, SW_HIDE);
+    }
+    compositor_.ClearZoom();
+    if (restore_focus && owner_) SetForegroundWindow(owner_);
 }
 
 bool QuickPreviewWindow::visible() const noexcept {
-    return hwnd_ && IsWindowVisible(hwnd_) != FALSE;
+    return hwnd_ && !closing_ && IsWindowVisible(hwnd_) != FALSE;
 }
 
 bool QuickPreviewWindow::OfflinePlaceholder() const noexcept {
@@ -292,7 +345,8 @@ void QuickPreviewWindow::Resize() {
 }
 
 float QuickPreviewWindow::FindBarHeight() const noexcept {
-    return find_open_ && (native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex)
+    return find_open_ && (native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex ||
+                          native_kind_ == NativeKind::Archive)
         ? kFindBarHeight * scale_ : 0.0f;
 }
 
@@ -613,6 +667,7 @@ void QuickPreviewWindow::CloseFind() {
     find_open_ = false;
     find_query_.clear();
     find_matches_.clear();
+    archive_.SetFilter(L"");
     find_index_ = 0;
     if (find_edit_) {
         SetWindowTextW(find_edit_, L"");
@@ -683,6 +738,12 @@ void QuickPreviewWindow::SyncFindFromEdit() {
     GetWindowTextW(find_edit_, buf, ARRAYSIZE(buf));
     if (find_query_ == buf) return;
     find_query_ = buf;
+    if (native_kind_ == NativeKind::Archive) {
+        // Archive search filters the tree (matches stay with their folders).
+        archive_.SetFilter(find_query_);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
     UpdateFindMatches();
     if (!find_matches_.empty()) {
         find_index_ = 0;
@@ -949,6 +1010,13 @@ void QuickPreviewWindow::FindNext(int direction) {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+Theme QuickPreviewWindow::CurrentTheme() const {
+    HIGHCONTRASTW value{sizeof(value)};
+    const bool high_contrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(value), &value, 0) &&
+        (value.dwFlags & HCF_HIGHCONTRASTON);
+    return high_contrast ? MakeHighContrastTheme() : MakeTheme(dark_, HexColor(0x0078D4));
+}
+
 void QuickPreviewWindow::DrawFindBar(ID2D1DeviceContext* dc, const D2D1_RECT_F& bar) {
     if (!dc) return;
     const bool high_contrast = [] {
@@ -956,7 +1024,7 @@ void QuickPreviewWindow::DrawFindBar(ID2D1DeviceContext* dc, const D2D1_RECT_F& 
         return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(value), &value, 0) &&
             (value.dwFlags & HCF_HIGHCONTRASTON);
     }();
-    const Theme theme = high_contrast ? MakeHighContrastTheme() : MakeTheme(dark_, HexColor(0x0078D4));
+    const Theme theme = CurrentTheme();
     find_painter_.SetCompositor(&compositor_);
     find_painter_.SetScale(scale_);
     if (!find_painter_.BeginFrame(theme, high_contrast)) return;
@@ -974,7 +1042,8 @@ void QuickPreviewWindow::DrawFindBar(ID2D1DeviceContext* dc, const D2D1_RECT_F& 
     std::wstring count_text;
     if (!find_query_.empty()) {
         wchar_t count[32]{};
-        if (find_matches_.empty()) swprintf_s(count, L"0/0");
+        if (native_kind_ == NativeKind::Archive) swprintf_s(count, L"%u", archive_.FilterHits());
+        else if (find_matches_.empty()) swprintf_s(count, L"0/0");
         else swprintf_s(count, L"%u/%u", find_index_ + 1,
                         static_cast<uint32_t>(find_matches_.size()));
         count_text = count;
@@ -1228,7 +1297,12 @@ void QuickPreviewWindow::Render() {
         if (result == PreviewDrawResult::Bitmap) {
             native_kind_ = NativeKind::Bitmap;
             DrawHud(dc, content, text_brush.get());
-        } else if (result == PreviewDrawResult::Text || result == PreviewDrawResult::Hex) {
+        } else if (result == PreviewDrawResult::Archive &&
+                   archive_.SetPayload(text, item_.name, item_.size)) {
+            native_kind_ = NativeKind::Archive;
+            archive_.Draw(dc, &compositor_, content, CurrentTheme(), scale_, true);
+        } else if (result == PreviewDrawResult::Text || result == PreviewDrawResult::Hex ||
+                   result == PreviewDrawResult::Archive) {
             native_kind_ = result == PreviewDrawResult::Hex ? NativeKind::Hex : NativeKind::Text;
             EnsureTextLayout(text, result == PreviewDrawResult::Hex,
                              (std::max)(1.0f, width - pad * 2.0f));
@@ -1272,8 +1346,19 @@ void QuickPreviewWindow::Render() {
     const HRESULT result = dc->EndDraw();
     if (result == D2DERR_RECREATE_TARGET || result == DXGI_ERROR_DEVICE_REMOVED ||
         result == DXGI_ERROR_DEVICE_RESET) compositor_.NotifyDeviceLost(result);
-    else compositor_.Present();
-    if (find_open_ && (native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex))
+    else {
+        compositor_.Present();
+        if (zoom_pending_) {
+            // Start after the first frame of the new item is on screen.
+            zoom_pending_ = false;
+            if (!compositor_.PlayZoom(static_cast<float>(zoom_origin_.x),
+                                      static_cast<float>(zoom_origin_.y), true,
+                                      kZoomOpenSeconds))
+                compositor_.ClearZoom();
+        }
+    }
+    if (find_open_ && (native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex ||
+                       native_kind_ == NativeKind::Archive))
         LayoutFindEdit();
     else if (find_edit_)
         ShowWindow(find_edit_, SW_HIDE);
@@ -1381,6 +1466,9 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
         if (native_kind_ == NativeKind::Bitmap) {
             ZoomAt(static_cast<float>(cursor.x), static_cast<float>(cursor.y),
                    std::pow(1.15f, steps));
+        } else if (native_kind_ == NativeKind::Archive) {
+            archive_.Scroll(steps);
+            archive_.Hover(static_cast<float>(cursor.x), static_cast<float>(cursor.y));
         } else {
             text_scroll_ = (std::max)(0.0f, text_scroll_ - steps * 56.0f * scale_);
         }
@@ -1407,6 +1495,11 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
         const D2D1_RECT_F content = ContentRect();
         if (point.x < content.left || point.x >= content.right ||
             point.y < content.top || point.y >= content.bottom) return 0;
+        if (native_kind_ == NativeKind::Archive) {
+            if (archive_.Click(static_cast<float>(point.x), static_cast<float>(point.y)))
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        }
         SetCapture(hwnd_);
         if (native_kind_ == NativeKind::Bitmap && CanPanImage()) {
             panning_ = true;
@@ -1432,6 +1525,12 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
             return 0;
         }
         const D2D1_RECT_F content = ContentRect();
+        if (native_kind_ == NativeKind::Archive) {
+            // Second click of a fast pair keeps toggling like a single click.
+            if (archive_.Click(static_cast<float>(point.x), static_cast<float>(point.y)))
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        }
         if (native_kind_ == NativeKind::Bitmap &&
             point.x >= content.left && point.x < content.right &&
             point.y >= content.top && point.y < content.bottom) {
@@ -1457,6 +1556,9 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
             TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, hwnd_, 0};
             mouse_tracking_ = TrackMouseEvent(&tracking) != FALSE;
         }
+        if (native_kind_ == NativeKind::Archive && !panning_ && !selecting_ &&
+            archive_.Hover(static_cast<float>(point.x), static_cast<float>(point.y)))
+            InvalidateRect(hwnd_, nullptr, FALSE);
         if (panning_) {
             pan_x_ = pan_start_x_ + static_cast<float>(point.x - pan_anchor_.x);
             pan_y_ = pan_start_y_ + static_cast<float>(point.y - pan_anchor_.y);
@@ -1474,6 +1576,7 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
     }
     case WM_MOUSELEAVE:
         mouse_tracking_ = false;
+        if (archive_.Leave()) InvalidateRect(hwnd_, nullptr, FALSE);
         if (chrome_hover_ != ChromeButton::None) {
             chrome_hover_ = ChromeButton::None;
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1538,6 +1641,11 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
         return 0;
     }
     case WM_TIMER:
+        if (wparam == kZoomCloseTimer) {
+            if (closing_) FinishClose(false);
+            else KillTimer(hwnd_, kZoomCloseTimer);
+            return 0;
+        }
         if (wparam == 9) {
             TickPlaybackSeek();
             return 0;
@@ -1670,8 +1778,23 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
                 return 0;
             }
         }
+        if (native_kind_ == NativeKind::Archive && !find_open_) {
+            // With a row selected, Left/Right fold the tree; otherwise they
+            // keep stepping through files. Paging keys scroll the tree.
+            const bool fold = (wparam == VK_LEFT || wparam == VK_RIGHT) && archive_.HasSelection();
+            const bool page = wparam == VK_PRIOR || wparam == VK_NEXT ||
+                              ((wparam == VK_HOME || wparam == VK_END) && !HasPlayback());
+            if (fold || page) {
+                archive_.Key(static_cast<UINT>(wparam));
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+        }
+        if (native_kind_ == NativeKind::Archive && find_open_ && wparam == VK_RETURN)
+            return 0;
         if (ctrl && wparam == 'F' &&
-            (native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex)) {
+            (native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex ||
+             native_kind_ == NativeKind::Archive)) {
             OpenFind();
             return 0;
         }

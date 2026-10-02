@@ -249,6 +249,44 @@ int wmain(int argc, wchar_t** argv) {
     Check(started, L"index stress host starts on an isolated pipe");
     if (!started) return 1;
     CloseHandle(process.hThread);
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--folder-sizes-only") {
+        HANDLE client = Connect(pipe_name, 15000);
+        Check(client != INVALID_HANDLE_VALUE, L"folder-size client connects to real isolated host");
+        PayloadWriter request; request.PutU32(1); request.PutU32(2);
+        request.PutString(L"C:\\PulseIndexStress"); request.PutString(L"\\\\server\\share");
+        bool received = false;
+        if (client != INVALID_HANDLE_VALUE && SendFrame(client, kFolderSizeRequest, 42, request.data())) {
+            const auto until = GetTickCount64() + 3000;
+            while (GetTickCount64() < until) {
+                MsgHeader header{}; std::vector<uint8_t> payload;
+                if (!ReadFrame(client, header, payload, 1000)) break;
+                if (header.type == RSP_IDX_STATUS) continue;
+                PayloadReader reader(payload.data(), payload.size()); std::vector<IndexedFolderSize> values;
+                received = header.type == kFolderSizeResponse && header.request_id == 42 &&
+                    ReadFolderSizes(reader, 2, values) && !values[0].available && !values[1].available;
+                break;
+            }
+        }
+        Check(received, L"production handler returns bounded versioned unavailable results for non-MFT coverage");
+        HANDLE malformed = Connect(pipe_name, 3000);
+        PayloadWriter invalid; invalid.PutU32(1); invalid.PutU32(static_cast<uint32_t>(kFolderSizeBatch + 1));
+        bool disconnected = false;
+        if (malformed != INVALID_HANDLE_VALUE && SendFrame(malformed, kFolderSizeRequest, 43, invalid.data())) {
+            const auto until = GetTickCount64() + 3000;
+            while (GetTickCount64() < until) {
+                DWORD available = 0;
+                if (!PeekNamedPipe(malformed, nullptr, 0, nullptr, &available, nullptr)) { disconnected = true; break; }
+                if (available) { MsgHeader header{}; std::vector<uint8_t> payload; ReadFrame(malformed, header, payload, 100); }
+                Sleep(5);
+            }
+        }
+        Check(disconnected, L"production handler rejects oversized batches");
+        if (malformed != INVALID_HANDLE_VALUE) CloseHandle(malformed);
+        if (client != INVALID_HANDLE_VALUE) { SendFrame(client, REQ_IDX_TEST_SHUTDOWN, 44); CloseHandle(client); }
+        Check(WaitForSingleObject(process.hProcess, 5000) == WAIT_OBJECT_0, L"folder-size test host shuts down cleanly");
+        CloseHandle(process.hProcess);
+        return failures ? 1 : 0;
+    }
 
     if (argc > 1 && std::wstring_view(argv[1]) == L"--shutdown-only") {
         std::wcout << L"[INFO] test token " << token << L", helper PID " << process.dwProcessId << L"\n";

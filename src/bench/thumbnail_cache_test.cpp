@@ -143,6 +143,52 @@ struct ThumbnailCacheTestAccess {
                 FindClose(search);
             }
             RemoveDirectoryW(dir.c_str());
+        {
+            // Grid budget: a screenful of 256 px thumbnails must fit without
+            // the view thrashing between thumbnails and icons.
+            ThumbnailCache grid(96ull * 1024ull * 1024ull, 1024);
+            for (int i = 0; i < 300; ++i) {
+                ThumbnailCache::Request req;
+                req.key = L"g" + std::to_wstring(i);
+                req.epoch = grid.epoch_.load();
+                ThumbnailCache::Item item;
+                item.cost = 256u * 256u * 4u;
+                grid.StoreResult(req, std::move(item));
+            }
+            check(grid.items_.size() == 300 && grid.items_.contains(L"g0"),
+                  "grid budget keeps 300 thumbnails of 256 px");
+        }
+        {
+            cache.Evict();
+            auto req = request(L"slow");
+            bool retried = true;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                ThumbnailCache::Item item;
+                item.failed = item.transient = true;
+                const ULONGLONG before = GetTickCount64();
+                cache.StoreResult(req, std::move(item));
+                const auto& stored = cache.items_.at(L"slow");
+                retried &= stored.transient && stored.retry_at > before;
+            }
+            check(retried, "host timeout is remembered as retryable, not as no preview");
+            ThumbnailCache::Item last;
+            last.failed = last.transient = true;
+            cache.StoreResult(req, std::move(last));
+            check(!cache.items_.at(L"slow").transient && !cache.transient_failures_.contains(L"slow"),
+                  "fourth consecutive timeout settles as a failure");
+            ThumbnailCache::Item good;
+            good.kind = ipc::PreviewContentKind::Bitmap;
+            good.cost = 1;
+            auto ok_req = request(L"slow-ok");
+            ok_req.identity = L"slow-identity";
+            cache.StoreResult(ok_req, std::move(good));
+            check(cache.still_by_identity_.contains(L"slow-identity") &&
+                  cache.still_by_identity_.at(L"slow-identity") == L"slow-ok",
+                  "decoded still bitmap is remembered for other sizes");
+            cache.Evict();
+            check(cache.still_by_identity_.empty() && cache.transient_failures_.empty(),
+                  "evict clears retry and stale bookkeeping");
+        }
         }
 
         ComPtr<ID3D11Device> d3d;
@@ -201,6 +247,34 @@ struct ThumbnailCacheTestAccess {
                         }
                         check(filled, "cover preview remains filled at pan boundaries");
                     }
+                }
+                {
+                    // A different size of an already decoded file draws the
+                    // old bitmap instead of falling back to the icon.
+                    cache.Evict();
+                    const std::wstring identity = cache.Key(L"stale", 0, 5, 6);
+                    ThumbnailCache::Item item;
+                    item.w = item.h = 64;
+                    item.stride = 64 * 4;
+                    item.pixels.assign(static_cast<size_t>(item.stride) * item.h, 255);
+                    item.cost = item.pixels.size();
+                    item.kind = ipc::PreviewContentKind::Bitmap;
+                    auto req = request(cache.Key(L"stale", 128, 5, 6));
+                    req.identity = identity;
+                    cache.StoreResult(req, std::move(item));
+                    context->BeginDraw();
+                    const auto result = cache.Draw(context.get(), D2D1::RectF(0, 0, 100, 100),
+                        L"stale", 0, 256, 0, 5, 6);
+                    context->EndDraw();
+                    bool queued = false;
+                    {
+                        std::lock_guard lock(cache.mutex_);
+                        // The worker may already have answered (failed: no such file).
+                        const std::wstring wanted = cache.Key(L"stale", 256, 5, 6);
+                        queued = cache.pending_.contains(wanted) || cache.items_.contains(wanted);
+                    }
+                    check(result == PreviewDrawResult::Bitmap && queued,
+                          "new size shows previous bitmap while it decodes");
                 }
                 context->SetTarget(nullptr);
             }

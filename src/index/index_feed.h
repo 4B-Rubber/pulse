@@ -1,6 +1,7 @@
 #pragma once
 #include "../ipc/protocol.h"
 #include "change_tracking.h"
+#include "folder_size_protocol.h"
 #include <windows.h>
 #include <string>
 #include <vector>
@@ -28,6 +29,36 @@ class IndexFeedConnection {
 public:
     explicit IndexFeedConnection(HANDLE cancel):cancel_(cancel) {}
     ~IndexFeedConnection() { Close(); }
+    bool FolderSizes(const std::vector<std::wstring>& paths, std::vector<IndexedFolderSize>& values) {
+        if (paths.empty() || paths.size() > kFolderSizeBatch) return false;
+        if (pipe_ == INVALID_HANDLE_VALUE) {
+            wchar_t override_name[256]{};
+            const auto n = GetEnvironmentVariableW(L"PULSE_INDEX_FEED_PIPE", override_name, 256);
+            const std::wstring name = n && n < 256 ? override_name : L"\\\\.\\pipe\\PulseIndex";
+            pipe_ = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+            if (pipe_ == INVALID_HANDLE_VALUE) return false;
+        }
+        ipc::PayloadWriter request;
+        request.PutU32(1); request.PutU32(static_cast<uint32_t>(paths.size()));
+        for (const auto& path : paths) { if (path.size() > 32768) return false; request.PutString(path); }
+        if (request.data().size() > 256 * 1024) return false;
+        ipc::MsgHeader header{}; header.magic = kFeedMagic; header.type = kFolderSizeRequest;
+        header.payload_size = static_cast<uint32_t>(request.data().size());
+        if (!Transfer(&header, sizeof(header), true, 750) ||
+            !Transfer(const_cast<uint8_t*>(request.data().data()), header.payload_size, true, 750)) { Close(); return false; }
+        const auto deadline = GetTickCount64() + 750;
+        for (;;) {
+            if (GetTickCount64() >= deadline || (cancel_ && WaitForSingleObject(cancel_, 0) == WAIT_OBJECT_0)) { Close(); return false; }
+            if (!Transfer(&header, sizeof(header), false, 750) || header.magic != kFeedMagic || header.payload_size > 65536) { Close(); return false; }
+            std::vector<uint8_t> bytes(header.payload_size);
+            if (!Transfer(bytes.data(), header.payload_size, false, 750)) { Close(); return false; }
+            if (header.type == 101) continue;
+            if (header.type != kFolderSizeResponse) { Close(); return false; }
+            ipc::PayloadReader reader(bytes.data(), bytes.size());
+            if (!ReadFolderSizes(reader, paths.size(), values)) { Close(); return false; }
+            return true;
+        }
+    }
     bool Request(bool changes, const std::wstring& root, uint64_t epoch, uint64_t cursor, FileFeedPage& page) {
         if (pipe_ == INVALID_HANDLE_VALUE) {
             wchar_t override_name[256]{};

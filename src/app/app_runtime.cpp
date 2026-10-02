@@ -1,7 +1,10 @@
 // app_runtime.cpp — extracted from app_main.cpp.
 #include "app_internal.h"
+#include "vertical_tabs.h"
 #include "app_column_view.h"
+#include "folder_sizes_ui.h"
 #include "update_status.h"
+#include "about_info.h"
 #include "../ui/lumatext_renderer.h"
 #include "../ui/fluent_menu.h"
 #include "../ui/drag_drop.h"
@@ -515,6 +518,8 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
                 vm.settings_content_folders.push_back(std::move(folder));
             }
             vm.settings_open_folders = s.appPrefs.open_folders_in_pulse;
+            vm.settings_win_e = s.appPrefs.take_over_win_e;
+            vm.settings_shell_tags = s.appPrefs.shell_tag_menu;
             vm.settings_blank_click_go_back = s.appPrefs.blank_click_go_back;
             vm.settings_change_tracking = s.appPrefs.change_tracking_enabled;
             vm.settings_change_days = s.appPrefs.change_tracking_days;
@@ -586,6 +591,12 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             vm.settings_index_installed = s.settings.service_installed();
             vm.settings_index_status = s.index.Status();
             vm.settings_index_migrating = s.settings.migration_pending();
+            if (vm.settings_page == 3) {
+                vm.settings_about_rows = app::BuildAboutRows(vm.settings_index_service,
+                                                             vm.settings_index_installed, s.scale);
+                vm.settings_release_notes = &app::EmbeddedReleaseNotes();
+                vm.settings_release_expanded = s.settingsReleaseExpanded;
+            }
             if (s.shot.active) {
                 wchar_t simulated[2]{};
                 if (GetEnvironmentVariableW(L"PULSE_TEST_INDEX_MIGRATING", simulated, 2) == 1 &&
@@ -838,18 +849,23 @@ int TrayDeckCap(const AppState& s) {
 }
 
 
+// Cyclic window into the newest-first item list: the card at `offset` is on
+// top, the following ones sit underneath, wrapping around the end so the
+// stack can be flipped through endlessly.
 std::vector<TrayDeckEntry> TrayDeckEntries(const app::StagingTray& tray, size_t offset,
                                                   size_t cap) {
-    std::vector<TrayDeckEntry> out;
+    std::vector<TrayDeckEntry> all;
     const auto& batches = tray.batches();
-    size_t skipped = 0;
-    for (int b = static_cast<int>(batches.size()) - 1; b >= 0 && out.size() < cap; --b) {
+    for (int b = static_cast<int>(batches.size()) - 1; b >= 0; --b) {
         const auto& items = batches[static_cast<size_t>(b)].items;
-        for (int k = 0; k < static_cast<int>(items.size()) && out.size() < cap; ++k) {
-            if (skipped < offset) { ++skipped; continue; }
-            out.push_back({ b, k, &items[static_cast<size_t>(k)] });
-        }
+        for (int k = 0; k < static_cast<int>(items.size()); ++k)
+            all.push_back({ b, k, &items[static_cast<size_t>(k)] });
     }
+    std::vector<TrayDeckEntry> out;
+    if (all.empty()) return out;
+    const size_t n = all.size();
+    const size_t start = offset % n;
+    for (size_t i = 0; i < std::min(cap, n); ++i) out.push_back(all[(start + i) % n]);
     return out;
 }
 
@@ -876,7 +892,7 @@ int TrayDeckHoverIndex(const AppState& s) {
     if (s.hoverRegion == static_cast<int>(ui::HitTestResult::TrayCard))
         return s.hoverControlIndex;
     if (s.hoverRegion == static_cast<int>(ui::HitTestResult::TrayItemRemove)) {
-        const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(s.trayDeckOffset),
+        const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(TrayStackTop(s)),
                                              static_cast<size_t>(TrayDeckCap(s)));
         for (int i = 0; i < static_cast<int>(entries.size()); ++i) {
             if (entries[static_cast<size_t>(i)].batch == s.hoverControlIndex &&
@@ -1142,15 +1158,193 @@ std::wstring DetailsAttributeText(DWORD attrs) {
     return result.empty() ? pulse::l10n::Get(pulse::l10n::StringId::AttrNormal).c_str() : result;
 }
 
-// Exponential smoothing toward layout targets; runs on the 16 ms UI timer.
-// Returns true while anything is still moving (caller invalidates).
+namespace {
+// CSS-style cubic-bezier easing (x1, y1, x2, y2) evaluated at time t.
+float CubicBezier(float x1, float y1, float x2, float y2, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    auto bx = [&](float u) {
+        const float v = 1.0f - u;
+        return 3.0f * v * v * u * x1 + 3.0f * v * u * u * x2 + u * u * u;
+    };
+    auto by = [&](float u) {
+        const float v = 1.0f - u;
+        return 3.0f * v * v * u * y1 + 3.0f * v * u * u * y2 + u * u * u;
+    };
+    float lo = 0.0f, hi = 1.0f, u = t;
+    for (int i = 0; i < 24; ++i) {
+        u = (lo + hi) * 0.5f;
+        if (bx(u) < t) lo = u; else hi = u;
+    }
+    return by(u);
+}
+
+constexpr float kTrayThrowOutMs = 220.0f;
+constexpr float kTrayThrowBackMs = 460.0f;
+constexpr float kTraySpringMs = 420.0f;
+constexpr float kTrayTumbleMs = 560.0f;
+constexpr float kTrayPuffMs = 620.0f;
+constexpr float kTrayFadeMs = 140.0f;
+
+void StartTrayMotion(AppState::TrayCardAnim& a, AppState::TrayMotion motion, ULONGLONG now) {
+    a.motion = motion;
+    a.motion_started = now;
+    a.from_fly = a.fly;
+    a.from_dx = a.dx;
+    a.from_dy = a.dy;
+    a.from_angle = a.angle;
+}
+
+// Advance throw / spring motion. Returns true while still moving.
+bool AdvanceTrayMotion(AppState::TrayCardAnim& a, ULONGLONG now) {
+    using M = AppState::TrayMotion;
+    const float ms = static_cast<float>(now - a.motion_started);
+    switch (a.motion) {
+    case M::None:
+        return false;
+    case M::ThrowOut: {
+        const float t = ms / kTrayThrowOutMs;
+        const float e = CubicBezier(0.3f, 0.6f, 0.4f, 1.0f, t);
+        a.fly = a.from_fly + (a.to_fly - a.from_fly) * e;
+        a.dx = a.from_dx * (1.0f - e);
+        a.dy = a.from_dy + (a.to_dy - a.from_dy) * e;
+        a.angle = a.from_angle + (a.to_angle - a.from_angle) * e;
+        if (t >= 1.0f) StartTrayMotion(a, M::ThrowBack, now);
+        return true;
+    }
+    case M::ThrowBack:
+    case M::Spring: {
+        const bool back = a.motion == M::ThrowBack;
+        const float t = ms / (back ? kTrayThrowBackMs : kTraySpringMs);
+        const float e = back ? CubicBezier(0.2f, 0.9f, 0.25f, 1.08f, t)
+                             : CubicBezier(0.2f, 1.4f, 0.4f, 1.0f, t);
+        a.fly = a.from_fly * (1.0f - e);
+        a.dx = a.from_dx * (1.0f - e);
+        a.dy = a.from_dy * (1.0f - e);
+        a.angle = a.from_angle * (1.0f - e);
+        if (t >= 1.0f) {
+            a.motion = M::None;
+            a.fly = a.dx = a.dy = a.angle = 0.0f;
+            return false;
+        }
+        return true;
+    }
+    }
+    return false;
+}
+
+std::wstring TrayFolderOf(const std::wstring& path) {
+    const std::wstring shown = TrayDisplayPath(path);
+    const size_t slash = shown.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return L"";
+    if (slash == 2 && shown.size() > 1 && shown[1] == L':') return shown.substr(0, 3);
+    return shown.substr(0, slash);
+}
+} // namespace
+
+int TrayStackTop(const AppState& s) {
+    const int total = TrayItemTotalCount(s.tray);
+    return total > 0 ? ((s.trayDeckOffset % total) + total) % total : 0;
+}
+
+// Send the top card to the back of the stack: it flies out toward `dir`
+// (+1 right, -1 left) from its current gesture pose, then settles under the
+// stack. dx/dy are the release offset in DIPs (0 for wheel / button).
+void ThrowTrayTop(AppState& s, float dir, float dx, float dy) {
+    const int total = TrayItemTotalCount(s.tray);
+    if (total < 2) return;
+    const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(TrayStackTop(s)), 1);
+    if (entries.empty()) return;
+    const ULONGLONG now = GetTickCount64();
+    AppState::TrayCardAnim& a = s.trayCards[entries.front().item->path];
+    a.dx = dx;
+    a.dy = dy;
+    a.angle = dx * 0.07f;
+    StartTrayMotion(a, AppState::TrayMotion::ThrowOut, now);
+    a.to_fly = (dir < 0.0f ? -1.0f : 1.0f) * 1.18f;
+    a.to_dy = dy;
+    a.to_angle = (dir < 0.0f ? -1.0f : 1.0f) * 16.0f;
+    s.trayDeckOffset = (TrayStackTop(s) + 1) % total;
+    if (s.hwnd) InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
+// End a press-and-hold on the top card. A far or fast enough fling sends
+// the card to the back; anything else springs it home. commit=false (lost
+// capture) always springs back.
+void ReleaseTrayDrag(AppState& s, bool commit) {
+    AppState::TrayDrag drag = s.trayDrag;
+    s.trayDrag = AppState::TrayDrag{};
+    if (!drag.active) return;
+    float vx = drag.vx;
+    if (GetTickCount64() - drag.last_t > 80) vx = 0.0f; // stopped before letting go
+    const bool fling = std::abs(drag.dx) > 70.0f || std::abs(vx) > 0.55f;
+    if (commit && fling && TrayItemTotalCount(s.tray) > 1) {
+        const float dir = std::abs(drag.dx) > 8.0f ? (drag.dx < 0.0f ? -1.0f : 1.0f)
+                                                    : (vx < 0.0f ? -1.0f : 1.0f);
+        ThrowTrayTop(s, dir, drag.dx, drag.dy * 0.35f);
+        return;
+    }
+    const auto found = s.trayCards.find(drag.path);
+    if (found != s.trayCards.end()) {
+        AppState::TrayCardAnim& a = found->second;
+        a.dx = drag.dx;
+        a.dy = drag.dy * 0.35f;
+        a.angle = drag.dx * 0.07f;
+        StartTrayMotion(a, AppState::TrayMotion::Spring, GetTickCount64());
+    }
+    if (s.hwnd) InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
+// Bring the last card back on top: it drops in from above.
+void TrayStepBack(AppState& s) {
+    const int total = TrayItemTotalCount(s.tray);
+    if (total < 2) return;
+    s.trayDeckOffset = (TrayStackTop(s) + total - 1) % total;
+    const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(s.trayDeckOffset), 1);
+    if (!entries.empty()) s.trayRaisePath = entries.front().item->path;
+    if (s.hwnd) InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
+// Smoke burst at the top card's close badge (renderer anchors it).
+void SpawnTrayPuffs(AppState& s) {
+    const ULONGLONG now = GetTickCount64();
+    uint32_t seed = static_cast<uint32_t>(now * 2654435761u);
+    auto frand = [&seed]() {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        return static_cast<float>(seed & 0xFFFFFF) / 16777216.0f;
+    };
+    for (int i = 0; i < 10; ++i) {
+        AppState::TrayPuff p;
+        p.start = now + static_cast<ULONGLONG>(frand() * 60.0f);
+        p.angle = static_cast<float>(i) / 10.0f * 6.2831853f + frand() * 0.5f;
+        p.dist = 16.0f + frand() * 16.0f;
+        p.size = 0.8f + frand() * 0.9f;
+        s.trayPuffs.push_back(p);
+    }
+}
+
+// Tell the next tick how the currently visible cards of `paths` should
+// leave: tumble off (dismiss / clear / release), staggered by stack order.
+void MarkTrayExit(AppState& s, const std::vector<std::wstring>& paths, bool stagger) {
+    const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(TrayStackTop(s)), 4);
+    ULONGLONG delay = 0;
+    for (const auto& e : entries) {
+        if (std::find(paths.begin(), paths.end(), e.item->path) == paths.end()) continue;
+        s.trayExitHints[e.item->path] = { AppState::TrayExit::Tumble, delay };
+        if (stagger) delay += 60;
+    }
+}
+
+// Per-frame stack animation on the 16 ms UI timer. Returns true while
+// anything is still moving (caller invalidates).
 bool TickTrayDeck(AppState& s) {
+    using M = AppState::TrayMotion;
+    using X = AppState::TrayExit;
     bool dirty = false;
     const ULONGLONG now = GetTickCount64();
     const float elapsed = s.trayLastTick ? static_cast<float>(now - s.trayLastTick) : 16.0f;
     s.trayLastTick = now;
     auto ease = [&dirty, elapsed](float& cur, float target, float k) {
-        const float timed_k = 1.0f - std::pow(1.0f - k, elapsed / 16.0f);
+        const float timed_k = 1.0f - std::pow(1.0f - k, std::min(elapsed, 100.0f) / 16.0f);
         const float next = cur + (target - cur) * timed_k;
         if (std::abs(next - cur) > 0.0015f) { cur = next; dirty = true; }
         else if (cur != target) { cur = target; dirty = true; }
@@ -1158,48 +1352,75 @@ bool TickTrayDeck(AppState& s) {
 
     ease(s.trayOpen, s.dropTray ? 1.0f : 0.0f, 0.20f);
 
-    // Window into the newest-first list; a fresh collect always jumps back
-    // to the newest items.
+    // A fresh collect always brings the newest item to the top.
     const int total = TrayItemTotalCount(s.tray);
-    const int cap = TrayDeckCap(s);
-    const int max_offset = std::max(0, total - cap);
-    const int clamped_offset = std::clamp(s.trayDeckOffset, 0, max_offset);
-    if (clamped_offset != s.trayDeckOffset) { s.trayDeckOffset = clamped_offset; dirty = true; }
+    const int top = TrayStackTop(s);
+    if (top != s.trayDeckOffset) { s.trayDeckOffset = top; dirty = true; }
     const bool grew = total > static_cast<int>(s.trayDeckLastTotal);
     if (grew && s.trayDeckOffset != 0) { s.trayDeckOffset = 0; dirty = true; }
     s.trayDeckLastTotal = static_cast<size_t>(total);
 
     const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(s.trayDeckOffset),
-                                         static_cast<size_t>(cap));
+                                         static_cast<size_t>(TrayDeckCap(s)));
     const int n = static_cast<int>(entries.size());
     const int hovered = TrayDeckHoverIndex(s);
+    const bool stackHot = hovered >= 0 || s.trayDrag.active;
+    ease(s.traySpread, stackHot ? 1.0f : 0.0f, 0.20f);
 
     std::unordered_set<std::wstring> live;
     live.reserve(entries.size() * 2);
     for (int i = 0; i < n; ++i) {
-        const app::TrayItem& item = *entries[static_cast<size_t>(i)].item;
+        const TrayDeckEntry& entry = entries[static_cast<size_t>(i)];
+        const app::TrayItem& item = *entry.item;
         live.insert(item.path);
-        const float target_slot = static_cast<float>(i) - (n - 1) * 0.5f;
         auto [it, inserted] = s.trayCards.try_emplace(item.path);
         AppState::TrayCardAnim& a = it->second;
-        if (inserted) {
-            // Collected items slide out from the center; items revealed by
-            // wheel-scrolling fade in directly at their slot.
-            a.slot = grew ? 0.0f : target_slot;
+        if (!inserted && a.ghost && a.exit != X::Return) {
+            a = AppState::TrayCardAnim{};
+            inserted = true;
+        }
+        if (inserted || a.ghost) {
+            a.ghost = false;
+            a.depth = static_cast<float>(i);
+            a.appear = 1.0f;
+            // A fresh collect drops in on top; cards revealed underneath
+            // start hidden behind the stack (depth 3) and rise into place.
+            if (i == 0 && grew) { a.appear = 0.0f; a.depth = 0.0f; }
+            else if (i > 0) a.depth = 3.0f;
+        }
+        if (item.path == s.trayRaisePath) {
+            a.appear = 0.0f;
+            a.depth = 0.0f;
+            a.motion = M::None;
+            a.fly = a.dx = a.dy = a.angle = 0.0f;
         }
         if (a.name.empty()) a.name = TrayItemName(item.path);
+        if (a.folder.empty()) a.folder = TrayFolderOf(item.path);
         a.attrs = item.attrs;
         a.is_dir = item.is_dir;
         a.missing = !item.exists;
-        a.ghost = false;
-        a.layout_count = n;
-        ease(a.slot, target_slot, 0.22f);
+        a.size = item.size;
+        a.cut = entry.batch >= 0 && entry.batch < static_cast<int>(s.tray.batches().size()) &&
+                s.tray.batches()[static_cast<size_t>(entry.batch)].move_intent;
+        a.shrink = 1.0f;
+        if (s.trayDrag.active && s.trayDrag.path == item.path) {
+            a.motion = M::None;
+            a.fly = 0.0f;
+            a.dx = s.trayDrag.dx;
+            a.dy = s.trayDrag.dy * 0.35f;
+            a.angle = s.trayDrag.dx * 0.07f;
+            dirty = true;
+        } else if (AdvanceTrayMotion(a, now)) {
+            dirty = true;
+        }
+        if (a.motion != M::ThrowOut) ease(a.depth, static_cast<float>(i), 0.20f);
         ease(a.appear, 1.0f, 0.16f);
-        ease(a.hover, i == hovered ? 1.0f : 0.0f, 0.28f);
+        ease(a.hover, i == 0 && hovered == 0 && !s.trayDrag.active ? 1.0f : 0.0f, 0.28f);
         ease(a.opacity, 1.0f, 0.25f);
     }
-    // Removed/scrolled-out items become ghosts: frozen slot, fade + sink,
-    // then dropped. Cap ghosts so fast wheeling can't pile them up.
+    s.trayRaisePath.clear();
+
+    // Cards that left the window play their exit, then are dropped.
     size_t ghosts = 0;
     for (auto it = s.trayCards.begin(); it != s.trayCards.end();) {
         if (live.count(it->first)) { ++it; continue; }
@@ -1208,15 +1429,68 @@ bool TickTrayDeck(AppState& s) {
             a.ghost = true;
             a.exit_started = now;
             a.exit_opacity = a.opacity;
+            a.exit_delay = 0;
+            const auto hint = s.trayExitHints.find(it->first);
+            if (hint != s.trayExitHints.end()) {
+                a.exit = hint->second.exit;
+                a.exit_delay = hint->second.delay;
+            } else {
+                // Still staged but outside the window: it was sent to the back.
+                bool staged = false;
+                for (const auto& b : s.tray.batches())
+                    for (const auto& item : b.items)
+                        if (item.path == it->first) staged = true;
+                a.exit = staged ? X::Return : X::Fade;
+            }
+            if (a.exit == X::Tumble) StartTrayMotion(a, M::None, now);
         }
-        // A bounded, time-based ease-out avoids a long tail at low frame rates.
-        const float progress = std::clamp(static_cast<float>(now - a.exit_started) / 140.0f, 0.0f, 1.0f);
-        a.opacity = a.exit_opacity * (1.0f - progress) * (1.0f - progress);
+        bool done = false;
+        const float local = static_cast<float>(now) - static_cast<float>(a.exit_started)
+                          - static_cast<float>(a.exit_delay);
+        switch (a.exit) {
+        case X::Fade: {
+            const float t = std::clamp(local / kTrayFadeMs, 0.0f, 1.0f);
+            a.opacity = a.exit_opacity * (1.0f - t) * (1.0f - t);
+            done = t >= 1.0f;
+            break;
+        }
+        case X::Tumble: {
+            if (local < 0.0f) break; // staggered: waiting its turn
+            const float t = std::clamp(local / kTrayTumbleMs, 0.0f, 1.0f);
+            const float e = CubicBezier(0.45f, -0.25f, 0.85f, 0.55f, t);
+            a.fly = a.from_fly + (1.25f - a.from_fly) * e;
+            a.dx = a.from_dx * (1.0f - e);
+            a.dy = a.from_dy + (40.0f - a.from_dy) * e;
+            a.angle = a.from_angle + (32.0f - a.from_angle) * e;
+            a.shrink = 1.0f - 0.08f * e;
+            a.hover = 0.0f;
+            const float ot = std::clamp((local - 60.0f) / 500.0f, 0.0f, 1.0f);
+            a.opacity = a.exit_opacity * (1.0f - CubicBezier(0.42f, 0.0f, 1.0f, 1.0f, ot));
+            done = t >= 1.0f;
+            break;
+        }
+        case X::Return: {
+            const bool moving = AdvanceTrayMotion(a, now);
+            if (a.motion != M::ThrowOut) ease(a.depth, 3.0f, 0.20f);
+            a.hover = 0.0f;
+            done = !moving && a.depth >= 2.99f;
+            if (local > 1200.0f) done = true;
+            break;
+        }
+        }
         dirty = true;
         ++ghosts;
-        if (progress >= 1.0f || ghosts > 6) { it = s.trayCards.erase(it); dirty = true; }
+        if (done || ghosts > 8) it = s.trayCards.erase(it);
         else ++it;
     }
+    s.trayExitHints.clear();
+
+    const size_t puffs = s.trayPuffs.size();
+    s.trayPuffs.erase(std::remove_if(s.trayPuffs.begin(), s.trayPuffs.end(),
+        [now](const AppState::TrayPuff& p) {
+            return now > p.start && static_cast<float>(now - p.start) >= kTrayPuffMs;
+        }), s.trayPuffs.end());
+    if (!s.trayPuffs.empty() || puffs != s.trayPuffs.size()) dirty = true;
     return dirty;
 }
 
@@ -1291,6 +1565,9 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.settings_list_smart_date = s.appPrefs.list_smart_date;
     vm.settings_list_zebra_rows = s.appPrefs.list_zebra_rows;
     vm.settings_list_size_bar = s.appPrefs.list_size_bar;
+    vm.settings_list_tag_names = s.appPrefs.list_tag_name_color;
+    vm.settings_vertical_tabs = s.appPrefs.vertical_tabs;
+    vm.settings_folder_sort = s.appPrefs.folder_sort_mode;
     vm.sidebar_scroll = s.sidebarScroll;
     if (s.groupDragActive) {
         vm.sidebar_group_drag_id = s.groupDragId;
@@ -1312,6 +1589,8 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         vm.status.task_text = st.last_error.empty() ? st.summary
             : st.summary + L" — " + st.last_error;
         vm.status.task_progress = st.active ? st.percent : -1.0f;
+        vm.status.task_active = st.active;
+        vm.status.task_failed = !st.last_error.empty();
         if(s.contentSelectionAction) vm.status.selection_text=l10n::Get(l10n::StringId::OpPreparingList);
     }
     app::ApplyUpdateStatus(vm.status, UpdateProgressForView(s), st.active);
@@ -1461,13 +1740,15 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
             if (off != s.chipOffsets.end()) vm.tab_groups[gi].x_offset = off->second;
         }
     }
-    // Staging tray card deck: live cards (newest batch first) + exiting ghosts.
+    // Staging tray card stack: live window (top first) + exiting ghosts.
     {
-        const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(s.trayDeckOffset),
+        const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(TrayStackTop(s)),
                                              static_cast<size_t>(TrayDeckCap(s)));
         ui::TrayDeckView& deck = vm.tray_deck;
         deck.open = s.trayOpen;
-        deck.offset = s.trayDeckOffset;
+        deck.spread = s.traySpread;
+        deck.thumb_dip = static_cast<float>(s.appPrefs.tray_icon_size);
+        deck.offset = TrayStackTop(s);
         deck.total_count = TrayItemTotalCount(s.tray);
         deck.batch_count = static_cast<int>(s.tray.batches().size());
         uint64_t total_size = 0;
@@ -1476,26 +1757,44 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         deck.live_count = static_cast<int>(entries.size());
         const int hover_index = TrayDeckHoverIndex(s);
         deck.hovered = hover_index >= 0 && hover_index < deck.live_count ? hover_index : -1;
+        auto fill = [&s](ui::TrayCardView& card, const AppState::TrayCardAnim& anim) {
+            card.name = anim.name;
+            card.folder = anim.folder;
+            card.depth = anim.depth;
+            card.hover = anim.hover;
+            card.appear = anim.appear;
+            card.fly = anim.fly;
+            card.dx = anim.dx;
+            card.dy = anim.dy;
+            card.angle = anim.angle;
+            card.shrink = anim.shrink;
+            card.opacity = anim.opacity;
+            card.on_top = anim.motion == AppState::TrayMotion::ThrowOut ||
+                          (anim.ghost && anim.exit == AppState::TrayExit::Tumble) ||
+                          (s.trayDrag.active && !anim.ghost);
+        };
         for (int i = 0; i < deck.live_count; ++i) {
-            const app::TrayItem& item = *entries[static_cast<size_t>(i)].item;
+            const TrayDeckEntry& entry = entries[static_cast<size_t>(i)];
+            const app::TrayItem& item = *entry.item;
             ui::TrayCardView card;
             card.path = item.path;
-            card.batch = entries[static_cast<size_t>(i)].batch;
-            card.sub = entries[static_cast<size_t>(i)].sub;
-            if (card.batch >= 0 && card.batch < static_cast<int>(s.tray.batches().size()))
-                card.batch_total_size = s.tray.batches()[static_cast<size_t>(card.batch)].total_size;
+            card.batch = entry.batch;
+            card.sub = entry.sub;
+            card.size = item.size;
             card.is_dir = item.is_dir;
             card.attrs = item.attrs;
             card.missing = !item.exists;
+            card.cut = entry.batch >= 0 &&
+                entry.batch < static_cast<int>(s.tray.batches().size()) &&
+                s.tray.batches()[static_cast<size_t>(entry.batch)].move_intent;
             const auto found = s.trayCards.find(item.path);
-            if (found != s.trayCards.end()) {
-                card.name = found->second.name;
-                card.slot = found->second.slot;
-                card.hover = found->second.hover;
-                card.appear = found->second.appear;
-                card.opacity = found->second.opacity;
+            if (found != s.trayCards.end() && !found->second.ghost) {
+                fill(card, found->second);
+                card.on_top = card.on_top && (i == 0 ||
+                    found->second.motion == AppState::TrayMotion::ThrowOut);
             } else {
                 card.name = TrayItemName(item.path);
+                card.depth = static_cast<float>(i);
             }
             deck.cards.push_back(std::move(card));
         }
@@ -1503,19 +1802,28 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
             if (!anim.ghost) continue;
             ui::TrayCardView card;
             card.path = key;
-            card.name = anim.name;
             card.is_dir = anim.is_dir;
             card.attrs = anim.attrs;
             card.missing = anim.missing;
+            card.cut = anim.cut;
+            card.size = anim.size;
             card.ghost = true;
-            card.exit_layout_count = anim.layout_count;
-            card.slot = anim.slot;
-            card.hover = anim.hover;
-            card.appear = anim.appear;
-            card.opacity = anim.opacity;
+            fill(card, anim);
             deck.cards.push_back(std::move(card));
         }
+        const ULONGLONG now = GetTickCount64();
+        for (const auto& p : s.trayPuffs) {
+            if (now < p.start) continue;
+            ui::TrayPuffView view;
+            view.t = std::clamp(static_cast<float>(now - p.start) / 620.0f, 0.0f, 1.0f);
+            view.angle = p.angle;
+            view.dist = p.dist;
+            view.size = p.size;
+            deck.puffs.push_back(view);
+        }
     }
+    // Vertical tabs join the sidebar before its scroll range is measured.
+    ApplyVerticalTabs(s, vm);
     // The tray (including exiting cards) determines the sidebar viewport.
     // Clamp only after it is populated, using the same model as draw/hit-test.
     s.sidebarScroll = std::clamp(s.sidebarScroll, 0.0f, s.renderer.SidebarMaxScroll(
@@ -1680,8 +1988,11 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.tooltip_y = static_cast<float>(s.hoverPoint.y);
     FillPaneSlots(s, vm);
     FillChangePopover(s, vm);
+    FillFolderSizes(s, vm);
     vm.window_effect = ui::WindowEffectFromId(s.appPrefs.window_effect);
     vm.background_image = s.appPrefs.background_image;
+    vm.wallpaper_look = s.appPrefs.wallpaper_look;
+    vm.wallpaper_blur = s.appPrefs.wallpaper_blur;
     vm.safe_mode = s.safeMode;
     return vm;
 }
@@ -1690,8 +2001,10 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
 // every hover needs a name hint. EffectiveSidebarWidth returns pixels (the
 // upstream DIP-scaling fix), which is what the rail test expects.
 bool SidebarRailActive(const AppState& s) {
-    return ui::SidebarRailLayout(
-        s.renderer.EffectiveSidebarWidth(static_cast<float>(s.compositor.Width())), s.scale);
+    // SidebarRect, not EffectiveSidebarWidth: the hover-peek overlay has text.
+    const D2D1_RECT_F sb = s.renderer.SidebarRect(static_cast<float>(s.compositor.Width()),
+                                                  static_cast<float>(s.compositor.Height()));
+    return ui::SidebarRailLayout(sb.right - sb.left, s.scale);
 }
 
 void ApplyHoverTarget(AppState& s, const ui::HitTestResult& hit) {
@@ -1791,7 +2104,10 @@ std::wstring TooltipForHover(AppState& s) {
         return text(s.hoverControlIndex == 1
             ? I::TooltipClearBackground : I::TooltipChooseBackground);
     case R::SettingsDensity: return text(I::SettingsRowHeight);
+    case R::SettingsFolderSort: return text(I::SettingsFolderSort);
     case R::SettingsTrayIcon: return text(I::SettingsTrayIcon);
+    case R::SettingsWallpaperLook: return text(I::SettingsWallpaperLook);
+    case R::SettingsWallpaperBlur: return text(I::SettingsWallpaperBlur);
     case R::SettingsAccent:
         return text(s.hoverControlIndex == 0 ? I::TooltipFollowAccent : I::SettingsThemeColor);
     case R::SettingsToggle:
@@ -1825,8 +2141,11 @@ std::wstring TooltipForHover(AppState& s) {
     case R::SplitButton: return text(I::SplitLayout);
     case R::DetailsToggle: return text(s.showDetailsPanel ? I::CollapseDetails : I::ExpandDetails);
     case R::PaneMediumIcons: return text(I::MediumIcons);
+    case R::PaneDetails: return text(I::ViewDetails);
+    case R::ToolbarSort: return text(I::SortBy);
+    case R::ToolbarMore: return text(I::More);
     case R::PaneColumnLayout: return text(I::ColumnLayout);
-    case R::PaneViewButton: return text(I::View);
+    case R::PaneViewButton: return text(I::More);
     case R::FilterBox: return text(I::FilterCurrent);
     case R::FilterClear: return text(I::Clear);
     case R::Splitter: return text(I::ResizeSplit);
@@ -1857,7 +2176,9 @@ std::wstring TooltipForHover(AppState& s) {
     case R::RowStar: return text(I::Star);
     case R::RowNewTab: return text(I::OpenNewTab);
     case R::RowMore: return text(I::MoreActions);
-    case R::SidebarItemAction: return text(I::Unpin);
+    case R::SidebarItemAction:
+        return text(IsVerticalTabPath(s.hoverPath) ? I::TooltipCloseTab : I::Unpin);
+    case R::SidebarToggle: return text(I::ToggleSidebar);
     // On the icon rail there is no text to read, so every row (and every folded
     // section's icon) names itself on hover.
     case R::SidebarHeader: return SidebarRailActive(s) ? s.hoverLabel : L"";
@@ -1924,13 +2245,20 @@ std::wstring TooltipForHover(AppState& s) {
         return L"";
     }
     case R::TrayCard: {
-        const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(s.trayDeckOffset),
+        const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(TrayStackTop(s)),
                                              static_cast<size_t>(TrayDeckCap(s)));
         if (s.hoverControlIndex >= 0 &&
-            s.hoverControlIndex < static_cast<int>(entries.size()))
-            return TrayDisplayPath(entries[static_cast<size_t>(s.hoverControlIndex)].item->path);
+            s.hoverControlIndex < static_cast<int>(entries.size())) {
+            std::wstring tip =
+                TrayDisplayPath(entries[static_cast<size_t>(s.hoverControlIndex)].item->path);
+            if (entries.size() > 1 || TrayItemTotalCount(s.tray) > 1)
+                tip += L"\n" + pulse::l10n::Get(pulse::l10n::StringId::TrayFlingHint);
+            return tip;
+        }
         return L"";
     }
+    case R::TrayPrev: return pulse::l10n::Get(pulse::l10n::StringId::TrayPrev);
+    case R::TrayNext: return pulse::l10n::Get(pulse::l10n::StringId::TrayNext);
     default: return L"";
     }
 }
@@ -2032,4 +2360,6 @@ std::wstring SelectedFullPath(AppState& s) {
 
 // main's SyncSavedSearchSidebar is not carried over: the sidebar's saved-search section was
 // removed on this branch, so SidebarState has no saved_searches list to fill.
+
+
 } // namespace pulse

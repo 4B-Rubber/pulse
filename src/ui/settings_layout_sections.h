@@ -26,7 +26,20 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
     const float picker=kBloomPickerDip*scale;
     l.accent_picker=D2D1::RectF(right-16*scale-picker,l.accent_card.top+(96*scale-picker)/2,
         right-16*scale,l.accent_card.top+(96*scale+picker)/2);
-    l.effect_card=row(narrow ? 98.0f : 64.0f); l.effect_choice=choice(l.effect_card,176);
+    // The tiles reuse SettingsEffect's existing hit regions and controller.
+    // A single tile selector avoids duplicate controls for the same setting.
+    const int effect_columns = right-left < 440*scale ? 2 : 4;
+    const int effect_rows = kWindowEffectCount/effect_columns;
+    const float effect_top = 66.0f;
+    l.effect_card=row(effect_top+82.0f*effect_rows+12.0f);
+    l.effect_choice = {};
+    const float effect_gap=8*scale;
+    const float effect_width=(right-left-32*scale-effect_gap*(effect_columns-1))/effect_columns;
+    for(int i=0;i<kWindowEffectCount;++i) {
+        const float tile_x=left+16*scale+(i%effect_columns)*(effect_width+effect_gap);
+        const float tile_y=l.effect_card.top+effect_top*scale+(i/effect_columns)*82*scale;
+        l.effect_row[i]=D2D1::RectF(tile_x,tile_y,tile_x+effect_width,tile_y+74*scale);
+    }
     l.language_card=row(narrow ? 98.0f : 64.0f); l.language_choice=choice(l.language_card,176);
     // Card 1 - appearance. Everything that decides how Pulse looks: theme, colours, window effect,
     // language, wallpaper, the tray icon size, the title-bar mark, the list row height and the
@@ -54,6 +67,11 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
     l.hidden_files_row=row(64);
     y+=8*scale; l.protected_files_row=row(64);
     y+=8*scale; l.pinned_names_row=row(64);
+    // Upstream's newer switches are laid out here too: this branch keeps every row visible
+    // (no disclosure), so they simply take their place in the same card.
+    y+=8*scale; l.win_e_row=row(64);
+    y+=8*scale; l.shell_tags_row=row(64);
+    y+=8*scale; l.vertical_tabs_row=row(64);
     // List row rendering switches from main's 1.0.39 details rework: they belong to the list
     // card, not behind a disclosure.
     for(auto& list_row : l.list_style_row) { y+=8*scale; list_row=row(64); }
