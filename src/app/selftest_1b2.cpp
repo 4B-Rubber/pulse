@@ -3169,7 +3169,9 @@ void TestPrefsRegistryReconcile() {
         ReadRegString(L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Pulse");
 
     const std::wstring exe = SelfExePath();
-    const std::wstring start_command = L"\"" + exe + L"\"";
+    // Since 1.0.49 the Run value carries --startup, so a login launch lands hidden in
+    // the tray (StartupCommandNeedsRepair upgrades the older bare form).
+    const std::wstring start_command = L"\"" + exe + L"\" --startup";
     const std::wstring folder_command = L"\"" + exe + L"\" \"%1\"";
     const std::wstring run_key = base + L"\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     auto folder_open = [&](const wchar_t* cls) {
