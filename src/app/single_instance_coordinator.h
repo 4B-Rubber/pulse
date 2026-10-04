@@ -56,6 +56,17 @@ public:
     static bool SendTabTransfer(HWND target, const TabTransfer& transfer,
                                 DWORD timeout_ms = 2000);
     static bool DecodeTabTransfer(const COPYDATASTRUCT* data, TabTransfer& transfer);
+    // Turning the multi-window mode off collects the extra windows back into the
+    // primary: each of them is asked to hand over every tab and close. The message
+    // carries only the receiving window; the sender drains its own tabs in order.
+    // The timeout is deliberately short: this is a notification, not a call - the
+    // receiver answers by handing its tabs back through this window, so waiting
+    // for it would block the window the user is looking at for the whole drain.
+    // A timeout still counts as delivered (the message is queued and processed
+    // later, see SendBlobPayload), only a dead window fails.
+    static bool SendDrainRequest(HWND target, HWND sink, DWORD timeout_ms = 50);
+    static bool DecodeDrainRequest(const COPYDATASTRUCT* data, HWND& sink);
+    static ULONG_PTR DrainRequestMessageId() noexcept;
 
     static bool DecodeOpenPath(const COPYDATASTRUCT* data, std::wstring& path);
     static ULONG_PTR OpenPathMessageId() noexcept;

@@ -11,11 +11,11 @@ namespace pulse::app {
 inline constexpr wchar_t kAppUserModelId[] = L"Pulse.FileManager";
 
 // Rebuilds the taskbar jump list: the folders pinned to quick access, each one
-// opening as a tab in the running window by default and opening a window of its
-// own when `pinned_new_window` is set, plus the "new window" task. Called while
-// the pinned set changes, so a right click on the taskbar button shows what is
-// pinned now.
+// opening as a tab in the running window, and - only while `multi_instance` is
+// set - opening a window of its own, plus the "new window" task. Called while
+// the pinned set or the mode changes, so a right click on the taskbar button
+// shows what is pinned now.
 void RefreshJumpList(const std::vector<std::wstring>& pinned_folders,
-                     bool pinned_new_window);
+                     bool multi_instance);
 
 } // namespace pulse::app

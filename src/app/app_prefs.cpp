@@ -78,7 +78,7 @@ namespace {
 constexpr const wchar_t* kStoredKeys[] = {
     L"launch_on_startup", L"keep_running_on_close", L"open_folders_in_pulse",
     L"verify_copies", L"show_status_performance", L"show_pinned_tab_names",
-    L"jump_list_pinned_new_window",
+    L"multi_instance_mode",
     L"show_hidden_files", L"show_protected_os_files", L"search_pinyin",
     L"global_search_enabled", L"global_search_modifiers", L"global_search_key",
     L"blank_click_action", L"change_tracking_enabled", L"change_tracking_days",
@@ -120,7 +120,7 @@ void AppPrefs::ResetToDefaults() {
     verify_copies = false;
     show_status_performance = false;
     show_pinned_tab_names = true;
-    jump_list_pinned_new_window = false;
+    multi_instance_mode = false;
     list_smart_date = true;
     list_zebra_rows = true;
     list_size_bar = false;
@@ -204,8 +204,8 @@ std::wstring AppPrefs::ToJson() const {
     out += show_status_performance ? L"true" : L"false";
     out += L",\n  \"show_pinned_tab_names\":";
     out += show_pinned_tab_names ? L"true" : L"false";
-    out += L",\n  \"jump_list_pinned_new_window\":";
-    out += jump_list_pinned_new_window ? L"true" : L"false";
+    out += L",\n  \"multi_instance_mode\":";
+    out += multi_instance_mode ? L"true" : L"false";
     out += L",\n  \"list_smart_date\":";
     out += list_smart_date ? L"true" : L"false";
     out += L",\n  \"list_zebra_rows\":";
@@ -358,8 +358,7 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     verify_copies = pulse::json::ExtractBool(json, L"verify_copies", false);
     show_status_performance = pulse::json::ExtractBool(json, L"show_status_performance", false);
     show_pinned_tab_names = pulse::json::ExtractBool(json, L"show_pinned_tab_names", true);
-    jump_list_pinned_new_window =
-        pulse::json::ExtractBool(json, L"jump_list_pinned_new_window", false);
+    multi_instance_mode = pulse::json::ExtractBool(json, L"multi_instance_mode", false);
     list_smart_date = pulse::json::ExtractBool(json, L"list_smart_date", true);
     list_zebra_rows = pulse::json::ExtractBool(json, L"list_zebra_rows", true);
     list_size_bar = pulse::json::ExtractBool(json, L"list_size_bar", false);

@@ -400,7 +400,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     r.index = 6;
                     return r;
                 }
-                if (ContainsPt(lay.jump_list_pinned_window_row, x, y)) {
+                if (ContainsPt(lay.multi_instance_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle;
                     r.index = 34;
                     return r;

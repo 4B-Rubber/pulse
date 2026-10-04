@@ -14,6 +14,7 @@ constexpr ULONG_PTR kOpenPathMessage = 0x50554C53; // 'PULS'
 constexpr ULONG_PTR kOpenRequestMessage = 0x50554C32; // 'PUL2'
 constexpr ULONG_PTR kTabTransferMessage = 0x50544254; // 'PTBT'
 constexpr ULONG_PTR kTabTransferSelectionMessage = 0x50544253; // 'PTBS'
+constexpr ULONG_PTR kDrainRequestMessage = 0x50554452; // 'PUDR'
 constexpr size_t kMaxForwardedPathChars = 32768;
 struct OpenRequestHeader {
     uint32_t version = 2;
@@ -243,6 +244,25 @@ bool SingleInstanceCoordinator::DecodeTabTransfer(const COPYDATASTRUCT* data,
 bool SingleInstanceCoordinator::DecodeOpenPath(const COPYDATASTRUCT* data,
                                                std::wstring& path) {
     return DecodePathPayload(data, kOpenPathMessage, path);
+}
+
+bool SingleInstanceCoordinator::SendDrainRequest(HWND target, HWND sink, DWORD timeout_ms) {
+    if (!sink) return false;
+    return SendBlobPayload(target, kDrainRequestMessage, &sink, sizeof(sink), timeout_ms);
+}
+
+bool SingleInstanceCoordinator::DecodeDrainRequest(const COPYDATASTRUCT* data, HWND& sink) {
+    sink = nullptr;
+    if (!data || data->dwData != kDrainRequestMessage || !data->lpData ||
+        data->cbData != sizeof(HWND)) {
+        return false;
+    }
+    std::memcpy(&sink, data->lpData, sizeof(sink));
+    return sink != nullptr && IsWindow(sink);
+}
+
+ULONG_PTR SingleInstanceCoordinator::DrainRequestMessageId() noexcept {
+    return kDrainRequestMessage;
 }
 
 const wchar_t* SingleInstanceCoordinator::WindowClassName() noexcept {

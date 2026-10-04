@@ -43,6 +43,31 @@ bool LaunchNewWindow(const std::wstring& path, const std::vector<std::wstring>& 
     return reinterpret_cast<INT_PTR>(result) > 32;
 }
 
+namespace {
+
+BOOL CALLBACK CollectPulseWindows(HWND hwnd, LPARAM param) {
+    auto* found = reinterpret_cast<std::vector<HWND>*>(param);
+    wchar_t name[64]{};
+    if (GetClassNameW(hwnd, name, ARRAYSIZE(name)) == 0) return TRUE;
+    if (_wcsicmp(name, SingleInstanceCoordinator::WindowClassName()) != 0) return TRUE;
+    found->push_back(hwnd);
+    return TRUE;
+}
+
+} // namespace
+
+std::vector<HWND> OtherPulseWindows(HWND exclude) {
+    std::vector<HWND> windows;
+    EnumWindows(CollectPulseWindows, reinterpret_cast<LPARAM>(&windows));
+    if (exclude) {
+        for (auto it = windows.begin(); it != windows.end();) {
+            if (*it == exclude) it = windows.erase(it);
+            else ++it;
+        }
+    }
+    return windows;
+}
+
 HWND PulseWindowUnderPoint(POINT screen_point, HWND exclude) {
     const HWND hit = WindowFromPoint(screen_point);
     if (!hit) return nullptr;

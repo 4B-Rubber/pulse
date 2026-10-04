@@ -1351,8 +1351,8 @@ enum class StringId : UINT {
     TrayNewWindow = IDS_TRAY_NEW_WINDOW,
     JumpListPinned = IDS_JUMPLIST_PINNED,
     TabGroupEdit = IDS_TAB_GROUP_EDIT,
-    SettingsJumpListNewWindow = IDS_SETTINGS_JUMP_LIST_NEW_WINDOW,
-    SettingsJumpListNewWindowDesc = IDS_SETTINGS_JUMP_LIST_NEW_WINDOW_DESC,
+    SettingsMultiInstance = IDS_SETTINGS_MULTI_INSTANCE,
+    SettingsMultiInstanceDesc = IDS_SETTINGS_MULTI_INSTANCE_DESC,
 };
 
 bool IsLanguageId(std::wstring_view id) noexcept;

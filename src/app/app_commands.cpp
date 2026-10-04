@@ -27,6 +27,8 @@
 #include "entry_sort.h"
 #include "session.h"
 #include "jump_list.h"
+#include "instance_launcher.h"
+#include "single_instance_coordinator.h"
 #include "context_menu.h"
 #include "app_change_tracking.h"
 #include "batch_rename.h"
@@ -2390,11 +2392,16 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
         s.renderer.InvalidateTypography();
         RefreshEditFonts(s);
     }
-    // The jump list is built from the preference, so a change has to rebuild it.
-    // Only the primary window owns the taskbar identity.
-    if (app::HasEffect(effects, app::SettingsEffect::JumpList) && !s.secondaryInstance) {
-        app::RefreshJumpList(s.places.quick_access_paths,
-                             s.appPrefs.jump_list_pinned_new_window);
+    // The jump list is built from the mode, so a change has to rebuild it, and
+    // turning the mode off collects the extra windows back into this one - it
+    // keeps the session, the tray icon and the hotkey. Only the primary window
+    // owns the taskbar identity, so a second window applies neither.
+    if (app::HasEffect(effects, app::SettingsEffect::MultiInstance) && !s.secondaryInstance) {
+        app::RefreshJumpList(s.places.quick_access_paths, s.appPrefs.multi_instance_mode);
+        if (!s.appPrefs.multi_instance_mode) {
+            for (HWND other : app::OtherPulseWindows(s.hwnd))
+                app::SingleInstanceCoordinator::SendDrainRequest(other, s.hwnd);
+        }
     }
     if (app::HasEffect(effects, app::SettingsEffect::RowHeight) ||
         app::HasEffect(effects, app::SettingsEffect::UiFontSize)) {

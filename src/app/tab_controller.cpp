@@ -257,14 +257,16 @@ void TabController::TogglePin(WindowTabs& tabs, int index) {
 }
 
 void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt,
-                                ui::FluentMenu& menu) {
+                                ui::FluentMenu& menu, bool multi_instance) {
     if (tab_index < 0 || tab_index >= static_cast<int>(tabs.items.size())) return;
     LayoutTab& tab = *tabs.items[static_cast<size_t>(tab_index)];
     std::vector<ui::FluentMenuItem> items;
     items.push_back(MenuItem(CmdTabNewRight, TabText(Text::TabNewRight), L"\xE710"));
     items.push_back(MenuItem(CmdTabDuplicate, TabText(Text::TabDuplicate), L"\xE8C8"));
-    items.push_back(MenuItem(CmdTabOpenInNewWindow,
-        pulse::l10n::Get(pulse::l10n::StringId::TabOpenNewWindow).c_str()));
+    if (multi_instance) {
+        items.push_back(MenuItem(CmdTabOpenInNewWindow,
+            pulse::l10n::Get(pulse::l10n::StringId::TabOpenNewWindow).c_str()));
+    }
     items.push_back(MenuItem(CmdTabRename,
         pulse::l10n::Get(pulse::l10n::StringId::TabRename).c_str(), L"\xE8AC"));
     ui::FluentMenuItem colors;

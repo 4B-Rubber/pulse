@@ -1781,7 +1781,7 @@ struct SettingsLayout {
     D2D1_RECT_F hidden_files_row{};
     D2D1_RECT_F protected_files_row{};
     D2D1_RECT_F pinned_names_row{};
-    D2D1_RECT_F jump_list_pinned_window_row{};
+    D2D1_RECT_F multi_instance_row{};
     D2D1_RECT_F vertical_tabs_row{};
     D2D1_RECT_F hints_row{};
     D2D1_RECT_F hints_reset_row{};

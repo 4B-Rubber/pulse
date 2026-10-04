@@ -1369,6 +1369,6 @@
 #define IDS_TAB_GROUP_EDIT 2528
 // Recent/starred item menu: reveal the row in its containing folder.
 #define IDS_OPEN_ITEM_LOCATION 2529
-// Settings: pinned jump-list folders open each in a window of their own.
-#define IDS_SETTINGS_JUMP_LIST_NEW_WINDOW 2530
-#define IDS_SETTINGS_JUMP_LIST_NEW_WINDOW_DESC 2531
+// Settings: several Pulse windows at once (torn-off tabs, jump-list windows).
+#define IDS_SETTINGS_MULTI_INSTANCE 2530
+#define IDS_SETTINGS_MULTI_INSTANCE_DESC 2531

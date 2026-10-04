@@ -514,7 +514,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // only the primary window owns the taskbar identity.
         if (!s->secondaryInstance)
             app::RefreshJumpList(s->places.quick_access_paths,
-                                 s->appPrefs.jump_list_pinned_new_window);
+                                 s->appPrefs.multi_instance_mode);
         // A window that was started as an extra one may be the only one left (a
         // tab torn out to the desktop closes its window), and then the tray, the
         // hotkey and the session belong to it. Retried in the background, so a
@@ -1014,6 +1014,28 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 fs::IsVirtualPath(path) ? path : ResolveOpenFolderPath(path);
             if (!resolved.empty()) NewTab(*s, resolved);
             AdoptSingletonOwnership(*s);
+            return TRUE;
+        }
+        HWND drain_sink = nullptr;
+        if (s && app::SingleInstanceCoordinator::DecodeDrainRequest(cds, drain_sink)) {
+            // The multi-window mode was turned off in the window that asked: this
+            // one hands every tab over in order and closes. A tab that cannot
+            // travel keeps the window alive rather than being lost.
+            bool all_sent = true;
+            for (const auto& layout : s->window_tabs.items) {
+                const app::Tab* folder = layout->ActiveFolder();
+                app::SingleInstanceCoordinator::TabTransfer transfer;
+                transfer.path = folder ? folder->current_path : std::wstring{};
+                if (transfer.path.empty() ||
+                    !app::SingleInstanceCoordinator::SendTabTransfer(drain_sink, transfer)) {
+                    all_sent = false;
+                    break;
+                }
+            }
+            if (all_sent) {
+                s->mergedAway = true; // closing now: this window must not be persisted
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
             return TRUE;
         }
         if (!s || !app::SingleInstanceCoordinator::DecodeOpenPath(cds, path)) return FALSE;
@@ -2369,8 +2391,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         GetEnvironmentVariableW(L"PULSE_TEST_PERSIST", nullptr, 0) > 0)
         state.isolatedTestPersist = true;
 #endif
-    for (int i = 1; i < __argc; ++i)
-        if (wcscmp(__wargv[i], L"--new-window") == 0) state.secondaryInstance = true;
+    for (int i = 1; i < __argc; ++i) {
+        if (wcscmp(__wargv[i], L"--new-window") != 0) continue;
+        // A shortcut or jump-list entry built while the mode was on can outlive
+        // it: the launch is then an ordinary one and the running window takes the
+        // folder as a tab. Read the preference here; the full app is not built yet.
+        app::AppPrefs launch_prefs;
+        launch_prefs.persist = false;
+        launch_prefs.Load();
+        if (launch_prefs.multi_instance_mode) state.secondaryInstance = true;
+    }
     for (int i = 1; i < __argc; ++i)
         if (state.isolatedTest && wcscmp(__wargv[i], L"--content-index-observer") == 0) state.contentIndexObserver = true;
 

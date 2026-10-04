@@ -1048,20 +1048,21 @@ int wmain(int argc, wchar_t** argv) {
         prefs.show_pinned_tab_names && parsed_prefs.FromJson(prefs.ToJson()) &&
         parsed_prefs.show_pinned_tab_names);
     {
-        // Taskbar jump list: pinned folders open as tabs in the running window by
-        // default, windows of their own when the switch is on (jump_list.cpp).
+        // Multi-window mode: off by default keeps every entry in the running
+        // window; on lets tabs be torn off and windows be opened (jump_list.cpp,
+        // tab_controller.cpp, app_input.cpp).
         pulse::app::AppPrefs jump_prefs;
-        passed &= Report("pinned jump-list folders open as tabs by default",
-            !jump_prefs.jump_list_pinned_new_window);
+        passed &= Report("multi-window mode is off by default",
+            !jump_prefs.multi_instance_mode);
         settings_ui.ToggleUi(34);
-        passed &= Report("pinned jump-list folders open as windows when enabled and persist",
-            prefs.jump_list_pinned_new_window && parsed_prefs.FromJson(prefs.ToJson()) &&
-            parsed_prefs.jump_list_pinned_new_window &&
-            HasEffect(last_effect, SettingsEffect::JumpList));
+        passed &= Report("multi-window mode turns on and persists",
+            prefs.multi_instance_mode && parsed_prefs.FromJson(prefs.ToJson()) &&
+            parsed_prefs.multi_instance_mode &&
+            HasEffect(last_effect, SettingsEffect::MultiInstance));
         settings_ui.ToggleUi(34);
-        passed &= Report("pinned jump-list folders switch back and persist",
-            !prefs.jump_list_pinned_new_window && parsed_prefs.FromJson(prefs.ToJson()) &&
-            !parsed_prefs.jump_list_pinned_new_window);
+        passed &= Report("multi-window mode switches back and persists",
+            !prefs.multi_instance_mode && parsed_prefs.FromJson(prefs.ToJson()) &&
+            !parsed_prefs.multi_instance_mode);
     }
     {
         pulse::app::AppPrefs update_prefs;

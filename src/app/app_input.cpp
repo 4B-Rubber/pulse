@@ -1337,9 +1337,12 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     // window rather than to a slot in this strip: the floating
                     // block parks at the strip edge, the reorder math below stays
                     // out of the way, and the release decides where it lands.
-                    s->tabDragExternal = mx < 0 || my < 0 ||
-                        mx >= static_cast<int>(s->compositor.Width()) ||
-                        my >= static_cast<int>(s->compositor.Height());
+                    // Without the multi-window mode a drag stays inside this
+                    // window: leaving the edge is a reorder, not a tear-off.
+                    s->tabDragExternal = s->appPrefs.multi_instance_mode &&
+                        (mx < 0 || my < 0 ||
+                         mx >= static_cast<int>(s->compositor.Width()) ||
+                         my >= static_cast<int>(s->compositor.Height()));
                     // Back inside the window the tab is drawn here again, so the
                     // card that followed the cursor goes away.
                     if (!s->tabDragExternal && s->tabDragGhost.visible())
@@ -3228,7 +3231,7 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 // The taskbar jump list keeps the same order.
                 if (was_active && !tab_row)
                     app::RefreshJumpList(s->places.quick_access_paths,
-                                         s->appPrefs.jump_list_pinned_new_window);
+                                         s->appPrefs.multi_instance_mode);
                 ResetSidebarPinDrag(*s);
                 if (GetCapture() == hwnd) ReleaseCapture();
                 if (!was_active && !path.empty() && !tab_row) NavigateTo(*s, path);
@@ -3686,7 +3689,8 @@ LRESULT HandleRButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             // the chip (right-click) and in the editor bubble.
             if (s->pane && EnsureMenu(*s)) {
                 RememberGroupActivation(*s, s->window_tabs.Active());
-                s->tabs.ShowTabMenu(s->window_tabs, hit.index, sp, *s->menu);
+                s->tabs.ShowTabMenu(s->window_tabs, hit.index, sp, *s->menu,
+                                    s->appPrefs.multi_instance_mode);
                 BindCurrentLayout(*s);
             }
             shown = true;

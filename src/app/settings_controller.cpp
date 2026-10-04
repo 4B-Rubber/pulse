@@ -555,8 +555,8 @@ void SettingsController::ToggleUi(int index) {
         prefs_->show_pinned_tab_names = !prefs_->show_pinned_tab_names;
         SaveAndApply(SettingsEffect::None);
     } else if (index == 34) {
-        prefs_->jump_list_pinned_new_window = !prefs_->jump_list_pinned_new_window;
-        SaveAndApply(SettingsEffect::JumpList);
+        prefs_->multi_instance_mode = !prefs_->multi_instance_mode;
+        SaveAndApply(SettingsEffect::MultiInstance);
     } else if (index == 20) {
         IntegrationAction(2);
     } else if (index == 28) {

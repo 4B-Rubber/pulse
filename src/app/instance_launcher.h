@@ -23,4 +23,8 @@ bool LaunchNewWindow(const std::wstring& path, const std::vector<std::wstring>& 
 // this is also how a tab finds the window the user dropped it on.
 HWND PulseWindowUnderPoint(POINT screen_point, HWND exclude);
 
+// Every other Pulse window on the desktop (each instance is one window), so the
+// primary can ask them to hand their tabs over.
+std::vector<HWND> OtherPulseWindows(HWND exclude);
+
 } // namespace pulse::app

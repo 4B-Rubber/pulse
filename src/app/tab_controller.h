@@ -31,7 +31,10 @@ public:
     // folder. Shared by the group menu and the chip hover card.
     void NewTabInGroup(WindowTabs& tabs, int group_id);
     void ShowGroupMenu(WindowTabs& tabs, int group_id, POINT screen_pt, ui::FluentMenu& menu);
-    void ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt, ui::FluentMenu& menu);
+    // `multi_instance` gates the "open in a new window" entry: without the mode
+    // every action stays inside the running window.
+    void ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt, ui::FluentMenu& menu,
+                     bool multi_instance);
 
     static const uint32_t* Palette() noexcept;
     static constexpr size_t PaletteSize() noexcept { return 8; }

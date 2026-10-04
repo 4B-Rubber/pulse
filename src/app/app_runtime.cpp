@@ -329,8 +329,7 @@ void AdoptSingletonOwnership(AppState& s) {
     ApplyGlobalSearchSettings(s);
     s.tray_controller.SetVisible(s.appPrefs.keep_running_on_close ||
                                  s.appPrefs.global_search_enabled);
-    app::RefreshJumpList(s.places.quick_access_paths,
-                         s.appPrefs.jump_list_pinned_new_window);
+    app::RefreshJumpList(s.places.quick_access_paths, s.appPrefs.multi_instance_mode);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -1826,7 +1825,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         vm.tab_group_card.visible = !vm.tab_group_card.rows.empty();
     }
     vm.show_pinned_tab_names = s.appPrefs.show_pinned_tab_names;
-    vm.settings_jump_list_new_window = s.appPrefs.jump_list_pinned_new_window;
+    vm.settings_multi_instance_mode = s.appPrefs.multi_instance_mode;
     vm.settings_list_smart_date = s.appPrefs.list_smart_date;
     vm.settings_list_zebra_rows = s.appPrefs.list_zebra_rows;
     vm.settings_list_size_bar = s.appPrefs.list_size_bar;
