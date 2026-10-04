@@ -26,6 +26,7 @@
 #include "snapshot_patch.h"
 #include "entry_sort.h"
 #include "session.h"
+#include "jump_list.h"
 #include "context_menu.h"
 #include "app_change_tracking.h"
 #include "batch_rename.h"
@@ -2388,6 +2389,12 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
         s.compositor.RecreateTextFormats(s.scale);
         s.renderer.InvalidateTypography();
         RefreshEditFonts(s);
+    }
+    // The jump list is built from the preference, so a change has to rebuild it.
+    // Only the primary window owns the taskbar identity.
+    if (app::HasEffect(effects, app::SettingsEffect::JumpList) && !s.secondaryInstance) {
+        app::RefreshJumpList(s.places.quick_access_paths,
+                             s.appPrefs.jump_list_pinned_new_window);
     }
     if (app::HasEffect(effects, app::SettingsEffect::RowHeight) ||
         app::HasEffect(effects, app::SettingsEffect::UiFontSize)) {

@@ -74,7 +74,8 @@ ComPtr<IObjectCollection> NewCollection() {
 
 } // namespace
 
-void RefreshJumpList(const std::vector<std::wstring>& pinned_folders) {
+void RefreshJumpList(const std::vector<std::wstring>& pinned_folders,
+                     bool pinned_new_window) {
     ComPtr<ICustomDestinationList> list;
     if (FAILED(CoCreateInstance(CLSID_DestinationList, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&list)))) {
@@ -90,8 +91,12 @@ void RefreshJumpList(const std::vector<std::wstring>& pinned_folders) {
         UINT added = 0;
         for (const std::wstring& folder : pinned_folders) {
             if (added >= max_slots) break;
-            if (ComPtr<IShellLinkW> link = MakeShellLink(
-                    FolderName(folder), folder, L"--new-window " + Quoted(folder))) {
+            // Without --new-window a running Pulse takes the folder as a tab
+            // (single_instance_coordinator); with it, the folder gets a window.
+            const std::wstring arguments =
+                pinned_new_window ? L"--new-window " + Quoted(folder) : Quoted(folder);
+            if (ComPtr<IShellLinkW> link =
+                    MakeShellLink(FolderName(folder), folder, arguments)) {
                 if (SUCCEEDED(pinned->AddObject(link.Get()))) ++added;
             }
         }

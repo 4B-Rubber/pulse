@@ -289,8 +289,23 @@ static app::SessionSnapshot CaptureWindowSession(AppState& s, HWND hwnd) {
     if (tab) snap.active_path = tab->current_path;
     RememberLayoutFocus(s);
     snap.active_layout_tab = static_cast<int>(s.window_tabs.active);
-    for (const auto& group : s.window_tabs.tab_groups)
-        snap.tab_groups.push_back({group.id, group.name, group.color_rgb, group.collapsed});
+    for (const auto& group : s.window_tabs.tab_groups) {
+        app::GroupSessionSnapshot group_snap{group.id, group.name, group.color_rgb,
+                                             group.collapsed};
+        // The live memory is a tab pointer; the session stores the position in
+        // the layout list, so the hover card can still mark "the tab you last
+        // used here" after a restart.
+        if (auto it = s.lastActiveInGroup.find(group.id);
+            it != s.lastActiveInGroup.end()) {
+            for (size_t i = 0; i < s.window_tabs.items.size(); ++i) {
+                if (s.window_tabs.items[i].get() == it->second) {
+                    group_snap.last_active = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        snap.tab_groups.push_back(std::move(group_snap));
+    }
     for (const auto& layout : s.window_tabs.items)
         snap.layout_tabs.push_back(app::CaptureLayoutTab(*layout));
     snap.tray = s.tray;
@@ -497,7 +512,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // The taskbar jump list mirrors what is pinned to quick access. It needs
         // the localized category and task names, so it runs after l10n::Initialize;
         // only the primary window owns the taskbar identity.
-        if (!s->secondaryInstance) app::RefreshJumpList(s->places.quick_access_paths);
+        if (!s->secondaryInstance)
+            app::RefreshJumpList(s->places.quick_access_paths,
+                                 s->appPrefs.jump_list_pinned_new_window);
         // A window that was started as an extra one may be the only one left (a
         // tab torn out to the desktop closes its window), and then the tray, the
         // hotkey and the session belong to it. Retried in the background, so a
@@ -740,6 +757,18 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     WarmupUnc(*s, path);
                     StartLoadingPath(*s, tab, path, PathLoadReason::RestoreSession);
                 });
+            // Rebuild the group activation memory: the session kept each group's
+            // last-used tab as a position in the restored layout list.
+            s->lastActiveInGroup.clear();
+            for (const auto& group : s->session_tab_groups) {
+                if (group.last_active < 0 ||
+                    static_cast<size_t>(group.last_active) >= s->window_tabs.items.size())
+                    continue;
+                const app::LayoutTab* tab =
+                    s->window_tabs.items[static_cast<size_t>(group.last_active)].get();
+                // A tab that changed groups since the save must not be claimed.
+                if (tab->tab_group == group.id) s->lastActiveInGroup[group.id] = tab;
+            }
             for (size_t i = 0; i < s->window_tabs.items.size(); ++i) {
                 app::RebuildLayoutRoot(*s->window_tabs.items[i]);
                 if (i < s->session_layout_tabs.size() &&

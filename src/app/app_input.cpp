@@ -3226,7 +3226,9 @@ LRESULT HandleLButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                             static_cast<size_t>(s->pinDragToIndex));
                 }
                 // The taskbar jump list keeps the same order.
-                if (was_active && !tab_row) app::RefreshJumpList(s->places.quick_access_paths);
+                if (was_active && !tab_row)
+                    app::RefreshJumpList(s->places.quick_access_paths,
+                                         s->appPrefs.jump_list_pinned_new_window);
                 ResetSidebarPinDrag(*s);
                 if (GetCapture() == hwnd) ReleaseCapture();
                 if (!was_active && !path.empty() && !tab_row) NavigateTo(*s, path);

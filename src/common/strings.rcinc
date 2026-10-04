@@ -2103,6 +2103,8 @@ BEGIN
  IDS_TRAY_NEXT "下一张"
  IDS_TRAY_FLING_HINT "按住卡片左右甩出，可把它放到最后"
  IDS_TAB_GROUP_EDIT "编辑组"
+ IDS_SETTINGS_JUMP_LIST_NEW_WINDOW "已固定文件夹在新窗口中打开"
+ IDS_SETTINGS_JUMP_LIST_NEW_WINDOW_DESC "关闭时，已固定文件夹在运行中的窗口里新建标签页"
 END
 LANGUAGE 0x09, 0x01
 STRINGTABLE
@@ -2142,6 +2144,8 @@ BEGIN
  IDS_TRAY_NEXT "Next"
  IDS_TRAY_FLING_HINT "Hold a card and fling it sideways to send it to the back"
  IDS_TAB_GROUP_EDIT "Edit group"
+ IDS_SETTINGS_JUMP_LIST_NEW_WINDOW "Pinned folders open in a new window"
+ IDS_SETTINGS_JUMP_LIST_NEW_WINDOW_DESC "Off opens a pinned folder as a tab in the running Pulse window"
 END
 LANGUAGE 0x04, 0x02
 STRINGTABLE

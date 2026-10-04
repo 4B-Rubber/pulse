@@ -50,7 +50,8 @@ bool HandleQuickAccessCommand(AppState& s, int command,
                               const std::vector<std::wstring>& paths) {
     if (command != app::CmdPinQuickAccess && command != app::CmdUnpinQuickAccess) return false;
     s.places.SetQuickAccessPinned(paths, command == app::CmdPinQuickAccess);
-    app::RefreshJumpList(s.places.quick_access_paths);
+    app::RefreshJumpList(s.places.quick_access_paths,
+                         s.appPrefs.jump_list_pinned_new_window);
     InvalidateRect(s.hwnd, nullptr, FALSE);
     return true;
 }

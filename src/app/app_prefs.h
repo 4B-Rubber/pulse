@@ -52,6 +52,9 @@ struct AppPrefsValues {
     // new_tab_open: 0 the current folder, 1 the default location.
     int startup_open = 0;
     int new_tab_open = 0;
+    // Taskbar jump list: a pinned folder opens in a window of its own; off opens
+    // it as a tab in the running Pulse window (jump_list.cpp).
+    bool jump_list_pinned_new_window = false;
     // Closing the only tab closes the window (app/last_tab_close.h).
     bool close_window_with_last_tab = false;
     bool confirm_recycle_delete = false; // ask before Delete moves items to the Recycle Bin

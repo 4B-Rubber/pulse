@@ -692,6 +692,7 @@ struct WindowViewModel {
     bool settings_show_hidden_files = false;
     bool settings_show_protected_os_files = false;
     bool show_pinned_tab_names = true;
+    bool settings_jump_list_new_window = false;
     bool settings_list_smart_date = true;
     bool settings_list_zebra_rows = true;
     bool settings_list_size_bar = false;

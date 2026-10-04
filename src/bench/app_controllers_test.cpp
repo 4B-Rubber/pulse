@@ -1048,6 +1048,22 @@ int wmain(int argc, wchar_t** argv) {
         prefs.show_pinned_tab_names && parsed_prefs.FromJson(prefs.ToJson()) &&
         parsed_prefs.show_pinned_tab_names);
     {
+        // Taskbar jump list: pinned folders open as tabs in the running window by
+        // default, windows of their own when the switch is on (jump_list.cpp).
+        pulse::app::AppPrefs jump_prefs;
+        passed &= Report("pinned jump-list folders open as tabs by default",
+            !jump_prefs.jump_list_pinned_new_window);
+        settings_ui.ToggleUi(34);
+        passed &= Report("pinned jump-list folders open as windows when enabled and persist",
+            prefs.jump_list_pinned_new_window && parsed_prefs.FromJson(prefs.ToJson()) &&
+            parsed_prefs.jump_list_pinned_new_window &&
+            HasEffect(last_effect, SettingsEffect::JumpList));
+        settings_ui.ToggleUi(34);
+        passed &= Report("pinned jump-list folders switch back and persist",
+            !prefs.jump_list_pinned_new_window && parsed_prefs.FromJson(prefs.ToJson()) &&
+            !parsed_prefs.jump_list_pinned_new_window);
+    }
+    {
         pulse::app::AppPrefs update_prefs;
         passed &= Report("automatic update checks default on, also for an older app.json",
             prefs.auto_check_updates && update_prefs.FromJson(L"{\"show_hints\":true}") &&
