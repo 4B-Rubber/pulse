@@ -840,6 +840,8 @@ AppPrefsValues AppPrefs::MergedWithDisk(const AppPrefsValues& disk) const {
         merged.show_status_performance = disk.show_status_performance;
     if (mine.show_pinned_tab_names == baseline.show_pinned_tab_names)
         merged.show_pinned_tab_names = disk.show_pinned_tab_names;
+    if (mine.multi_instance_mode == baseline.multi_instance_mode)
+        merged.multi_instance_mode = disk.multi_instance_mode;
     if (mine.search_pinyin == baseline.search_pinyin)
         merged.search_pinyin = disk.search_pinyin;
     if (mine.global_search_enabled == baseline.global_search_enabled)
