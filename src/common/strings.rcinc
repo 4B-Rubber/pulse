@@ -2105,6 +2105,7 @@ BEGIN
  IDS_TAB_GROUP_EDIT "编辑组"
  IDS_SETTINGS_MULTI_INSTANCE "多窗口模式"
  IDS_SETTINGS_MULTI_INSTANCE_DESC "允许多个 Pulse 窗口：标签页可拖出成新窗口，菜单和任务栏跳转列表可在新窗口打开；关闭时所有入口都在当前窗口新建标签页"
+ IDS_OP_ITEMS_PER_SECOND "项/秒"
 END
 LANGUAGE 0x09, 0x01
 STRINGTABLE
@@ -2146,6 +2147,7 @@ BEGIN
  IDS_TAB_GROUP_EDIT "Edit group"
  IDS_SETTINGS_MULTI_INSTANCE "Multi-window mode"
  IDS_SETTINGS_MULTI_INSTANCE_DESC "Allow several Pulse windows at once: tabs can be torn off, and menus and the jump list can open new windows; off keeps every entry as a tab in the running window"
+ IDS_OP_ITEMS_PER_SECOND "items/s"
 END
 LANGUAGE 0x04, 0x02
 STRINGTABLE

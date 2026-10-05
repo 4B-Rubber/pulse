@@ -1353,6 +1353,7 @@ enum class StringId : UINT {
     TabGroupEdit = IDS_TAB_GROUP_EDIT,
     SettingsMultiInstance = IDS_SETTINGS_MULTI_INSTANCE,
     SettingsMultiInstanceDesc = IDS_SETTINGS_MULTI_INSTANCE_DESC,
+    OpItemsPerSecond = IDS_OP_ITEMS_PER_SECOND,
 };
 
 bool IsLanguageId(std::wstring_view id) noexcept;

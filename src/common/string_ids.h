@@ -1372,3 +1372,5 @@
 // Settings: several Pulse windows at once (torn-off tabs, jump-list windows).
 #define IDS_SETTINGS_MULTI_INSTANCE 2530
 #define IDS_SETTINGS_MULTI_INSTANCE_DESC 2531
+// File operations that track items (delete, restore) label their speed with this unit.
+#define IDS_OP_ITEMS_PER_SECOND 2532

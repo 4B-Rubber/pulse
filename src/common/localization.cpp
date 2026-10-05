@@ -10,7 +10,7 @@ namespace {
 
 constexpr UINT kFirstString = IDS_SETTINGS;
 // Must stay on the highest allocated string id, otherwise Get() returns empty.
-constexpr UINT kLastString = IDS_SETTINGS_MULTI_INSTANCE_DESC;
+constexpr UINT kLastString = IDS_OP_ITEMS_PER_SECOND;
 static_assert(static_cast<UINT>(StringId::UiFontLarger) <= kLastString);
 static_assert(static_cast<UINT>(StringId::UpdateWaitingOperations) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SidebarShowHidden) <= kLastString);
@@ -28,6 +28,7 @@ static_assert(static_cast<UINT>(StringId::TabGroupEdit) <= kLastString);
 static_assert(static_cast<UINT>(StringId::OpenItemLocation) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SettingsMultiInstance) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SettingsMultiInstanceDesc) <= kLastString);
+static_assert(static_cast<UINT>(StringId::OpItemsPerSecond) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SettingsChangeTracking) >= kFirstString &&
               static_cast<UINT>(StringId::ChangeDisabled) <= kLastString &&
               static_cast<UINT>(StringId::FolderSortMixed) <= kLastString &&
