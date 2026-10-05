@@ -784,16 +784,29 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             else if (app::Tab* t = ActiveTab(*s))
                 RememberPath(*s, t->current_path);
         } else {
-        // Shots accept the This PC arguments too (GUI checks of the drive view).
-        std::wstring startPath = !s->shot.active ? L"C:\\"
-            : app::IsThisPcArgument(s->shot.path) ? std::wstring() : s->shot.path;
-        if (!s->shot.active && !s->session_path.empty()) startPath = s->session_path;
-        else if (!s->shot.active && !s->open_path.empty())
-            startPath = app::IsThisPcArgument(s->open_path) ? std::wstring()
-                                                            : ResolveOpenFolderPath(s->open_path);
+        // A shell namespace (the taskbar's Explorer button, the desktop's Recycle Bin)
+        // is translated to its Pulse view, or to nothing when Pulse has no view for it:
+        // the window still opens, it just has nothing of its own to show. This PC is the
+        // empty path; an unrecognized namespace keeps the default instead of a CLSID tab.
+        std::wstring startPath = L"C:\\";
+        if (s->shot.active) {
+            // Shots accept the This PC arguments too (GUI checks of the drive view).
+            startPath = app::IsThisPcArgument(s->shot.path) ? std::wstring()
+                : ResolveIncomingPath(s->shot.path);
+            if (startPath.empty() && !app::IsThisPcArgument(s->shot.path)) startPath = L"C:\\";
+        } else if (!s->session_path.empty()) {
+            startPath = s->session_path;
+        } else if (!s->open_path.empty()) {
+            if (app::IsThisPcArgument(s->open_path)) {
+                startPath.clear();
+            } else {
+                const std::wstring incoming = ResolveIncomingPath(s->open_path);
+                if (!incoming.empty()) startPath = incoming;
+            }
+        }
         // A new window nobody aimed anywhere: the recent view, not whatever the
         // window that spawned it happened to be showing.
-        else if (!s->shot.active && s->secondaryInstance) startPath = app::MakeRecentPath();
+        else if (s->secondaryInstance) startPath = app::MakeRecentPath();
         else if (open_default_location)
             startPath = app::DefaultLocation(s->appPrefs); // empty = This PC
         s->pane->NewTab(startPath);
@@ -819,7 +832,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (!s->shot.active && !s->secondaryInstance && !s->open_path.empty() &&
             (!s->session_layout_tabs.empty() || !s->session_path.empty())) {
             const bool this_pc = app::IsThisPcArgument(s->open_path);
-            const std::wstring open_path = this_pc ? std::wstring() : ResolveOpenFolderPath(s->open_path);
+            const std::wstring open_path = this_pc ? std::wstring() : ResolveIncomingPath(s->open_path);
             if (this_pc) OpenTabAt(*s, open_path);  // NewTab would open C: for ""
             else if (!open_path.empty() && !ActivateExistingFolderTab(*s, open_path))
                 NewTab(*s, open_path);
@@ -992,9 +1005,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // activates the existing tab instead).
             // A virtual location ("pulse:recent", a tag, a search) is opened as
             // it is; only a real path is resolved to its folder.
-            const std::wstring resolved =
-                fs::IsVirtualPath(transfer.path) ? transfer.path
-                                                 : ResolveOpenFolderPath(transfer.path);
+            const std::wstring resolved = ResolveIncomingPath(transfer.path);
             if (!resolved.empty()) {
                 NewTab(*s, resolved);
                 if (app::Tab* opened = s->pane ? s->pane->ActiveTab() : nullptr) {
@@ -1010,8 +1021,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         if (s && app::SingleInstanceCoordinator::DecodeTabTransfer(cds, path)) {
             // A window of an older build hands the folder over without its selection.
-            const std::wstring resolved =
-                fs::IsVirtualPath(path) ? path : ResolveOpenFolderPath(path);
+            const std::wstring resolved = ResolveIncomingPath(path);
             if (!resolved.empty()) NewTab(*s, resolved);
             AdoptSingletonOwnership(*s);
             return TRUE;
