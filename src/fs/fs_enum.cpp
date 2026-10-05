@@ -131,6 +131,16 @@ bool IsVirtualPath(const std::wstring& path) {
     return path.starts_with(L"pulse:");
 }
 
+bool IsShellNamespacePath(const std::wstring& path) {
+    std::wstring_view v = path;
+    // Older runs pushed namespaces through the path normalizer, which left the
+    // "\\?\" prefix behind. That leftover is a namespace too, not a folder.
+    if (v.starts_with(L"\\\\?\\")) v = v.substr(4);
+    if (v.size() >= 2 && v[0] == L':' && v[1] == L':') return true;
+    if (v.size() < 6) return false;
+    return _wcsnicmp(v.data(), L"shell:", 6) == 0;
+}
+
 bool IsUncPath(const std::wstring& path) {
     return path.starts_with(L"\\\\?\\UNC\\") ||
            (path.starts_with(L"\\\\") && !path.starts_with(L"\\\\?\\"));
@@ -138,7 +148,10 @@ bool IsUncPath(const std::wstring& path) {
 
 std::wstring NormalizePath(std::wstring path) {
     if (path.empty()) return path;
-    if (IsVirtualPath(path)) return path;
+    // Virtual views and shell namespaces are not filesystem paths and must not be
+    // rewritten: "\\?\\::{GUID}" is not a folder, and GetFullPathNameW would fold a
+    // "shell:" name into the working directory.
+    if (IsVirtualPath(path) || IsShellNamespacePath(path)) return path;
     // Replace forward slashes with backslashes.
     std::replace(path.begin(), path.end(), L'/', L'\\');
     if (path.starts_with(L"\\\\?\\")) {
@@ -188,7 +201,8 @@ std::wstring StripLnkSuffix(const std::wstring& name) {
     return name.substr(0, name.size() - 4);
 }
 
-static void EnumerateFindFirstFileEx(const std::wstring& path, std::vector<DirEntry>& out) {
+static bool EnumerateFindFirstFileEx(const std::wstring& path, std::vector<DirEntry>& out,
+                                     const EnumerateProgress& progress) {
     std::wstring pattern = path;
     if (!pattern.ends_with(L"\\")) pattern += L"\\";
     pattern += L"*";
@@ -203,11 +217,12 @@ static void EnumerateFindFirstFileEx(const std::wstring& path, std::vector<DirEn
         FIND_FIRST_EX_LARGE_FETCH);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
-        if (err == ERROR_FILE_NOT_FOUND) return;
+        if (err == ERROR_FILE_NOT_FOUND) return true;
         std::ostringstream oss;
         oss << "FindFirstFileExW failed, error=" << err;
         throw std::runtime_error(oss.str());
     }
+    size_t since_progress = 0;
     do {
         if (fd.cFileName[0] == L'.' &&
             (fd.cFileName[1] == L'\0' || (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
@@ -224,6 +239,13 @@ static void EnumerateFindFirstFileEx(const std::wstring& path, std::vector<DirEn
         e.reparse_tag = e.is_reparse ? fd.dwReserved0 : 0;
         e.cloud_recall = (fd.dwFileAttributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0;
         out.push_back(std::move(e));
+        if (++since_progress >= 4096) {
+            since_progress = 0;
+            if (progress && !progress(out)) {
+                FindClose(h);
+                return false;
+            }
+        }
     } while (FindNextFileW(h, &fd));
     const DWORD error = GetLastError();
     FindClose(h);
@@ -231,9 +253,11 @@ static void EnumerateFindFirstFileEx(const std::wstring& path, std::vector<DirEn
         out.clear();
         throw std::runtime_error("FindNextFileW failed, error=" + std::to_string(error));
     }
+    return true;
 }
 
-static void EnumerateNtQuery(const std::wstring& path, std::vector<DirEntry>& out) {
+static bool EnumerateNtQuery(const std::wstring& path, std::vector<DirEntry>& out,
+                             const EnumerateProgress& progress) {
     InitNtApi();
 
     std::wstring target = path;
@@ -313,6 +337,7 @@ static void EnumerateNtQuery(const std::wstring& path, std::vector<DirEntry>& ou
         }
 
         auto* info = reinterpret_cast<NtFileFullDirInformation*>(buffer.data());
+        const size_t before_batch = out.size();
         for (;;) {
             DirEntry e;
             e.name.assign(info->FileName, info->FileNameLength / sizeof(WCHAR));
@@ -338,10 +363,18 @@ static void EnumerateNtQuery(const std::wstring& path, std::vector<DirEntry>& ou
             info = reinterpret_cast<NtFileFullDirInformation*>(
                 reinterpret_cast<BYTE*>(info) + info->NextEntryOffset);
         }
+        // A 64 KB buffer holds hundreds of entries: a natural batch boundary for callers
+        // that publish partial results instead of waiting for the whole directory.
+        if (out.size() != before_batch && progress && !progress(out)) {
+            CloseHandle(hEvent);
+            CloseHandle(h);
+            return false;
+        }
     }
 
     CloseHandle(hEvent);
     CloseHandle(h);
+    return true;
 }
 
 // "This PC" view (empty path): one entry per logical drive, label matches
@@ -404,11 +437,12 @@ static void EnumerateServerShares(const std::wstring& server, std::vector<DirEnt
     NetApiBufferFree(buf);
 }
 
-void EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out) {
+bool EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out,
+                        const EnumerateProgress& progress) {
     out.clear();
     if (path.empty()) {
         EnumerateThisPc(out);
-        return;
+        return true;
     }
     std::wstring normalized = NormalizePath(path);
     if (normalized.starts_with(L"\\\\?\\UNC\\")) {
@@ -416,17 +450,22 @@ void EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out) {
         while (!rest.empty() && rest.back() == L'\\') rest.pop_back();
         if (!rest.empty() && rest.find(L'\\') == std::wstring::npos) {
             EnumerateServerShares(rest, out);
-            return;
+            return true;
         }
     }
+    const auto finished = [&] {
+        // Callers use the hook as a batch boundary; always give them a last one.
+        return !progress || progress(out);
+    };
     try {
-        EnumerateNtQuery(normalized, out);
-        return;
+        if (EnumerateNtQuery(normalized, out, progress)) return finished();
+        return false;
     } catch (...) {
         // Fall back to FindFirstFileExW.
     }
     out.clear();
-    EnumerateFindFirstFileEx(normalized, out);
+    if (EnumerateFindFirstFileEx(normalized, out, progress)) return finished();
+    return false;
 }
 
 } // namespace pulse::fs
