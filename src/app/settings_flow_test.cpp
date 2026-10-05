@@ -245,6 +245,40 @@ int RunAdaptiveColumnsTest(AppState& s, const wchar_t* output) {
         s.columnResizing = false;
         s.columnResizeIndex = -1;
         s.columnResizePane = -1;
+        // The Recycle Bin renders the search-style column set (it carries the path column)
+        // while its path kind is "recycle", not "search": a resize has to write the array
+        // that pane reads, or dragging and refitting both go nowhere.
+        const ui::DetailsColumnWidths recycle_details{140.0f, 150.0f, 90.0f, 0.0f, 0.0f};
+        const std::array<float, 4> recycle_search{200.0f, 140.0f, 150.0f, 90.0f};
+        tab->current_path = L"pulse:recycle";
+        tab->view_mode = ui::ViewMode::Details;
+        tab->details_column_dividers = recycle_details;
+        tab->search_column_dividers = recycle_search;
+        {
+            const auto recycle_vm = BuildVm(s, false);
+            size_t recycle_index = recycle_vm.pane_slots.size();
+            for (size_t i = 0; i < recycle_vm.pane_slots.size(); ++i)
+                if (PaneAtSlot(s, static_cast<int>(i)) == s.pane) { recycle_index = i; break; }
+            const bool found = recycle_index < recycle_vm.pane_slots.size();
+            check(found && recycle_vm.pane_slots[recycle_index].pane.is_search,
+                "recycle bin pane renders the search-style column set");
+            if (found) {
+                const auto& slot = recycle_vm.pane_slots[recycle_index];
+                const auto columns = s.renderer.DetailsColumns(slot.rect, slot.pane);
+                check(columns.Has(ui::MainRenderer::ColumnKind::Path),
+                    "recycle bin columns include the path column");
+                ResizePaneColumnDivider(s, *tab, recycle_vm,
+                    static_cast<int>(recycle_index), 0, columns.DividerX(0) - 40.0f * s.scale);
+                check(tab->search_column_dividers != recycle_search &&
+                      tab->details_column_dividers == recycle_details,
+                    "dragging a recycle bin divider moves the widths that pane shows");
+                AutoFitPaneColumnDivider(s, *tab, recycle_vm,
+                    static_cast<int>(recycle_index), 0);
+                check(tab->search_column_dividers[0] == 0.0f &&
+                      tab->details_column_dividers == recycle_details,
+                    "refitting a recycle bin divider resets only the search-style width");
+            }
+        }
         tab->current_path = saved_path;
         tab->view_mode = saved_view;
         tab->details_column_dividers = saved_details;
