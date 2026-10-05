@@ -1004,6 +1004,51 @@ void UpdateSmoothScroll(AppState& s) {
     ClampScroll(s);
 }
 
+namespace {
+// The bounds and the column set a resize gesture belongs to. A stale pane index falls
+// back to the focused pane, which is what the drag used to do for its bounds alone.
+struct PaneColumnTarget {
+    D2D1_RECT_F bounds{};
+    bool search_layout = false;
+};
+
+PaneColumnTarget PaneColumnTargetFor(AppState& s, const ui::WindowViewModel& vm,
+                                     int pane_index) {
+    PaneColumnTarget target;
+    if (pane_index >= 0 && pane_index < static_cast<int>(vm.pane_slots.size())) {
+        const auto& slot = vm.pane_slots[static_cast<size_t>(pane_index)];
+        target.bounds = s.renderer.PaneBodyBounds(slot.pane, slot.rect);
+        target.search_layout = slot.pane.is_search;
+        return target;
+    }
+    const D2D1_RECT_F window = s.renderer.ContentRect(
+        static_cast<float>(s.compositor.Width()),
+        static_cast<float>(s.compositor.Height()));
+    target.bounds = s.renderer.PaneBodyBounds(vm.pane, window);
+    target.search_layout = vm.pane.is_search;
+    return target;
+}
+} // namespace
+
+void ResizePaneColumnDivider(AppState& s, app::Tab& tab, const ui::WindowViewModel& vm,
+                             int pane_index, int divider, float cursor_x) {
+    const PaneColumnTarget target = PaneColumnTargetFor(s, vm, pane_index);
+    if (target.search_layout) {
+        tab.search_column_dividers = s.renderer.ResizeSearchColumnDivider(
+            target.bounds, tab.search_column_dividers, divider, cursor_x);
+    } else {
+        tab.details_column_dividers = s.renderer.ResizeDetailsColumnDivider(
+            target.bounds, tab.details_column_dividers, divider, cursor_x);
+    }
+}
+
+void AutoFitPaneColumnDivider(AppState& s, app::Tab& tab, const ui::WindowViewModel& vm,
+                              int pane_index, int divider) {
+    const PaneColumnTarget target = PaneColumnTargetFor(s, vm, pane_index);
+    s.renderer.AutoFitColumnDivider(target.bounds, tab.details_column_dividers,
+                                    target.search_layout, tab.search_column_dividers, divider);
+}
+
 LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (!s) return DefWindowProcW(hwnd, msg, wParam, lParam);
         int mx = GET_X_LPARAM(lParam);
@@ -1085,33 +1130,11 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (GetCapture() == hwnd) ReleaseCapture();
             } else {
                 ui::WindowViewModel resizeVm = BuildVm(*s);
-                D2D1_RECT_F paneRect = s->renderer.ContentRect(
-                    static_cast<float>(s->compositor.Width()),
-                    static_cast<float>(s->compositor.Height()));
-                if (s->columnResizePane >= 0 &&
-                    s->columnResizePane < static_cast<int>(resizeVm.pane_slots.size())) {
-                    const auto& resizeSlot = resizeVm.pane_slots[
-                        static_cast<size_t>(s->columnResizePane)];
-                    paneRect = s->renderer.PaneBodyBounds(resizeSlot.pane, resizeSlot.rect);
-                } else {
-                    paneRect = s->renderer.PaneBodyBounds(resizeVm.pane, paneRect);
-                }
                 app::Pane* resizePane = PaneAtSlot(*s, s->columnResizePane);
                 app::Tab* resizeTab = resizePane ? resizePane->ActiveTab() : nullptr;
                 if (resizeTab) {
-                    std::wstring kind;
-                    app::ParsePulsePath(resizeTab->current_path, &kind, nullptr);
-                    if (kind == L"search") {
-                        resizeTab->search_column_dividers =
-                            s->renderer.ResizeSearchColumnDivider(
-                                paneRect, resizeTab->search_column_dividers,
-                                s->columnResizeIndex, static_cast<float>(mx));
-                    } else {
-                        resizeTab->details_column_dividers =
-                            s->renderer.ResizeDetailsColumnDivider(
-                                paneRect, resizeTab->details_column_dividers,
-                                s->columnResizeIndex, static_cast<float>(mx));
-                    }
+                    ResizePaneColumnDivider(*s, *resizeTab, resizeVm, s->columnResizePane,
+                                            s->columnResizeIndex, static_cast<float>(mx));
                 }
                 s->hoverRegion = static_cast<int>(ui::HitTestResult::ColumnDivider);
                 s->hoverControlIndex = s->columnResizeIndex;
@@ -3130,13 +3153,7 @@ LRESULT HandleLButtonDblClk(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPA
             app::Tab* fitTab = fitPane ? fitPane->ActiveTab() : nullptr;
             if (fitTab && hit.pane_index >= 0 &&
                 hit.pane_index < static_cast<int>(vm.pane_slots.size())) {
-                std::wstring kind;
-                app::ParsePulsePath(fitTab->current_path, &kind, nullptr);
-                s->renderer.AutoFitColumnDivider(
-                    s->renderer.PaneBodyBounds(vm.pane_slots[static_cast<size_t>(hit.pane_index)].pane,
-                        vm.pane_slots[static_cast<size_t>(hit.pane_index)].rect),
-                    fitTab->details_column_dividers, kind == L"search",
-                    fitTab->search_column_dividers, hit.index);
+                AutoFitPaneColumnDivider(*s, *fitTab, vm, hit.pane_index, hit.index);
                 if (s->renameIndex >= 0) LayoutRenameOverlay(*s);
             }
             InvalidateRect(hwnd, nullptr, FALSE);

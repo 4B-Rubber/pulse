@@ -20,6 +20,15 @@ void ClearDropFeedback(AppState& s);
 std::wstring BaseName(const std::wstring& path);
 bool PointOnPaneHeader(const AppState& s, const ui::WindowViewModel& vm,
                               int pane_index, float x, float y);
+// Column widths live in two arrays and a pane renders with exactly one of them: the
+// search-style set (the one carrying the path column) covers search results, saved
+// searches, the Recycle Bin and the changes view, and the pane view model's is_search
+// flag says which. Both the drag and the double-click refit go through these, so a
+// gesture always writes the widths the pane actually reads.
+void ResizePaneColumnDivider(AppState& s, app::Tab& tab, const ui::WindowViewModel& vm,
+                             int pane_index, int divider, float cursor_x);
+void AutoFitPaneColumnDivider(AppState& s, app::Tab& tab, const ui::WindowViewModel& vm,
+                              int pane_index, int divider);
 std::wstring HeaderDropHint(const std::vector<std::wstring>& sources);
 std::wstring ResolveHeaderDropFolder(const std::vector<std::wstring>& sources);
 DWORD ResolveDropTarget(AppState& s, const std::vector<std::wstring>& sources,
