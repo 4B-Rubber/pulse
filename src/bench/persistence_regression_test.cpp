@@ -20,7 +20,10 @@ int main() {
     std::wstring before; ReadUtf8File(config, before);
     HANDLE locked = CreateFileW(config.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     AppPrefs prefs; prefs.persist = false;
-    Check(!prefs.Load() && prefs.load_failed, "PERSIST-01 existing locked configuration records failure");
+    // Load() reports an unreadable file through load_failed instead of a false return:
+    // the in-memory values stay usable, and it is Save() that refuses to write them back.
+    Check(prefs.Load() && prefs.load_failed && prefs.background_image.empty(),
+          "PERSIST-01 existing locked configuration records failure");
     CloseHandle(locked); prefs.persist = true;
     Check(!prefs.Save(), "PERSIST-01 unlock alone cannot overwrite with defaults");
     std::wstring after; ReadUtf8File(config, after);
@@ -28,9 +31,18 @@ int main() {
     prefs.persist=false;
     Check(prefs.Load() && !prefs.load_failed && prefs.background_image==L"original.png", "PERSIST-01 successful reread restores settings");
     WriteUtf8FileAtomic(config, L"{\"background_image\":");
-    Check(!prefs.Load() && prefs.load_failed, "PERSIST-01 malformed configuration rejected");
+    Check(prefs.Load() && prefs.load_failed && prefs.background_image==L"original.png",
+          "PERSIST-01 malformed configuration rejected");
     prefs.persist=true; Check(!prefs.Save(), "PERSIST-01 malformed config protected");
     WriteUtf8FileAtomic(config,before); prefs.persist=false; prefs.Load(); prefs.persist=true;
+    // The main file keeps one previous copy: a damaged app.json falls back to it
+    // instead of losing the settings (the policy Save() documents).
+    Check(prefs.Save(), "PERSIST-01 saving keeps the previous file as a backup");
+    WriteUtf8FileAtomic(config, L"{\"background_image\":");
+    prefs.persist=false;
+    Check(prefs.Load() && !prefs.load_failed && prefs.background_image==L"original.png",
+          "PERSIST-01 damaged main file falls back to the backup");
+    WriteUtf8FileAtomic(config,before); prefs.Load(); prefs.persist=true;
     LayoutTabSnapshot saved; saved.layout=1; saved.focused=1; saved.target=0;
     PaneFolderSnapshot pc; PaneFolderSnapshot disk; disk.path=L"C:\\";
     saved.panes={pc,disk}; LayoutTab tab;
