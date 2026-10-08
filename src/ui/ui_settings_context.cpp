@@ -84,7 +84,8 @@ void MainRenderer::DrawSettingsPulseMenu(const WindowViewModel& vm,const D2D1_RE
     painter_.DrawText(l10n::Get(I::ContextPulseMenuDesc),D2D1::RectF(card.left+54*s,card.top+39*s,l.pulse_restore.left-12*s,card.top+65*s),compositor_->SmallFormat(),theme.text_secondary);
     // 恢复默认: an accent link, only live when something is hidden.
     {
-        const bool any=vm.settings_builtin_hidden!=0;
+        bool any=vm.settings_builtin_hidden!=0;
+        for(int i=0;i<static_cast<int>(app::BuiltinMenuSurface::Count);++i) any|=PulseMenuOrderCustom(vm,static_cast<app::BuiltinMenuSurface>(i));
         const bool hot=any && IsHovered(vm,HitTestResult::SettingsToggle,67);
         if(hot) fill(l.pulse_restore,4*s,theme.fill_hover);
         painter_.DrawText(l10n::Get(I::RestoreDefaults),D2D1::RectF(l.pulse_restore.left+4*s,l.pulse_restore.top,l.pulse_restore.right,l.pulse_restore.bottom),
@@ -118,9 +119,9 @@ void MainRenderer::DrawSettingsPulseMenu(const WindowViewModel& vm,const D2D1_RE
         painter_.DrawText(label,D2D1::RectF(x,r.top,r.right,r.bottom),compositor_->TextFormat(),on ? theme.accent : theme.text);
     }
     // Rows (list order = menu order of the selected surface).
-    const auto rows=app::BuiltinMenuSurfaceRows(PulseMenuSurface(vm));
-    for(size_t k=0;k<rows.count;++k) {
-        const auto& row=rows.rows[k];
+    const auto rows=app::BuiltinMenuOrderedRows(PulseMenuSurface(vm),PulseMenuOrder(vm));
+    for(size_t k=0;k<rows.size();++k) {
+        const auto& row=rows[k];
         D2D1_RECT_F r{};
         bool on=true,hot=false;int hit=-1;
         if(row.fixed!=app::BuiltinFixedRow::None) {
@@ -150,37 +151,74 @@ void MainRenderer::DrawSettingsPulseMenu(const WindowViewModel& vm,const D2D1_RE
             painter_.DrawSwitch(D2D1::RectF(r.right-44*s,r.top+6*s,r.right,r.bottom-6*s),L"",state);
         }
     }
-    // Live preview built from the same rows the real menu keeps.
+    // Live preview built from the same rows the real menu keeps. Movable
+    // rows show a grip on hover and can be dragged to a new place.
     const auto pv=l.pulse_preview;
     if(pv.bottom<=pv.top) return;
     if(vm.settings_context_tab!=2)
         painter_.DrawText(l10n::Get(vm.settings_context_tab==1 ? I::ContextPreviewBackground : I::ContextPreviewItem),
                           D2D1::RectF(pv.left,pv.top,pv.right,pv.top+18*s),compositor_->SmallFormat(),theme.text_secondary);
-    const auto box=D2D1::RectF(pv.left,pv.top+kPulsePreviewTitle*s,pv.right,pv.bottom);
+    if(l.pulse_order_reset.right>l.pulse_order_reset.left) {
+        const auto label=l10n::Get(I::ContextOrderReset);
+        const float w=CellTextWidth(label,true);
+        if(IsHovered(vm,HitTestResult::SettingsToggle,kSettingsMenuOrderReset))
+            fill(D2D1::RectF(l.pulse_order_reset.right-w-8*s,l.pulse_order_reset.top,l.pulse_order_reset.right+4*s,l.pulse_order_reset.bottom),4*s,theme.fill_hover);
+        painter_.DrawText(label,D2D1::RectF(l.pulse_order_reset.right-w-2*s,l.pulse_order_reset.top,l.pulse_order_reset.right+2*s,l.pulse_order_reset.bottom),
+                          compositor_->SmallFormat(),theme.accent);
+    }
+    const auto box=PulsePreviewBox(pv,s);
     fill(D2D1::RectF(box.left+1*s,box.top+2*s,box.right+1*s,box.bottom+3*s),8*s,D2D1::ColorF(0,0,0,0.06f));
     fill(box,8*s,theme.surface_flyout);
     stroke(box,8*s,theme.stroke_card,1);
+    painter_.DrawText(l10n::Get(vm.settings_context_tab==2 ? I::ContextOrderHintRow : I::ContextOrderHint),
+                      D2D1::RectF(box.left+2*s,box.bottom+6*s,box.right,pv.bottom),compositor_->SmallFormat(),theme.text_secondary);
+    const auto pl=LayoutPulsePreview(vm,box,s);
+    auto hovered=[&](const app::BuiltinMenuRow& row) {
+        return !pl.dragging && IsHovered(vm,HitTestResult::SettingsToggle,PulseMenuRowHit(row));
+    };
+    auto grip=[&](float x,float cy,const D2D1_COLOR_F& color) {
+        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> b;dc->CreateSolidColorBrush(color,&b);
+        if(!b) return;
+        for(int col=0;col<2;++col) for(int k=-1;k<=1;++k)
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x+col*3.5f*s,cy+k*4.5f*s),1.1f*s,1.1f*s),b.Get());
+    };
+    auto ghost_card=[&](const D2D1_RECT_F& g) {
+        fill(D2D1::RectF(g.left-1*s,g.top+3*s,g.right+1*s,g.bottom+6*s),7*s,D2D1::ColorF(0.16f,0.2f,0.35f,0.08f));
+        fill(D2D1::RectF(g.left,g.top+1*s,g.right,g.bottom+3*s),6*s,D2D1::ColorF(0.16f,0.2f,0.35f,0.08f));
+        fill(g,6*s,theme.surface_flyout);
+        stroke(g,6*s,theme.stroke_card,1);
+    };
+    auto insertion=[&](float x0,float y0,float x1,float y1) {
+        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> b;dc->CreateSolidColorBrush(theme.accent,&b);
+        if(!b) return;
+        dc->DrawLine(D2D1::Point2F(x0,y0),D2D1::Point2F(x1,y1),b.Get(),2*s);
+        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> inner;dc->CreateSolidColorBrush(theme.surface_flyout,&inner);
+        if(inner) dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0,y0),3.5f*s,3.5f*s),inner.Get());
+        dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x0,y0),3*s,3*s),b.Get(),1.5f*s);
+    };
     if(vm.settings_context_tab==2) {
         // One list row with the hover buttons that stay on.
         const auto row=D2D1::RectF(box.left+8*s,box.top+12*s,box.right-8*s,box.bottom-12*s);
         fill(row,4*s,theme.fill_hover);
         DrawIconText(row.left+8*s,row.top+6*s,20*s,20*s,L"\xE8A5",L"",theme.text_secondary,0.8f);
         painter_.DrawText(L"notes.txt",D2D1::RectF(row.left+36*s,row.top,row.right-90*s,row.bottom),compositor_->TextFormat(),theme.text);
-        float bx=row.right-28*s;
-        const auto visible=app::BuiltinMenuVisibleRows(app::BuiltinMenuSurface::RowButtons,vm.settings_builtin_hidden);
-        for(auto it=visible.rbegin();it!=visible.rend();++it) {
-            DrawIconText(bx+4*s,row.top+8*s,16*s,16*s,it->row->glyph,L"",theme.text_secondary,0.75f);
-            bx-=26*s;
+        for(const auto& v:pl.rows) {
+            if(hovered(v.row)) fill(v.rect,4*s,theme.fill_pressed);
+            DrawIconText(v.rect.left+4*s,v.rect.top+4*s,16*s,16*s,v.row.glyph,L"",theme.text_secondary,0.75f);
+        }
+        if(pl.dragging) {
+            const float x=(pl.gap.left+pl.gap.right)*0.5f;
+            insertion(x,pl.gap.top+1*s,x,pl.gap.bottom-1*s);
+            ghost_card(pl.ghost);
+            DrawIconText(pl.ghost.left+4*s,pl.ghost.top+4*s,16*s,16*s,pl.drag_row.glyph,L"",theme.text,0.8f);
         }
         return;
     }
-    float y=box.top+kPulsePreviewPad*s;
-    const float x0=box.left+6*s,x1=box.right-6*s;
-    for(const auto& v:app::BuiltinMenuVisibleRows(PulseMenuSurface(vm),vm.settings_builtin_hidden)) {
-        const auto& row=*v.row;
+    auto draw_row=[&](const app::BuiltinMenuRow& row,const D2D1_RECT_F& rect) {
+        float y=rect.top;
         if(row.item==app::BuiltinMenuItem::Tags) {
             static constexpr D2D1_COLOR_F kSwatch[]={{0.93f,0.27f,0.27f,1},{0.96f,0.56f,0.13f,1},{0.13f,0.73f,0.38f,1},{0.92f,0.70f,0.03f,1},{0.66f,0.33f,0.97f,1},{0.23f,0.51f,0.96f,1},{0.58f,0.64f,0.72f,1}};
-            float sx=x0+16*s;
+            float sx=rect.left+16*s;
             for(const auto& c:kSwatch) {
                 Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> b;dc->CreateSolidColorBrush(c,&b);
                 if(b) dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(sx+5*s,y+kPulsePreviewSwatches*s*0.5f),5*s,5*s),b.Get());
@@ -188,27 +226,64 @@ void MainRenderer::DrawSettingsPulseMenu(const WindowViewModel& vm,const D2D1_RE
             }
             y+=kPulsePreviewSwatches*s;
         }
-        const auto r=D2D1::RectF(x0,y,x1,y+kPulsePreviewRow*s);
+        const auto r=D2D1::RectF(rect.left,y,rect.right,y+kPulsePreviewRow*s);
         if(row.fixed==app::BuiltinFixedRow::Strip) {
             static constexpr const wchar_t* kStrip[]={L"\xE8C6",L"\xE8C8",L"\xE74D",L"\xE8AC"};
             float sx=r.left+28*s;
             for(const auto* g:kStrip) {DrawIconText(sx,r.top+9*s,16*s,16*s,g,L"",theme.text,0.8f);sx+=44*s;}
-        } else {
-            if(row.glyph) DrawIconText(r.left+10*s,r.top+9*s,16*s,16*s,row.glyph,L"",theme.text,0.8f);
-            const auto label=row.item==app::BuiltinMenuItem::Tags ? l10n::Get(I::TagsEllipsis) : app::BuiltinMenuRowLabel(row);
-            painter_.DrawText(label,D2D1::RectF(r.left+36*s,r.top,r.right-8*s,r.bottom),compositor_->SmallFormat(),theme.text);
-            if(row.submenu) {
-                DrawIconText(r.right-22*s,r.top+11*s,12*s,12*s,L"\xE76C",L"",theme.text_secondary,0.7f);
-            } else if(row.shortcut) {
-                const float w=CellTextWidth(row.shortcut,true);
-                painter_.DrawText(row.shortcut,D2D1::RectF(r.right-10*s-w,r.top,r.right-6*s,r.bottom),compositor_->SmallFormat(),theme.text_secondary);
+            return;
+        }
+        if(row.glyph) DrawIconText(r.left+10*s,r.top+9*s,16*s,16*s,row.glyph,L"",theme.text,0.8f);
+        const auto label=row.item==app::BuiltinMenuItem::Tags ? l10n::Get(I::TagsEllipsis) : app::BuiltinMenuRowLabel(row);
+        painter_.DrawText(label,D2D1::RectF(r.left+36*s,r.top,r.right-8*s,r.bottom),compositor_->SmallFormat(),theme.text);
+        if(row.submenu) {
+            DrawIconText(r.right-22*s,r.top+11*s,12*s,12*s,L"\xE76C",L"",theme.text_secondary,0.7f);
+        } else if(row.shortcut) {
+            const float w=CellTextWidth(row.shortcut,true);
+            painter_.DrawText(row.shortcut,D2D1::RectF(r.right-10*s-w,r.top,r.right-6*s,r.bottom),compositor_->SmallFormat(),theme.text_secondary);
+        }
+    };
+    const float x0=box.left+6*s,x1=box.right-6*s;
+    for(const auto& v:pl.rows) {
+        const bool fixed=v.row.fixed!=app::BuiltinFixedRow::None;
+        if(hovered(v.row)) {
+            if(!fixed) {
+                fill(v.rect,4*s,theme.fill_hover);
+                grip(box.left+7*s,(v.rect.top+v.rect.bottom)*0.5f,theme.text_secondary);
+            } else {
+                // Open and the action strip stay on top: a lock where the grip would be.
+                DrawIconText(box.left+3*s,(v.rect.top+v.rect.bottom)*0.5f-6*s,12*s,12*s,L"\xE72E",L"",theme.text_secondary,0.7f);
             }
         }
-        y+=kPulsePreviewRow*s;
-        if(v.separator_after) {
-            hline(x0+4*s,x1-4*s,y+kPulsePreviewSeparator*s*0.5f,theme.stroke_divider);
-            y+=kPulsePreviewSeparator*s;
-        }
+        draw_row(v.row,v.rect);
+        if(v.separator_after)
+            hline(x0+4*s,x1-4*s,v.rect.bottom+kPulsePreviewSeparator*s*0.5f,theme.stroke_divider);
     }
+    if(pl.dragging) {
+        const float y=(pl.gap.top+pl.gap.bottom)*0.5f;
+        insertion(x0+2*s,y,x1-2*s,y);
+        ghost_card(pl.ghost);
+        draw_row(pl.drag_row,pl.ghost);
+        grip(box.left+7*s,(pl.ghost.top+pl.ghost.bottom)*0.5f,theme.text_secondary);
+    }
+}
+
+float MainRenderer::SettingsMenuRowStart(const WindowViewModel& vm,const D2D1_RECT_F& rect,int item) {
+    const auto l=MakeSettingsLayout(vm,rect,scale_,title_bar_height_,status_height_,&painter_);
+    if(l.pulse_preview.bottom<=l.pulse_preview.top) return NAN;
+    WindowViewModel still=vm;still.settings_menu_drag=-1;
+    for(const auto& r:LayoutPulsePreview(still,PulsePreviewBox(l.pulse_preview,scale_),scale_).rows)
+        if(r.row.fixed==app::BuiltinFixedRow::None && static_cast<int>(r.row.item)==item)
+            return vm.settings_context_tab==2 ? r.rect.left : r.rect.top;
+    return NAN;
+}
+
+app::BuiltinMenuOrder MainRenderer::SettingsMenuDropOrder(const WindowViewModel& vm,const D2D1_RECT_F& rect,float x,float y) {
+    const auto l=MakeSettingsLayout(vm,rect,scale_,title_bar_height_,status_height_,&painter_);
+    const auto pv=l.pulse_preview;
+    const float slack=40*scale_;
+    if(pv.bottom<=pv.top || x<pv.left-slack || x>pv.right+slack || y<pv.top-slack || y>pv.bottom+slack) return {};
+    const auto pl=LayoutPulsePreview(vm,PulsePreviewBox(pv,scale_),scale_);
+    return pl.dragging ? pl.order : app::BuiltinMenuOrder{};
 }
 }

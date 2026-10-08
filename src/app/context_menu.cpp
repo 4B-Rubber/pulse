@@ -137,8 +137,57 @@ BuiltinMenuItem BuiltinItemForRow(const ui::FluentMenuItem& item) {
 }
 } // namespace
 
+namespace {
+// Consecutive rows owned by one movable item (the tag swatches and 标签...,
+// the three selection commands) move as one block.
+void ReorderBuiltinRows(std::vector<ui::FluentMenuItem>& items, const BuiltinMenuOrder& order) {
+    struct Block { size_t first, count, rank; };
+    auto rank_of = [&](BuiltinMenuItem item) {
+        const auto it = std::find(order.begin(), order.end(), item);
+        return it == order.end() ? order.size() : static_cast<size_t>(it - order.begin());
+    };
+    std::vector<Block> blocks;
+    for (size_t i = 0; i < items.size();) {
+        const BuiltinMenuItem owner = BuiltinItemForRow(items[i]);
+        const size_t rank = owner == BuiltinMenuItem::Count ? order.size() : rank_of(owner);
+        size_t end = i + 1;
+        if (rank < order.size()) {
+            while (end < items.size() && BuiltinItemForRow(items[end]) == owner) ++end;
+            blocks.push_back({ i, end - i, rank });
+        }
+        i = end;
+    }
+    auto sorted = blocks;
+    std::stable_sort(sorted.begin(), sorted.end(), [](const Block& a, const Block& b) { return a.rank < b.rank; });
+    bool moved = false;
+    for (size_t b = 0; b < blocks.size(); ++b) moved |= sorted[b].first != blocks[b].first;
+    if (!moved) return;
+    std::vector<bool> slot_separator(blocks.size());
+    for (size_t b = 0; b < blocks.size(); ++b)
+        slot_separator[b] = items[blocks[b].first + blocks[b].count - 1].separator_after;
+    std::vector<ui::FluentMenuItem> out;
+    out.reserve(items.size());
+    size_t next = 0;
+    for (size_t i = 0; i < items.size();) {
+        if (next < blocks.size() && i == blocks[next].first) {
+            const Block& source = sorted[next];
+            for (size_t k = 0; k < source.count; ++k) out.push_back(std::move(items[source.first + k]));
+            out.back().separator_after = slot_separator[next];
+            i += blocks[next].count;
+            ++next;
+        } else {
+            out.push_back(std::move(items[i++]));
+        }
+    }
+    items = std::move(out);
+}
+} // namespace
+
 void ApplyBuiltinMenuPrefs(std::vector<ui::FluentMenuItem>& items,
-                           const ContextMenuPrefs& prefs) {
+                           const ContextMenuPrefs& prefs,
+                           BuiltinMenuSurface surface) {
+    if (surface < BuiltinMenuSurface::Count && prefs.BuiltinOrderCustom(surface))
+        ReorderBuiltinRows(items, prefs.BuiltinOrder(surface));
     if (prefs.builtin_hidden == 0 || items.empty()) return;
     auto hidden = [&](const ui::FluentMenuItem& item) {
         const BuiltinMenuItem owner = BuiltinItemForRow(item);

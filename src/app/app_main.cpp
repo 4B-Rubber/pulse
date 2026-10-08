@@ -494,6 +494,30 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->places.Load();
         ProbePinnedNetworks(*s);
         s->ctxMenuPrefs.Load();
+        if (s->isolatedTest) {
+            // GUI verification of the menu settings with a given hidden mask
+            // (decimal), without touching the user's context_menu.json.
+            wchar_t mask[16]{};
+            if (GetEnvironmentVariableW(L"PULSE_TEST_BUILTIN_HIDDEN", mask, ARRAYSIZE(mask)) > 0) {
+                s->ctxMenuPrefs.builtin_hidden = static_cast<uint32_t>(wcstoul(mask, nullptr, 10));
+                s->ctxMenuPrefs.persist = false;
+            }
+            // PULSE_TEST_BUILTIN_ORDER0/1/2: comma-joined row keys per surface.
+            for (int surface = 0; surface < static_cast<int>(app::BuiltinMenuSurface::Count); ++surface) {
+                wchar_t name[32]{};
+                swprintf_s(name, L"PULSE_TEST_BUILTIN_ORDER%d", surface);
+                wchar_t keys[512]{};
+                if (GetEnvironmentVariableW(name, keys, ARRAYSIZE(keys)) == 0) continue;
+                app::BuiltinMenuOrder order;
+                wchar_t* next = nullptr;
+                for (wchar_t* key = wcstok_s(keys, L",", &next); key; key = wcstok_s(nullptr, L",", &next))
+                    for (int i = 0; i < app::kBuiltinMenuItemCount; ++i)
+                        if (app::BuiltinMenuKey(static_cast<app::BuiltinMenuItem>(i)) == key)
+                            order.push_back(static_cast<app::BuiltinMenuItem>(i));
+                s->ctxMenuPrefs.SetBuiltinOrder(static_cast<app::BuiltinMenuSurface>(surface), order);
+                s->ctxMenuPrefs.persist = false;
+            }
+        }
         s->appPrefs.Load();
         NoteRunningVersion(*s);
         if (!s->shot.active && s->appPrefs.theme_mode >= 0) {
@@ -548,7 +572,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                                  s->appPrefs.list_size_bar, s->appPrefs.list_tag_name_color,
                                  s->appPrefs.list_selection_outline);
         s->renderer.SetDetailsColumns(s->appPrefs.details_columns);
-        s->renderer.SetRowActions(app::RowActionMask(s->ctxMenuPrefs.builtin_hidden));
+        s->renderer.SetRowActions(app::RowActionMask(s->ctxMenuPrefs.builtin_hidden,
+            s->ctxMenuPrefs.BuiltinOrder(app::BuiltinMenuSurface::RowButtons)));
         s->renderer.SetThumbnailBadges(s->appPrefs.list_thumbnail_badges);
         app::SetFolderSortMode(app::FolderSortModeFromInt(s->appPrefs.folder_sort_mode));
         ui::typography::SetTextRenderMode(static_cast<ui::typography::TextRenderMode>(s->appPrefs.text_render));
@@ -1409,11 +1434,17 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
+        if (s->settings.menu_drag_live() ||
+            (hit.region == ui::HitTestResult::SettingsToggle && hit.index >= ui::kSettingsMenuRowHit)) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)); // movable Pulse menu preview row
+            return TRUE;
+        }
         break;
     }
 
     case WM_CANCELMODE:
         HandleSidebarResize(s, hwnd, msg, lParam);
+        if (s) s->settings.EndMenuDrag();
         if (s) { s->detailsPreviewPanning = false; s->renderer.EndDetailsPreviewPan(); }
         if (GetCapture() == hwnd) ReleaseCapture();
         break;

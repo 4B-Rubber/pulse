@@ -2,6 +2,8 @@
 
 #include "../common/localization.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <initializer_list>
 #include <iterator>
 
@@ -122,23 +124,74 @@ std::wstring BuiltinMenuRowLabel(const BuiltinMenuRow& row) {
     return row.item < B::Count ? BuiltinMenuLabel(row.item) : std::wstring{};
 }
 
-std::vector<BuiltinMenuVisibleRow> BuiltinMenuVisibleRows(BuiltinMenuSurface surface,
-                                                          uint32_t builtin_hidden) {
+BuiltinMenuOrder BuiltinMenuDefaultOrder(BuiltinMenuSurface surface) {
     const auto rows = BuiltinMenuSurfaceRows(surface);
+    BuiltinMenuOrder order;
+    for (size_t i = 0; i < rows.count; ++i)
+        if (rows.rows[i].fixed == F::None && rows.rows[i].item < B::Count) order.push_back(rows.rows[i].item);
+    return order;
+}
+
+BuiltinMenuOrder NormalizeBuiltinMenuOrder(BuiltinMenuSurface surface, const BuiltinMenuOrder& saved) {
+    const auto table = BuiltinMenuDefaultOrder(surface);
+    auto has = [](const BuiltinMenuOrder& list, B item) {
+        return std::find(list.begin(), list.end(), item) != list.end();
+    };
+    BuiltinMenuOrder out;
+    out.reserve(table.size());
+    for (const B item : saved)
+        if (has(table, item) && !has(out, item)) out.push_back(item);
+    for (size_t i = 0; i < table.size(); ++i) {
+        if (has(out, table[i])) continue;
+        size_t at = 0;
+        for (size_t j = i; j-- > 0;) {
+            const auto prev = std::find(out.begin(), out.end(), table[j]);
+            if (prev != out.end()) { at = static_cast<size_t>(prev - out.begin()) + 1; break; }
+        }
+        out.insert(out.begin() + static_cast<std::ptrdiff_t>(at), table[i]);
+    }
+    return out;
+}
+
+std::vector<BuiltinMenuRow> BuiltinMenuOrderedRows(BuiltinMenuSurface surface, const BuiltinMenuOrder& order) {
+    const auto rows = BuiltinMenuSurfaceRows(surface);
+    std::vector<BuiltinMenuRow> out(rows.rows, rows.rows + rows.count);
+    if (order.empty()) return out;
+    const auto items = NormalizeBuiltinMenuOrder(surface, order);
+    size_t next = 0;
+    for (auto& slot : out) {
+        if (slot.fixed != F::None || slot.item >= B::Count || next >= items.size()) continue;
+        const B item = items[next++];
+        for (size_t i = 0; i < rows.count; ++i) {
+            if (rows.rows[i].item != item || rows.rows[i].fixed != F::None) continue;
+            const bool separator = slot.separator_after;
+            slot = rows.rows[i];
+            slot.separator_after = separator;
+            break;
+        }
+    }
+    return out;
+}
+
+std::vector<BuiltinMenuVisibleRow> BuiltinMenuVisibleRows(BuiltinMenuSurface surface,
+                                                          uint32_t builtin_hidden,
+                                                          const BuiltinMenuOrder& order) {
+    const auto rows = BuiltinMenuOrderedRows(surface, order);
     std::vector<BuiltinMenuVisibleRow> kept;
-    kept.reserve(rows.count);
-    bool last_dropped = false;
-    for (size_t i = 0; i < rows.count; ++i) {
-        const auto& row = rows.rows[i];
+    kept.reserve(rows.size());
+    bool last_dropped = false, last_kept = false;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const auto& row = rows[i];
         const bool hidden = row.item < B::Count && (builtin_hidden & BuiltinMenuBit(row.item)) != 0;
         last_dropped = hidden;
         if (hidden) {
             if (row.separator_after && !kept.empty()) kept.back().separator_after = true;
             continue;
         }
-        kept.push_back({ &row, row.separator_after });
+        kept.push_back({ row, row.separator_after });
+        last_kept = i + 1 == rows.size();
     }
-    if (!kept.empty() && (last_dropped || kept.back().row == rows.rows + rows.count - 1))
+    if (!kept.empty() && (last_dropped || last_kept))
         kept.back().separator_after = false;
     return kept;
 }
@@ -175,12 +228,19 @@ std::wstring BuiltinMenuLabel(BuiltinMenuItem item) {
     return l10n::Get(Info(item).label);
 }
 
-uint32_t RowActionMask(uint32_t builtin_hidden) {
+uint32_t RowActionMask(uint32_t builtin_hidden, const BuiltinMenuOrder& row_order) {
     uint32_t mask = kRowActionsAll;
     if (builtin_hidden & BuiltinMenuBit(BuiltinMenuItem::RowStar)) mask &= ~kRowActionStar;
     if (builtin_hidden & BuiltinMenuBit(BuiltinMenuItem::RowNewTab)) mask &= ~kRowActionNewTab;
     if (builtin_hidden & BuiltinMenuBit(BuiltinMenuItem::RowMore)) mask &= ~kRowActionMore;
-    return mask;
+    const auto order = NormalizeBuiltinMenuOrder(BuiltinMenuSurface::RowButtons, row_order);
+    if (row_order.empty() || order == BuiltinMenuDefaultOrder(BuiltinMenuSurface::RowButtons)) return mask;
+    uint32_t code = 0;
+    for (size_t i = 0; i < order.size() && i < 3; ++i) {
+        const uint32_t id = order[i] == B::RowStar ? 0u : order[i] == B::RowNewTab ? 1u : 2u;
+        code |= id << (2u * static_cast<uint32_t>(i));
+    }
+    return mask | (code << kRowActionOrderShift);
 }
 
 } // namespace pulse::app

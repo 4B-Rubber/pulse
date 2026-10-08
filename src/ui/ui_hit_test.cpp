@@ -503,6 +503,14 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     if(ContainsPt(lay.pulse_tab[i],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=64+i;return r;}
                 }
                 if(ContainsPt(lay.pulse_restore,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=67;return r;}
+                // Preview rows: press to drag (kSettingsMenuRowHit + item);
+                // the fixed rows only report hover. 68 restores the tab's order.
+                if(ContainsPt(lay.pulse_order_reset,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=kSettingsMenuOrderReset;return r;}
+                if(ContainsPt(lay.pulse_preview,x,y)) {
+                    WindowViewModel still=vm;still.settings_menu_drag=-1;
+                    for(const auto& row:LayoutPulsePreview(still,PulsePreviewBox(lay.pulse_preview,scale_),scale_).rows)
+                        if(ContainsPt(row.rect,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=PulseMenuRowHit(row.row);return r;}
+                }
                 for(int g=0;g<SettingsLayout::kContextCards;++g) {
                     if(g<5 && ContainsPt(lay.context_toggle[g],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=10+g;return r;}
                     if(ContainsPt(lay.context_header[g],x,y)) {r.region=HitTestResult::SettingsDisclosure;r.index=8+g;return r;}

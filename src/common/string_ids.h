@@ -1408,3 +1408,7 @@
 // Split view: hover button on the divider between two panes.
 #define IDS_SPLIT_SWAP_LR 2567
 #define IDS_SPLIT_SWAP_TB 2568
+// 右键菜单 › Pulse 菜单 preview: drag rows to reorder.
+#define IDS_CONTEXT_ORDER_RESET 2569
+#define IDS_CONTEXT_ORDER_HINT 2570
+#define IDS_CONTEXT_ORDER_HINT_ROW 2571

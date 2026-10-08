@@ -706,6 +706,13 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
                 return n == 1 && v[0] >= L'0' && v[0] <= L'2' ? v[0] - L'0' : -1;
             }();
             if (shot_context_tab >= 0) vm.settings_context_tab = shot_context_tab;
+            for (int i = 0; i < static_cast<int>(app::BuiltinMenuSurface::Count); ++i)
+                vm.settings_builtin_order[i] = s.ctxMenuPrefs.BuiltinOrder(static_cast<app::BuiltinMenuSurface>(i));
+            if (s.settings.menu_drag_live()) {
+                vm.settings_menu_drag = s.settings.menu_drag_item();
+                vm.settings_menu_drag_pos = s.settings.menu_drag_pos();
+                vm.settings_menu_drag_grab = s.settings.menu_drag_grab();
+            }
             for (int i = 0; i < app::kBuiltinMenuItemCount; ++i) {
                 const auto item = static_cast<app::BuiltinMenuItem>(i);
                 ui::SettingsRowView row;
@@ -2395,6 +2402,22 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.hover_region = s.hoverRegion;
     vm.hover_control_index = s.hoverControlIndex;
     vm.hover_sub_index = s.hoverSubIndex;
+    if (s.shot.active && s.isolatedTest) {
+        // Hidden checks of the 右键菜单 preview: PULSE_SHOT_MENU_HOVER=<item>
+        // (or f1 / f2 for the fixed rows) hovers a row; PULSE_SHOT_MENU_DRAG=
+        // <item>,<px> holds it with the pointer at that client coordinate.
+        wchar_t v[32]{};
+        if (GetEnvironmentVariableW(L"PULSE_SHOT_MENU_HOVER", v, ARRAYSIZE(v)) > 0) {
+            vm.hover_region = static_cast<int>(ui::HitTestResult::SettingsToggle);
+            vm.hover_control_index = v[0] == L'f' ? ui::kSettingsMenuFixedHit + _wtoi(v + 1)
+                                                  : ui::kSettingsMenuRowHit + _wtoi(v);
+        }
+        if (GetEnvironmentVariableW(L"PULSE_SHOT_MENU_DRAG", v, ARRAYSIZE(v)) > 0) {
+            wchar_t* end = nullptr;
+            vm.settings_menu_drag = static_cast<int>(wcstol(v, &end, 10));
+            if (end && *end == L',') vm.settings_menu_drag_pos = static_cast<float>(wcstod(end + 1, nullptr));
+        }
+    }
     vm.hover_pane_index = s.hoverPaneIndex;
     vm.column_resize_pressed = s.columnResizing;
     vm.tooltip_text = s.tooltipText;

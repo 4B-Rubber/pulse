@@ -40,6 +40,9 @@ enum class BuiltinMenuItem : uint8_t {
 };
 
 constexpr int kBuiltinMenuItemCount = static_cast<int>(BuiltinMenuItem::Count);
+// User order of a surface's movable rows (fixed rows always stay on top).
+// An empty order means the table order.
+using BuiltinMenuOrder = std::vector<BuiltinMenuItem>;
 static_assert(kBuiltinMenuItemCount <= 32, "builtin_hidden is a 32-bit mask");
 
 constexpr uint32_t BuiltinMenuBit(BuiltinMenuItem item) {
@@ -57,7 +60,10 @@ constexpr uint32_t kRowActionStar = 1u;
 constexpr uint32_t kRowActionNewTab = 2u;
 constexpr uint32_t kRowActionMore = 4u;
 constexpr uint32_t kRowActionsAll = kRowActionStar | kRowActionNewTab | kRowActionMore;
-uint32_t RowActionMask(uint32_t builtin_hidden);
+// Bits 3-8 carry the left-to-right order of the three buttons as 2-bit ids
+// (0 star, 1 new tab, 2 more); 0 there means the default order.
+constexpr uint32_t kRowActionOrderShift = 3u;
+uint32_t RowActionMask(uint32_t builtin_hidden, const BuiltinMenuOrder& row_order = {});
 
 // Settings page: the three surfaces the Pulse menu card switches between.
 enum class BuiltinMenuSurface : uint8_t { Item, Background, RowButtons, Count };
@@ -82,14 +88,25 @@ struct BuiltinMenuRows {
 BuiltinMenuRows BuiltinMenuSurfaceRows(BuiltinMenuSurface surface);
 // Label of a surface row (fixed rows included).
 std::wstring BuiltinMenuRowLabel(const BuiltinMenuRow& row);
-// Rows still shown for `builtin_hidden`, with separators moved the way
-// ApplyBuiltinMenuPrefs moves them (settings preview).
+
+// The movable rows of `surface` in table order.
+BuiltinMenuOrder BuiltinMenuDefaultOrder(BuiltinMenuSurface surface);
+// `saved` with foreign and repeated items dropped and missing ones put back
+// after their table predecessor, so new items land where they belong.
+BuiltinMenuOrder NormalizeBuiltinMenuOrder(BuiltinMenuSurface surface, const BuiltinMenuOrder& saved);
+// The surface rows with the movable rows in `order`. Separators belong to
+// the slot, not to the item: a moved row takes the separator of the place
+// it lands in, so the groups keep their shape.
+std::vector<BuiltinMenuRow> BuiltinMenuOrderedRows(BuiltinMenuSurface surface, const BuiltinMenuOrder& order);
+// Rows still shown for `builtin_hidden` in `order`, with separators moved the
+// way ApplyBuiltinMenuPrefs moves them (settings preview).
 struct BuiltinMenuVisibleRow {
-    const BuiltinMenuRow* row;
+    BuiltinMenuRow row;
     bool separator_after;
 };
 std::vector<BuiltinMenuVisibleRow> BuiltinMenuVisibleRows(BuiltinMenuSurface surface,
-                                                          uint32_t builtin_hidden);
+                                                          uint32_t builtin_hidden,
+                                                          const BuiltinMenuOrder& order = {});
 // True when the item shows in both the file and the blank-area menu, so one
 // switch changes both.
 bool BuiltinMenuShared(BuiltinMenuItem item);
