@@ -1181,7 +1181,7 @@ void StartLoadingPath(AppState& s, app::Tab& tab, const std::wstring& path, Path
     if (snap) {
         tab.SetSnapshot(snap);
         tab.loading = false;
-        if (tab.snapshot && tab.EntryCount() != 0) tab.SelectOnly(0);
+        if (tab.snapshot && tab.EntryCount() != 0) tab.FocusFirstEntry();
         if (from_net) {
             tab.cache_unix = disk_ts;
             tab.banner_title = l10n::Get(l10n::StringId::Cache);
@@ -1532,7 +1532,7 @@ static bool ApplyNotifiesToVisible(AppState& s, const std::wstring& path,
         tab->order_held = true;
         if (!selection_restore.names.empty()) app::RestoreListingSelection(*tab, selection_restore, &pane, &s.places);
         else if (tab->snapshot && tab->EntryCount() != 0 && tab->selected_index < 0)
-            tab->SelectOnly(0);
+            tab->FocusFirstEntry();
         if (!store_snap) store_snap = tab->snapshot;
         any = true;
     });

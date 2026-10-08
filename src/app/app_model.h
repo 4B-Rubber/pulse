@@ -235,6 +235,14 @@ struct Tab {
     void SelectionSizeSummary(uint64_t* bytes, int* files, int* folders) const;
     void RemapSelection(const std::vector<std::wstring>& names, const std::wstring& focus_name,
                         bool select_first_if_missing = true);
+    // A freshly opened folder focuses its first row without selecting it (as
+    // in File Explorer): copy, cut, delete and rename need a real selection.
+    // The hint lasts until the selection changes.
+    void FocusFirstEntry();
+    bool HasFocusHint() const {
+        return focus_hint_revision == selection_revision && selected_index < 0 && CountBound() > 0;
+    }
+    uint64_t focus_hint_revision = UINT64_MAX;
 
     // Navigation helpers.
     void NavigateTo(const std::wstring& path);

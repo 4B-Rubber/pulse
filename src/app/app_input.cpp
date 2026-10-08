@@ -3844,8 +3844,10 @@ LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     if (view < 0) view = 0;
                     const int dx = wParam == VK_LEFT ? -1 : (wParam == VK_RIGHT ? 1 : 0);
                     const int dy = wParam == VK_UP ? -1 : (wParam == VK_DOWN ? 1 : 0);
-                    const int next = s->renderer.MoveViewIndex(vm.pane, FocusedPaneRect(*s),
-                                                                view, dx, dy);
+                    // The first arrow press selects the focused (not yet
+                    // selected) first row instead of stepping past it.
+                    const int next = tab->HasFocusHint() ? 0
+                        : s->renderer.MoveViewIndex(vm.pane, FocusedPaneRect(*s), view, dx, dy);
                     tab->MoveFocus(vm.pane.SourceIndex(next), shift, &vm.pane);
                     EnsureRowVisible(*s, *tab, tab->selected_index);
                 }

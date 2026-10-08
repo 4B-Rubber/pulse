@@ -222,6 +222,11 @@ void Tab::MaterializeSelection() {
     for (int i = 0; i < n; ++i) if (EntryVisible(i)) selected.insert(i);
 }
 
+void Tab::FocusFirstEntry() {
+    ClearSelection();
+    focus_hint_revision = selection_revision;
+}
+
 void Tab::SelectOnly(int index) {
     RememberSelection remember{*this};
     ++selection_revision;
@@ -1602,6 +1607,7 @@ void FillPaneViewModel(ui::PaneViewModel& out, const Pane& pane, const PlacesCat
     out.selected_count = tab->SelectedCount();
     out.all_selected = tab->all_selected;
     out.selected_indices = tab->all_selected ? nullptr : &tab->selected;
+    out.focus_first_hint = tab->HasFocusHint();
     out.scroll_y = tab->scroll_y;
     out.scroll_x = tab->scroll_x;
     out.view_mode = tab->view_mode;

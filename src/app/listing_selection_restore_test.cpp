@@ -165,7 +165,11 @@ bool RunListingSelectionRestoreTest() {
         app::CapturePendingListingSelection(tab);
         tab.current_path = L"C:\\other-directory";
         publish(tab, {L"x", L"y"});
-        check(names(tab) == std::set<std::wstring>{L"x"}, "navigation does not inherit the previous folder position");
+        check(tab.SelectedCount() == 0 && tab.selected_index < 0 && tab.HasFocusHint(),
+            "navigation focuses the new folder's first row without inheriting or selecting");
+        tab.SelectOnly(1);
+        check(!tab.HasFocusHint() && names(tab) == std::set<std::wstring>{L"y"},
+            "a real selection replaces the first-row focus hint");
     }
     if (log) { fprintf(log, "failures=%d\n", failures); fclose(log); }
     return failures == 0;

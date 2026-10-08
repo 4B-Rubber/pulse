@@ -107,8 +107,8 @@ inline void RestoreListingSelection(Tab& tab, const ListingSelectionRestore& res
             if (!visible.empty()) tab.SelectOnly(visible.front());
             return;
         }
-        if (tab.EntryCount() != 0) tab.SelectOnly(0);
-    } else if (tab.snapshot && tab.EntryCount() != 0) tab.SelectOnly(0);
+        if (tab.EntryCount() != 0) tab.FocusFirstEntry();
+    } else if (tab.snapshot && tab.EntryCount() != 0) tab.FocusFirstEntry();
     else tab.ClearSelection();
 }
 } // namespace pulse::app

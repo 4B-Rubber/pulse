@@ -1928,7 +1928,6 @@ D2D1_RECT_F MainRenderer::RenameFieldRect(const PaneViewModel& vm, const D2D1_RE
     const ListEntryView& e = MakeVisibleEntry(vm, static_cast<size_t>(source_index));
     ViewLayout layout(vm.view_mode, list, vm.EntryCount(), vm.scroll_x, vm.scroll_y,
                       scale_, ListRowHeightDip(vm, list), vm.Groups());
-    const D2D1_RECT_F cell = layout.ItemRect(view);
     const D2D1_RECT_F nameRc = layout.NameRect(view);
     const bool iconGrid = vm.view_mode == ViewMode::ExtraLargeIcons ||
                           vm.view_mode == ViewMode::LargeIcons ||
@@ -1964,15 +1963,24 @@ D2D1_RECT_F MainRenderer::RenameFieldRect(const PaneViewModel& vm, const D2D1_RE
         textY = nameRc.top + (textH - lineH) * 0.5f;
         textH = lineH;
     }
-    const NameTrail trail = LayoutNameTrail(
-        nameX, textY, textH, nameColRight, cell.top, cell.bottom, scale_,
-        e.name, tagDotCount, 0.0f, false, false, false,
-        compositor_, compositor_->DwriteFactory(), compositor_->TextFormat());
-    // Reserve the frame inset and EDIT margins as well as the name's ink width.
-    const float field_w = std::max(40.0f * scale_,
-        std::min(nameColRight - nameX, trail.name_w + 14.0f * scale_));
+    // The field is sized for the name being typed, not the old one: the whole
+    // name column in details, at least 360 dip elsewhere (centered on icon
+    // cells), so added dates and versions stay visible while editing.
+    const float minW = 40.0f * scale_;
+    const float wideW = 360.0f * scale_;
+    const float listLeft = list.left + margin_;
+    const float listRight = std::max(listLeft + minW, list.right - margin_);
+    float fieldLeft = nameX;
+    float field_w = std::max(minW, nameColRight - nameX);
+    if (iconGrid) {
+        field_w = std::min(std::max(nameRc.right - nameRc.left, wideW), listRight - listLeft);
+        fieldLeft = std::clamp((nameRc.left + nameRc.right - field_w) * 0.5f, listLeft,
+                               std::max(listLeft, listRight - field_w));
+    } else if (vm.view_mode != ViewMode::Details) {
+        field_w = std::max(minW, std::min(std::max(field_w, wideW), listRight - nameX));
+    }
     const float field_h = std::max(22.0f * scale_, std::min(textH, 30.0f * scale_));
-    return D2D1::RectF(nameX, textY, nameX + field_w, textY + field_h);
+    return D2D1::RectF(fieldLeft, textY, fieldLeft + field_w, textY + field_h);
 }
 
 namespace {
@@ -2291,6 +2299,27 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                     D2D1::RoundedRect(rc, theme.radius_control * scale_, theme.radius_control * scale_),
                     brAccent_.get(), 2.0f * scale_);
             }
+            if (draw_shapes && i == 0 && vm.focus_first_hint && !selected && pane_focused) {
+                // Folder just opened: keyboard focus without a selection, so a
+                // stray Ctrl+C / Ctrl+X cannot collect the first item.
+                if (!dashStroke_.get()) {
+                    ID2D1Factory* factory = nullptr;
+                    dc->GetFactory(&factory);
+                    if (factory) {
+                        D2D1_STROKE_STYLE_PROPERTIES props{};
+                        props.dashStyle = D2D1_DASH_STYLE_DASH;
+                        props.dashCap = D2D1_CAP_STYLE_FLAT;
+                        factory->CreateStrokeStyle(props, nullptr, 0, &dashStroke_);
+                        factory->Release();
+                    }
+                }
+                MakeBrush(dc, IsHighContrast() ? theme.text : WithAlpha(theme.accent, 0.75f), brFillInput_);
+                const D2D1_RECT_F rc = D2D1::RectF(bg.left + inset, bg.top + scale_,
+                                                   bg.right - inset, bg.bottom - scale_);
+                dc->DrawRoundedRectangle(
+                    D2D1::RoundedRect(rc, theme.radius_control * scale_, theme.radius_control * scale_),
+                    brFillInput_.get(), 1.0f * scale_, dashStroke_.get());
+            }
 
             if (draw_text && change && iconGrid) {
                 const float bw = std::min(ChangeBadgeWidth(*change, scale_, compositor_), cell.right - cell.left - 12 * scale_);
@@ -2426,10 +2455,8 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 compositor_, compositor_->DwriteFactory(), compositor_->FileNameFormat(), change != nullptr,
                 vm.view_mode == ViewMode::Details ? (e.is_dir ? 3 : 2) : 0, name_matches, row_actions_);
             if (src == vm.rename_index) {
-                const D2D1_RECT_F fieldRc = RenameFieldRect(vm, viewport, src);
-                fluent::ControlState fieldState{};
-                fieldState.focused = true;
-                painter_.DrawTextFieldFrame(fieldRc, fieldState);
+                // The rename frame is drawn after every row (below): it can be
+                // wider than its own cell.
             } else {
                 D2D1_COLOR_F nameColor = theme.text;
                 if (list_tag_names_ && tagDotCount > 0 && !IsHighContrast()) {
@@ -2836,6 +2863,14 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             }
         }
         if (text_layer) dc->PopLayer();
+    }
+    if (vm.rename_index >= 0 && vm.ViewIndex(vm.rename_index) >= 0) {
+        // On top of the neighbouring cells it overlaps in icon and tile views.
+        dc->PushAxisAlignedClip(D2D1::RectF(x, y, x + w, y + h), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        fluent::ControlState fieldState{};
+        fieldState.focused = true;
+        painter_.DrawTextFieldFrame(RenameFieldRect(vm, viewport, vm.rename_index), fieldState);
+        dc->PopAxisAlignedClip();
     }
     if (morphing) DrawMorphFrom(vm, *morph, viewport, theme);
     if (shift) shift->EndFrame();

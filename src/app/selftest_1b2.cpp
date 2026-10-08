@@ -4318,6 +4318,15 @@ void TestMultiSelect() {
     Check(tab.SelectedCount() == 0 && !tab.IsSelected(0) && tab.selected_index < 0,
           L"select: escape clears");
 
+    tab.FocusFirstEntry();
+    Check(tab.HasFocusHint() && tab.SelectedCount() == 0 && tab.selected_index < 0 && !tab.IsSelected(0),
+          L"select: an opened folder focuses its first row without selecting it");
+    tab.MoveFocus(0, false);
+    Check(!tab.HasFocusHint() && tab.IsSelected(0) && tab.SelectedCount() == 1,
+          L"select: the first arrow press selects the focused row");
+    tab.ClearSelection();
+    Check(!tab.HasFocusHint(), L"select: escape does not bring the focus hint back");
+
     tab.SelectOnly(0);
     tab.ToggleSelect(2);
     tab.ToggleSelect(4);
