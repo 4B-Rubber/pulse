@@ -1055,6 +1055,7 @@ public:
     // Drum "Group by" picker drawn over everything (app/group_wheel_ui.cpp).
     GroupWheel& GroupWheelPicker() { return group_wheel_; }
     float ToolbarGroupWidth(float w) const;
+    std::wstring ToolbarGroupLabel() const;   // "Group: Date" text of the active chip
     float SearchBarMinWidth() const { return search_min_dip_; }
     D2D1_RECT_F SidebarToggleRect(float w) const;
     float PaneHeaderHeight() const { return pane_header_height_; }

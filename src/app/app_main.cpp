@@ -2526,6 +2526,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
             state.tooltipText = state.hoverLabel;
         } else if (wcscmp(__wargv[i], L"--shot-details") == 0) {
             state.shot_details = true;
+        } else if (wcscmp(__wargv[i], L"--shot-group") == 0 && i + 1 < __argc) {
+            state.shot_group = std::clamp(_wtoi(__wargv[++i]), 0, 6);
         } else if (wcscmp(__wargv[i], L"--shot-details-multi") == 0) {
             state.shot_details = true;
             state.shot_details_multi = true;
@@ -2931,6 +2933,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
             state.window_tabs.items[state.window_tabs.active]->title = L"工作";
             state.window_tabs.items[state.window_tabs.active]->marker_rgb = 0x0078D4;
         }
+        if (state.shot_group > 0)
+            if (app::Tab* grouped = ActiveTab(state)) grouped->group_by = state.shot_group;
         if (state.shot_details) {
             state.showDetailsPanel = true;
             state.renderer.SetDetailsPanelVisible(true);

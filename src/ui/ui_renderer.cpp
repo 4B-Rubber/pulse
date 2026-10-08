@@ -203,7 +203,14 @@ float MainRenderer::ToolbarGroupWidth(float w) const {
     if (toolbar_group_ < 0) return 0.0f;
     // Narrow windows: icon only, like Sort and Filter.
     if (w - EffectiveSidebarWidth(w) < 700.0f * scale_) return 32.0f * scale_;
-    if (toolbar_group_ > 0) return 212.0f * scale_;
+    if (toolbar_group_ > 0) {
+        // Icon 30 + label + 6 + clear button 28 DIP, so the x sits next to the
+        // text instead of at the end of a fixed 212 DIP pill.
+        IDWriteFactory2* factory = compositor_ ? compositor_->DwriteFactory() : nullptr;
+        if (!factory) return 212.0f * scale_;
+        const float label = std::ceil(MeasureTextWidth(factory, compositor_->TextFormat(), ToolbarGroupLabel()));
+        return std::min(label + 64.0f * scale_, 212.0f * scale_);
+    }
     return ToolbarCommandWidth(painter_, compositor_ ? compositor_->TextFormat() : nullptr,
                                l10n::StringId::ToolbarGroup, L"\xF168", true, scale_, 108.0f);
 }

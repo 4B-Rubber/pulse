@@ -440,6 +440,7 @@ struct AppState {
     bool shot_tooltip = false;
     // GUI verification for the details panel: open it with a pre-selection.
     bool shot_details = false;
+    int shot_group = 0;   // --shot-group N: group the shot folder (1 name .. 6 location)
     bool shot_details_multi = false;
     float shot_scale_override = 0.0f;
     bool shot_high_contrast = false;
