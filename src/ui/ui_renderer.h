@@ -776,6 +776,10 @@ struct WindowViewModel {
     std::wstring settings_index_error;
     std::vector<IndexVolumeRowView> settings_index_volumes;
     std::vector<std::wstring> settings_index_excluded_paths;
+    bool settings_index_system_known = false;   // service reports the system folder switch
+    bool settings_index_exclude_system = false;
+    uint32_t settings_index_system_groups = 0;  // bit i = index::kSystemExclusionGroups[i]
+    bool settings_index_system_expanded = false;
     std::vector<NetworkRootRowView> settings_network_roots;
     std::wstring settings_version;
     std::wstring settings_build_id;

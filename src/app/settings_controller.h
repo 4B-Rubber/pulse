@@ -57,6 +57,7 @@ enum class SettingsTaskKind : uint8_t {
     NetworkRebuild,
     NetworkRemove,
     DiagnosticsExport,
+    SystemExclusion,
 };
 
 constexpr bool IsNetworkTask(SettingsTaskKind kind) noexcept {
@@ -235,6 +236,10 @@ public:
     void ToggleVolume(int index);
     void AddExclude();
     void RemoveExclude(int index);
+    // 1 toggles the system folder switch, 2 expands its group list, and
+    // 10 + i toggles index::kSystemExclusionGroups[i].
+    void SystemExclusionAction(int action);
+    bool system_exclusion_expanded() const noexcept { return system_exclusion_expanded_; }
     void IndexAction(int action);
     void NetworkAction(int action, bool pin_after_add = false);
     void RemoveNetwork(int index);
@@ -253,6 +258,7 @@ private:
     };
 
     bool global_search_capturing_ = false;
+    bool system_exclusion_expanded_ = false;
     int slider_drag_ = -1;
     std::wstring global_search_error_;
     int page_ = 0;

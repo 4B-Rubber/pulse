@@ -251,12 +251,31 @@ void IndexClient::HandleVolumes(const uint8_t* p, size_t n) {
             excluded_paths.push_back(std::move(path_value));
         }
     }
+    uint32_t system_flags = 0, group_count = 0, system_count = 0;
+    std::vector<std::wstring> groups, system_paths;
+    bool system_known = r.GetU32(system_flags) && r.GetU32(group_count);
+    for (uint32_t i = 0; system_known && i < group_count; ++i) {
+        std::wstring group;
+        system_known = r.GetString(group);
+        if (system_known) groups.push_back(std::move(group));
+    }
+    system_known = system_known && r.GetU32(system_count);
+    for (uint32_t i = 0; system_known && i < system_count; ++i) {
+        std::wstring path_value;
+        system_known = r.GetString(path_value);
+        if (system_known) system_paths.push_back(std::move(path_value));
+    }
+    if (!system_known) { groups.clear(); system_paths.clear(); }
     {
         std::lock_guard<std::mutex> lock(mu_);
         service_mode_ = service != 0;
         index_path_ = std::move(path);
         volumes_ = std::move(volumes);
         excluded_paths_ = std::move(excluded_paths);
+        system_known_ = system_known;
+        exclude_system_ = system_known && (system_flags & 1u) != 0;
+        system_groups_ = std::move(groups);
+        system_paths_ = std::move(system_paths);
         scope_ready_ = true;
     }
     if (notify_ && status_msg_) PostMessageW(notify_, status_msg_, 0, 0);
@@ -409,6 +428,15 @@ bool IndexClient::GetScope(std::vector<VolumeInfo>& volumes, std::vector<std::ws
     std::lock_guard<std::mutex> lock(mu_);
     if (!connected_ || !scope_ready_) return false;
     volumes = volumes_; excluded = excluded_paths_;
+    excluded.insert(excluded.end(), system_paths_.begin(), system_paths_.end());
+    return true;
+}
+
+bool IndexClient::SystemExclusion(bool& enabled, std::vector<std::wstring>& groups) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!system_known_) return false;
+    enabled = exclude_system_;
+    groups = system_groups_;
     return true;
 }
 
@@ -535,6 +563,11 @@ bool IndexClient::ConfigureExcludePathElevated(const std::wstring& path, bool en
     const std::wstring parameters = L"--configure-exclude " + QuoteCommandArg(path) +
                                     (enabled ? L" --enable" : L" --disable");
     return RunElevatedIndexCommand(ExePath(), parameters);
+}
+
+bool IndexClient::ConfigureSystemExclusionElevated(const std::wstring& group, bool enabled) {
+    return RunElevatedIndexCommand(ExePath(), L"--configure-system-exclusion " + QuoteCommandArg(group) +
+                                   (enabled ? L" --enable" : L" --disable"));
 }
 
 bool IndexClient::ExportDiagnosticsElevated(const std::wstring& empty_directory) {

@@ -1817,6 +1817,32 @@ TitleChrome MakeTitleChrome(float window_w, float scale, float title_h) {
 constexpr float kSettingsNavW = 200.0f;
 constexpr int kSettingsNavCount = 6;  // 5: 预览增强包
 
+// System folder groups shown under Settings > Exclusions: 0-3 follow
+// index::kSystemExclusionGroups, 4-5 are always skipped by the index.
+inline pulse::l10n::StringId SystemGroupLabel(int group) {
+    using I = pulse::l10n::StringId;
+    static constexpr I kLabels[] = {I::SystemGroupWindows, I::SystemGroupTemp, I::SystemGroupOld,
+                                    I::SystemGroupProgramData, I::SystemGroupRecycle,
+                                    I::SystemGroupComponents};
+    return kLabels[group < 0 || group > 5 ? 0 : group];
+}
+inline const wchar_t* SystemGroupDetail(int group) {
+    static constexpr const wchar_t* kDetails[] = {
+        L"C:\\Windows",
+        L"Windows\\Temp \u00b7 AppData\\Local\\Temp \u00b7 INetCache \u00b7 CrashDumps",
+        L"Windows.old \u00b7 $WINDOWS.~BT \u00b7 $Windows.~WS \u00b7 $WinREAgent",
+        L"C:\\ProgramData",
+        L"$Recycle.Bin \u00b7 System Volume Information",
+        L"WinSxS \u00b7 servicing \u00b7 node_modules"};
+    return kDetails[group < 0 || group > 5 ? 0 : group];
+}
+inline bool SystemGroupEnabled(const WindowViewModel& vm, int group) {
+    return group >= 4 || (vm.settings_index_system_groups & (1u << group)) != 0;
+}
+inline bool SystemGroupChipVisible(const WindowViewModel& vm, int group) {
+    return SystemGroupEnabled(vm, group);
+}
+
 struct SettingsLayout {
     // Cards 0-4: Explorer groups (with a master switch). Card 5: Pulse's own
     // commands, rows only (context_toggle[5] stays empty).
@@ -1920,6 +1946,11 @@ struct SettingsLayout {
     std::vector<D2D1_RECT_F> index_volume_rows;
     D2D1_RECT_F index_exclude_action{};
     D2D1_RECT_F index_exclude_empty{};
+    // System folder switch: card spans the switch row, chips, group rows and
+    // the user's exclusion rows below them.
+    D2D1_RECT_F index_system_card{}, index_system_row{}, index_system_more{};
+    D2D1_RECT_F index_system_chip[6]{};
+    D2D1_RECT_F index_system_group[6]{};
     std::vector<D2D1_RECT_F> index_exclude_rows;
     std::vector<D2D1_RECT_F> index_exclude_remove;
     D2D1_RECT_F network_action[2]{};
@@ -2086,6 +2117,40 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         l.index_exclude_action = D2D1::RectF(card_right - add_folder_w, y - 36.0f * scale,
                                              card_right, y - 36.0f * scale + section_btn_h);
         const float remove_w = label_btn_w(pulse::l10n::Get(pulse::l10n::StringId::Remove));
+        const float system_top = y;
+        if (vm.settings_index_system_known) {
+            l.index_system_row = D2D1::RectF(card_left, y, card_right, y + 64.0f * scale);
+            y += 60.0f * scale;
+            const float chips_left = card_left + 48.0f * scale;
+            const float chips_right = card_right - 16.0f * scale;
+            float x = chips_left, chip_y = y;
+            auto place = [&](float w, float h) {
+                w = (std::min)(w, chips_right - chips_left);
+                if (x > chips_left && x + w > chips_right) { x = chips_left; chip_y += 28.0f * scale; }
+                const D2D1_RECT_F r = D2D1::RectF(x, chip_y + (22.0f * scale - h) * 0.5f,
+                                                  x + w, chip_y + (22.0f * scale + h) * 0.5f);
+                x += w + 6.0f * scale;
+                return r;
+            };
+            for (int g = 0; g < 6; ++g) {
+                if (!SystemGroupChipVisible(vm, g)) continue;
+                l.index_system_chip[g] = place(painter
+                    ? painter->MeasureBadgeWidth(pulse::l10n::Get(SystemGroupLabel(g))) : 120.0f * scale,
+                    22.0f * scale);
+            }
+            const float more_w = (painter ? painter->MeasureBadgeWidth(
+                pulse::l10n::Get(pulse::l10n::StringId::SettingsSystemCustomize)) : 60.0f * scale) + 16.0f * scale;
+            l.index_system_more = place(more_w, 28.0f * scale);
+            y = chip_y + 22.0f * scale + 14.0f * scale;
+            if (vm.settings_index_system_expanded) {
+                for (int g = 0; g < 6; ++g) {
+                    l.index_system_group[g] = D2D1::RectF(card_left + 36.0f * scale, y,
+                                                          card_right - 12.0f * scale, y + 52.0f * scale);
+                    y += 52.0f * scale;
+                }
+                y += 8.0f * scale;
+            }
+        }
         l.index_exclude_rows.reserve(vm.settings_index_excluded_paths.size());
         l.index_exclude_remove.reserve(vm.settings_index_excluded_paths.size());
         for (size_t i = 0; i < vm.settings_index_excluded_paths.size(); ++i) {
@@ -2096,7 +2161,10 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
                 row.right - 12.0f * scale, row.top + 44.0f * scale));
             y += 56.0f * scale;
         }
-        if (vm.settings_index_excluded_paths.empty()) {
+        if (vm.settings_index_system_known) {
+            l.index_system_card = D2D1::RectF(card_left, system_top, card_right, y + 4.0f * scale);
+            y += 4.0f * scale;
+        } else if (vm.settings_index_excluded_paths.empty()) {
             const float empty_h = 168.0f * scale;
             l.index_exclude_empty = D2D1::RectF(card_left, y, card_right, y + empty_h);
             y += empty_h;

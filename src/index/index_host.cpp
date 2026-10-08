@@ -337,6 +337,14 @@ std::vector<uint8_t> VolumesPayload() {
         // Sent after the volume rows so newer clients receive the exclusion list.
         w.PutU32(static_cast<uint32_t>(config.excluded_paths.size()));
         for (const auto& path : config.excluded_paths) w.PutString(path);
+        // Appended for clients that show the system folder switch; older
+        // clients stop reading after the user list.
+        w.PutU32(config.exclude_system ? 1u : 0u);
+        w.PutU32(static_cast<uint32_t>(config.system_groups.size()));
+        for (const auto& group : config.system_groups) w.PutString(group);
+        const auto system_paths = SystemExclusionPaths(config);
+        w.PutU32(static_cast<uint32_t>(system_paths.size()));
+        for (const auto& path : system_paths) w.PutString(path);
     } else {
         w.PutU32(0);
     }
@@ -1160,6 +1168,11 @@ int ConfigureCommand(const std::vector<std::wstring>& args) {
         const bool disabled = args.size() >= 4 && args[3] == L"--disable";
         if (!enabled && !disabled) return ERROR_INVALID_PARAMETER;
         ok = ConfigureExcludePath(args[2], enabled, &error);
+    } else if (args.size() >= 3 && args[1] == L"--configure-system-exclusion") {
+        const bool enabled = args.size() >= 4 && args[3] == L"--enable";
+        const bool disabled = args.size() >= 4 && args[3] == L"--disable";
+        if (!enabled && !disabled) return ERROR_INVALID_PARAMETER;
+        ok = ConfigureSystemExclusion(args[2], enabled, &error);
     } else if (args.size() >= 2 && args[1] == L"--rebuild-index") {
         ok = true;
     }
@@ -1239,7 +1252,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (a1 == L"--uninstall") return UninstallService();
     if (a1 == L"--export-diagnostics") return ExportDiagnosticsCommand(args);
     if (a1 == L"--configure-volume" || a1 == L"--set-index-path" ||
-        a1 == L"--configure-exclude" ||
+        a1 == L"--configure-exclude" || a1 == L"--configure-system-exclusion" ||
         a1 == L"--rebuild-index") return ConfigureCommand(args);
     if (a1 == L"--service") {
         SERVICE_TABLE_ENTRYW table[] = {

@@ -436,6 +436,7 @@ void Engine::PublishExcludedPaths(const IndexConfig& config,
                                  const std::function<void()>& locked_action) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     excluded_paths_ = config.excluded_paths;
+    for (auto& path : SystemExclusionPaths(config)) excluded_paths_.push_back(std::move(path));
     // Rebuild initialization remains atomic with configuration publication.
     InvalidateFilterLocked();
     if (locked_action) locked_action();
@@ -3679,6 +3680,11 @@ void Engine::Worker() {
         UpdateVolumeVisibilityLocked(initial_drives);
         needs_search_rebuild = NeedsSearchRebuildLocked();
     }
+    // A config from before the system folder exclusions gets the defaults
+    // persisted once; its snapshot still shows those folders, so rebuild it.
+    if (MachineIndexScope() && !startup_config.system_groups_saved &&
+        SaveMachineConfig(startup_config) && have_cache)
+        needs_search_rebuild = true;
     PingNotify(true);
 
     bool fresh = false;

@@ -495,6 +495,8 @@ bool SettingsController::StartUiTask(SettingsTask task) {
             return index::IndexClient::ConfigureVolumeElevated(value.key, value.enabled);
         case SettingsTaskKind::Exclude:
             return index::IndexClient::ConfigureExcludePathElevated(value.path, value.enabled);
+        case SettingsTaskKind::SystemExclusion:
+            return index::IndexClient::ConfigureSystemExclusionElevated(value.key, value.enabled);
         case SettingsTaskKind::InstallService: {
             DWORD code = 0;
             if (index::IndexClient::InstallServiceElevated(&code)) return true;
@@ -1030,6 +1032,30 @@ void SettingsController::RemoveExclude(int position) {
     ClearError();
     SettingsTask task{SettingsTaskKind::Exclude};
     task.path = paths[static_cast<size_t>(position)];
+    StartUiTask(std::move(task));
+}
+
+void SettingsController::SystemExclusionAction(int action) {
+    if (action == 2) {
+        system_exclusion_expanded_ = !system_exclusion_expanded_;
+        return;
+    }
+    if (!index_ || !index_->ServiceMode() || !ui_.task_completion) return;
+    bool enabled = false;
+    std::vector<std::wstring> groups;
+    if (!index_->SystemExclusion(enabled, groups)) return;
+    SettingsTask task{SettingsTaskKind::SystemExclusion};
+    if (action == 1) {
+        task.key = L"all";
+        task.enabled = !enabled;
+    } else {
+        const int group = action - 10;
+        if (!enabled || group < 0 ||
+            group >= static_cast<int>(std::size(index::kSystemExclusionGroups))) return;
+        task.key = index::kSystemExclusionGroups[group];
+        task.enabled = std::find(groups.begin(), groups.end(), task.key) == groups.end();
+    }
+    ClearError();
     StartUiTask(std::move(task));
 }
 

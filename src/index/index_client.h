@@ -31,7 +31,10 @@ public:
     uint64_t Revision() const { return revision_.load(); }
     std::vector<VolumeInfo> Volumes() const;
     std::vector<std::wstring> ExcludedPaths() const;
+    // excluded also lists the folders hidden by the system folder switch.
     bool GetScope(std::vector<VolumeInfo>& volumes, std::vector<std::wstring>& excluded) const;
+    // False until a service that reports the system folder switch answers.
+    bool SystemExclusion(bool& enabled, std::vector<std::wstring>& groups) const;
     void RefreshVolumesAsync();
     bool RequestConfigureVolume(const std::wstring& volume_id, bool enabled);
     bool RequestRebuild();
@@ -40,6 +43,7 @@ public:
     static bool InstallServiceElevated(DWORD* error = nullptr);
     static bool ConfigureIndexPathElevated(const std::wstring& path, std::wstring* error = nullptr);
     static bool ConfigureExcludePathElevated(const std::wstring& path, bool enabled);
+    static bool ConfigureSystemExclusionElevated(const std::wstring& group, bool enabled);
     static bool ExportDiagnosticsElevated(const std::wstring& empty_directory);
 
     // Fire-and-forget. Reply arrives as search_msg (wParam = request id).
@@ -87,6 +91,10 @@ private:
     std::vector<VolumeInfo> volumes_;
     bool scope_ready_ = false;
     std::vector<std::wstring> excluded_paths_;
+    bool system_known_ = false;
+    bool exclude_system_ = false;
+    std::vector<std::wstring> system_groups_;
+    std::vector<std::wstring> system_paths_;
     uint32_t result_id_ = 0;
     SearchResult result_;
     std::mutex pipe_mu_;

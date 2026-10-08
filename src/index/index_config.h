@@ -38,10 +38,22 @@ struct IndexConfig {
     std::wstring index_path;
     std::unordered_set<std::wstring> excluded_volume_ids;
     std::vector<std::wstring> excluded_paths;
+    // Built-in system folder groups (kSystemExclusionGroups). Configs written
+    // before this setting existed leave system_groups_saved false.
+    bool exclude_system = true;
+    std::vector<std::wstring> system_groups{L"windows", L"temp", L"old"};
+    bool system_groups_saved = false;
 
     bool IsExcluded(const std::wstring& id) const;
     bool IsPathExcluded(std::wstring_view path) const;
 };
+
+inline constexpr const wchar_t* kSystemExclusionGroups[] = {
+    L"windows", L"temp", L"old", L"programdata"};
+bool IsSystemExclusionGroup(std::wstring_view group);
+// Folders hidden from the index by the enabled system groups, expanded for
+// the system drive and every local user profile.
+std::vector<std::wstring> SystemExclusionPaths(const IndexConfig& config);
 
 std::wstring NormalizeVolumeId(std::wstring id);
 std::vector<VolumeInfo> EnumerateLocalVolumes(const IndexConfig& config);
@@ -63,5 +75,7 @@ bool SaveMachineConfig(const IndexConfig& config, std::wstring* error = nullptr)
 bool ConfigureVolume(const std::wstring& id, bool enabled, std::wstring* error = nullptr);
 bool ConfigureIndexPath(const std::wstring& path, std::wstring* error = nullptr);
 bool ConfigureExcludePath(const std::wstring& path, bool enabled, std::wstring* error = nullptr);
+// group is "all" for the master switch or one of kSystemExclusionGroups.
+bool ConfigureSystemExclusion(const std::wstring& group, bool enabled, std::wstring* error = nullptr);
 
 } // namespace pulse::index

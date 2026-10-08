@@ -599,6 +599,28 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             vm.settings_index_error = l10n::ServiceText(s.settings.error());
             vm.settings_index_volumes.clear();
             vm.settings_index_excluded_paths = s.index.ExcludedPaths();
+            {
+                bool exclude_system = false;
+                std::vector<std::wstring> groups;
+                vm.settings_index_system_known = s.index.SystemExclusion(exclude_system, groups);
+                vm.settings_index_exclude_system = exclude_system;
+                vm.settings_index_system_groups = 0;
+                for (const auto& group : groups)
+                    for (size_t i = 0; i < std::size(index::kSystemExclusionGroups); ++i)
+                        if (group == index::kSystemExclusionGroups[i])
+                            vm.settings_index_system_groups |= 1u << i;
+                vm.settings_index_system_expanded = s.settings.system_exclusion_expanded();
+                if (s.shot.active && vm.settings_page == 1 && !vm.settings_index_system_known) {
+                    // Shots show the defaults; PULSE_SHOT_SYSTEM_EXPANDED=1 opens the list.
+                    wchar_t expanded[4]{};
+                    vm.settings_index_system_known = true;
+                    vm.settings_index_exclude_system = true;
+                    vm.settings_index_system_groups = 0x7u;
+                    vm.settings_index_system_expanded =
+                        GetEnvironmentVariableW(L"PULSE_SHOT_SYSTEM_EXPANDED", expanded, 4) &&
+                        expanded[0] == L'1';
+                }
+            }
             vm.settings_network_roots.clear();
             auto index_volumes = s.index.Volumes();
             if (s.shot.active && vm.settings_page == 1 && index_volumes.empty()) {
@@ -2510,7 +2532,9 @@ std::wstring TooltipForHover(AppState& s) {
         if (s.hoverControlIndex == 3) return text(I::SettingsOpenFolders);
         if (s.hoverControlIndex == 4) return text(I::SettingsShowPerformance);
         return L"";
-    case R::SettingsIndexExcludeAction: return text(I::TooltipAddExclusion);
+    case R::SettingsIndexExcludeAction:
+        if (s.hoverControlIndex == 1) return text(I::SettingsSystemFoldersTip);
+        return s.hoverControlIndex == 0 ? text(I::TooltipAddExclusion) : L"";
     case R::SettingsIndexExcludeRemove: return text(I::TooltipRemoveExclusion);
     case R::SettingsDiagnosticsAction: {
         static constexpr I actions[] = {

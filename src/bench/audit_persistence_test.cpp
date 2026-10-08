@@ -2,7 +2,10 @@
 #include "../index/index_config.h"
 #include "../common/utf8_file.h"
 #include <filesystem>
+#include <algorithm>
 #include <cstdio>
+#include <vector>
+#include <windows.h>
 
 namespace pulse::app {
 static std::wstring fixture;
@@ -62,6 +65,55 @@ int main() {
     Check(index::LoadIndexConfigFrom(machine, L"default", config) && !config.load_failed, "AUD-015 successful reread clears failure");
     DeleteFileW(machine.c_str());
     Check(index::LoadIndexConfigFrom(machine, L"default", config) && config.index_path == L"default", "AUD-015 missing config initializes defaults");
+
+    // System folder exclusions: configs from older releases get the defaults
+    // and stay unmarked so the service persists them and rebuilds once.
+    const std::vector<std::wstring> default_groups{L"windows", L"temp", L"old"};
+    Check(config.exclude_system && config.system_groups == default_groups && !config.system_groups_saved,
+          "SYS-001 missing config uses default system groups");
+    WriteUtf8FileAtomic(machine, valid);
+    Check(index::LoadIndexConfigFrom(machine, L"default", config) && config.exclude_system &&
+          config.system_groups == default_groups && !config.system_groups_saved,
+          "SYS-002 config without system keys is unmarked with defaults");
+    WriteUtf8FileAtomic(machine, LR"({"exclude_system":false,"system_exclusion_groups":["temp","bogus","temp","programdata"]})");
+    Check(index::LoadIndexConfigFrom(machine, L"default", config) && !config.exclude_system &&
+          config.system_groups == std::vector<std::wstring>{L"temp", L"programdata"} && config.system_groups_saved,
+          "SYS-003 saved groups drop unknown and duplicate names");
+    WriteUtf8FileAtomic(machine, LR"({"system_exclusion_groups":[]})");
+    Check(index::LoadIndexConfigFrom(machine, L"default", config) && config.system_groups.empty() &&
+          config.system_groups_saved, "SYS-004 empty saved group list stays empty");
+    DeleteFileW(machine.c_str());
+    {
+        wchar_t windows[MAX_PATH]{};
+        GetSystemWindowsDirectoryW(windows, MAX_PATH);
+        auto has = [](const std::vector<std::wstring>& paths, const std::wstring& value) {
+            return std::any_of(paths.begin(), paths.end(), [&](const std::wstring& p) {
+                return CompareStringOrdinal(p.c_str(), -1, value.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+        };
+        index::IndexConfig defaults;
+        const auto system_paths = index::SystemExclusionPaths(defaults);
+        const std::wstring windir = windows;
+        const std::wstring drive = windir.substr(0, 2);
+        wchar_t local[MAX_PATH]{};
+        const bool have_temp = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) > 0;
+        Check(has(system_paths, windir) && has(system_paths, windir + L"\\Temp") &&
+              has(system_paths, drive + L"\\Windows.old") &&
+              (!have_temp || has(system_paths, std::wstring(local) + L"\\Temp")),
+              "SYS-005 defaults cover Windows, temp folders and old installs");
+        wchar_t data[MAX_PATH]{};
+        GetEnvironmentVariableW(L"ProgramData", data, MAX_PATH);
+        Check(!has(system_paths, data), "SYS-006 ProgramData is kept by default");
+        index::IndexConfig only_data;
+        only_data.system_groups = {L"programdata"};
+        const auto data_paths = index::SystemExclusionPaths(only_data);
+        Check(data_paths.size() == 1 && has(data_paths, data), "SYS-007 ProgramData group adds only ProgramData");
+        index::IndexConfig off;
+        off.exclude_system = false;
+        Check(index::SystemExclusionPaths(off).empty(), "SYS-008 switch off excludes nothing");
+        Check(index::IsSystemExclusionGroup(L"old") && !index::IsSystemExclusionGroup(L"all") &&
+              !index::IsSystemExclusionGroup(L"Windows"), "SYS-009 group names are exact");
+    }
     std::filesystem::remove_all(dir);
     return failures ? 1 : 0;
 }

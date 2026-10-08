@@ -154,8 +154,36 @@ std::wstring ConfigJson(const IndexConfig& config) {
         out += L"\n    \"" + escaped + L"\"";
     }
     if (!excluded_paths.empty()) out += L"\n  ";
+    out += L"],\n  \"exclude_system\":";
+    out += config.exclude_system ? L"true" : L"false";
+    out += L",\n  \"system_exclusion_groups\":[";
+    for (size_t i = 0; i < config.system_groups.size(); ++i) {
+        if (i) out += L",";
+        out += L"\"" + config.system_groups[i] + L"\"";
+    }
     out += L"]\n}\n";
     return out;
+}
+
+void AddProfileFolders(const std::wstring& suffix, std::vector<std::wstring>& out) {
+    HKEY list = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", 0,
+            KEY_READ | KEY_WOW64_64KEY, &list) != ERROR_SUCCESS) return;
+    wchar_t sid[256]{};
+    for (DWORD i = 0;; ++i) {
+        DWORD sid_len = ARRAYSIZE(sid);
+        if (RegEnumKeyExW(list, i, sid, &sid_len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        wchar_t raw[MAX_PATH]{};
+        DWORD bytes = sizeof(raw) - sizeof(wchar_t);
+        if (RegGetValueW(list, sid, L"ProfileImagePath", RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+                nullptr, raw, &bytes) != ERROR_SUCCESS) continue;
+        wchar_t expanded[MAX_PATH]{};
+        const DWORD n = ExpandEnvironmentStringsW(raw, expanded, ARRAYSIZE(expanded));
+        if (!n || n > ARRAYSIZE(expanded) || expanded[0] == 0 || expanded[1] != L':') continue;
+        out.push_back(std::wstring(expanded) + suffix);
+    }
+    RegCloseKey(list);
 }
 
 bool IsNtfs(const std::wstring& fs) {
@@ -178,6 +206,41 @@ bool IndexConfig::IsPathExcluded(std::wstring_view path) const {
             path[excluded.size()] == L'/') return true;
     }
     return false;
+}
+
+bool IsSystemExclusionGroup(std::wstring_view group) {
+    return std::any_of(std::begin(kSystemExclusionGroups), std::end(kSystemExclusionGroups),
+                       [&](const wchar_t* known) { return group == known; });
+}
+
+std::vector<std::wstring> SystemExclusionPaths(const IndexConfig& config) {
+    std::vector<std::wstring> out;
+    if (!config.exclude_system) return out;
+    wchar_t windows[MAX_PATH]{};
+    const UINT n = GetSystemWindowsDirectoryW(windows, ARRAYSIZE(windows));
+    if (!n || n >= ARRAYSIZE(windows) || windows[1] != L':') return out;
+    const std::wstring windir = windows;
+    const std::wstring drive = windir.substr(0, 2);
+    auto enabled = [&](const wchar_t* group) {
+        return std::find(config.system_groups.begin(), config.system_groups.end(), group) !=
+            config.system_groups.end();
+    };
+    if (enabled(L"windows")) out.push_back(windir);
+    if (enabled(L"temp")) {
+        out.push_back(windir + L"\\Temp");
+        AddProfileFolders(L"\\AppData\\Local\\Temp", out);
+        AddProfileFolders(L"\\AppData\\Local\\Microsoft\\Windows\\INetCache", out);
+        AddProfileFolders(L"\\AppData\\Local\\CrashDumps", out);
+    }
+    if (enabled(L"old")) {
+        for (const wchar_t* name : {L"\\Windows.old", L"\\$WINDOWS.~BT", L"\\$Windows.~WS", L"\\$WinREAgent"})
+            out.push_back(drive + name);
+    }
+    if (enabled(L"programdata")) {
+        const std::wstring data = KnownFolder(CSIDL_COMMON_APPDATA);
+        if (data.size() > 3) out.push_back(data);
+    }
+    return out;
 }
 
 std::wstring NormalizeVolumeId(std::wstring id) {
@@ -265,6 +328,16 @@ bool LoadIndexConfigFrom(const std::wstring& path, const std::wstring& default_i
               [](const auto& a, const auto& b) {
                   return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
               }), loaded.excluded_paths.end());
+    loaded.exclude_system = pulse::json::ExtractBool(json, L"exclude_system", true);
+    loaded.system_groups_saved = json.find(L"\"system_exclusion_groups\"") != std::wstring::npos;
+    if (loaded.system_groups_saved) {
+        loaded.system_groups.clear();
+        for (auto& group : pulse::json::ExtractStringArray(json, L"system_exclusion_groups"))
+            if (IsSystemExclusionGroup(group) &&
+                std::find(loaded.system_groups.begin(), loaded.system_groups.end(), group) ==
+                    loaded.system_groups.end())
+                loaded.system_groups.push_back(std::move(group));
+    }
     config = std::move(loaded);
     return true;
 }
@@ -362,6 +435,24 @@ bool ConfigureExcludePath(const std::wstring& path, bool enabled, std::wstring* 
         if (it == config.excluded_paths.end()) config.excluded_paths.push_back(normalized);
     } else if (it != config.excluded_paths.end()) {
         config.excluded_paths.erase(it);
+    }
+    ++config.generation;
+    return SaveMachineConfig(config, error);
+}
+
+bool ConfigureSystemExclusion(const std::wstring& group, bool enabled, std::wstring* error) {
+    if (group != L"all" && !IsSystemExclusionGroup(group)) {
+        SetError(error, L"未知的系统文件夹分组");
+        return false;
+    }
+    IndexConfig config;
+    if (!LoadMachineConfig(config, error)) return false;
+    if (group == L"all") {
+        config.exclude_system = enabled;
+    } else {
+        auto it = std::find(config.system_groups.begin(), config.system_groups.end(), group);
+        if (enabled && it == config.system_groups.end()) config.system_groups.push_back(group);
+        else if (!enabled && it != config.system_groups.end()) config.system_groups.erase(it);
     }
     ++config.generation;
     return SaveMachineConfig(config, error);

@@ -2335,7 +2335,8 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             s->settings.IndexAction(hit.index);
             InvalidateRect(hwnd, nullptr, FALSE);
         } else if (hit.region == ui::HitTestResult::SettingsIndexExcludeAction) {
-            s->settings.AddExclude();
+            if (hit.index == 0) s->settings.AddExclude();
+            else s->settings.SystemExclusionAction(hit.index);
             InvalidateRect(hwnd, nullptr, FALSE);
         } else if (hit.region == ui::HitTestResult::SettingsIndexExcludeRemove) {
             s->settings.RemoveExclude(hit.index);

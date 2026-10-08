@@ -456,6 +456,25 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     r.index = 0;
                     return r;
                 }
+                // System folder switch shares the region: 1 switch row,
+                // 2 customize, 10 + i group i (only the configurable 0-3).
+                if (ContainsPt(lay.index_system_more, x, y)) {
+                    r.region = HitTestResult::SettingsIndexExcludeAction;
+                    r.index = 2;
+                    return r;
+                }
+                if (ContainsPt(lay.index_system_row, x, y)) {
+                    r.region = HitTestResult::SettingsIndexExcludeAction;
+                    r.index = 1;
+                    return r;
+                }
+                for (int g = 0; g < 4; ++g) {
+                    if (ContainsPt(lay.index_system_group[g], x, y)) {
+                        r.region = HitTestResult::SettingsIndexExcludeAction;
+                        r.index = 10 + g;
+                        return r;
+                    }
+                }
                 for (size_t i = 0; i < lay.index_exclude_remove.size(); ++i) {
                     if (ContainsPt(lay.index_exclude_remove[i], x, y)) {
                         r.region = HitTestResult::SettingsIndexExcludeRemove;

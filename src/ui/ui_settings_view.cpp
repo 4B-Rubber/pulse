@@ -252,6 +252,135 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         painter_.DrawButton({ lay.index_exclude_action,
                               pulse::l10n::Get(pulse::l10n::StringId::AddFolder), {},
                               fluent::ButtonKind::Primary, add_exclude });
+        if (vm.settings_index_system_known &&
+            lay.index_system_card.bottom > lay.index_system_card.top) {
+            draw_card(lay.index_system_card);
+            const auto& row = lay.index_system_row;
+            const bool service = vm.settings_index_service;
+            const bool on = vm.settings_index_exclude_system;
+            if (service && IsHovered(vm, HitTestResult::SettingsIndexExcludeAction, 1)) {
+                MakeBrush(dc, theme.fill_hover, brFillHover_);
+                FillRoundedRect(dc, brFillHover_.get(), row.left + 4.0f * scale_, row.top + 4.0f * scale_,
+                                row.right - row.left - 8.0f * scale_, 52.0f * scale_, 6.0f * scale_);
+            }
+            {
+                // Outlined shield, matching the 16-DIP row icons.
+                Microsoft::WRL::ComPtr<ID2D1Factory> factory;
+                dc->GetFactory(&factory);
+                Microsoft::WRL::ComPtr<ID2D1PathGeometry> shield;
+                Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+                if (factory && SUCCEEDED(factory->CreatePathGeometry(&shield)) &&
+                    SUCCEEDED(shield->Open(&sink))) {
+                    const float u = scale_;
+                    const float ox = row.left + 16.0f * scale_, oy = row.top + 15.0f * scale_;
+                    const auto P = [&](float x, float y) { return D2D1::Point2F(ox + x * u, oy + y * u); };
+                    sink->BeginFigure(P(8.0f, 1.8f), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(P(13.0f, 3.6f));
+                    sink->AddLine(P(13.0f, 7.6f));
+                    sink->AddBezier(D2D1::BezierSegment(P(13.0f, 10.7f), P(10.9f, 13.0f), P(8.0f, 14.2f)));
+                    sink->AddBezier(D2D1::BezierSegment(P(5.1f, 13.0f), P(3.0f, 10.7f), P(3.0f, 7.6f)));
+                    sink->AddLine(P(3.0f, 3.6f));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink->BeginFigure(P(5.8f, 8.0f), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(P(7.4f, 9.6f));
+                    sink->AddLine(P(10.4f, 6.6f));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                    if (SUCCEEDED(sink->Close())) {
+                        MakeBrush(dc, on ? theme.accent : theme.text_secondary, brAccent_);
+                        dc->DrawGeometry(shield.Get(), brAccent_.get(), 1.2f * scale_);
+                    }
+                }
+            }
+            const float text_left = row.left + 48.0f * scale_;
+            const float text_w = (std::max)(40.0f * scale_, row.right - text_left - 32.0f * scale_ - switch_w);
+            MakeBrush(dc, service ? theme.text : theme.text_disabled, brText_);
+            DrawTextRect(dc, compositor_->TextFormat(), brText_.get(),
+                         pulse::l10n::Get(pulse::l10n::StringId::SettingsSystemFolders),
+                         text_left, row.top + 10.0f * scale_, text_w, 22.0f * scale_);
+            MakeBrush(dc, theme.text_secondary, brTextSecondary_);
+            DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(),
+                         pulse::l10n::Get(pulse::l10n::StringId::SettingsSystemFoldersDesc),
+                         text_left, row.top + 33.0f * scale_, text_w, 18.0f * scale_);
+            fluent::ControlState sw{};
+            sw.checked = on;
+            sw.enabled = service;
+            sw.hovered = service && IsHovered(vm, HitTestResult::SettingsIndexExcludeAction, 1);
+            painter_.DrawSwitch(D2D1::RectF(row.right - 16.0f * scale_ - switch_w,
+                                            row.top + 30.0f * scale_ - switch_h * 0.5f,
+                                            row.right - 16.0f * scale_,
+                                            row.top + 30.0f * scale_ + switch_h * 0.5f),
+                                L"", sw);
+            for (int g = 0; g < 6; ++g) {
+                const auto& chip = lay.index_system_chip[g];
+                if (chip.right <= chip.left) continue;
+                painter_.DrawBadge({ chip, pulse::l10n::Get(SystemGroupLabel(g)),
+                                     on ? fluent::BadgeKind::Accent : fluent::BadgeKind::Neutral });
+            }
+            {
+                const auto& more = lay.index_system_more;
+                if (IsHovered(vm, HitTestResult::SettingsIndexExcludeAction, 2)) {
+                    MakeBrush(dc, theme.fill_hover, brFillHover_);
+                    FillRoundedRect(dc, brFillHover_.get(), more.left, more.top,
+                                    more.right - more.left, more.bottom - more.top, 4.0f * scale_);
+                }
+                MakeBrush(dc, theme.accent, brAccent_);
+                DrawTextRect(dc, compositor_->SmallFormat(), brAccent_.get(),
+                             pulse::l10n::Get(pulse::l10n::StringId::SettingsSystemCustomize),
+                             more.left + 6.0f * scale_, more.top + 5.0f * scale_,
+                             more.right - more.left - 20.0f * scale_, 18.0f * scale_);
+                const float cx = more.right - 10.0f * scale_;
+                const float cy = (more.top + more.bottom) * 0.5f;
+                const float d = vm.settings_index_system_expanded ? -2.5f * scale_ : 2.5f * scale_;
+                dc->DrawLine(D2D1::Point2F(cx - 3.5f * scale_, cy - d * 0.6f), D2D1::Point2F(cx, cy + d * 0.8f),
+                             brAccent_.get(), 1.3f * scale_);
+                dc->DrawLine(D2D1::Point2F(cx, cy + d * 0.8f), D2D1::Point2F(cx + 3.5f * scale_, cy - d * 0.6f),
+                             brAccent_.get(), 1.3f * scale_);
+            }
+            for (int g = 0; g < 6 && vm.settings_index_system_expanded; ++g) {
+                const auto& group = lay.index_system_group[g];
+                if (group.bottom <= group.top) continue;
+                const bool locked = g >= 4;
+                const bool group_enabled = service && on && !locked;
+                MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
+                FillRect(dc, brStrokeDivider_.get(), group.left, group.top, group.right - group.left, 1.0f);
+                if (group_enabled && IsHovered(vm, HitTestResult::SettingsIndexExcludeAction, 10 + g)) {
+                    MakeBrush(dc, theme.fill_hover, brFillHover_);
+                    FillRoundedRect(dc, brFillHover_.get(), group.left, group.top + 2.0f * scale_,
+                                    group.right - group.left, group.bottom - group.top - 4.0f * scale_,
+                                    6.0f * scale_);
+                }
+                fluent::ControlState check{};
+                check.checked = on && SystemGroupEnabled(vm, g);
+                check.enabled = group_enabled;
+                check.hovered = group_enabled && IsHovered(vm, HitTestResult::SettingsIndexExcludeAction, 10 + g);
+                painter_.DrawCheckBox(D2D1::RectF(group.left + 4.0f * scale_, group.top,
+                                                  group.left + 36.0f * scale_, group.bottom), L"", check);
+                const float label_left = group.left + 44.0f * scale_;
+                const auto label = pulse::l10n::Get(SystemGroupLabel(g));
+                MakeBrush(dc, locked || !on ? theme.text_secondary : theme.text, brText_);
+                DrawTextRect(dc, compositor_->TextFormat(), brText_.get(), label,
+                             label_left, group.top + 6.0f * scale_,
+                             group.right - label_left - 8.0f * scale_, 22.0f * scale_);
+                if (locked) {
+                    const auto always = pulse::l10n::Get(pulse::l10n::StringId::SettingsSystemAlways);
+                    const float bw = painter_.MeasureBadgeWidth(always);
+                    const float bx = group.right - 8.0f * scale_ - bw;
+                    painter_.DrawBadge({ D2D1::RectF(bx, group.top + 15.0f * scale_, bx + bw,
+                                                     group.top + 37.0f * scale_),
+                                         always, fluent::BadgeKind::Neutral });
+                }
+                MakeBrush(dc, theme.text_secondary, brTextSecondary_);
+                DrawTextRect(dc, compositor_->SmallFormat(), brTextSecondary_.get(), SystemGroupDetail(g),
+                             label_left, group.top + 29.0f * scale_,
+                             group.right - label_left - 8.0f * scale_, 18.0f * scale_);
+            }
+            if (!lay.index_exclude_rows.empty()) {
+                MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
+                FillRect(dc, brStrokeDivider_.get(), lay.index_system_card.left + 12.0f * scale_,
+                         lay.index_exclude_rows.front().top,
+                         lay.index_system_card.right - lay.index_system_card.left - 24.0f * scale_, 1.0f);
+            }
+        }
         if (vm.settings_index_excluded_paths.empty() &&
             lay.index_exclude_empty.bottom > lay.index_exclude_empty.top) {
             draw_card(lay.index_exclude_empty);
