@@ -915,6 +915,7 @@ enum class StringId : UINT {
     SettingsAborted = IDS_SETTINGS_ABORTED,
     SettingsServiceStartError = IDS_SETTINGS_SERVICE_START_ERROR,
     SettingsServiceError = IDS_SETTINGS_SERVICE_ERROR,
+    SettingsIndexDirNotPrivate = IDS_SETTINGS_INDEX_DIR_NOT_PRIVATE,
     SettingsRemoveServerError = IDS_SETTINGS_REMOVE_SERVER_ERROR,
     SettingsAddServerError = IDS_SETTINGS_ADD_SERVER_ERROR,
     SettingsOperationError = IDS_SETTINGS_OPERATION_ERROR,

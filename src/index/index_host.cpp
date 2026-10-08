@@ -898,11 +898,16 @@ int RunHost(bool as_service, bool test_mode = false,
         if (CompareStringOrdinal(config.index_path.c_str(), -1, (MachineDataRoot() + L"\\Index").c_str(), -1,
                                  TRUE) == CSTR_EQUAL)
             (void)MachineIndexRoot();
-        if (!index_directory_lock.Acquire(std::filesystem::path(config.index_path)) ||
-            !ProtectIndexDirectory(config.index_path)) {
+        const bool pinned = index_directory_lock.Acquire(std::filesystem::path(config.index_path));
+        bool private_directory = pinned && ProtectIndexDirectory(config.index_path);
+        if (pinned && !private_directory && AdoptIndexDirectory(std::filesystem::path(config.index_path))) {
+            ServiceTrace(L"Index directory left readable by an older release was made private");
+            private_directory = ProtectIndexDirectory(config.index_path);
+        }
+        if (!private_directory) {
             ServiceTrace(L"Index directory is not private; refusing to expose service metadata");
-            SetSvc(SERVICE_STOPPED, ERROR_ACCESS_DENIED);
-            return ERROR_ACCESS_DENIED;
+            SetSvc(SERVICE_STOPPED, kIndexDirectoryNotPrivate);
+            return static_cast<int>(kIndexDirectoryNotPrivate);
         }
         SetActiveIndexDirectory(config.index_path);
         const std::wstring probe = config.index_path + L"\\.pulse-write-check-" +

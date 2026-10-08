@@ -1371,3 +1371,5 @@
 // File operations that track items (delete, restore) label their speed with this unit.
 #define IDS_OP_ITEMS_PER_SECOND 2533
 #define IDS_CONTEXT_SLOW_DISABLED 2534
+// The configured index folder holds non-Pulse entries, so the service will not use it.
+#define IDS_SETTINGS_INDEX_DIR_NOT_PRIVATE 2535

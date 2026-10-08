@@ -3,6 +3,7 @@
 #include "../index/index_config.h"
 #include "../index/network_agent_security.h"
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <thread>
@@ -183,6 +184,91 @@ int main() {
         check(fs::exists(target / L"pulse-index.bin"), "resume rollback preserves prior copy");
         DiscardIndexMigrationCopies(migration);
         check(fs::exists(source / L"pulse-index.bin") && !fs::exists(target / L"pulse-index.bin"), "failed activation rollback retains source");
+    }
+    // Index folders chosen before #66 inherited their parent's readable ACL.
+    check(AdoptableIndexEntry(L"v9\\volumes\\119c0b9769de1692\\base-a.bin", false) &&
+        AdoptableIndexEntry(L"v9\\9ACBEFD40DDAC9E8\\base-b.bin.pinyin-v2", false) &&
+        AdoptableIndexEntry(L"v9\\volumes\\4821D5763218EFCA\\manifest.json", false) &&
+        AdoptableIndexEntry(L"changes-S-1-5-21-1-2-3-1000-1.bin", false) &&
+        AdoptableIndexEntry(L"Volumes\\1F61284F4A2DF699", true) && AdoptableIndexEntry(L"v9\\volumes", true),
+        "legacy index layout is recognised as host-owned");
+    check(!AdoptableIndexEntry(L"notes.txt", false) && !AdoptableIndexEntry(L"v9\\notes.txt", false) &&
+        !AdoptableIndexEntry(L"v9\\photos", true) && !AdoptableIndexEntry(L"v9\\volumes\\nothex\\base-a.bin", false) &&
+        !AdoptableIndexEntry(L"v9\\9ACBEFD40DDAC9E8\\base-a.binary", false) &&
+        !AdoptableIndexEntry(L"v9\\9ACBEFD40DDAC9E8\\base-a.bin space", false),
+        "foreign names are never adopted");
+    auto sddl = [](const fs::path& path) {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        std::wstring text;
+        if (GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                nullptr, nullptr, nullptr, nullptr, &descriptor) == ERROR_SUCCESS) {
+            LPWSTR value = nullptr;
+            if (ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, SDDL_REVISION_1,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &value, nullptr)) {
+                text = value;
+                LocalFree(value);
+            }
+            LocalFree(descriptor);
+        }
+        return text;
+    };
+    const auto foreign = root / L"legacy-foreign";
+    write(foreign / L"v9" / L"9acbefd40ddac9e8" / L"base-a.bin");
+    write(foreign / L"notes.txt");
+    const auto foreign_file = sddl(foreign / L"notes.txt"), foreign_root = sddl(foreign);
+    {
+        PrivateIndexDirectoryLock pin;
+        check(pin.Acquire(foreign) && !AdoptIndexDirectory(foreign) && !ProtectIndexDirectory(foreign.wstring()),
+            "legacy folder holding a foreign file is refused");
+    }
+    check(!foreign_file.empty() && sddl(foreign / L"notes.txt") == foreign_file && sddl(foreign) == foreign_root,
+        "refused legacy folder keeps every ACL unchanged");
+    const auto linked = root / L"legacy-junction";
+    write(linked / L"v9" / L"9acbefd40ddac9e8" / L"base-a.bin");
+    const std::wstring junction = L"cmd /c mklink /J \"" + (linked / L"volumes").wstring() + L"\" \"" +
+        foreign.wstring() + L"\" >nul";
+    const bool made_junction = _wsystem(junction.c_str()) == 0 && fs::exists(linked / L"volumes");
+    check(made_junction && !AdoptIndexDirectory(linked) && sddl(foreign / L"notes.txt") == foreign_file,
+        "junction inside a legacy folder is refused without touching its target");
+    if (made_junction) RemoveDirectoryW((linked / L"volumes").c_str());
+    const auto outside = root / L"outside.bin", hardlinked = root / L"legacy-hardlink";
+    write(outside);
+    fs::create_directories(hardlinked / L"v9" / L"9acbefd40ddac9e8");
+    const auto outside_acl = sddl(outside);
+    const bool made_link = CreateHardLinkW((hardlinked / L"v9" / L"9acbefd40ddac9e8" / L"base-a.bin").c_str(),
+        outside.c_str(), nullptr) != FALSE;
+    check(made_link && !AdoptIndexDirectory(hardlinked) && sddl(outside) == outside_acl,
+        "hard link inside a legacy folder is refused without touching the linked file");
+    const auto legacy = root / L"legacy-index";
+    write(legacy / L"v9" / L"volumes" / L"119c0b9769de1692" / L"base-a.bin");
+    write(legacy / L"v9" / L"9acbefd40ddac9e8" / L"base-a.bin.pinyin-v2");
+    write(legacy / L"changes-s-1-5-21-1-2-3-1000-1.bin");
+    {
+        PrivateIndexDirectoryLock pin;
+        const bool legacy_pinned = pin.Acquire(legacy);
+        check(legacy_pinned && !ProtectIndexDirectory(legacy.wstring()), "readable legacy index is not private before adoption");
+        const bool adopted = legacy_pinned && AdoptIndexDirectory(legacy);
+        check(adopted || (have_elevation && !elevation.TokenIsElevated),
+            "elevated host adopts a legacy index that holds only its own files");
+        if (adopted) {
+            check(ProtectIndexDirectory(legacy.wstring()) && security::PrivateTree(legacy.wstring()),
+                "adopted legacy index passes the production private-tree check");
+            bool denied = false;
+            if (restricted && ImpersonateLoggedOnUser(restricted)) {
+                HANDLE file = CreateFileW((legacy / L"changes-s-1-5-21-1-2-3-1000-1.bin").c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+                const DWORD code = GetLastError();
+                RevertToSelf();
+                denied = file == INVALID_HANDLE_VALUE && code == ERROR_ACCESS_DENIED;
+                if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+            }
+            check(denied, "restricted token cannot read an adopted legacy index");
+            std::ifstream kept(legacy / L"v9" / L"volumes" / L"119c0b9769de1692" / L"base-a.bin", std::ios::binary);
+            const std::string bytes{std::istreambuf_iterator<char>(kept), std::istreambuf_iterator<char>()};
+            check(bytes == "private-index-metadata", "adoption keeps existing index bytes");
+        } else {
+            printf("[SKIP] legacy index adoption requires elevated administrator\n");
+        }
     }
     if (restricted) CloseHandle(restricted);
     fs::remove_all(root);

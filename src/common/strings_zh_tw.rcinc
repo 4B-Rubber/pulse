@@ -346,6 +346,7 @@ BEGIN
     IDS_CONTEXT_SYSTEM_DESC         "桌布、旋轉、捷徑、以前的版本等。預設隱藏。"
     IDS_CONTEXT_PRINT_DESC          "列印。預設保留。"
     IDS_CONTEXT_SLOW_DISABLED       "因應逾時被停用，點按開關即可恢復"
+    IDS_SETTINGS_INDEX_DIR_NOT_PRIVATE "索引位置中有不屬於 Pulse 的檔案或連結，為保護隱私，索引服務不會使用它。請在「索引位置」中改選一個空資料夾。"
     IDS_RESTORE_DEFAULTS            "恢復預設"
     IDS_TOOLTIP_CLOSE_TAB           "關閉分頁"
     IDS_TOOLTIP_NEW_TAB             "新增分頁"

@@ -50,6 +50,9 @@ std::wstring MachineDataRoot();
 std::wstring MachineIndexRoot();
 // Protect an empty folder or validate an already-private tree; fail closed.
 bool ProtectIndexDirectory(const std::wstring& path);
+// Service exit code when the configured index folder is readable by other users
+// and holds entries the host does not own, so it cannot be made private.
+inline constexpr unsigned long kIndexDirectoryNotPrivate = 1338; // ERROR_INVALID_SECURITY_DESCR
 std::wstring UserIndexRoot();
 std::wstring MachineConfigPath();
 

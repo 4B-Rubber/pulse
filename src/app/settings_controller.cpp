@@ -5,6 +5,7 @@
 #include "default_file_manager.h"
 #include "shell_integration_registry.h"
 #include "../index/index_client.h"
+#include "../index/index_config.h"
 #include "../index/network_agent_client.h"
 #include "../common/preview_packs.h"
 #include "pack_catalog.h"
@@ -497,6 +498,10 @@ bool SettingsController::StartUiTask(SettingsTask task) {
         case SettingsTaskKind::InstallService: {
             DWORD code = 0;
             if (index::IndexClient::InstallServiceElevated(&code)) return true;
+            if (code == index::kIndexDirectoryNotPrivate) {
+                error = l10n::Get(l10n::StringId::SettingsIndexDirNotPrivate);
+                return false;
+            }
             wchar_t detail[512]{};
             FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                 nullptr, code, 0, detail, ARRAYSIZE(detail), nullptr);

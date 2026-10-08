@@ -5,6 +5,8 @@
 #include <filesystem>
 #include <vector>
 #include <algorithm>
+#include <cwctype>
+#include <string_view>
 
 namespace pulse::index {
 // Pin every path component from the volume root down. Protecting only the
@@ -104,6 +106,112 @@ inline bool PreparePrivateIndexDirectory(const std::filesystem::path& path) {
             if (!IsPrivateIndexObject(entry.path())) return false;
         return true;
     } catch (...) { return false; }
+}
+
+// Index folders chosen before #66 kept their parent's ACL, so ordinary users
+// could read and write them. Such a folder is adopted only when every entry is
+// a name the index host itself writes; anything else is left untouched.
+inline bool AdoptableIndexEntry(const std::filesystem::path& relative, bool directory) {
+    std::vector<std::wstring> parts;
+    for (const auto& part : relative) {
+        std::wstring value = part.wstring();
+        std::transform(value.begin(), value.end(), value.begin(), towlower);
+        parts.push_back(std::move(value));
+    }
+    if (parts.empty()) return false;
+    auto hex = [](const std::wstring& value) {
+        return value.size() == 16 && value.find_first_not_of(L"0123456789abcdef") == std::wstring::npos;
+    };
+    auto shard_directory = [&](size_t count) {
+        const bool family = parts[0] == L"v9" || parts[0] == L"volumes";
+        return (count == 1 && family) ||
+            (count == 2 && family && (hex(parts[1]) || (parts[0] == L"v9" && parts[1] == L"volumes"))) ||
+            (count == 3 && parts[0] == L"v9" && parts[1] == L"volumes" && hex(parts[2]));
+    };
+    if (directory) return shard_directory(parts.size());
+    const std::wstring_view name = parts.back();
+    const bool plain = name.find_first_not_of(L"abcdefghijklmnopqrstuvwxyz0123456789.-") == std::wstring_view::npos;
+    if (!plain) return false;
+    if (parts.size() == 1)
+        return name == L"config.json" || name.starts_with(L"pulse-index") ||
+            name.starts_with(L"changes-s-1-") || name.starts_with(L".pulse-write-check-");
+    if (parts.size() < 3 || !shard_directory(parts.size() - 1) || !hex(parts[parts.size() - 2])) return false;
+    for (const std::wstring_view base : {L"base-a.bin", L"base-b.bin", L"manifest.json", L"wal-a.log", L"wal-b.log"})
+        if (name.starts_with(base) && (name.size() == base.size() || name[base.size()] == L'.')) return true;
+    return false;
+}
+
+// Rewrites security on the opened object itself; SetKernelObjectSecurity does
+// not propagate, and the handle never follows a link planted in the folder.
+inline bool AdoptIndexObject(const std::wstring& path, bool directory, PSECURITY_DESCRIPTOR descriptor,
+                             SECURITY_INFORMATION information) {
+    HANDLE handle = CreateFileW(path.c_str(), READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const bool ok = GetFileInformationByHandle(handle, &info) &&
+        !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) == directory &&
+        (directory || info.nNumberOfLinks == 1) &&
+        SetKernelObjectSecurity(handle, information, descriptor);
+    CloseHandle(handle);
+    return ok;
+}
+
+inline bool AdoptIndexChildren(const std::filesystem::path& root, const std::filesystem::path& relative,
+                               PSECURITY_DESCRIPTOR directory_descriptor, PSECURITY_DESCRIPTOR file_descriptor) {
+    const auto directory = relative.empty() ? root : root / relative;
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileExW((directory / L"*").c_str(), FindExInfoBasic, &data,
+        FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (find == INVALID_HANDLE_VALUE) return false;
+    bool ok = true;
+    do {
+        const std::wstring_view name = data.cFileName;
+        if (name == L"." || name == L"..") continue;
+        const bool is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        const auto child = relative / data.cFileName;
+        ok = !(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && AdoptableIndexEntry(child, is_directory) &&
+            AdoptIndexObject((root / child).wstring(), is_directory,
+                is_directory ? directory_descriptor : file_descriptor,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION) &&
+            (!is_directory || AdoptIndexChildren(root, child, directory_descriptor, file_descriptor));
+    } while (ok && FindNextFileW(find, &data));
+    if (ok && GetLastError() != ERROR_NO_MORE_FILES) ok = false;
+    FindClose(find);
+    return ok;
+}
+
+// Caller holds PrivateIndexDirectoryLock on root. The root is closed first, so
+// nobody but SYSTEM/Administrators can add entries (or links) while each level
+// is secured top-down. The caller must still validate with ProtectIndexDirectory.
+inline bool AdoptIndexDirectory(const std::filesystem::path& root) {
+    namespace fs = std::filesystem;
+    if (!root.is_absolute() || root == root.root_path()) return false;
+    std::error_code error;
+    size_t entries = 0;
+    for (fs::recursive_directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
+        const DWORD attributes = GetFileAttributesW(it->path().c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            !AdoptableIndexEntry(it->path().lexically_relative(root), (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) ||
+            ++entries > 100000) return false;
+    }
+    if (error) return false;
+    PSECURITY_DESCRIPTOR root_descriptor = nullptr, directory_descriptor = nullptr, file_descriptor = nullptr;
+    bool ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", SDDL_REVISION_1, &root_descriptor, nullptr) &&
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)", SDDL_REVISION_1, &directory_descriptor, nullptr) &&
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"O:BAD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)", SDDL_REVISION_1, &file_descriptor, nullptr);
+    ok = ok && AdoptIndexObject(root.wstring(), true, root_descriptor,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION) &&
+        AdoptIndexChildren(root, {}, directory_descriptor, file_descriptor);
+    if (root_descriptor) LocalFree(root_descriptor);
+    if (directory_descriptor) LocalFree(directory_descriptor);
+    if (file_descriptor) LocalFree(file_descriptor);
+    return ok;
 }
 }
 
