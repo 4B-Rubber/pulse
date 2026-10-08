@@ -38,6 +38,9 @@ constexpr const wchar_t* kGlyphRecycle = L"\xE75C";
 constexpr const wchar_t* kGlyphSelectAll = L"\xE8B3";
 constexpr const wchar_t* kGlyphInvert = L"\xE7A1";
 constexpr const wchar_t* kGlyphWildcard = L"\xE71C";
+constexpr const wchar_t* kGlyphViewMenu = L"\xE8A9";
+constexpr const wchar_t* kGlyphSortMenu = L"\xE8CB";
+constexpr const wchar_t* kGlyphGroupMenu = L"\xF168";
 
 ui::FluentMenuItem Item(int cmd, const wchar_t* text, const wchar_t* glyph,
                         const wchar_t* shortcut = nullptr, bool enabled = true) {
@@ -111,15 +114,34 @@ BuiltinMenuItem BuiltinItemForCommand(int command) {
     case CmdInvertSelection:
     case CmdSelectWildcard: return BuiltinMenuItem::SelectCommands;
     case CmdUndo: return BuiltinMenuItem::Undo;
+    case CmdRefresh: return BuiltinMenuItem::Refresh;
+    case CmdNewFolder: return BuiltinMenuItem::NewFolder;
+    case CmdNewTextFile: return BuiltinMenuItem::NewTextFile;
+    case CmdPaste: return BuiltinMenuItem::Paste;
+    case CmdProperties: return BuiltinMenuItem::Properties;
+    case CmdFolderProperties: return BuiltinMenuItem::FolderProperties;
     default: return BuiltinMenuItem::Count;
     }
 }
+
+namespace {
+// 查看 / 排序方式 / 分组 are command-less flyout headers built by
+// AppendBackgroundViewCommands; their glyph is what identifies them.
+BuiltinMenuItem BuiltinItemForRow(const ui::FluentMenuItem& item) {
+    if (item.command != CmdNone) return BuiltinItemForCommand(item.command);
+    if (item.children.empty()) return BuiltinMenuItem::Count;
+    if (item.glyph == kGlyphViewMenu) return BuiltinMenuItem::View;
+    if (item.glyph == kGlyphSortMenu) return BuiltinMenuItem::Sort;
+    if (item.glyph == kGlyphGroupMenu) return BuiltinMenuItem::Group;
+    return BuiltinMenuItem::Count;
+}
+} // namespace
 
 void ApplyBuiltinMenuPrefs(std::vector<ui::FluentMenuItem>& items,
                            const ContextMenuPrefs& prefs) {
     if (prefs.builtin_hidden == 0 || items.empty()) return;
     auto hidden = [&](const ui::FluentMenuItem& item) {
-        const BuiltinMenuItem owner = BuiltinItemForCommand(item.command);
+        const BuiltinMenuItem owner = BuiltinItemForRow(item);
         return owner != BuiltinMenuItem::Count && !prefs.BuiltinVisible(owner);
     };
     const bool last_dropped = hidden(items.back());
@@ -291,7 +313,7 @@ ui::FluentMenuItem BuildShortcutHints() {
 }
 
 ui::FluentMenuItem BuildGroupMenu(const BackgroundViewOptions& options) {
-    auto group = Item(CmdNone, l10n::Get(l10n::StringId::GroupBy).c_str(), L"\xF168",
+    auto group = Item(CmdNone, l10n::Get(l10n::StringId::GroupBy).c_str(), kGlyphGroupMenu,
                       nullptr, options.can_group);
     struct GroupRow { int command; int value; l10n::StringId label; };
     constexpr GroupRow rows[] = {
@@ -324,9 +346,9 @@ ui::FluentMenuItem BuildGroupMenu(const BackgroundViewOptions& options) {
 
 void AppendBackgroundViewCommands(std::vector<ui::FluentMenuItem>& items,
                                   const BackgroundViewOptions& options) {
-    auto view = Item(CmdNone, l10n::Get(l10n::StringId::View).c_str(), L"\xE8A9");
+    auto view = Item(CmdNone, l10n::Get(l10n::StringId::View).c_str(), kGlyphViewMenu);
     view.children = BuildViewMenu(options.view_mode, options.details_panel, options.filesystem);
-    auto sort = Item(CmdNone, l10n::Get(l10n::StringId::SortBy).c_str(), L"\xE8CB", nullptr, options.can_sort);
+    auto sort = Item(CmdNone, l10n::Get(l10n::StringId::SortBy).c_str(), kGlyphSortMenu, nullptr, options.can_sort);
     sort.children = BuildSortMenu(options);
     auto refresh = Item(CmdRefresh, l10n::Get(l10n::StringId::Refresh).c_str(), L"\xE72C", L"F5");
     refresh.separator_after = true;

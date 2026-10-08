@@ -697,6 +697,15 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             }
             // Pulse's own commands: card 5, after the seen catalog (see
             // SettingsController::ToggleUi).
+            vm.settings_builtin_first = vm.settings_items.size();
+            vm.settings_builtin_hidden = s.ctxMenuPrefs.builtin_hidden;
+            vm.settings_context_tab = s.settings.ContextTab();
+            static const int shot_context_tab = [] {
+                wchar_t v[4]{};
+                const DWORD n = GetEnvironmentVariableW(L"PULSE_SHOT_CONTEXT_TAB", v, 4);
+                return n == 1 && v[0] >= L'0' && v[0] <= L'2' ? v[0] - L'0' : -1;
+            }();
+            if (shot_context_tab >= 0) vm.settings_context_tab = shot_context_tab;
             for (int i = 0; i < app::kBuiltinMenuItemCount; ++i) {
                 const auto item = static_cast<app::BuiltinMenuItem>(i);
                 ui::SettingsRowView row;

@@ -767,6 +767,12 @@ struct WindowViewModel {
     int settings_language = 0;    // 0 system, 1 zh-CN, 2 zh-TW, 3 en-US
     BloomAccentPicker* settings_bloom = nullptr;
     bool settings_group_on[5] = { true, true, false, false, true };
+    // 本地右键菜单 › Pulse 菜单 card: selected tab (0 on a file, 1 blank area,
+    // 2 row buttons), the hidden-item mask, and where BuiltinMenuItem 0 sits
+    // in settings_items.
+    int settings_context_tab = 0;
+    uint32_t settings_builtin_hidden = 0;
+    size_t settings_builtin_first = 0;
     std::vector<SettingsRowView> settings_items;
     bool settings_index_service = false;
     bool settings_index_installed = false;
@@ -1447,6 +1453,7 @@ private:
     void DrawTaskPill(const WindowViewModel& vm, const D2D1_RECT_F& area, const Theme& theme);
     void DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettingsContext(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
+    void DrawSettingsPulseMenu(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettingsPacks(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
 

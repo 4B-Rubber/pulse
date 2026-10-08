@@ -220,6 +220,8 @@ public:
     void Language(std::wstring_view language_id);
     void Wallpaper(int action);
     void ToggleUi(int index);
+    // 本地右键菜单 › Pulse 菜单 tab: 0 on a file, 1 blank area, 2 row buttons.
+    int ContextTab() const { return context_tab_; }
     void IntegrationAction(int index);
     int IntegrationState() const noexcept;
     std::wstring IntegrationSummary() const;
@@ -246,6 +248,7 @@ public:
     void DiagnosticsAction(int action);
 
 private:
+    int context_tab_ = 0;
     friend struct SettingsControllerTestPeer;
 
     struct TaskState {

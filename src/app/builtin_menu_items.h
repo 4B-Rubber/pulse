@@ -1,13 +1,14 @@
 // builtin_menu_items.h — Pulse's own context-menu rows and list-row hover
 // buttons that the 右键菜单 settings page can hide (#41, #44-⑩).
 //
-// Open, the cut / copy / delete / rename strip and Properties always stay;
-// everything listed here can be turned off. Hidden items persist by key in
+// Open and the cut / copy / delete / rename strip always stay; everything
+// listed here can be turned off. Hidden items persist by key in
 // context_menu.json ("pulse_items"), so the enum order is free to change.
 #pragma once
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace pulse::app {
 
@@ -26,10 +27,20 @@ enum class BuiltinMenuItem : uint8_t {
     RowNewTab,
     RowStar,
     RowMore,
+    View,
+    Sort,
+    Group,
+    Refresh,
+    NewFolder,
+    NewTextFile,
+    Paste,
+    Properties,
+    FolderProperties,
     Count
 };
 
 constexpr int kBuiltinMenuItemCount = static_cast<int>(BuiltinMenuItem::Count);
+static_assert(kBuiltinMenuItemCount <= 32, "builtin_hidden is a 32-bit mask");
 
 constexpr uint32_t BuiltinMenuBit(BuiltinMenuItem item) {
     return 1u << static_cast<uint32_t>(item);
@@ -47,5 +58,46 @@ constexpr uint32_t kRowActionNewTab = 2u;
 constexpr uint32_t kRowActionMore = 4u;
 constexpr uint32_t kRowActionsAll = kRowActionStar | kRowActionNewTab | kRowActionMore;
 uint32_t RowActionMask(uint32_t builtin_hidden);
+
+// Settings page: the three surfaces the Pulse menu card switches between.
+enum class BuiltinMenuSurface : uint8_t { Item, Background, RowButtons, Count };
+// Rows that are shown for reference but can never be hidden.
+enum class BuiltinFixedRow : uint8_t { None, Open, Strip };
+
+// One row of a surface, in the order the real menu shows it. `item` is
+// Count for a fixed row.
+struct BuiltinMenuRow {
+    BuiltinMenuItem item;
+    BuiltinFixedRow fixed;
+    const wchar_t* glyph;
+    const wchar_t* shortcut;
+    bool separator_after;
+    bool submenu;
+};
+
+struct BuiltinMenuRows {
+    const BuiltinMenuRow* rows;
+    size_t count;
+};
+BuiltinMenuRows BuiltinMenuSurfaceRows(BuiltinMenuSurface surface);
+// Label of a surface row (fixed rows included).
+std::wstring BuiltinMenuRowLabel(const BuiltinMenuRow& row);
+// Rows still shown for `builtin_hidden`, with separators moved the way
+// ApplyBuiltinMenuPrefs moves them (settings preview).
+struct BuiltinMenuVisibleRow {
+    const BuiltinMenuRow* row;
+    bool separator_after;
+};
+std::vector<BuiltinMenuVisibleRow> BuiltinMenuVisibleRows(BuiltinMenuSurface surface,
+                                                          uint32_t builtin_hidden);
+// True when the item shows in both the file and the blank-area menu, so one
+// switch changes both.
+bool BuiltinMenuShared(BuiltinMenuItem item);
+
+// One-click presets, as builtin_hidden masks. Full is the default.
+enum class BuiltinMenuPreset : uint8_t { Slim, Standard, Full, Count };
+uint32_t BuiltinMenuPresetHidden(BuiltinMenuPreset preset);
+// The preset whose mask equals `builtin_hidden`, or Count for 自定义.
+BuiltinMenuPreset BuiltinMenuPresetFor(uint32_t builtin_hidden);
 
 } // namespace pulse::app

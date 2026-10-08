@@ -68,6 +68,56 @@ int wmain() {
     com.RecordSeen(L"v:pintoquickaccess", L"Pin to Quick access", false, category, true);
     com.MigrateSeenKeys();
     check(com.seen[0].key == L"v:pintoquickaccess", "COM command with similar text is not reassigned to Pulse");
+    {
+        // Pulse menu card: new switchable rows, presets and preview rows.
+        using app::BuiltinMenuItem;
+        using app::BuiltinMenuPreset;
+        app::ContextMenuPrefs fresh;
+        check(fresh.builtin_hidden == 0 && app::BuiltinMenuPresetFor(fresh.builtin_hidden) == BuiltinMenuPreset::Full,
+            "CMI-B01 defaults keep every Pulse row (preset 完整)");
+        app::ContextMenuPrefs hide;
+        hide.SetBuiltinVisible(BuiltinMenuItem::Paste, false);
+        hide.SetBuiltinVisible(BuiltinMenuItem::View, false);
+        hide.SetBuiltinVisible(BuiltinMenuItem::FolderProperties, false);
+        app::ContextMenuPrefs back;
+        check(back.FromJson(hide.ToJson()) && !back.BuiltinVisible(BuiltinMenuItem::Paste) &&
+            !back.BuiltinVisible(BuiltinMenuItem::View) && !back.BuiltinVisible(BuiltinMenuItem::FolderProperties) &&
+            back.BuiltinVisible(BuiltinMenuItem::Properties) && back.builtin_hidden == hide.builtin_hidden,
+            "CMI-B02 new rows persist by key");
+        check(app::BuiltinMenuPresetFor(back.builtin_hidden) == BuiltinMenuPreset::Count, "CMI-B03 hand-picked mask reads as 自定义");
+        bool presets = true;
+        for (int i = 0; i < static_cast<int>(BuiltinMenuPreset::Count); ++i) {
+            const auto preset = static_cast<BuiltinMenuPreset>(i);
+            presets &= app::BuiltinMenuPresetFor(app::BuiltinMenuPresetHidden(preset)) == preset;
+        }
+        const uint32_t slim = app::BuiltinMenuPresetHidden(BuiltinMenuPreset::Slim);
+        presets &= (slim & app::BuiltinMenuBit(BuiltinMenuItem::Paste)) == 0 &&
+            (slim & app::BuiltinMenuBit(BuiltinMenuItem::Properties)) == 0 &&
+            (slim & app::BuiltinMenuBit(BuiltinMenuItem::PinNetwork)) != 0;
+        check(presets, "CMI-B04 presets round-trip; 精简 keeps paste and properties");
+        bool fixed_ok = true, separators_ok = true;
+        for (int surface = 0; surface < static_cast<int>(app::BuiltinMenuSurface::Count); ++surface) {
+            for (const uint32_t hidden : { 0u, slim, 0xffffffffu }) {
+                const auto rows = app::BuiltinMenuVisibleRows(static_cast<app::BuiltinMenuSurface>(surface), hidden);
+                if (!rows.empty()) separators_ok &= !rows.back().separator_after;
+                int fixed = 0;
+                for (const auto& r : rows) {
+                    if (r.row->fixed != app::BuiltinFixedRow::None) ++fixed;
+                    else fixed_ok &= (hidden & app::BuiltinMenuBit(r.row->item)) == 0;
+                }
+                if (surface == 0) fixed_ok &= fixed == 2;
+            }
+        }
+        check(fixed_ok, "CMI-B05 open and the action strip always stay; hidden rows leave the preview");
+        check(separators_ok, "CMI-B06 preview never ends in a separator");
+        check(app::BuiltinMenuShared(BuiltinMenuItem::CopyPath) && app::BuiltinMenuShared(BuiltinMenuItem::Undo) &&
+            !app::BuiltinMenuShared(BuiltinMenuItem::Paste) && !app::BuiltinMenuShared(BuiltinMenuItem::Properties),
+            "CMI-B07 两处共用 marks rows present in both menus");
+        bool labels = true;
+        for (int i = 0; i < app::kBuiltinMenuItemCount; ++i)
+            labels &= !app::BuiltinMenuKey(static_cast<BuiltinMenuItem>(i)).empty();
+        check(labels, "CMI-B08 every Pulse row has a stable key");
+    }
     if (base.parent_path() != parent || !base.filename().wstring().starts_with(L"context-menu-identity-")) return 1;
     std::error_code error; fs::remove_all(base, error);
     check(!error && !fs::exists(base), "private preferences fixture removed");

@@ -967,6 +967,19 @@ void SettingsController::ToggleUi(int index) {
         }
         global_search_error_.clear();
         Apply(SettingsEffect::GlobalSearch);
+    } else if (index >= 60 && index < 63) {
+        // Pulse menu presets (精简 / 标准 / 完整).
+        context_->builtin_hidden =
+            BuiltinMenuPresetHidden(static_cast<BuiltinMenuPreset>(index - 60));
+        context_->Save();
+        Apply(SettingsEffect::ListStyle);
+    } else if (index >= 64 && index < 67) {
+        context_tab_ = index - 64;
+    } else if (index == 67) {
+        // The card's 恢复默认 resets Pulse's own rows only.
+        context_->builtin_hidden = 0;
+        context_->Save();
+        Apply(SettingsEffect::ListStyle);
     } else if (index >= 10 && index < 15) {
         static constexpr ipc::CtxMenuGroup groups[] = {
             ipc::CtxMenuGroup::Software, ipc::CtxMenuGroup::OpenWith,

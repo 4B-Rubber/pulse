@@ -7,6 +7,7 @@
 #include "typography.h"
 #include "name_highlight.h"
 #include "../app/places.h"
+#include "../app/builtin_menu_items.h"
 #include "../app/search_query.h"
 #include "../common/text_format.h"
 #include "../common/display_path.h"
@@ -1843,6 +1844,25 @@ inline bool SystemGroupChipVisible(const WindowViewModel& vm, int group) {
     return SystemGroupEnabled(vm, group);
 }
 
+inline app::BuiltinMenuSurface PulseMenuSurface(const WindowViewModel& vm) {
+    return vm.settings_context_tab == 1 ? app::BuiltinMenuSurface::Background
+         : vm.settings_context_tab == 2 ? app::BuiltinMenuSurface::RowButtons
+                                        : app::BuiltinMenuSurface::Item;
+}
+// Preview metrics (DIP), shared by layout and drawing.
+inline constexpr float kPulsePreviewTitle = 24.0f, kPulsePreviewRow = 34.0f,
+    kPulsePreviewSwatches = 34.0f, kPulsePreviewSeparator = 9.0f, kPulsePreviewPad = 5.0f;
+inline float PulseMenuPreviewHeight(const WindowViewModel& vm, float scale) {
+    if (vm.settings_context_tab == 2) return (kPulsePreviewTitle + 56.0f) * scale;
+    float h = 2 * kPulsePreviewPad;
+    for (const auto& r : app::BuiltinMenuVisibleRows(PulseMenuSurface(vm), vm.settings_builtin_hidden)) {
+        h += kPulsePreviewRow;
+        if (r.row->item == app::BuiltinMenuItem::Tags) h += kPulsePreviewSwatches;
+        if (r.separator_after) h += kPulsePreviewSeparator;
+    }
+    return (kPulsePreviewTitle + h) * scale;
+}
+
 struct SettingsLayout {
     // Cards 0-4: Explorer groups (with a master switch). Card 5: Pulse's own
     // commands, rows only (context_toggle[5] stays empty).
@@ -1850,6 +1870,10 @@ struct SettingsLayout {
     D2D1_RECT_F context_cards[kContextCards]{}, context_header[kContextCards]{}, context_toggle[kContextCards]{},
         context_empty[kContextCards]{}, context_restore{};
     std::vector<D2D1_RECT_F> context_rows;
+    // Pulse menu card (first on the page): presets (3 = 自定义, display
+    // only), surface tabs, fixed rows of the current tab, live preview.
+    D2D1_RECT_F pulse_card{}, pulse_restore{}, pulse_preset[4]{}, pulse_tabs{}, pulse_tab[3]{},
+        pulse_fixed[2]{}, pulse_preview{}, context_other{};
     D2D1_RECT_F duplicate_options{};
     D2D1_RECT_F section[4]{}, group[3]{}, footer{};
     D2D1_RECT_F theme_row{}, theme_tile[3]{}, effect_choice{}, language_choice{};
@@ -2193,10 +2217,65 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
     } else if (vm.settings_page == 2) {
         y += 30*scale;
         l.context_rows.resize(vm.settings_items.size());
-        for(int g=0;g<SettingsLayout::kContextCards;++g) {
+        {
+            // Pulse menu card: header, presets, surface tabs, then the
+            // switch list with a live menu preview on the right.
+            const float left=l.content.left+pad,right=l.content.right-pad,top=y;
+            const float inner=left+54*scale;
+            const float link_w=label_btn_w(l10n::Get(l10n::StringId::RestoreDefaults))-8*scale;
+            l.pulse_restore=D2D1::RectF(right-16*scale-link_w,top+18*scale,right-16*scale,top+46*scale);
+            y=top+72*scale;
+            static constexpr l10n::StringId kPresetDesc[]={l10n::StringId::ContextPresetSlimDesc,l10n::StringId::ContextPresetStandardDesc,
+                l10n::StringId::ContextPresetFullDesc,l10n::StringId::ContextPresetCustomDesc};
+            float px=inner;
+            for(int i=0;i<4;++i) {
+                // Fit the longer caption line (small text is narrower than the button font).
+                const float w=std::max(80*scale,label_btn_w(l10n::Get(kPresetDesc[i]))*0.92f);
+                l.pulse_preset[i]=D2D1::RectF(px,y,px+w,y+48*scale);
+                px+=w+8*scale;
+            }
+            y+=60*scale;
+            static constexpr l10n::StringId kTabs[]={l10n::StringId::ContextTabItem,l10n::StringId::ContextTabBackground,l10n::StringId::ContextTabRow};
+            float tx=inner+3*scale;
+            for(int i=0;i<3;++i) {
+                const float w=std::max(72*scale,label_btn_w(l10n::Get(kTabs[i])));
+                l.pulse_tab[i]=D2D1::RectF(tx,y+3*scale,tx+w,y+33*scale);
+                tx+=w;
+            }
+            l.pulse_tabs=D2D1::RectF(inner,y,tx+3*scale,y+36*scale);
+            y+=52*scale;
+            const bool preview=right-left>=700*scale;
+            const float preview_w=244*scale;
+            const float list_right=preview ? right-24*scale-preview_w-28*scale : right-24*scale;
+            const float list_top=y;
+            const auto rows=app::BuiltinMenuSurfaceRows(PulseMenuSurface(vm));
+            for(size_t k=0;k<rows.count;++k) {
+                const auto& row=rows.rows[k];
+                const auto row_rc=D2D1::RectF(inner,y,list_right,y+44*scale);
+                if(row.fixed!=app::BuiltinFixedRow::None) {
+                    l.pulse_fixed[row.fixed==app::BuiltinFixedRow::Open ? 0 : 1]=row_rc;
+                } else {
+                    const size_t i=vm.settings_builtin_first+static_cast<size_t>(row.item);
+                    if(i<l.context_rows.size()) l.context_rows[i]=row_rc;
+                }
+                y+=44*scale;
+            }
+            float bottom=y;
+            if(preview) {
+                const float h=PulseMenuPreviewHeight(vm,scale);
+                l.pulse_preview=D2D1::RectF(right-24*scale-preview_w,list_top,right-24*scale,list_top+h);
+                bottom=std::max(bottom,l.pulse_preview.bottom);
+            }
+            y=bottom+16*scale;
+            l.pulse_card=D2D1::RectF(left,top,right,y);
+            y+=20*scale;
+            l.context_other=D2D1::RectF(left,y,right,y+20*scale);
+            y+=30*scale;
+        }
+        for(int g=0;g<5;++g) {
             const float top=y;
             l.context_header[g]=D2D1::RectF(l.content.left+pad,y,l.content.right-pad,y+76*scale);
-            if(g<5) l.context_toggle[g]=D2D1::RectF(l.content.right-pad-100*scale,y+20*scale,l.content.right-pad-56*scale,y+52*scale);
+            l.context_toggle[g]=D2D1::RectF(l.content.right-pad-100*scale,y+20*scale,l.content.right-pad-56*scale,y+52*scale);
             y+=76*scale;
             if(vm.settings_expanded & (1u<<(g+8))) {
                 for(size_t i=0;i<vm.settings_items.size();++i) if(vm.settings_items[i].group==g) {
