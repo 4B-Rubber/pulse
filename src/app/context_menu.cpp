@@ -231,7 +231,17 @@ void AppendRecentChangesCommand(std::vector<ui::FluentMenuItem>& items,
                                 const std::wstring& path) {
     if (path.empty() || fs::IsVirtualPath(path)) return;
     auto item = Item(CmdViewRecentChanges, l10n::Get(l10n::StringId::ChangeView).c_str(), L"\xE81C");
-    items.insert(items.begin() + (items.empty() ? 0 : 1), std::move(item));
+    // Where the settings preview shows it (builtin_menu_items.cpp): right
+    // after the cut / copy / delete / rename strip on an item, right above
+    // 撤销 on the blank area, so moved rows land where the preview says.
+    const auto strip = std::find_if(items.begin(), items.end(), [](const ui::FluentMenuItem& row) {
+        return row.command == CmdNone && row.children.empty() && !row.quick_swatches.empty();
+    });
+    if (strip != items.end()) { items.insert(strip + 1, std::move(item)); return; }
+    const auto undo = std::find_if(items.begin(), items.end(), [](const ui::FluentMenuItem& row) {
+        return row.command == CmdUndo;
+    });
+    items.insert(undo, std::move(item));
 }
 
 std::vector<ui::FluentMenuItem> BuildRecycleItemMenu(bool can_undo,
