@@ -969,6 +969,9 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 const bool horizontal = s->settings.ContextTab() == 2;
                 if (s->settings.MenuDragMove(static_cast<float>(horizontal ? mx : my)))
                     InvalidateRect(hwnd, nullptr, FALSE);
+                // Captured: no WM_SETCURSOR arrives, so set the drag cursor here.
+                if (s->settings.menu_drag_live())
+                    SetCursor(LoadCursorW(nullptr, horizontal ? IDC_SIZEWE : IDC_SIZENS));
                 return 0;
             }
         }

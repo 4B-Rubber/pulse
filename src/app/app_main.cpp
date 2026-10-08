@@ -1434,9 +1434,14 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
-        if (s->settings.menu_drag_live() ||
-            (hit.region == ui::HitTestResult::SettingsToggle && hit.index >= ui::kSettingsMenuRowHit)) {
-            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)); // movable Pulse menu preview row
+        if (s->settings.menu_drag_live()) {
+            // Rows only slide along one axis: up/down, or left/right for 行按钮.
+            SetCursor(LoadCursorW(nullptr, s->settings.ContextTab() == 2 ? IDC_SIZEWE : IDC_SIZENS));
+            return TRUE;
+        }
+        if (hit.region == ui::HitTestResult::SettingsToggle && hit.index >= ui::kSettingsMenuRowHit) {
+            // Hand, not IDC_SIZEALL: some pointer themes draw "move" like "no".
+            SetCursor(LoadCursorW(nullptr, IDC_HAND)); // movable Pulse menu preview row
             return TRUE;
         }
         break;
