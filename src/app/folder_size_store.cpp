@@ -51,11 +51,16 @@ void Store::MarkStale(Entry& entry, uint64_t now, uint64_t delay) {
     if (entry.value.has_value && entry.value.source != FolderSizeSource::Index)
         entry.value.state = FolderSizeState::Cached;
 }
-bool Store::InvalidateAncestors(const std::wstring& path, uint64_t now, uint64_t delay) {
+namespace {
+bool Known(const Store::Entry& entry) {
+    return entry.value.has_value || entry.completed != 0 || entry.work.Running();
+}
+}
+bool Store::InvalidateAncestors(const std::wstring& path, uint64_t now, uint64_t delay, bool known_only) {
     bool changed = false;
     std::wstring ancestor = path;
     for (;;) {
-        if (auto found = entries.find(ancestor); found != entries.end()) {
+        if (auto found = entries.find(ancestor); found != entries.end() && (!known_only || Known(found->second))) {
             MarkStale(found->second, now, delay); changed = true;
         }
         if (ancestor.size() <= 7) break;
@@ -65,11 +70,11 @@ bool Store::InvalidateAncestors(const std::wstring& path, uint64_t now, uint64_t
     }
     return changed;
 }
-bool Store::Invalidate(const std::wstring& path, uint64_t now, uint64_t delay) {
-    bool changed = InvalidateAncestors(path, now, delay);
+bool Store::Invalidate(const std::wstring& path, uint64_t now, uint64_t delay, bool known_only) {
+    bool changed = InvalidateAncestors(path, now, delay, known_only);
     const auto prefix = path.back() == L'\\' ? path : path + L'\\';
     for (auto found = entries.lower_bound(prefix); found != entries.end() && found->first.starts_with(prefix); ++found) {
-        if (found->first == path) continue;
+        if (found->first == path || (known_only && !Known(found->second))) continue;
         MarkStale(found->second, now, delay); changed = true;
     }
     return changed;

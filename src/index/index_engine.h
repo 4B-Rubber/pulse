@@ -175,7 +175,16 @@ private:
     ULONGLONG folder_size_retry_after_ = 0;
     bool folder_size_usn_update_ = false;
     std::atomic<bool> folder_size_gap_{false};
+    // Totals are aggregated under a shared lock so searches keep running; edits
+    // published in between are detected by this counter (guarded by mutex_).
+    uint64_t folder_size_mutations_ = 0;
+    std::mutex folder_size_build_mutex_;
+    // A running service aggregates on its worker and answers clients at once.
+    bool folder_size_background_ = false;
+    std::atomic<bool> folder_size_wanted_{false};
     FolderSizeIndex::Item FolderSizeItem(int32_t id) const;
+    bool FolderSizeIdsLocked(const std::vector<std::wstring>& paths, std::vector<int32_t>& ids) const;
+    bool BuildFolderTotals();
     ChangeTracker changes_;
     std::mutex change_seed_mutex_;
     std::unordered_set<std::wstring> change_seed_owners_;
@@ -396,6 +405,7 @@ private:
     void UpdateVolumeVisibilityLocked(const std::vector<VolumeInfo>& active, bool only_hide = false);
     void InvalidateFilterLocked() {
         ++filter_epoch_;
+        ++folder_size_mutations_;
         if (!folder_size_usn_update_) {
             folder_sizes_.Reset();
             folder_size_retry_after_ = 0;

@@ -2,6 +2,8 @@
 #include <vector>
 #include <cstring>
 #include <cstdio>
+#include <map>
+#include <string>
 
 int main() {
     using namespace pulse::index;
@@ -36,6 +38,58 @@ int main() {
         check(emitted == 1 && complete == (mode == 0), mode == 0 ? "complete source succeeds after all chunks" :
             mode == 1 ? "read failure after emitted records stays incomplete" :
             mode == 2 ? "cancellation after first record stays incomplete" : "consumer stop never reports complete volume");
+    }
+    // Fragmented large files keep $DATA in an extension record; FILE_NAME only
+    // holds a creation-time size. Either record order must yield the real size.
+    struct Writer {
+        BYTE* d; size_t at = 48;
+        void u16(size_t o, uint16_t v) { memcpy(d + o, &v, 2); }
+        void u32(size_t o, uint32_t v) { memcpy(d + o, &v, 4); }
+        void u64(size_t o, uint64_t v) { memcpy(d + o, &v, 8); }
+        void header(uint64_t base) {
+            u32(0, 0x454c4946); u16(4, 42); u16(6, 1); u16(16, 1); u16(20, 48); u16(22, 1);
+            u32(28, 512); u64(32, base);
+        }
+        void resident(uint32_t type, const std::vector<BYTE>& value) {
+            const uint32_t length = static_cast<uint32_t>((24 + value.size() + 7) & ~size_t(7));
+            u32(at, type); u32(at + 4, length); u32(at + 16, static_cast<uint32_t>(value.size())); u16(at + 20, 24);
+            memcpy(d + at + 24, value.data(), value.size()); at += length;
+        }
+        void name(const wchar_t* text, uint64_t stale_size) {
+            const size_t n = wcslen(text);
+            std::vector<BYTE> v(66 + n * 2);
+            uint64_t parent = 5; memcpy(v.data(), &parent, 8); memcpy(v.data() + 48, &stale_size, 8);
+            v[64] = static_cast<BYTE>(n); v[65] = 1; memcpy(v.data() + 66, text, n * 2);
+            resident(0x30, v);
+        }
+        void data(uint64_t size) {
+            u32(at, 0x80); u32(at + 4, 72); d[at + 8] = 1; u64(at + 24, 1000); u16(at + 32, 64);
+            u64(at + 40, size + 4096); u64(at + 48, size); u64(at + 56, size); at += 72;
+        }
+        void finish() { u32(at, 0xffffffff); u32(24, static_cast<uint32_t>(at + 8)); }
+    };
+    constexpr uint64_t kReal = 287641720;
+    for (int order = 0; order < 2; ++order) {
+        geometry.MftValidDataLength.QuadPart = 4 * 512;
+        std::map<std::wstring, uint64_t> sizes;
+        unsigned emitted = 0, reads = 0;
+        std::atomic<bool> running{true};
+        const bool complete = EnumerateMftRecords(geometry, [&](uint64_t, void* bytes, DWORD size) {
+            memset(bytes, 0, size);
+            if (++reads != 2 || size < 4 * 512) return true;
+            BYTE* base = static_cast<BYTE*>(bytes);
+            const int big = order == 0 ? 0 : 1, extension = order == 0 ? 1 : 0;
+            Writer b{base + big * 512}; b.header(0); b.resident(0x20, std::vector<BYTE>(8, 0)); b.name(L"big", 0); b.finish();
+            Writer e{base + extension * 512}; e.header((1ull << 48) | static_cast<uint64_t>(big)); e.data(kReal); e.finish();
+            Writer s{base + 2 * 512}; s.header(0); s.name(L"small", 0); s.resident(0x80, std::vector<BYTE>(7, 1)); s.finish();
+            Writer o{base + 3 * 512}; o.header(0); o.resident(0x20, std::vector<BYTE>(8, 0)); o.name(L"orphan", 11); o.finish();
+            return true;
+        }, &running, {}, [&](MftFile&& file) { ++emitted; sizes[file.name] = file.size; return true; });
+        check(complete && emitted == 3 && sizes[L"big"] == kReal,
+              order == 0 ? "extension $DATA after its base record supplies the real file size" :
+                           "extension $DATA before its base record supplies the real file size");
+        check(sizes[L"small"] == 7 && sizes.count(L"orphan") && sizes[L"orphan"] == 11,
+              "base $DATA and unmatched attribute lists keep their existing sizes");
     }
     return failures ? 1 : 0;
 }

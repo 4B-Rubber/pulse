@@ -376,6 +376,14 @@ struct EngineTestAccess {
         e.InvalidateFilterLocked();
         check(size(fixture).available && size(fixture).bytes == 75,
             "replacement snapshot clears failure delay and restores correct totals");
+        e.folder_size_background_ = true; e.InvalidateFilterLocked();
+        const auto background_builds = e.folder_sizes_.Builds();
+        check(!size(fixture).available && e.folder_size_wanted_ && e.folder_sizes_.Builds() == background_builds,
+            "service clients are answered at once instead of waiting for whole-index aggregation");
+        check(e.BuildFolderTotals() && size(fixture).available && size(fixture).bytes == 75 &&
+              e.folder_sizes_.Builds() == background_builds + 1,
+            "worker aggregation publishes totals for the next client poll");
+        e.folder_size_background_ = false;
         std::error_code ec; std::filesystem::remove_all(fixture, ec); check(!ec, "isolated folder-index fixture cleanup");
 
         FolderSizeIndex index;

@@ -1,5 +1,6 @@
 #include "../app/folder_sizes.h"
 #include "../app/folder_size_scanner.h"
+#include "../app/folder_size_store.h"
 #include <winioctl.h>
 #include <windows.h>
 #include <condition_variable>
@@ -327,6 +328,32 @@ void ChildCalculationCancelsAncestor(const fs::path& fixture) {
 }
 }
 
+// A newly armed watch reconciles results that already exist. Rows still waiting
+// for their first result must keep their revision, or the index answer already
+// on its way is dropped and the whole list waits for the next poll.
+void StoreArmReconcile() {
+    using pulse::app::folder_size::Key;
+    pulse::app::folder_size::Store store;
+    const std::set<std::wstring> keep;
+    const auto root = Key(L"C:\\pulse-store-fixture");
+    auto* pending = store.Ensure(Key(L"C:\\pulse-store-fixture\\pending"), keep);
+    auto* scanned = store.Ensure(Key(L"C:\\pulse-store-fixture\\scanned"), keep);
+    auto* running = store.Ensure(Key(L"C:\\pulse-store-fixture\\running"), keep);
+    if (!pending || !scanned || !running) { Check(false, "store fixture entries"); return; }
+    scanned->value.has_value = true; scanned->value.source = Source::Scan; scanned->completed = 1;
+    running->work.activity = pulse::app::FolderSizeActivity::Scanning;
+    pending->next_index_at = 99;
+    const auto pending_revision = pending->revision, scanned_revision = scanned->revision;
+    const auto running_epoch = running->request_epoch;
+    store.Invalidate(root, 1000, 0, true);
+    Check(pending->revision == pending_revision && pending->next_index_at == 99,
+          "armed watch keeps the in-flight index request of a row without any result");
+    Check(scanned->revision != scanned_revision && scanned->completed == 0,
+          "armed watch still re-verifies previously scanned rows");
+    Check(running->request_epoch != running_epoch, "armed watch restarts scans that began before coverage");
+    store.Invalidate(root, 2000, 0);
+    Check(pending->revision != pending_revision, "real change notifications still invalidate pending rows");
+}
 int wmain(int argc, wchar_t** argv) {
     if (argc == 3 && std::wstring(argv[1]) == L"--serve-index")
         return pulse::app::RunFolderSizeFakeIndexServer(argv[2]);
@@ -352,6 +379,7 @@ int wmain(int argc, wchar_t** argv) {
             std::printf("[SUMMARY] %u assertions, %u failure(s)\n", checks, failures);
             return failures ? 1 : 0;
         }
+        StoreArmReconcile();
         fs::create_directories(root / L"nested" / L"child");
         fs::create_directories(root / L"empty");
         File(root / L"nested" / L"a.bin", 1234);

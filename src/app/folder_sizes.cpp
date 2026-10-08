@@ -107,9 +107,9 @@ struct FolderSizes::Impl {
             !entry.value.partial && entry.value.verified && entry.value.verified_revision == entry.revision &&
             entry.watch_generation != 0 && Coverage(path) == entry.watch_generation;
     }
-    void InvalidateLocked(const std::wstring& key, uint64_t delay = 200) {
+    void InvalidateLocked(const std::wstring& key, uint64_t delay = 200, bool known_only = false) {
         if (key.empty()) return;
-        if (store.Invalidate(key, GetTickCount64(), delay)) { changed = true; ++dirty_revision; }
+        if (store.Invalidate(key, GetTickCount64(), delay, known_only)) { changed = true; ++dirty_revision; }
     }
     void Invalidate(const std::wstring& path) {
         const auto key = Key(path);
@@ -188,7 +188,9 @@ struct FolderSizes::Impl {
                         found->second.generation = ++watch_sequence;
                         // The first notification reconciles a newly armed read;
                         // it is not a write burst that needs a debounce delay.
-                        InvalidateLocked(root, initial ? 0 : 200);
+                        // Rows still waiting for their first result have nothing
+                        // to reconcile: keep their in-flight index answer.
+                        InvalidateLocked(root, initial ? 0 : 200, initial);
                     } else {
                         std::set<std::wstring> paths;
                         for (const auto& event : events) {
@@ -252,7 +254,8 @@ struct FolderSizes::Impl {
             const bool received = connection.FolderSizes(paths, values);
             {
                 std::lock_guard lock(mutex);
-                next_poll = GetTickCount64() + (received ? 1000 : 10000);
+                const auto answered = GetTickCount64();
+                next_poll = answered + (received ? 1000 : 2000);
                 if (stopping) continue;
                 (void)request_scope;
                 for (size_t i = 0; i < paths.size(); ++i) {
@@ -272,6 +275,9 @@ struct FolderSizes::Impl {
                             ++dirty_revision; changed = true;
                         }
                         entry.value.verified_at = folder_size::NowUtcMs();
+                    } else if (received && i < values.size()) {
+                        // Totals may still be building in the service: ask again soon.
+                        entry.next_index_at = (std::min)(entry.next_index_at, answered + 5000);
                     }
                     // An unavailable poll does not turn a retained estimate into a
                     // different list label. Its timestamp remains available in details.

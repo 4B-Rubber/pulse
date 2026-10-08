@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 #include <vector>
 
 namespace pulse::index {
 namespace {
 
 constexpr uint32_t kAttrStdInfo = 0x10;
+constexpr uint32_t kAttrList = 0x20;
 constexpr uint32_t kAttrFileName = 0x30;
 constexpr uint32_t kAttrData = 0x80;
 constexpr uint32_t kAttrEnd = 0xFFFFFFFF;
@@ -153,24 +155,62 @@ const BYTE* AttrValue(const BYTE* attr, uint32_t& len) {
     return attr + r->value_off;
 }
 
+// Large or heavily fragmented files keep their unnamed $DATA in an extension
+// record listed by $ATTRIBUTE_LIST. Their FILE_NAME size is only a creation-
+// time copy (often 0), so the base record is held until the extension's size
+// is known.
+struct ExtensionSizes {
+    std::unordered_map<uint64_t, uint64_t> data; // base FRN -> logical size
+    std::vector<MftFile> held;
+};
+
+bool UnnamedDataSize(const BYTE* rec, const FileRecord* hdr, uint64_t& size) {
+    const BYTE* p = rec + hdr->attr_off;
+    const BYTE* end = rec + hdr->bytes_used;
+    while (static_cast<size_t>(end - p) >= sizeof(AttrHeader)) {
+        auto* a = reinterpret_cast<const AttrHeader*>(p);
+        if (a->type == kAttrEnd || a->length < sizeof(AttrHeader) || a->length > static_cast<size_t>(end - p)) break;
+        if (a->type == kAttrData && a->name_len == 0) {
+            if (a->non_resident) {
+                if (a->length < sizeof(AttrHeader) + sizeof(AttrNonResident)) return false;
+                auto* nr = reinterpret_cast<const AttrNonResident*>(p + sizeof(AttrHeader));
+                // Sizes are only valid in the segment that starts at VCN 0.
+                if (nr->start_vcn != 0) return false;
+                size = nr->real_size;
+                return true;
+            }
+            uint32_t vlen = 0;
+            if (!AttrValue(p, vlen)) return false;
+            size = vlen;
+            return true;
+        }
+        p += a->length;
+    }
+    return false;
+}
+
 bool ParseRecord(BYTE* rec, uint32_t rec_size, uint32_t sector, uint64_t index,
-                 const std::function<bool(MftFile&&)>& emit) {
+                 const std::function<bool(MftFile&&)>& emit, ExtensionSizes* extensions = nullptr) {
     if (rec_size < sizeof(FileRecord)) return true;
     auto* hdr = reinterpret_cast<FileRecord*>(rec);
     if (hdr->magic != 0x454C4946) return true; // 'FILE'
     if (!ApplyUsa(rec, rec_size, sector)) return true;
     if ((hdr->flags & 1) == 0) return true; // not in use
-    if (hdr->base != 0) return true;        // extension record; base already holds names
     if (hdr->bytes_used > rec_size || hdr->attr_off < sizeof(FileRecord) ||
         hdr->attr_off > hdr->bytes_used)
         return true;
+    if (hdr->base != 0) {                   // extension record; base already holds names
+        uint64_t size = 0;
+        if (extensions && UnnamedDataSize(rec, hdr, size)) extensions->data[hdr->base] = size;
+        return true;
+    }
 
     MftFile best;
     best.frn = (static_cast<uint64_t>(hdr->seq) << 48) | (index & 0xFFFFFFFFFFFFULL);
     best.is_dir = (hdr->flags & 2) != 0;
     uint8_t best_name_type = 0xFF;
     uint64_t data_size = 0;
-    bool have_data = false;
+    bool have_data = false, have_list = false;
 
     const BYTE* p = rec + hdr->attr_off;
     const BYTE* end = rec + hdr->bytes_used;
@@ -179,6 +219,7 @@ bool ParseRecord(BYTE* rec, uint32_t rec_size, uint32_t sector, uint64_t index,
         if (a->type == kAttrEnd || a->length < sizeof(AttrHeader)) break;
         if (a->length > static_cast<size_t>(end - p)) break;
         const bool unnamed = a->name_len == 0;
+        if (a->type == kAttrList) have_list = true;
 
         if (a->type == kAttrStdInfo && !a->non_resident) {
             uint32_t vlen = 0;
@@ -228,6 +269,10 @@ bool ParseRecord(BYTE* rec, uint32_t rec_size, uint32_t sector, uint64_t index,
     }
     if (have_data) best.size = data_size;
     if (best.name.empty()) return true;
+    if (extensions && have_list && !have_data && !best.is_dir) {
+        extensions->held.push_back(std::move(best));
+        return true;
+    }
     return emit(std::move(best));
 }
 
@@ -309,6 +354,12 @@ MftReadResult EnumerateMftRecordsResult(const NTFS_VOLUME_DATA_BUFFER& vd,
     std::vector<BYTE> chunk(chunk_bytes);
     size_t count = 0;
     uint64_t file_off = 0;
+    ExtensionSizes extensions;
+    const std::function<bool(MftFile&&)> deliver = [&](MftFile&& f) {
+        ++count;
+        if (progress && (count % 50000) == 0) progress(count);
+        return emit(std::move(f));
+    };
     for (const Run& run : runs) {
         if (running && !running->load()) return MftReadResult::Stopped;
         if (run.sparse) {
@@ -333,12 +384,8 @@ MftReadResult EnumerateMftRecordsResult(const NTFS_VOLUME_DATA_BUFFER& vd,
                 uint64_t record_off = 0;
                 if (!CheckedAdd(file_off, offset, record_off)) return MftReadResult::Failed;
                 const uint64_t index = record_off / rec_size;
-                if (!ParseRecord(chunk.data() + offset, rec_size, sector, index,
-                                 [&](MftFile&& f) {
-                    ++count;
-                    if (progress && (count % 50000) == 0) progress(count);
-                    return emit(std::move(f));
-                })) return MftReadResult::Stopped;
+                if (!ParseRecord(chunk.data() + offset, rec_size, sector, index, deliver, &extensions))
+                    return MftReadResult::Stopped;
             }
             if (!CheckedAdd(disk, bytes, disk) ||
                 !CheckedAdd(file_off, bytes, file_off))
@@ -346,6 +393,12 @@ MftReadResult EnumerateMftRecordsResult(const NTFS_VOLUME_DATA_BUFFER& vd,
             left -= bytes;
         }
         if (left && !CheckedAdd(file_off, left, file_off)) return MftReadResult::Failed;
+    }
+    // Extension records may precede or follow their base record anywhere in $MFT.
+    for (auto& f : extensions.held) {
+        if (running && !running->load()) return MftReadResult::Stopped;
+        if (const auto found = extensions.data.find(f.frn); found != extensions.data.end()) f.size = found->second;
+        if (!deliver(std::move(f))) return MftReadResult::Stopped;
     }
     if (running && !running->load()) return MftReadResult::Stopped;
     return count > 0 ? MftReadResult::Complete : MftReadResult::Failed;

@@ -586,6 +586,7 @@ void Engine::Start(HWND notify, UINT msg) {
     notify_msg_ = msg;
     running_ = true;
     ready_ = false;
+    folder_size_background_ = true;
     change_signal_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     thread_ = std::thread(&Engine::Worker, this);
 }
@@ -2770,6 +2771,7 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
         ~SizeUpdate() { finish(); }
     } size_update{[&] {
         folder_size_usn_update_ = false;
+        ++folder_size_mutations_;
         if (idx >= 0) folder_sizes_.Replace(idx, size_before, FolderSizeItem(idx),
             [this](int32_t id) { return FolderSizeItem(id); });
     }};
@@ -3789,6 +3791,9 @@ void Engine::Worker() {
             topology_tick = 0;
             continue;
         }
+        // Clients asked for folder totals: aggregate here, never in a pipe thread
+        // that would exceed the client's IPC deadline.
+        if (folder_size_wanted_ && ready_ && !building_ && !folder_size_gap_) BuildFolderTotals();
         bool changed = false;
         bool structural = false;
         bool failed = false;

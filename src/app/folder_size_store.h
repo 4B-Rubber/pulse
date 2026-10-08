@@ -30,8 +30,11 @@ public:
     Entry* Ensure(const std::wstring& key, const std::set<std::wstring>& protected_paths);
     void Touch(Entry& entry);
     void MarkStale(Entry& entry, uint64_t now, uint64_t delay);
-    bool InvalidateAncestors(const std::wstring& path, uint64_t now, uint64_t delay);
-    bool Invalidate(const std::wstring& path, uint64_t now, uint64_t delay);
+    // `known_only` leaves idle entries without any result untouched: a newly
+    // armed watch has nothing to reconcile for them, and marking them stale
+    // would discard an index answer already on its way.
+    bool InvalidateAncestors(const std::wstring& path, uint64_t now, uint64_t delay, bool known_only = false);
+    bool Invalidate(const std::wstring& path, uint64_t now, uint64_t delay, bool known_only = false);
     SavedValues Snapshot() const;
     std::map<std::wstring, Entry> entries;
 private:
