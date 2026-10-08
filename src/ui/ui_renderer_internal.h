@@ -160,6 +160,9 @@ void ClearTextWidthCache() {
     constexpr float kTabPinnedW = 36.0f; // Chrome pinned tab: icon-only square
     constexpr float kTabPinnedNamedW = 112.0f;
     constexpr float kTabCloseAlwaysW = 96.0f;
+    constexpr float kTabCompactW = 40.0f;     // icon-only inactive tab when crowded
+    constexpr float kTabActiveMinW = 120.0f;  // active tab keeps its title and close
+    constexpr float kTabScrollArrowW = 24.0f;
     constexpr float kTabClosePadDip = 10.0f;
     constexpr float kTabCloseSizeDip = 16.0f;
     constexpr float kCommandIconButtonDip = 32.0f;
@@ -199,6 +202,7 @@ void ClearTextWidthCache() {
     constexpr const wchar_t* kIconFile = L"\xE8A5";
     constexpr const wchar_t* kIconTray = L"\xE8A1";
     constexpr const wchar_t* kIconChevronRight = L"\xE76C";
+    constexpr const wchar_t* kIconChevronLeft = L"\xE76B";
     constexpr const wchar_t* kIconChevronUp = L"\xE70E";
     constexpr const wchar_t* kIconChevronDown = L"\xE70D";
     constexpr const wchar_t* kIconCloseSmall = L"\xE711";

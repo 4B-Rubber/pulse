@@ -974,6 +974,7 @@ struct HitTestResult {
         ToolbarGroupClear,   // "x" on the active group chip: stop grouping
         SettingsPreviewStore,  // Settings > Quick Look formats: get a missing system extension (index = row)
         SettingsPackAction,    // Settings > 预览增强包: index = PackAction
+        TabScroll,             // overflowing tab strip arrows: index -1 = left, 1 = right
     } region = None;
     SidebarAddAction sidebar_action = SidebarAddAction::None;
     int index = -1;          // tab/row/sidebar item/tray batch/tray item.
@@ -1363,6 +1364,15 @@ public:
                           D2D1_RECT_F* out) const;
     // Uniform tab pitch (excludes group-chip offsets); used by drag math.
     float TabPitchPx(const WindowViewModel& vm, float window_w) const;
+    // Overflowing tab strip: wheel over the strip (`steps` = wheel notches,
+    // positive = toward the first tab) and arrow pages. False when the strip
+    // fits or the point is outside it.
+    bool ScrollTabStrip(const WindowViewModel& vm, float window_w, float x, float y, float steps);
+    void ScrollTabStripPage(const WindowViewModel& vm, float window_w, int direction);
+    // Closing tabs keeps the current widths until the pointer leaves the strip,
+    // so repeated clicks land on the next close button (as in Chrome).
+    void FreezeTabWidths(const WindowViewModel& vm, float window_w);
+    bool ReleaseTabWidths();
     float SettingsMaxScroll(const WindowViewModel& vm, float window_w, float window_h) const;
     D2D1_RECT_F SettingsDropdownBounds(const WindowViewModel& vm, int index, float window_w, float window_h) const;
     float SettingsDestinationOffset(const WindowViewModel& vm, int setting_id, float window_w, float window_h) const;
@@ -1388,6 +1398,22 @@ private:
             int group = -1; // index into WindowViewModel::tab_groups
         };
         std::vector<Chip> chips;  // one chip at the start of each same-group run
+        // Too many tabs for the strip: inactive tabs shrink to their icon
+        // (`compact`) while the active one keeps its title (`active_w`); past
+        // that the strip scrolls between the two arrows (`overflow`).
+        int active = -1;          // visible, unpinned active tab, or -1
+        float active_w = 0.0f;
+        float pinned_w = 0.0f;
+        bool compact = false;
+        bool overflow = false;
+        float view_left = 0.0f, view_right = 0.0f; // tab clip span when overflowing
+        float arrow_w = 0.0f;
+        float scroll = 0.0f, max_scroll = 0.0f;
+        float new_x = 0.0f;       // "+" button left edge
+        float Width(const WindowViewModel& vm, size_t i) const {
+            if (vm.tabs[i].pinned) return pinned_w;
+            return static_cast<int>(i) == active ? active_w : w;
+        }
     };
     TabStripMetrics ComputeTabStrip(const WindowViewModel& vm, float window_w) const;
     void DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
@@ -1554,6 +1580,13 @@ private:
     std::array<uint64_t, 8> list_loading_since_{};
     bool list_loading_animate_ = true;
     bool list_loading_active_ = false;
+    // Tab strip overflow state: ComputeTabStrip clamps the scroll and reveals
+    // a newly active tab, so hit testing and drawing always agree.
+    mutable float tab_scroll_ = 0.0f;
+    mutable int tab_scroll_active_ = -1;
+    float tab_freeze_w_ = 0.0f, tab_freeze_active_w_ = 0.0f;
+    size_t tab_freeze_count_ = 0;
+    bool tab_freeze_compact_ = false;
     std::array<uint64_t, 8> folder_size_pending_since_{};
     bool folder_size_anim_active_ = false;
     motion::CopyFeedback copy_feedback_;

@@ -943,6 +943,8 @@ LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         int my = GET_Y_LPARAM(lParam);
         s->hoverPoint = POINT{ mx, my };
         s->bloom_accent.SetPointer(static_cast<float>(mx), static_cast<float>(my), true);
+        if (static_cast<float>(my) >= s->renderer.TitleBarHeight() && s->renderer.ReleaseTabWidths())
+            InvalidateRect(hwnd, nullptr, FALSE);
         if (s->settings.slider_drag() >= 0) {
             if (!(wParam & MK_LBUTTON)) {
                 s->settings.EndSlider(); // capture lost without WM_LBUTTONUP
@@ -1960,6 +1962,7 @@ LRESULT HandleMouseLeave(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         (void)wParam;
         (void)lParam;
         if (s) {
+            if (s->renderer.ReleaseTabWidths()) InvalidateRect(hwnd, nullptr, FALSE);
             s->scrollbarHovered = false;
             s->sidebarScrollbarHot = false;
             s->hoverRow = -1;
@@ -2253,10 +2256,17 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             s->tabDragStartPt = POINT{ mx, my };
             SetCapture(hwnd);
         } else if (hit.region == ui::HitTestResult::TabClose && hit.index >= 0) {
+            s->renderer.FreezeTabWidths(BuildVm(*s, false), static_cast<float>(s->compositor.Width()));
             CloseLayoutTab(*s, static_cast<size_t>(hit.index));
             InvalidateRect(hwnd, nullptr, FALSE);
-        } else if (hit.region == ui::HitTestResult::TabNew) {
-            OpenNewTab(*s);
+        } else if (hit.region == ui::HitTestResult::TabNew || hit.region == ui::HitTestResult::TabScroll) {
+            // Shares a branch: this else-if chain is at the compiler's nesting limit.
+            if (hit.region == ui::HitTestResult::TabNew) {
+                OpenNewTab(*s);
+            } else {
+                s->renderer.ScrollTabStripPage(BuildVm(*s, false), static_cast<float>(s->compositor.Width()), hit.index);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         } else if (hit.region == ui::HitTestResult::ThemeToggle) {
             ToggleTheme(*s);
         } else if (hit.region == ui::HitTestResult::SettingsButton) {
@@ -3586,6 +3596,18 @@ LRESULT HandleMouseWheel(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         if (!s) return DefWindowProcW(hwnd, msg, wParam, lParam);
         s->blankClickTab = nullptr;
         CancelRenameClick(*s);
+        {
+            // Overflowing tab strip scrolls under the wheel, on any page.
+            POINT tp{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hwnd, &tp);
+            if (tp.y >= 0 && static_cast<float>(tp.y) < s->renderer.TitleBarHeight() &&
+                s->renderer.ScrollTabStrip(BuildVm(*s, false), static_cast<float>(s->compositor.Width()),
+                    static_cast<float>(tp.x), static_cast<float>(tp.y),
+                    static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / static_cast<float>(WHEEL_DELTA))) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+        }
         if (IsSettingsTab(ActiveTab(*s))) {
             const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             ui::WindowViewModel svm = BuildVm(*s);

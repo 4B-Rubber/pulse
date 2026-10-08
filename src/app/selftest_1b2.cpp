@@ -4634,6 +4634,77 @@ void TestSplitLayout() {
           new_tab_hit.region == ui::HitTestResult::TabNew,
           L"chrome: pinned tab and new-tab button do not overlap");
 
+    // Crowded strips: tabs, then "+", then the settings pill, never overlapping.
+    auto crowded = [](int count, int active) {
+        ui::WindowViewModel vm;
+        for (int i = 0; i < count; ++i) {
+            ui::TabView t;
+            t.title = L"Tab " + std::to_wstring(i);
+            t.active = i == active;
+            vm.tabs.push_back(t);
+        }
+        return vm;
+    };
+    const float crowd_w = 1200.0f;
+    const D2D1_RECT_F crowd_rect = D2D1::RectF(0, 0, crowd_w, 640);
+    for (const int count : {1, 6, 12, 40}) {
+        const auto vm = crowded(count, count - 1);
+        D2D1_RECT_F first{};
+        chrome.TabItemRect(vm, crowd_w, 0, &first);
+        const float mid_y = (first.top + first.bottom) * 0.5f;
+        float last_tab = -1.0f, new_left = -1.0f, new_right = -1.0f, settings_left = -1.0f;
+        for (float x = 0.0f; x < crowd_w; x += 1.0f) {
+            const auto scan_hit = chrome.HitTest(vm, crowd_rect, x, mid_y);
+            const auto region = scan_hit.region;
+            if (region == ui::HitTestResult::Tab || region == ui::HitTestResult::TabClose) last_tab = x;
+            if (region == ui::HitTestResult::TabNew) { if (new_left < 0.0f) new_left = x; new_right = x; }
+            if (region == ui::HitTestResult::SettingsButton && settings_left < 0.0f) settings_left = x;
+        }
+        Check(new_left > last_tab && new_right < settings_left && settings_left > 0.0f,
+              (L"chrome: " + std::to_wstring(count) + L" tabs stay left of new-tab and settings").c_str());
+    }
+    {
+        auto vm = crowded(40, 30);
+        D2D1_RECT_F active_rc{}, other_rc{};
+        Check(chrome.TabItemRect(vm, crowd_w, 30, &active_rc) && chrome.TabItemRect(vm, crowd_w, 29, &other_rc) &&
+              std::abs((active_rc.right - active_rc.left) - 120.0f) < 0.01f &&
+              std::abs((other_rc.right - other_rc.left) - 40.0f) < 0.01f,
+              L"chrome: crowded tabs shrink to icons while the active tab keeps its title");
+        const float mid_y = (active_rc.top + active_rc.bottom) * 0.5f;
+        const auto active_hit = chrome.HitTest(vm, crowd_rect, (active_rc.left + active_rc.right) * 0.5f, mid_y);
+        Check(active_hit.region == ui::HitTestResult::Tab && active_hit.index == 30,
+              L"chrome: scrolling strip reveals the active tab");
+        const auto other_hit = chrome.HitTest(vm, crowd_rect, (other_rc.left + other_rc.right) * 0.5f, mid_y);
+        Check(other_hit.region == ui::HitTestResult::Tab && other_hit.index == 29,
+              L"chrome: icon-only tabs have no close button");
+        D2D1_RECT_F strip_start{}, first{};
+        chrome.TabItemRect(crowded(1, 0), crowd_w, 0, &strip_start);
+        const float view_left = strip_start.left + 24.0f; // kTabScrollArrowW
+        chrome.TabItemRect(vm, crowd_w, 0, &first);
+        const auto left_arrow = chrome.HitTest(vm, crowd_rect, strip_start.left + 12.0f, mid_y);
+        Check(left_arrow.region == ui::HitTestResult::TabScroll && left_arrow.index == -1 && first.right <= view_left,
+              L"chrome: earlier tabs are scrolled behind the left arrow");
+        Check(chrome.ScrollTabStrip(vm, crowd_w, 400.0f, mid_y, 100.0f) &&
+              chrome.TabItemRect(vm, crowd_w, 0, &first) && first.left >= view_left - 0.01f,
+              L"chrome: wheel scrolls the strip back to the first tab");
+        Check(!chrome.ScrollTabStrip(crowded(3, 0), crowd_w, 400.0f, mid_y, 1.0f),
+              L"chrome: a strip that fits ignores the wheel");
+    }
+    {
+        auto vm = crowded(10, 9);
+        D2D1_RECT_F before{}, frozen{}, released{};
+        chrome.TabItemRect(vm, 1400.0f, 0, &before);
+        chrome.FreezeTabWidths(vm, 1400.0f);
+        vm.tabs.pop_back();
+        vm.tabs.back().active = true;
+        chrome.TabItemRect(vm, 1400.0f, 0, &frozen);
+        Check(std::abs((frozen.right - frozen.left) - (before.right - before.left)) < 0.01f,
+              L"chrome: closing a tab keeps tab widths while the pointer stays");
+        Check(chrome.ReleaseTabWidths() && chrome.TabItemRect(vm, 1400.0f, 0, &released) &&
+              released.right - released.left > frozen.right - frozen.left + 1.0f && !chrome.ReleaseTabWidths(),
+              L"chrome: leaving the strip lets the remaining tabs grow");
+    }
+
     ui::PaneViewModel pvm;
     pvm.filter_text = L"foo";
     pvm.filter_map = std::make_shared<ui::PaneViewModel::FilterMap>(

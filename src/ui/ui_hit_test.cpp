@@ -28,8 +28,7 @@ bool MainRenderer::TabItemRect(const WindowViewModel& vm, float window_w, int in
     const TabStripMetrics m = ComputeTabStrip(vm, window_w);
     const float left = m.x0 + static_cast<float>(index) * m.pitch
         + (index < static_cast<int>(m.extra.size()) ? m.extra[static_cast<size_t>(index)] : 0.0f);
-    const float w = vm.tabs[static_cast<size_t>(index)].pinned
-        ? (vm.show_pinned_tab_names ? kTabPinnedNamedW : kTabPinnedW) * scale_ : m.w;
+    const float w = m.Width(vm, static_cast<size_t>(index));
     *out = D2D1::RectF(left, m.y, left + w, m.y + m.h);
     return true;
 }
@@ -135,8 +134,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
         const TabStripMetrics strip = ComputeTabStrip(vm, rect.right);
         auto hitTab = [&](int i) -> bool {
             if (vm.tabs[static_cast<size_t>(i)].hidden) return false;
-            const float tabW = vm.tabs[static_cast<size_t>(i)].pinned
-                ? (vm.show_pinned_tab_names ? kTabPinnedNamedW : kTabPinnedW) * scale_ : strip.w;
+            // A scrolling strip only shows tabs between its arrows.
+            if (strip.overflow && (x < strip.view_left || x >= strip.view_right)) return false;
+            const float tabW = strip.Width(vm, static_cast<size_t>(i));
             const float extra = i < static_cast<int>(strip.extra.size())
                 ? strip.extra[static_cast<size_t>(i)] : 0.0f;
             float tabLeft = strip.x0
@@ -153,13 +153,22 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             }
             if (x < tabLeft || x >= tabLeft + tabW) return false;
             r.index = i;
-            const bool show_close = TabCloseVisible(vm, i, tabW, scale_);
+            const bool compact = strip.compact && !vm.tabs[static_cast<size_t>(i)].pinned && i != strip.active;
+            const bool show_close = !compact && TabCloseVisible(vm, i, tabW, scale_);
             const float close_hit = (kTabClosePadDip + kTabCloseSizeDip) * scale_;
             r.region = show_close && x >= tabLeft + tabW - close_hit
                 ? HitTestResult::TabClose : HitTestResult::Tab;
             return true;
         };
         if (!vertical_tabs_) {
+        if (strip.overflow && y >= strip.y && y < strip.y + strip.h) {
+            if (x >= strip.view_left - strip.arrow_w && x < strip.view_left) {
+                r.region = HitTestResult::TabScroll; r.index = -1; return r;
+            }
+            if (x >= strip.view_right && x < strip.view_right + strip.arrow_w) {
+                r.region = HitTestResult::TabScroll; r.index = 1; return r;
+            }
+        }
         // Raised run is on top, so it wins overlapping hits.
         if (vm.tab_drag_index >= 0 && vm.tab_drag_index < static_cast<int>(vm.tabs.size())) {
             const int dragN = std::max(1, vm.tab_drag_count);
@@ -169,6 +178,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
         }
         // Group chips: strip slots between tabs, click opens the group popup.
         for (const auto& chip : strip.chips) {
+            if (strip.overflow && (x < strip.view_left || x >= strip.view_right)) break;
             if (x >= chip.left && x < chip.left + chip.width &&
                 y >= strip.y + 4.0f * scale_ && y < strip.y + strip.h - 4.0f * scale_) {
                 r.region = HitTestResult::TabGroup;
@@ -181,7 +191,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 i < vm.tab_drag_index + std::max(1, vm.tab_drag_count)) continue;
             if (hitTab(i)) return r;
         }
-        const float cx = strip.end_x;
+        const float cx = strip.new_x;
         if (x >= cx && x < cx + 32.0f * scale_) {
             r.region = HitTestResult::TabNew;
             return r;

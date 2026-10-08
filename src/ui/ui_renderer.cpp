@@ -818,7 +818,7 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
     auto drawTab = [&](size_t i, float left, bool raised) {
         const bool active = vm.tabs[i].active;
         const bool pinned = vm.tabs[i].pinned;
-        const float tabW = pinned ? (vm.show_pinned_tab_names ? kTabPinnedNamedW : kTabPinnedW) * scale_ : strip.w;
+        const float tabW = strip.Width(vm, i);
         const bool hovered = IsHovered(vm, HitTestResult::Tab, static_cast<int>(i)) ||
                              IsHovered(vm, HitTestResult::TabClose, static_cast<int>(i));
         const bool connect = active || raised;
@@ -877,8 +877,9 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
             FillRoundedRect(dc, brAccent_.get(), tabRc.left + 15*scale_, tabRc.bottom - 3*scale_,
                 std::min(28*scale_, tabW - 24*scale_), 2*scale_, scale_);
         }
-        if (pinned && !vm.show_pinned_tab_names) {
-            // Chrome pinned tab: centered icon, no title, no close button.
+        if ((pinned && !vm.show_pinned_tab_names) || (strip.compact && !pinned && !active)) {
+            // Chrome pinned tab, or a crowded inactive tab: centered icon, no
+            // title, no close button (the tooltip names it).
             DrawIconText(left, tabY, tabW, tabH,
                 vm.tabs[i].title.empty() ? kIconFolder
                     : vm.tabs[i].title == pulse::l10n::Get(pulse::l10n::StringId::Settings)
@@ -931,6 +932,32 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
         return out;
     };
     if (!vertical_tabs_) {
+    // Overflowing strip: tabs are clipped between the scroll arrows and fade
+    // out toward an edge that has more tabs beyond it. An opacity mask keeps
+    // the fade correct over wallpapers and translucent chrome.
+    bool tabLayer = false;
+    if (strip.overflow && strip.view_right > strip.view_left) {
+        const float view = strip.view_right - strip.view_left;
+        const float fade = std::min(24.0f * scale_, view * 0.25f) / view;
+        const D2D1_GRADIENT_STOP stops[] = {
+            {0.0f, D2D1::ColorF(0, 0, 0, strip.scroll > 0.5f ? 0.0f : 1.0f)},
+            {fade, D2D1::ColorF(0, 0, 0, 1.0f)},
+            {1.0f - fade, D2D1::ColorF(0, 0, 0, 1.0f)},
+            {1.0f, D2D1::ColorF(0, 0, 0, strip.scroll < strip.max_scroll - 0.5f ? 0.0f : 1.0f)}};
+        ComPtr<ID2D1GradientStopCollection> collection;
+        ComPtr<ID2D1LinearGradientBrush> mask;
+        if (SUCCEEDED(dc->CreateGradientStopCollection(stops, 4, &collection)) && collection.get() &&
+            SUCCEEDED(dc->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties(D2D1::Point2F(strip.view_left, 0.0f),
+                                                    D2D1::Point2F(strip.view_right, 0.0f)),
+                collection.get(), &mask)) && mask.get()) {
+            dc->PushLayer(D2D1::LayerParameters1(D2D1::RectF(strip.view_left, 0.0f, strip.view_right, h),
+                                                 nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                                 D2D1::IdentityMatrix(), 1.0f, mask.get(),
+                                                 D2D1_LAYER_OPTIONS1_NONE), nullptr);
+            tabLayer = true;
+        }
+    }
     for (const auto& chip : strip.chips) {
         if (chip.group < 0 || chip.group >= static_cast<int>(vm.tab_groups.size())) continue;
         const TabGroupView& gv = vm.tab_groups[static_cast<size_t>(chip.group)];
@@ -995,8 +1022,22 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
 
     // The tab and sheet form one surface; a straight rule here breaks the shoulders.
 
-    x = strip.end_x;
-    // New tab button follows the final rest slot (not the sliding tabs).
+    if (tabLayer) dc->PopLayer();
+    if (strip.overflow) {
+        for (const int direction : {-1, 1}) {
+            const float ax = direction < 0 ? strip.view_left - strip.arrow_w : strip.view_right;
+            const bool enabled = direction < 0 ? strip.scroll > 0.5f : strip.scroll < strip.max_scroll - 0.5f;
+            const bool hot = enabled && IsHovered(vm, HitTestResult::TabScroll, direction);
+            DrawButton(D2D1::RectF(ax, tabY, ax + strip.arrow_w, tabY + tabH), theme,
+                       hot ? theme.fill_hover : kTransparent,
+                       direction < 0 ? kIconChevronLeft : kIconChevronRight, direction < 0 ? L"<" : L">",
+                       enabled ? theme.text_secondary : WithAlpha(theme.text_secondary, theme.text_secondary.a * 0.35f),
+                       true, true, 0.7f);
+        }
+    }
+    x = strip.new_x;
+    // New tab button follows the final rest slot (not the sliding tabs); a
+    // scrolling strip pins it to the right edge.
     D2D1_RECT_F newRc = D2D1::RectF(x, tabY, x + 32 * scale_, tabY + tabH);
     DrawButton(newRc, theme, IsHovered(vm, HitTestResult::TabNew) ? theme.fill_hover : kTransparent,
         kIconAdd, L"+", theme.text_secondary, true, true);
@@ -1374,26 +1415,60 @@ MainRenderer::TabStripMetrics MainRenderer::ComputeTabStrip(
     }
     m.extra.assign(vm.tabs.size(), 0.0f);
 
+    const float newW = 32.0f * scale_;
     const float available = std::max(0.0f, tabsRight - m.x0 - 36.0f * scale_ - chipsTotal);
     size_t visibleCount = 0;
     size_t pinnedCount = 0; // visible pinned tabs get a fixed narrow slot
-    for (const auto& t : vm.tabs) {
+    for (size_t i = 0; i < vm.tabs.size(); ++i) {
+        const auto& t = vm.tabs[i];
         if (t.hidden) continue;
         if (t.pinned) ++pinnedCount; else ++visibleCount;
+        if (t.active && !t.pinned) m.active = static_cast<int>(i);
     }
     const float pinnedW = (vm.show_pinned_tab_names ? kTabPinnedNamedW : kTabPinnedW) * scale_;
+    m.pinned_w = pinnedW;
     const float pinnedTotal = static_cast<float>(pinnedCount) * (pinnedW + control_gap_);
-    m.w = visibleCount == 0 ? 0.0f
-        : std::min(kTabMaxW * scale_, std::max(kTabMinW * scale_,
-            std::max(0.0f, available - pinnedTotal)
-                / static_cast<float>(visibleCount) - control_gap_));
+    const float spare = std::max(0.0f, available - pinnedTotal);
+    const float minW = kTabMinW * scale_;
+    const float normalW = visibleCount == 0 ? 0.0f
+        : spare / static_cast<float>(visibleCount) - control_gap_;
+    if (tab_freeze_w_ > 0.0f && visibleCount > 0 && visibleCount <= tab_freeze_count_ &&
+        static_cast<float>(visibleCount) * (tab_freeze_w_ + control_gap_) +
+            (m.active >= 0 ? tab_freeze_active_w_ - tab_freeze_w_ : 0.0f) <= spare + 0.5f) {
+        // Recently closed: keep the widths the pointer was aiming at.
+        m.w = tab_freeze_w_;
+        m.active_w = tab_freeze_active_w_;
+        m.compact = tab_freeze_compact_;
+    } else if (visibleCount == 0 || normalW >= minW) {
+        m.w = visibleCount == 0 ? 0.0f : std::min(kTabMaxW * scale_, normalW);
+        m.active_w = m.w;
+    } else {
+        // Crowded: inactive tabs keep only their icon, the active one its title.
+        const float activeW = m.active >= 0 ? kTabActiveMinW * scale_ : 0.0f;
+        const size_t rest = visibleCount - (m.active >= 0 ? 1 : 0);
+        float iconW = rest == 0 ? minW
+            : (spare - (m.active >= 0 ? activeW + control_gap_ : 0.0f)) / static_cast<float>(rest) - control_gap_;
+        iconW = std::min(iconW, minW);
+        m.compact = true;
+        m.overflow = iconW < kTabCompactW * scale_;
+        m.w = m.overflow ? kTabCompactW * scale_ : iconW;
+        m.active_w = m.active >= 0 ? activeW : m.w;
+    }
+    if (m.active < 0) m.active_w = m.w;
     m.y = 4.0f * scale_;
     m.h = title_bar_height_ - 8.0f * scale_;
     m.pitch = m.w + control_gap_;
+    const float stripLeft = m.x0;
+    if (m.overflow) {
+        m.arrow_w = kTabScrollArrowW * scale_;
+        m.view_left = stripLeft + m.arrow_w;
+        m.view_right = std::max(m.view_left, tabsRight - newW - 4.0f * scale_ - m.arrow_w);
+        m.x0 = m.view_left;
+    }
 
     // Final pass: per-tab extra offset + definitive chip positions. Collapsed
     // members contribute zero width (chip stays visible at the fold point);
-    // pinned tabs use the fixed narrow slot.
+    // pinned tabs use the fixed narrow slot, the active tab its own width.
     float acc = 0.0f;
     size_t chipIdx = 0;
     for (size_t i = 0; i < vm.tabs.size(); ++i) {
@@ -1407,10 +1482,70 @@ MainRenderer::TabStripMetrics MainRenderer::ComputeTabStrip(
         m.extra[i] = acc;
         if (vm.tabs[i].hidden) acc -= m.pitch;
         else if (vm.tabs[i].pinned) acc += pinnedW - m.w;
+        else if (static_cast<int>(i) == m.active) acc += m.active_w - m.w;
     }
     m.end_x = m.x0 + chipsTotal + static_cast<float>(pinnedCount) *
-        (pinnedW + control_gap_) + static_cast<float>(visibleCount) * m.pitch;
+        (pinnedW + control_gap_) + static_cast<float>(visibleCount) * m.pitch +
+        (m.active >= 0 ? m.active_w - m.w : 0.0f);
+    if (m.overflow) {
+        const float view = m.view_right - m.view_left;
+        m.max_scroll = std::max(0.0f, m.end_x - control_gap_ - m.view_left - view);
+        if (m.active >= 0 && m.active != tab_scroll_active_) {
+            // A newly active tab (click, keyboard, new tab) scrolls into view.
+            const size_t a = static_cast<size_t>(m.active);
+            const float left = static_cast<float>(a) * m.pitch + m.extra[a];
+            const float margin = std::min(m.w, view * 0.25f);
+            if (left - margin < tab_scroll_) tab_scroll_ = left - margin;
+            if (left + m.active_w + margin > tab_scroll_ + view) tab_scroll_ = left + m.active_w + margin - view;
+        }
+        tab_scroll_ = std::clamp(tab_scroll_, 0.0f, m.max_scroll);
+        m.scroll = tab_scroll_;
+        m.x0 -= m.scroll;
+        m.end_x -= m.scroll;
+        for (auto& chip : m.chips) chip.left -= m.scroll;
+        m.new_x = tabsRight - newW;
+    } else {
+        tab_scroll_ = 0.0f;
+        m.new_x = m.end_x;
+    }
+    tab_scroll_active_ = m.active;
     return m;
+}
+
+bool MainRenderer::ScrollTabStrip(const WindowViewModel& vm, float window_w, float x, float y,
+                                  float steps) {
+    if (vertical_tabs_ || y < 0.0f || y >= title_bar_height_) return false;
+    const TabStripMetrics m = ComputeTabStrip(vm, window_w);
+    if (!m.overflow || x < m.view_left - m.arrow_w || x >= m.view_right + m.arrow_w) return false;
+    tab_scroll_ = std::clamp(tab_scroll_ - steps * 2.0f * m.pitch, 0.0f, m.max_scroll);
+    return true;
+}
+
+void MainRenderer::ScrollTabStripPage(const WindowViewModel& vm, float window_w, int direction) {
+    const TabStripMetrics m = ComputeTabStrip(vm, window_w);
+    if (!m.overflow) return;
+    const float page = std::max(m.pitch, (m.view_right - m.view_left) * 0.6f);
+    tab_scroll_ = std::clamp(tab_scroll_ + static_cast<float>(direction) * page, 0.0f, m.max_scroll);
+}
+
+void MainRenderer::FreezeTabWidths(const WindowViewModel& vm, float window_w) {
+    tab_freeze_w_ = 0.0f;
+    const TabStripMetrics m = ComputeTabStrip(vm, window_w);
+    // Scrolling strips already keep their geometry; tabs at full width
+    // simply grow back.
+    if (m.overflow || m.w <= 0.0f || m.w >= kTabMaxW * scale_ - 0.5f) return;
+    size_t count = 0;
+    for (const auto& t : vm.tabs) if (!t.hidden && !t.pinned) ++count;
+    tab_freeze_w_ = m.w;
+    tab_freeze_active_w_ = m.active_w;
+    tab_freeze_compact_ = m.compact;
+    tab_freeze_count_ = count;
+}
+
+bool MainRenderer::ReleaseTabWidths() {
+    if (tab_freeze_w_ <= 0.0f) return false;
+    tab_freeze_w_ = 0.0f;
+    return true;
 }
 
 } // namespace pulse::ui
