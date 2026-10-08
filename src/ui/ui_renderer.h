@@ -39,7 +39,9 @@ namespace pulse::ui {
 enum class PaneHeaderIcon;
 
 inline constexpr unsigned kSettingsContextExpandedMask = 0x1f00u;
-inline constexpr unsigned kSettingsDefaultExpandedMask = kSettingsContextExpandedMask | 0x7u;
+// Third-party context-menu groups (kSettingsContextExpandedMask) start
+// collapsed under 其他软件添加的项; the Pulse menu card is always open.
+inline constexpr unsigned kSettingsDefaultExpandedMask = 0x7u;
 
 class BloomAccentPicker;
 
