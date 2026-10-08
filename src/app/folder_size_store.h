@@ -23,6 +23,10 @@ public:
         FolderSizeWork work;
         bool auto_deferred = false;
         uint64_t next_index_at = 0;
+        // The service's latest answer for this path was an available total.
+        // Cleared by unavailable answers (journal gap, totals building) and
+        // failed connections; never persisted.
+        bool index_current = false;
         uint64_t completed = 0, not_before = 0;
         uint64_t revision = 0, request_epoch = 0, watch_generation = 0;
         std::list<std::wstring>::iterator position;

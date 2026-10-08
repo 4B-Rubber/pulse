@@ -140,27 +140,33 @@ bool RunFolderSizeIndexClientTest(const std::filesystem::path& fixture, std::ofs
             Sleep(1);
         }
         gate.Release();
-        check(estimated && !invalid_estimate, "observed wrong index estimate is explicitly unverified while real scan runs");
-        check(sizes.Get(estimate_root.wstring()).state == FolderSizeState::Ready &&
+        check(estimated && !invalid_estimate, "observed index total is published as an unverified index value");
+        Sleep(1500);
+        check(sizes.Get(estimate_root.wstring()).state == FolderSizeState::Indexed &&
+              sizes.Get(estimate_root.wstring()).bytes == 800 && sizes.ReadStats().jobs_started == 0,
+              "a current index total is not rescanned automatically");
+        sizes.Calculate(estimate_root.wstring());
+        check(wait([&] { return sizes.Get(estimate_root.wstring()).state == FolderSizeState::Ready; }) &&
               sizes.Get(estimate_root.wstring()).bytes == 64 * 32 * 13 &&
               sizes.Get(estimate_root.wstring()).source == FolderSizeSource::Scan,
-              "index estimate is automatically replaced by complete scan without clicking");
+              "clicking an index total replaces it with a complete scan");
         sizes.Stop();
     }
     {
         check(wait([&] { return pipe.listening.load(); }), "exact-total fixture pipe is listening before client starts");
         FolderSizes sizes;
         sizes.Sync({{nested}, {empty}}, {});
-        check(wait([&] { return sizes.Get(nested).state == FolderSizeState::Ready; }) && sizes.Get(nested).bytes == 13567 &&
-            sizes.Get(nested).source == FolderSizeSource::Scan,
-            "automatic scan replaces any indexed estimate with actual logical size");
-        check(wait([&] { return sizes.Get(empty).state == FolderSizeState::Ready; }) &&
+        check(wait([&] { return sizes.Get(nested).state == FolderSizeState::Indexed; }) && sizes.Get(nested).bytes == 800 &&
+            sizes.Get(nested).source == FolderSizeSource::Index,
+            "visible folder shows the service total");
+        check(wait([&] { return sizes.Get(empty).state == FolderSizeState::Indexed; }) &&
             sizes.Get(empty).has_value && sizes.Get(empty).bytes == 0,
-            "batched requests preserve a scanned empty folder as known zero");
+            "batched requests preserve an indexed empty folder as known zero");
         pipe.bytes = 1200;
-        Sleep(1100);
-        check(sizes.Get(nested).state == FolderSizeState::Ready && sizes.Get(nested).bytes == 13567,
-            "later incorrect index estimates cannot overwrite an automatic scan");
+        sizes.Invalidate(nested);
+        check(wait([&] { return sizes.Get(nested).bytes == 1200; }) &&
+            sizes.Get(nested).source == FolderSizeSource::Index && sizes.ReadStats().jobs_started == 0,
+            "changes follow updated service totals without automatic rescans");
         pipe.available = false;
         sizes.Invalidate(nested);
         check(wait([&] { return sizes.Get(nested).state == FolderSizeState::Ready; }) && sizes.Get(nested).bytes == 13567,
@@ -190,15 +196,15 @@ bool RunFolderSizeIndexClientTest(const std::filesystem::path& fixture, std::ofs
         }
         sizes.Sync(visible, {});
         check(wait([&] {
-            for (const auto& row : visible) if (sizes.Get(row.path).state != FolderSizeState::Ready || sizes.Get(row.path).bytes != 1) return false;
+            for (const auto& row : visible) if (sizes.Get(row.path).state != FolderSizeState::Indexed || sizes.Get(row.path).bytes != 1200) return false;
             return true;
-        }), "visible folders beyond one IPC batch all complete automatic scans");
-        pipe.bytes = 2400;
-        Sleep(1100);
-        check([&] {
-            for (const auto& row : visible) if (sizes.Get(row.path).bytes != 1) return false;
-            return true;
-        }(), "incorrect index batches cannot replace completed real totals");
+        }) && sizes.ReadStats().jobs_started == 0, "visible folders beyond one IPC batch all receive service totals without scans");
+        pipe.available = false;
+        sizes.Invalidate(visible.front().path);
+        check(wait([&] { return sizes.Get(visible.front().path).state == FolderSizeState::Ready &&
+                                sizes.Get(visible.front().path).bytes == 1; }),
+              "an unavailable answer for one folder falls back to its real scan");
+        pipe.available = true;
         sizes.Stop();
     }
     Sleep(20);

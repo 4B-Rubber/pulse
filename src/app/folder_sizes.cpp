@@ -107,6 +107,14 @@ struct FolderSizes::Impl {
             !entry.value.partial && entry.value.verified && entry.value.verified_revision == entry.revision &&
             entry.watch_generation != 0 && Coverage(path) == entry.watch_generation;
     }
+    // A current index total is authoritative for automatic work: the service
+    // already counted the subtree (including names it hides from search), so
+    // rescanning would only re-read it. Clicks still scan; unavailable or
+    // unreachable indexes fall back to scanning.
+    static bool IndexCurrent(const folder_size::Store::Entry& entry) {
+        return entry.index_current && entry.value.has_value && !entry.value.partial &&
+            entry.value.source == FolderSizeSource::Index;
+    }
     void InvalidateLocked(const std::wstring& key, uint64_t delay = 200, bool known_only = false) {
         if (key.empty()) return;
         if (store.Invalidate(key, GetTickCount64(), delay, known_only)) { changed = true; ++dirty_revision; }
@@ -220,6 +228,7 @@ struct FolderSizes::Impl {
             std::vector<std::wstring> paths;
             std::vector<std::pair<uint64_t, uint64_t>> versions;
             uint64_t request_scope = 0;
+            bool more = false;
             {
                 std::unique_lock lock(mutex);
                 if (seen_scope != scope) { seen_scope = scope; next_poll = 0; cursor = 0; }
@@ -241,7 +250,10 @@ struct FolderSizes::Impl {
                 cursor %= paths.size();
                 std::rotate(paths.begin(), paths.begin() + cursor, paths.end());
                 cursor = (cursor + index::kFolderSizeBatch) % paths.size();
-                if (paths.size() > index::kFolderSizeBatch) paths.resize(index::kFolderSizeBatch);
+                // Remaining paths follow at once: automatic scans only wait
+                // 150 ms for an index answer before starting.
+                more = paths.size() > index::kFolderSizeBatch;
+                if (more) paths.resize(index::kFolderSizeBatch);
                 for (const auto& path : paths) {
                     const auto& entry = store.entries.at(path);
                     versions.emplace_back(entry.revision, entry.request_epoch);
@@ -255,7 +267,7 @@ struct FolderSizes::Impl {
             {
                 std::lock_guard lock(mutex);
                 const auto answered = GetTickCount64();
-                next_poll = answered + (received ? 1000 : 2000);
+                next_poll = answered + (received ? (more ? 0 : 1000) : 2000);
                 if (stopping) continue;
                 (void)request_scope;
                 for (size_t i = 0; i < paths.size(); ++i) {
@@ -264,6 +276,9 @@ struct FolderSizes::Impl {
                     (void)demand;
                     if (found == store.entries.end() || manual.contains(paths[i])) continue;
                     auto& entry = found->second;
+                    // Any answer other than an available total revokes index authority,
+                    // even when the request itself has since been superseded.
+                    if (!received || i >= values.size() || !values[i].available) entry.index_current = false;
                     if (entry.revision != versions[i].first || entry.request_epoch != versions[i].second ||
                         (entry.value.source == FolderSizeSource::Scan && entry.value.has_value &&
                          entry.value.state != FolderSizeState::Calculating)) continue;
@@ -275,6 +290,7 @@ struct FolderSizes::Impl {
                             ++dirty_revision; changed = true;
                         }
                         entry.value.verified_at = folder_size::NowUtcMs();
+                        entry.index_current = true;
                     } else if (received && i < values.size()) {
                         // Totals may still be building in the service: ask again soon.
                         entry.next_index_at = (std::min)(entry.next_index_at, answered + 5000);
@@ -395,7 +411,7 @@ struct FolderSizes::Impl {
                         if (!entry.work.Running()) entry.work.activity = FolderSizeActivity::Deferred;
                     }
                     if (!explicit_request && entry.auto_deferred) continue;
-                    if (now < entry.not_before || (!explicit_request && Reusable(path, entry))) continue;
+                    if (now < entry.not_before || (!explicit_request && (Reusable(path, entry) || IndexCurrent(entry)))) continue;
                     if (!explicit_request && entry.completed && now - entry.completed < kFreshMs) continue;
                     if (std::any_of(jobs.begin(), jobs.end(), [&](const auto& job) {
                         return Within(path, job->path) || Within(job->path, path);
