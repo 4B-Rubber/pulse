@@ -70,6 +70,7 @@ void OpsManager::RunAuthorizedDelete(const OpRequest& req, uint64_t task_id) {
         };
         auto progress = [&](const std::wstring& item, float percent) {
             SetStatus([&](OpStatus& status) {
+                status.authorization = AuthorizationState::None;
                 status.current_item = item.empty() ? source : item;
                 status.completed_items = completed.size();
                 status.percent = req.sources.empty() ? 0.0f :
@@ -108,6 +109,9 @@ void OpsManager::RunAuthorizedDelete(const OpRequest& req, uint64_t task_id) {
         }
         completed.insert(completed.end(), result.sources.begin(), result.sources.end());
         SetStatus([&](OpStatus& status) {
+            // A retried attempt on a reused elevated session never invokes the
+            // authorization callback, so leave the Requesting view explicitly.
+            status.authorization = AuthorizationState::None;
             status.completed_items = completed.size();
             update_rate(status);
         });
