@@ -67,8 +67,16 @@ int ConfigureServiceIndexPath(const std::wstring& path) {
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     IndexConfig previous;
     if (!LoadMachineConfig(previous, nullptr)) return ERROR_INVALID_DATA;
-    if (SameIndexLocation(previous.index_path, path))
-        return ProtectIndexDirectory(previous.index_path) ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
+    if (SameIndexLocation(previous.index_path, path)) {
+        if (ProtectIndexDirectory(previous.index_path)) return ERROR_SUCCESS;
+        // Setup re-applies the current location on every upgrade; adopt a folder
+        // chosen before #66 here too, as the service does on start.
+        const std::filesystem::path current(previous.index_path);
+        PrivateIndexDirectoryLock current_lock;
+        return current_lock.Acquire(current) && AdoptIndexDirectory(current) &&
+                ProtectIndexDirectory(previous.index_path)
+            ? ERROR_SUCCESS : static_cast<int>(kIndexDirectoryNotPrivate);
+    }
     // Hold the destination identity across copy, config publication, service
     // restart and source cleanup, including rollback branches.
     PrivateIndexDirectoryLock migration_lock;

@@ -1,6 +1,7 @@
 // index_client.cpp — Connect to Pulse.Index (service or spawned helper).
 #include "../common/command_line.h"
 #include "index_client.h"
+#include "index_config.h"
 #include "search_trace.h"
 #include <chrono>
 #include <algorithm>
@@ -519,6 +520,8 @@ bool IndexClient::ConfigureIndexPathElevated(const std::wstring& path, std::wstr
             *error = L"请选择独立的索引文件夹，不能与原位置互相包含，也不能使用链接目录。选择磁盘根目录时会自动使用其中的 Index 文件夹。"; break;
         case ERROR_PARTIAL_COPY:
             *error = L"索引已切换到新位置，但部分旧文件被占用，未能清理。新索引可以正常使用。"; break;
+        case kIndexDirectoryNotPrivate:
+            *error = L"索引位置里有不属于 Pulse 的文件或链接，为保护隐私，索引服务不会使用它。请改选一个空文件夹。"; break;
         case ERROR_SERVICE_NOT_ACTIVE: case ERROR_SERVICE_REQUEST_TIMEOUT:
             *error = L"索引服务未能恢复。原索引文件已保留，请重新启动索引服务后重试。"; break;
         default:
