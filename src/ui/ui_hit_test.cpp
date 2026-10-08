@@ -974,6 +974,21 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
     D2D1_RECT_F content = ContentRect(rect.right, rect.bottom);
     if (x < content.left || x >= content.right || y < content.top || y >= content.bottom) return r;
 
+    // The swap button only exists while its divider (or the button) is hovered,
+    // so it never takes clicks meant for the pane edges underneath.
+    if (vm.hover_region == static_cast<int>(HitTestResult::Splitter) && !vm.splitter_pressed) {
+        for (int i = 0; i < static_cast<int>(vm.splitters.size()); ++i) {
+            const auto& sp = vm.splitters[static_cast<size_t>(i)];
+            if (sp.swap_rect.right <= sp.swap_rect.left) continue;
+            if (vm.hover_control_index != i && vm.hover_control_index != kSplitterSwapIndex + i) continue;
+            if (x >= sp.swap_rect.left && x < sp.swap_rect.right &&
+                y >= sp.swap_rect.top && y < sp.swap_rect.bottom) {
+                r.region = HitTestResult::Splitter;
+                r.index = kSplitterSwapIndex + i;
+                return r;
+            }
+        }
+    }
     for (int i = 0; i < static_cast<int>(vm.splitters.size()); ++i) {
         const auto& sp = vm.splitters[static_cast<size_t>(i)];
         if (x >= sp.hit_rect.left && x < sp.hit_rect.right &&

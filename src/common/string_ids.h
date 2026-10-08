@@ -1405,3 +1405,6 @@
 #define IDS_CONTEXT_PRESET_STANDARD_DESC 2564
 #define IDS_CONTEXT_PRESET_FULL_DESC 2565
 #define IDS_CONTEXT_PRESET_CUSTOM_DESC 2566
+// Split view: hover button on the divider between two panes.
+#define IDS_SPLIT_SWAP_LR 2567
+#define IDS_SPLIT_SWAP_TB 2568

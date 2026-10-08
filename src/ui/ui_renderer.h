@@ -521,7 +521,12 @@ struct SplitterView {
     D2D1_RECT_F hit_rect{};
     D2D1_RECT_F parent_bounds{};
     bool vertical = true; // vertical divider between left/right panes
+    // Two-pane layouts: round swap button shown while the divider is hovered.
+    // Empty otherwise.
+    D2D1_RECT_F swap_rect{};
 };
+// Splitter hit index of the swap button on splitter i: kSplitterSwapIndex + i.
+inline constexpr int kSplitterSwapIndex = 1000;
 
 struct SettingsRowView {
     std::wstring key;

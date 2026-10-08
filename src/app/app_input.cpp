@@ -2152,6 +2152,10 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
         } else if (hit.region == ui::HitTestResult::Splitter) {
             s->dragPending = false;
+            if (hit.index >= ui::kSplitterSwapIndex) {
+                SwapSplitPanes(*s);
+                return 0;
+            }
             s->splitterDragging = true;
             s->splitterDragIndex = hit.index;
             if (hit.index >= 0 && hit.index < static_cast<int>(vm.splitters.size())) {

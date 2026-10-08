@@ -834,6 +834,15 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
         view.hit_rect = sp.hit_rect;
         view.parent_bounds = sp.parent_bounds;
         view.vertical = (sp.orientation == app::SplitOrientation::Vertical);
+        if (splitters.size() == 1 && laid.size() == 2) {
+            // Level with the pane headers for left/right, centered for top/bottom.
+            const float r = 16.0f * s.scale;
+            const float cx = view.vertical ? (sp.hit_rect.left + sp.hit_rect.right) * 0.5f
+                                           : (sp.parent_bounds.left + sp.parent_bounds.right) * 0.5f;
+            const float cy = view.vertical ? sp.parent_bounds.top + 29.0f * s.scale
+                                           : (sp.hit_rect.top + sp.hit_rect.bottom) * 0.5f;
+            view.swap_rect = D2D1::RectF(cx - r, cy - r, cx + r, cy + r);
+        }
         vm.splitters.push_back(view);
         s.splitterNodes.push_back(sp.node);
     }
@@ -2579,7 +2588,11 @@ std::wstring TooltipForHover(AppState& s) {
     case R::PaneViewButton: return text(I::More);
     case R::FilterBox: return text(s.appPrefs.show_hints ? I::TipxFilter : I::FilterCurrent);
     case R::FilterClear: return text(I::Clear);
-    case R::Splitter: return text(I::ResizeSplit);
+    case R::Splitter:
+        if (s.hoverControlIndex >= ui::kSplitterSwapIndex)
+            return text(LayoutOf(s) == app::LayoutPreset::TwoHorizontal ? I::SplitSwapTopBottom
+                                                                         : I::SplitSwapLeftRight);
+        return text(I::ResizeSplit);
     case R::DetailsOpen: return text(I::Open);
     case R::DetailsStar: return text(I::Favorite);
     case R::DetailsMore: return text(I::MoreActions);

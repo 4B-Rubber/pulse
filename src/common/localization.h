@@ -947,6 +947,8 @@ enum class StringId : UINT {
     ContextPresetStandardDesc = IDS_CONTEXT_PRESET_STANDARD_DESC,
     ContextPresetFullDesc = IDS_CONTEXT_PRESET_FULL_DESC,
     ContextPresetCustomDesc = IDS_CONTEXT_PRESET_CUSTOM_DESC,
+    SplitSwapLeftRight = IDS_SPLIT_SWAP_LR,
+    SplitSwapTopBottom = IDS_SPLIT_SWAP_TB,
     SettingsRemoveServerError = IDS_SETTINGS_REMOVE_SERVER_ERROR,
     SettingsAddServerError = IDS_SETTINGS_ADD_SERVER_ERROR,
     SettingsOperationError = IDS_SETTINGS_OPERATION_ERROR,

@@ -378,6 +378,8 @@ BEGIN
     IDS_CONTEXT_PRESET_STANDARD_DESC "隱藏少用項目"
     IDS_CONTEXT_PRESET_FULL_DESC "全部顯示 · 預設"
     IDS_CONTEXT_PRESET_CUSTOM_DESC "手動調整"
+    IDS_SPLIT_SWAP_LR "左右對調"
+    IDS_SPLIT_SWAP_TB "上下對調"
     IDS_RESTORE_DEFAULTS            "恢復預設"
     IDS_TOOLTIP_CLOSE_TAB           "關閉分頁"
     IDS_TOOLTIP_NEW_TAB             "新增分頁"
