@@ -170,6 +170,11 @@ struct PaneViewModel {
     std::unordered_set<int> folder_size_actions;
     std::unordered_set<int> folder_size_muted;
     std::unordered_set<int> folder_size_running;
+    // No value yet: pending rows (an answer is on its way) draw a skeleton bar;
+    // idle rows (deferred, failed, never automatic) draw a dash that reads
+    // as the calculate action while the row is hovered.
+    std::unordered_set<int> folder_size_pending;
+    std::unordered_set<int> folder_size_idle;
     ChangeBadge title_change_badge;
     bool is_changes = false;
     std::wstring change_empty_text, change_status_text;
@@ -1148,6 +1153,8 @@ public:
         // Loading placeholders shimmer (and must appear on time) while any
         // pane is still enumerating.
         active = active || list_loading_active_;
+        // Folder size skeleton shimmer and the scanning label's breathing.
+        active = active || folder_size_anim_active_;
         // Operation pill: indeterminate ring spin and the completion check fade.
         active = active || task_pill_spinning_ ||
                  (task_pill_done_at_ != 0 && now - task_pill_done_at_ < kTaskPillDoneMs + 400);
@@ -1547,6 +1554,8 @@ private:
     std::array<uint64_t, 8> list_loading_since_{};
     bool list_loading_animate_ = true;
     bool list_loading_active_ = false;
+    std::array<uint64_t, 8> folder_size_pending_since_{};
+    bool folder_size_anim_active_ = false;
     motion::CopyFeedback copy_feedback_;
     static constexpr ULONGLONG kTaskPillDoneMs = 1600;
     static constexpr ULONGLONG kTaskPillFadeMs = 300;

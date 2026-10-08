@@ -40,6 +40,8 @@ void FillFolderSizes(AppState& s, ui::WindowViewModel& vm) {
         pane.folder_size_actions.clear();
         pane.folder_size_muted.clear();
         pane.folder_size_running.clear();
+        pane.folder_size_pending.clear();
+        pane.folder_size_idle.clear();
         // Content hits are files held in a separate paged store, not snapshot/entries.
         if (pane.loading || pane.content_results ||
             (!pane.is_file_system && !pane.is_search) || pane.is_recycle) continue;
@@ -103,8 +105,19 @@ void FillFolderSizes(AppState& s, ui::WindowViewModel& vm) {
     for (const auto& row : rows) {
         const auto value = s.folderSizes.Get(row.path);
         const auto work = s.folderSizes.GetWork(row.path);
-        std::wstring text = value.has_value ? format::ByteSize(value.bytes) :
-            l10n::Get(work.Running() ? l10n::StringId::Calculating : l10n::StringId::FolderSizeCalculate);
+        // Without a value: an answer that is on its way (index reply, queue,
+        // first scan delay) is a quiet placeholder, an active scan says so,
+        // and only rows that will not resolve by themselves offer the action.
+        const bool scanning = work.activity == app::FolderSizeActivity::Scanning ||
+            (work.activity == app::FolderSizeActivity::Queued && work.manual);
+        const bool pending = !value.has_value && !scanning &&
+            (work.activity == app::FolderSizeActivity::Queued ||
+             (work.activity == app::FolderSizeActivity::Idle && !fs::IsUncPath(row.path)));
+        std::wstring text;
+        if (value.has_value) text = format::ByteSize(value.bytes);
+        else if (scanning) text = l10n::Get(l10n::StringId::Calculating);
+        else if (pending) row.pane->folder_size_pending.insert(row.index);
+        else { text = L"\u2014"; row.pane->folder_size_idle.insert(row.index); }
         if (value.has_value && value.partial) text = L"\u2265 " + text;
         if (value.has_value && (value.state == app::FolderSizeState::Cached ||
             value.source != app::FolderSizeSource::Scan)) row.pane->folder_size_muted.insert(row.index);
@@ -119,6 +132,8 @@ void FillFolderSizes(AppState& s, ui::WindowViewModel& vm) {
         vm.pane.folder_size_actions = slot.pane.folder_size_actions;
         vm.pane.folder_size_muted = slot.pane.folder_size_muted;
         vm.pane.folder_size_running = slot.pane.folder_size_running;
+        vm.pane.folder_size_pending = slot.pane.folder_size_pending;
+        vm.pane.folder_size_idle = slot.pane.folder_size_idle;
     }
 }
 

@@ -1994,6 +1994,7 @@ struct RowShiftTransform {
     RowShiftTransform(const RowShiftTransform&) = delete;
     RowShiftTransform& operator=(const RowShiftTransform&) = delete;
 };
+constexpr uint64_t kFolderSizePendingLimitMs = 10000;
 } // namespace
 
 void MainRenderer::DrawListSkeleton(const D2D1_RECT_F& viewport, const Theme& theme,
@@ -2084,6 +2085,24 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
     }
     if (pane_index >= 0 && pane_index < static_cast<int>(list_loading_since_.size()))
         list_loading_since_[pane_index] = 0;
+    // Folder size answers usually land within ~50 ms; placeholders only show
+    // for slower ones so fast navigation never flashes them.
+    uint64_t folder_size_pending_age = 0;
+    if (pane_index >= 0 && pane_index < static_cast<int>(folder_size_pending_since_.size())) {
+        uint64_t& since = folder_size_pending_since_[static_cast<size_t>(pane_index)];
+        if (vm.folder_size_pending.empty()) {
+            since = 0;
+        } else {
+            if (since == 0) since = motion_now_;
+            folder_size_pending_age = motion_now_ - since;
+            // Past kFolderSizePendingLimitMs the placeholders give way to the
+            // calculate offer instead of shimmering indefinitely.
+            if (folder_size_pending_age <= kFolderSizePendingLimitMs) folder_size_anim_active_ = true;
+        }
+    }
+    const bool folder_size_animate = motion::SystemAnimationsEnabled() && !IsHighContrast();
+    const std::wstring folder_size_offer = pulse::l10n::Get(pulse::l10n::StringId::FolderSizeCalculate);
+    const std::wstring folder_size_scanning = pulse::l10n::Get(pulse::l10n::StringId::Calculating);
     const size_t entryCount = vm.EntryCount();
     if (entryCount == 0) return;
     const D2D1_RECT_F viewport = D2D1::RectF(x, y, x + w, y + h);
@@ -2638,16 +2657,56 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                         float size_left = left, size_avail = avail;
                         if (e.is_dir && folder_size != vm.folder_size_labels.end()) {
                             size_text = &folder_size->second;
-                            const bool action = *size_text == pulse::l10n::Get(pulse::l10n::StringId::FolderSizeCalculate);
-                            const bool hot = hover_region == static_cast<int>(HitTestResult::RowFolderSize) && hover_control_index == src;
-                            const auto ink = action ? (hot ? theme.accent : theme.text_secondary) :
-                                vm.folder_size_muted.contains(src) ? theme.text_secondary : theme.text;
-                            MakeBrush(dc, cut ? WithAlpha(ink, 0.55f) : ink, brTextSecondary_);
-                            if (vm.folder_size_running.contains(src) && avail >= 48.0f * scale_) {
-                                MakeBrush(dc, theme.accent, brAccent_);
-                                dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(left + 3.0f * scale_,
-                                    (cell.top + cell.bottom) * 0.5f), 2.0f * scale_, 2.0f * scale_), brAccent_.get());
-                                size_left += 12.0f * scale_; size_avail -= 12.0f * scale_;
+                            // Only rows that will not resolve by themselves offer the
+                            // action, and only while hovered; otherwise a faint dash.
+                            const bool stale = vm.folder_size_pending.contains(src) &&
+                                folder_size_pending_age > kFolderSizePendingLimitMs;
+                            const bool idle = vm.folder_size_idle.contains(src) || stale;
+                            static const std::wstring kDash = L"\u2014";
+                            if (stale) size_text = &kDash;
+                            const bool offer = idle && src == vm.hover_index;
+                            if (offer) size_text = &folder_size_offer;
+                            const bool scanning = !idle && *size_text == folder_size_scanning;
+                            D2D1_COLOR_F ink = offer ? theme.accent :
+                                idle ? WithAlpha(theme.text_secondary, theme.text_secondary.a * 0.6f) :
+                                scanning || vm.folder_size_muted.contains(src) ? theme.text_secondary : theme.text;
+                            if (scanning && folder_size_animate) {
+                                folder_size_anim_active_ = true;
+                                const float phase = static_cast<float>(motion_now_ % 1200) / 1200.0f;
+                                ink.a *= 1.0f - 0.55f * (0.5f - 0.5f * std::cos(phase * 6.2831853f));
+                            }
+                            MakeBrush(dc, cut ? WithAlpha(ink, ink.a * 0.55f) : ink, brTextSecondary_);
+                            if (vm.folder_size_pending.contains(src) && !stale && folder_size_pending_age >= 150 &&
+                                !IsHighContrast() && size_avail > 0.0f) {
+                                const float appear = folder_size_animate
+                                    ? std::min(1.0f, static_cast<float>(folder_size_pending_age - 150) / 200.0f) : 1.0f;
+                                const float barW = std::min(size_avail, 46.0f * scale_);
+                                const float barH = 9.0f * scale_;
+                                const float cy = (cell.top + cell.bottom) * 0.5f;
+                                const D2D1_RECT_F bar = D2D1::RectF(size_left + size_avail - barW, cy - barH * 0.5f,
+                                                                    size_left + size_avail, cy + barH * 0.5f);
+                                D2D1_COLOR_F base = theme.text;
+                                base.a = (theme.bg.r < 0.5f ? 0.08f : 0.06f) * appear;
+                                MakeBrush(dc, base, brFillInput_);
+                                dc->FillRoundedRectangle(D2D1::RoundedRect(bar, barH * 0.5f, barH * 0.5f), brFillInput_.get());
+                                if (folder_size_animate) {
+                                    // A soft highlight sweeps across the bar every 1.4 s.
+                                    const float cx = bar.left - barW + 3.0f * barW *
+                                        static_cast<float>(motion_now_ % 1400) / 1400.0f;
+                                    D2D1_COLOR_F glow = theme.text;
+                                    glow.a = (theme.bg.r < 0.5f ? 0.07f : 0.06f) * appear;
+                                    D2D1_COLOR_F clear = glow;
+                                    clear.a = 0.0f;
+                                    const D2D1_GRADIENT_STOP stops[] = {{0.0f, clear}, {0.5f, glow}, {1.0f, clear}};
+                                    ComPtr<ID2D1GradientStopCollection> collection;
+                                    ComPtr<ID2D1LinearGradientBrush> sweep;
+                                    if (SUCCEEDED(dc->CreateGradientStopCollection(stops, 3, &collection)) && collection.get() &&
+                                        SUCCEEDED(dc->CreateLinearGradientBrush(
+                                            D2D1::LinearGradientBrushProperties(D2D1::Point2F(cx - barW * 0.5f, 0.0f),
+                                                                                D2D1::Point2F(cx + barW * 0.5f, 0.0f)),
+                                            collection.get(), &sweep)) && sweep.get())
+                                        dc->FillRoundedRectangle(D2D1::RoundedRect(bar, barH * 0.5f, barH * 0.5f), sweep.get());
+                                }
                             }
                         }
                         // Number right-aligned, unit in its own sub-column: digits line up.
@@ -2703,10 +2762,13 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                     const auto size = vm.folder_size_labels.find(src);
                     if (size != vm.folder_size_labels.end()) meta = size->second;
                 }
-                const bool manual_size = e.is_dir &&
-                    meta == pulse::l10n::Get(pulse::l10n::StringId::FolderSizeCalculate);
+                const bool manual_size = e.is_dir && vm.folder_size_idle.contains(src);
+                const bool offer_size = manual_size && src == vm.hover_index;
+                if (offer_size) meta = folder_size_offer;
                 if (e.is_dir && vm.folder_size_labels.contains(src)) {
-                    const auto ink = manual_size || vm.folder_size_muted.contains(src) ? theme.text_secondary : theme.text;
+                    const auto ink = offer_size ? theme.accent :
+                        manual_size ? WithAlpha(theme.text_secondary, theme.text_secondary.a * 0.6f) :
+                        vm.folder_size_muted.contains(src) || meta == folder_size_scanning ? theme.text_secondary : theme.text;
                     MakeBrush(dc, cut ? WithAlpha(ink, 0.55f) : ink, brTextSecondary_);
                 }
                 DrawTextEndEllipsis(dc, compositor_->DwriteFactory(), compositor_->SmallFormat(),
@@ -2722,11 +2784,15 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                     auto* format = compositor_->SmallFormat();
                     const auto alignment = format->GetTextAlignment();
                     format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    const bool manual = size->second == pulse::l10n::Get(pulse::l10n::StringId::FolderSizeCalculate);
-                    const auto ink = manual || vm.folder_size_muted.contains(src) ? theme.text_secondary : theme.text;
+                    const bool manual = vm.folder_size_idle.contains(src);
+                    const bool offer = manual && src == vm.hover_index;
+                    const auto ink = offer ? theme.accent :
+                        manual ? WithAlpha(theme.text_secondary, theme.text_secondary.a * 0.6f) :
+                        vm.folder_size_muted.contains(src) || size->second == folder_size_scanning
+                            ? theme.text_secondary : theme.text;
                     MakeBrush(dc, cut ? WithAlpha(ink, 0.55f) : ink, brTextSecondary_);
                     DrawTextEndEllipsis(dc, compositor_->DwriteFactory(), format,
-                        brTextSecondary_.get(), size->second,
+                        brTextSecondary_.get(), offer ? folder_size_offer : size->second,
                         bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
                     format->SetTextAlignment(alignment);
                 }
