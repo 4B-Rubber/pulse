@@ -285,7 +285,8 @@ add_executable(pulse_pack_installer_test
     src/app/update_installer.cpp
     src/app/update_transport.cpp)
 target_include_directories(pulse_pack_installer_test PRIVATE "${CMAKE_BINARY_DIR}/generated")
-target_link_libraries(pulse_pack_installer_test PRIVATE pulse_runtime_log bcrypt cabinet shell32 user32 winhttp)
+target_link_libraries(pulse_pack_installer_test PRIVATE pulse_runtime_log bcrypt cabinet crypt32 shell32 user32 winhttp)
+target_sources(pulse_pack_installer_test PRIVATE src/app/update_download_cleanup.cpp)
 
 add_executable(pulse_update_session_test src/bench/update_session_test.cpp src/app/startup_location.cpp)
 
@@ -1325,7 +1326,7 @@ add_executable(pulse_shell_tag_com_test
     src/fs/fs_enum.cpp src/ui/view_layout.cpp)
 target_link_libraries(pulse_shell_tag_com_test PRIVATE pulse_localization pulse_runtime_log
     user32 shell32 ole32 uuid advapi32 shlwapi netapi32 psapi)
-add_executable(pulse_single_instance_audit_test src/bench/single_instance_audit_test.cpp src/app/single_instance_coordinator.cpp)
+add_executable(pulse_single_instance_audit_test src/bench/single_instance_audit_test.cpp src/app/single_instance_coordinator.cpp src/app/this_pc_argument.cpp)
 target_link_libraries(pulse_single_instance_audit_test PRIVATE ole32 user32)
 add_executable(pulse_preview_pan_lifetime_audit_test src/bench/preview_pan_lifetime_audit_test.cpp)
 target_link_libraries(pulse_preview_pan_lifetime_audit_test PRIVATE gdi32 user32)
@@ -1662,7 +1663,7 @@ target_link_libraries(pulse_update_download_cleanup_test PRIVATE bcrypt crypt32 
 
 add_executable(pulse_places_json_roundtrip_test src/bench/places_json_roundtrip_test.cpp
     src/app/places.cpp src/app/tag_ads_sync.cpp src/fs/fs_enum.cpp src/ui/view_layout.cpp)
-target_link_libraries(pulse_places_json_roundtrip_test PRIVATE user32 shell32 ole32 uuid advapi32 shlwapi netapi32 pulse_localization)
+target_link_libraries(pulse_places_json_roundtrip_test PRIVATE user32 shell32 ole32 uuid advapi32 shlwapi netapi32 pulse_localization pulse_runtime_log)
 
 add_executable(pulse_index_exclusion_concurrency_test src/bench/index_exclusion_concurrency_test.cpp ${query_narrow_sources})
 target_include_directories(pulse_index_exclusion_concurrency_test PRIVATE "${CMAKE_BINARY_DIR}/generated")
