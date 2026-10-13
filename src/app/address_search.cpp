@@ -33,7 +33,7 @@ static void RestoreSearchDraft(app::Tab& tab) {
     const auto spec = app::ParseSearchQuery(rest);
     tab.search_input_path = tab.current_path;
     tab.search_input_content = !spec.content.empty();
-    tab.search_input_text = tab.search_input_content ? spec.content : spec.name;
+    tab.search_input_text = tab.search_input_content ? spec.content : app::NameQueryDraft(rest);
     tab.search_input_current = spec.location != app::LocationScope::Indexed;
     tab.search_input_root = spec.location == app::LocationScope::CustomFolder
         ? spec.custom_folder : spec.current_folder;
@@ -286,6 +286,7 @@ void SubmitAddressSearch(AppState& s, bool live) {
         if (!was_content_query) spec.name.clear();
     } else {
         spec.name = query;
+        spec.name_is_query = true;
         spec.content.clear();
         spec.content_exclude.clear();
     }
@@ -293,7 +294,8 @@ void SubmitAddressSearch(AppState& s, bool live) {
     spec.custom_folder.clear();
     spec.location = s.addressSearchCurrent && !spec.current_folder.empty()
         ? app::LocationScope::CurrentFolder : app::LocationScope::Indexed;
-    auto compiled_text = app::CompileSearchQuery(spec);
+    auto compiled_text = s.addressSearchContent ? app::CompileSearchQuery(spec)
+        : app::CompileNameQueryInput(query, s.addressSearchCurrent ? s.addressSearchRoot : L"");
     const auto path = app::MakeSearchPath(compiled_text);
     if (tab->current_path == path) {
         if (restore_empty_content || (!live && tab->search_content_stopped)) {

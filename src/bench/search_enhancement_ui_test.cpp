@@ -37,24 +37,41 @@ bool RectInside(D2D1_RECT_F rect, D2D1_RECT_F field) {
         rect.top + epsilon >= field.top && rect.bottom <= field.bottom + epsilon &&
         rect.right + epsilon >= rect.left && rect.bottom + epsilon >= rect.top;
 }
+bool ValidSlots(const pulse::ui::AddressSearchLayout& layout, D2D1_RECT_F field) {
+    const std::array<D2D1_RECT_F, 5> ordered = {
+        layout.scope, layout.input, layout.mode, layout.options, layout.close};
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        if (!RectInside(ordered[i], field) ||
+            (i && ordered[i - 1].right > ordered[i].left + 0.01f)) return false;
+    }
+    // Rendering uses mode; hit testing uses its name alias. Content and clear
+    // are intentionally empty because one mode chip and one trailing x are used.
+    return RectInside(layout.name, field) && RectInside(layout.content, field) &&
+        RectInside(layout.clear, field) &&
+        layout.name.left == layout.mode.left && layout.name.right == layout.mode.right &&
+        layout.name.top == layout.mode.top && layout.name.bottom == layout.mode.bottom &&
+        layout.content.left == layout.mode.right && layout.content.right == layout.mode.right &&
+        layout.clear.left == layout.close.left && layout.clear.right == layout.close.left;
+}
 void LayoutCase(float width, float scale, bool logical_width) {
     const float physical_width = logical_width ? width * scale : width;
     const auto field = D2D1::RectF(17.0f, 9.0f, 17.0f + physical_width, 9.0f + 36.0f * scale);
     const auto layout = pulse::ui::LayoutAddressSearch(field, scale);
-    const std::array<D2D1_RECT_F, 7> ordered = {layout.scope, layout.name, layout.content, layout.input, layout.clear, layout.options, layout.close};
-    bool inside = true, separated = true;
-    for (size_t i = 0; i < ordered.size(); ++i) {
-        inside &= RectInside(ordered[i], field);
-        if (i) separated &= ordered[i - 1].right <= ordered[i].left + 0.01f;
-    }
+    const bool slots_valid = ValidSlots(layout, field);
+    const float field_dip = physical_width / scale;
+    const bool responsive = layout.scope_label == (field_dip >= 280) &&
+        layout.mode_label == (field_dip >= 400) &&
+        (layout.scope.right > layout.scope.left) == (field_dip >= 200) &&
+        (layout.options.right > layout.options.left) == (field_dip >= 260) &&
+        (layout.close.right > layout.close.left) == (field_dip >= 140);
     const float input_width = (layout.input.right - layout.input.left) / scale;
     // Normal pane sizes keep at least 64 DIP; constrained physical widths must
     // still leave a usable 32 DIP edit region instead of negative geometry.
     const bool enough_input = input_width + 0.01f >= (logical_width ? 64.0f : 32.0f);
-    if (!inside || !separated || !enough_input)
+    if (!slots_valid || !responsive || !enough_input)
         std::cout << "[INFO] width=" << width << " scale=" << scale << " logical=" << logical_width
-                  << " inputDIP=" << input_width << " inside=" << inside << " separated=" << separated << '\n';
-    Check(inside && separated && enough_input, logical_width ? "DIP-scaled address search bounds/input" : "physical-width address search bounds/input");
+                  << " inputDIP=" << input_width << " slots=" << slots_valid << " responsive=" << responsive << '\n';
+    Check(slots_valid && responsive && enough_input, logical_width ? "DIP-scaled address search bounds/input" : "physical-width address search bounds/input");
 }
 }
 int main() {
@@ -88,10 +105,19 @@ int main() {
     const auto enabled = app::CompileSearchQuery(app::ParseSearchQuery(L"zhongguo"));
     Check(index::QueryHasPinyin(index::ParseQuery(enabled)), "advanced query roundtrip preserves default pinyin");
     for (float scale : {1.0f, 1.5f, 2.0f}) {
-        for (float width : {180.0f, 260.0f, 340.0f, 520.0f}) {
+        for (float width : {139.0f, 140.0f, 180.0f, 199.0f, 200.0f, 259.0f, 260.0f,
+                            279.0f, 280.0f, 339.0f, 340.0f, 399.0f, 400.0f, 520.0f}) {
             LayoutCase(width, scale, true);
             LayoutCase(width, scale, false);
         }
     }
+    const auto field = D2D1::RectF(17.0f, 9.0f, 537.0f, 45.0f);
+    auto invalid = ui::LayoutAddressSearch(field, 1.0f);
+    invalid.mode.left = invalid.input.right - 1.0f;
+    invalid.name = invalid.mode;
+    Check(!ValidSlots(invalid, field), "layout guard rejects actual input/mode overlap");
+    invalid = ui::LayoutAddressSearch(field, 1.0f);
+    invalid.name.left += 1.0f;
+    Check(!ValidSlots(invalid, field), "layout guard rejects drawing/hit-target disagreement");
     return failures ? 1 : 0;
 }

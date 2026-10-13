@@ -1,6 +1,9 @@
 #ifdef PULSE_WITH_SELFTEST
 #include "../ui/ui_renderer_internal.h"
 #include "../common/windows_compat.h"
+#include <algorithm>
+#include <climits>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 
@@ -10,6 +13,7 @@ struct ColumnResizeUiTest {
         const std::filesystem::path root = L"bench_data/column-resize";
         std::filesystem::create_directories(root);
         std::ofstream log(root / L"results.log");
+        if (!log) return false;
         bool ok = true;
         auto check = [&](bool pass, const char* message) {
             log << (pass ? "[PASS] " : "[FAIL] ") << message << std::endl; ok &= pass;
@@ -55,6 +59,130 @@ struct ColumnResizeUiTest {
                 const auto shot = root / (std::to_wstring(width) + L"-" + std::to_wstring(static_cast<int>(scale*100)) + (dark ? L"-dark.png" : L"-light.png"));
                 check(compositor.SaveSnapshot(shot.c_str()), "save actual column renderer screenshot");
             }
+            const auto old_mode = typography::CurrentTextRenderMode();
+            const int old_font = typography::UiFontScalePercent();
+            const auto old_language = l10n::preference();
+            for (float scale : {1.0f, 1.5f}) for (int font : {100, 125, 90})
+            for (const auto mode : {typography::TextRenderMode::Auto, typography::TextRenderMode::Sharp, typography::TextRenderMode::Smooth})
+            for (const wchar_t* language : {L"en-US", L"zh-CN"}) {
+                const std::wstring sample = L"2026-12-30 23:59 XLSX 路径 final-report.xlsx";
+                (void)renderer.CellTextWidth(sample);
+                (void)renderer.CellTextWidth(sample, true);
+                (void)renderer.AutoColumnWidths();
+                check(!renderer.cell_text_widths_.empty(), "prewarm real independent list text cache");
+                typography::SetUiFontScale(font); typography::SetTextRenderMode(mode); l10n::SetLanguage(language);
+                renderer.SetScale(scale); compositor.RecreateTextFormats(scale);
+                renderer.InvalidateTypography();
+                check(renderer.cell_text_widths_.empty() && renderer.auto_widths_scale_ < 0,
+                      "production typography invalidation clears both independent list caches");
+                MainRenderer fresh; fresh.SetCompositor(&compositor); fresh.SetScale(scale);
+                const auto a = renderer.AutoColumnWidths(), b = fresh.AutoColumnWidths();
+                auto close = [](float left, float right) { return std::abs(left - right) < 0.1f; };
+                check(close(renderer.CellTextWidth(sample), fresh.CellTextWidth(sample)) &&
+                      close(renderer.CellTextWidth(sample, true), fresh.CellTextWidth(sample, true)) &&
+                      close(a.date, b.date) && close(a.type, b.type) && close(a.size, b.size) &&
+                      close(a.created, b.created) && close(a.accessed, b.accessed),
+                      "warmed renderer matches fresh baseline after same-DPI font backend language changes");
+                if (!((font == 125 && mode == typography::TextRenderMode::Auto && std::wstring_view(language) == L"en-US") ||
+                      (font == 90 && mode == typography::TextRenderMode::Smooth && std::wstring_view(language) == L"zh-CN"))) continue;
+                for (bool dark : {false, true}) {
+                    compositor.Resize(static_cast<UINT>(760 * scale), static_cast<UINT>(320 * scale));
+                    const auto theme = MakeTheme(dark, HexColor(0x0078D4));
+                    renderer.UpdateBrushes(theme); renderer.text_background_ = theme.bg;
+                    renderer.painter_.BeginFrame(theme, false);
+                    PaneViewModel pane; pane.view_mode = ViewMode::Details; pane.is_search = true;
+                    pane.path = L"C:\\private-typography-fixture";
+                    pane.header_text = L"Typography cache regression";
+                    ListEntryView entry; entry.name = L"final-report-季度数据.xlsx";
+                    entry.path = pane.path + L"\\a-long-parent-folder\\another-parent\\" + entry.name;
+                    entry.type_text = L"Excel document"; entry.date_text = L"2026-12-30 23:59"; entry.size_text = L"1023.9 KB";
+                    pane.entries.push_back(entry);
+                    WindowViewModel vm;
+                    auto* dc = compositor.Dc(); dc->BeginDraw(); dc->Clear(theme.bg);
+                    renderer.DrawSinglePane(vm, pane, {8 * scale, 8 * scale, 752 * scale, 312 * scale}, 0, true, false, theme);
+                    check(SUCCEEDED(dc->EndDraw()), "draw resized typography with real path metadata layout");
+                    const auto shot = root / (L"typography-" + std::to_wstring(font) + L"-" +
+                        std::to_wstring(static_cast<int>(scale * 100)) + (dark ? L"-dark.png" : L"-light.png"));
+                    check(compositor.SaveSnapshot(shot.c_str()), "save real typography layout screenshot");
+                }
+            }
+            // Type chip labels sit centered in every text rendering mode. User report:
+            // with Text rendering set to Sharp / Smooth (DirectWrite) the extension was
+            // drawn against the chip's left edge; Auto (LumaText) centered it.
+            {
+                typography::SetUiFontScale(100);
+                for (float scale : {1.0f, 1.5f}) {
+                    float auto_cy = -1.0f;
+                    for (const auto mode : {typography::TextRenderMode::Auto, typography::TextRenderMode::Sharp,
+                                            typography::TextRenderMode::Smooth}) {
+                        typography::SetTextRenderMode(mode);
+                        renderer.SetScale(scale); compositor.RecreateTextFormats(scale);
+                        renderer.InvalidateTypography();
+                        compositor.Resize(static_cast<UINT>(200 * scale), static_cast<UINT>(100 * scale));
+                        const auto theme = MakeTheme(false, HexColor(0x0078D4));
+                        renderer.UpdateBrushes(theme); renderer.text_background_ = theme.bg;
+                        const std::wstring chip = L"DWG";
+                        const float origin = std::round(40.0f * scale);
+                        const auto box = D2D1::RectF(origin, origin,
+                            origin + (renderer.TypeChipWidthDip(chip) - kTypeChipGapDip) * scale,
+                            origin + 17.0f * scale);
+                        auto* dc = compositor.Dc(); dc->BeginDraw(); dc->Clear(theme.bg);
+                        renderer.DrawTypeChipLabel(dc, chip, box, HexColor(0x202020), theme.bg);
+                        check(SUCCEEDED(dc->EndDraw()), "draw a type chip label");
+                        ComPtr<ID2D1Image> image;
+                        dc->GetTarget(&image);
+                        ComPtr<ID2D1Bitmap1> target, readback;
+                        HRESULT hr = image->QueryInterface(__uuidof(ID2D1Bitmap1), reinterpret_cast<void**>(&target.p));
+                        if (SUCCEEDED(hr)) {
+                            auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                                target->GetPixelFormat(), 96, 96);
+                            hr = dc->CreateBitmap(target->GetPixelSize(), nullptr, 0, &props, &readback);
+                        }
+                        if (SUCCEEDED(hr)) hr = readback->CopyFromBitmap(nullptr, target.get(), nullptr);
+                        D2D1_MAPPED_RECT mapped{};
+                        if (SUCCEEDED(hr)) hr = readback->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+                        check(SUCCEEDED(hr), "read type chip label pixels");
+                        if (FAILED(hr)) continue;
+                        // Ink = anything that is not the cleared background, searched a few
+                        // pixels beyond the box so a label outside it would still be seen.
+                        const uint32_t bg = reinterpret_cast<const uint32_t*>(mapped.bits)[0];
+                        // Blended backgrounds may round by a step or two; only real ink counts.
+                        const auto differs = [](uint32_t a, uint32_t b) {
+                            for (int shift = 0; shift < 24; shift += 8) {
+                                const int ca = static_cast<int>((a >> shift) & 0xFF), cb = static_cast<int>((b >> shift) & 0xFF);
+                                if (std::abs(ca - cb) > 24) return true;
+                            }
+                            return false;
+                        };
+                        int min_x = INT_MAX, max_x = -1, min_y = INT_MAX, max_y = -1;
+                        const int x0 = static_cast<int>(box.left - 6 * scale), x1 = static_cast<int>(box.right + 6 * scale);
+                        const int y0 = static_cast<int>(box.top - 6 * scale), y1 = static_cast<int>(box.bottom + 6 * scale);
+                        for (int y = y0; y < y1; ++y) {
+                            const auto* row = reinterpret_cast<const uint32_t*>(mapped.bits + static_cast<size_t>(y) * mapped.pitch);
+                            for (int x = x0; x < x1; ++x) {
+                                if (!differs(row[x], bg)) continue;
+                                min_x = std::min(min_x, x); max_x = std::max(max_x, x);
+                                min_y = std::min(min_y, y); max_y = std::max(max_y, y);
+                            }
+                        }
+                        readback->Unmap();
+                        const bool found = max_x >= 0;
+                        const float ink_cx = (static_cast<float>(min_x) + static_cast<float>(max_x) + 1.0f) * 0.5f;
+                        const float ink_cy = (static_cast<float>(min_y) + static_cast<float>(max_y) + 1.0f) * 0.5f;
+                        const float box_cx = (box.left + box.right) * 0.5f;
+                        log << "[INFO] chip mode=" << static_cast<int>(mode) << " scale=" << scale
+                            << " ink_x=" << min_x << ".." << max_x << " ink_y=" << min_y << ".." << max_y
+                            << " box_x=" << box.left << ".." << box.right << std::endl;
+                        check(found && std::abs(ink_cx - box_cx) <= 1.5f * scale,
+                              "type chip label is centered horizontally in every text rendering mode");
+                        if (mode == typography::TextRenderMode::Auto) auto_cy = found ? ink_cy : -1.0f;
+                        else check(found && auto_cy >= 0.0f && std::abs(ink_cy - auto_cy) <= 1.5f * scale,
+                                   "type chip label sits at the same height as with LumaText");
+                    }
+                }
+            }
+            typography::SetUiFontScale(old_font); typography::SetTextRenderMode(old_mode);
+            l10n::SetLanguage(l10n::LanguageId(old_language));
         }
         DestroyWindow(hwnd); return ok;
     }

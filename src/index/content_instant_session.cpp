@@ -39,7 +39,7 @@ struct Changes {
 void LogSubscriptionFailure(const Changes& state, uint64_t generation, size_t pending) noexcept {
     try {
         const char* names[]{"none", "queue_overflow", "feed_connect", "feed_not_ready", "feed_gap",
-            "watch_overflow", "watch_not_ready", "transport"};
+            "watch_overflow", "watch_not_ready", "transport", "metadata", "directory_enumeration", "reconcile"};
         wchar_t directory[32768]{};
         DWORD count = GetEnvironmentVariableW(L"PULSE_CONTENT_TIMING_DIR", directory, ARRAYSIZE(directory));
         std::filesystem::path root;
@@ -180,6 +180,16 @@ bool RunInstantContentSession(ContentIndex& index, ContentSearchRequest request,
         return hooks && hooks->search ? hooks->search(query, cancelled, std::move(deliver)) :
             index.SearchTask(query, cancelled, std::move(deliver));
     };
+    const auto attributes = [&](const std::wstring& path) {
+        return hooks && hooks->attributes ? hooks->attributes(path) : GetFileAttributesW(path.c_str());
+    };
+    const auto list_directory = [&](const std::wstring& path, std::vector<std::wstring>& children) {
+        if (hooks && hooks->list_directory) return hooks->list_directory(path, children);
+        std::error_code error;
+        std::filesystem::directory_iterator it(path, error), end;
+        for (; !error && it != end && !cancelled; it.increment(error)) children.push_back(it->path().wstring());
+        return cancelled ? DWORD{ERROR_CANCELLED} : static_cast<DWORD>(error.value());
+    };
     const bool ok = search(request, [&](auto progress, auto hits) {
         for (const auto& hit : hits) matched[ContentScopeKey(hit.path)] = hit.path;
         progress.live = request.subscribe;
@@ -213,29 +223,62 @@ bool RunInstantContentSession(ContentIndex& index, ContentSearchRequest request,
         for (const auto& [key, change] : pending) {
             if (cancelled) break;
             const auto& path = change.path;
-            const auto attributes = GetFileAttributesW(path.c_str());
-            if (attributes == INVALID_FILE_ATTRIBUTES) {
-                const auto error = GetLastError();
-                if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) continue;
+            bool reconciled = false, missing = false;
+            DWORD error = ERROR_SUCCESS;
+            auto stage = ContentSubscriptionFailure::Metadata;
+            std::set<std::wstring> discovered;
+            // One notification must survive a transient metadata or directory
+            // failure. Keep retries bounded and never publish a partial listing.
+            for (unsigned attempt = 0; attempt < 3 && !cancelled; ++attempt) {
+                discovered.clear(); error = ERROR_SUCCESS; missing = false;
+                stage = ContentSubscriptionFailure::Metadata;
+                const DWORD attr = attributes(path);
+                if (attr == INVALID_FILE_ATTRIBUTES) {
+                    error = GetLastError();
+                    missing = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+                    if (missing) error = ERROR_SUCCESS;
+                    else if (!error) error = ERROR_GEN_FAILURE;
+                } else if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) discovered.insert(path);
+                    else if (change.imported) {
+                        std::vector<std::wstring> directories{path};
+                        while (!directories.empty() && !error && !cancelled) {
+                            auto directory = std::move(directories.back()); directories.pop_back();
+                            std::vector<std::wstring> children;
+                            error = list_directory(directory, children);
+                            if (error) { stage = ContentSubscriptionFailure::DirectoryEnumeration; break; }
+                            for (const auto& child : children) {
+                                if (cancelled) break;
+                                if (!included(child)) continue;
+                                const DWORD child_attr = attributes(child);
+                                if (child_attr == INVALID_FILE_ATTRIBUTES) {
+                                    error = GetLastError();
+                                    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) { error = 0; continue; }
+                                    if (!error) error = ERROR_GEN_FAILURE;
+                                    stage = ContentSubscriptionFailure::Metadata; break;
+                                }
+                                if (child_attr & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+                                if (child_attr & FILE_ATTRIBUTE_DIRECTORY) directories.push_back(child);
+                                else discovered.insert(child);
+                            }
+                        }
+                    }
+                }
+                if (!error) { reconciled = true; break; }
+                {
+                    std::lock_guard lock(changes.mutex);
+                    if (changes.error) break;
+                }
+                if (attempt == 2 || WaitForSingleObject(changes.stop, 150 * (attempt + 1)) != WAIT_TIMEOUT) break;
+            }
+            if (cancelled) break;
+            if (!reconciled) { fail(stage, error); continue; }
+            if (missing) {
                 for (auto it = matched.begin(); it != matched.end();) {
                     if (Under(it->second, path)) { ContentHit hit; hit.path = it->second; hit.removed = true; removed.push_back(std::move(hit)); it = matched.erase(it); }
                     else ++it;
                 }
-            } else if (!(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
-                if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) files.insert(path);
-                else if (change.imported) {
-                    // Enumerate only the changed/imported directory, never the whole configured scope.
-                    std::error_code error;
-                    std::filesystem::recursive_directory_iterator it(path, std::filesystem::directory_options::skip_permission_denied, error), end;
-                    while (it != end && !error && !cancelled) {
-                        const auto child = it->path().wstring();
-                        const auto attr = GetFileAttributesW(child.c_str());
-                        if (!included(child) || (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT))) it.disable_recursion_pending();
-                        else if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) files.insert(child);
-                        it.increment(error);
-                    }
-                }
-            }
+            } else files.insert(discovered.begin(), discovered.end());
         }
         if (!removed.empty()) {
             auto progress = final; progress.delta = true; progress.error = 0; progress.done = true;

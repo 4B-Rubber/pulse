@@ -1,55 +1,32 @@
 // context_menu_prefs.cpp — JSON load/save for the Explorer fusion-zone prefs.
 #include "context_menu_prefs.h"
+#include "../common/config_json.h"
 #include "session.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
 #include <algorithm>
+#include <iterator>
 #include <unordered_set>
 #include <windows.h>
 
 namespace pulse::app {
 namespace {
 
-std::wstring ExtractObject(const std::wstring& json, const std::wstring& key) {
-    const std::wstring quoted = L"\"" + key + L"\"";
-    size_t pos = json.find(quoted);
-    if (pos == std::wstring::npos) return L"";
-    pos = json.find(L'{', pos + quoted.size());
-    if (pos == std::wstring::npos) return L"";
-    int depth = 0;
-    for (size_t i = pos; i < json.size(); ++i) {
-        if (json[i] == L'{') ++depth;
-        else if (json[i] == L'}') {
-            --depth;
-            if (depth == 0) return json.substr(pos, i - pos + 1);
-        }
-    }
-    return L"";
-}
+using pulse::json::ExtractObject;
+
+// 2: slow_ext only holds handlers the host proved hung (collect_hung). Files
+// written before that carry disables from the old "everyone still running
+// after 1 s" rule, which hid every healthy extension after three stalls.
+constexpr int kPrefsVersion = 2;
 
 int ClampCap(int v, int lo, int hi, int fallback) {
     if (v < lo || v > hi) return fallback;
     return v;
 }
 
-// Every key ToJson() writes (except "version"). A file truncated mid-write still
-// parses into a handful of keys, so the count doubles as the completeness test that
-// sends ReadDiskState() to the backup. A new key in ToJson() needs a line here too.
-constexpr const wchar_t* kStoredKeys[] = {
-    L"explorer_cap", L"open_with_mru", L"categories", L"items", L"seen", L"slow_ext"
-};
-
-// Half the keys, rounded up: fewer than this and the file is treated as damaged
-// rather than as the user's configuration.
-constexpr int kMinStoredKeys = (static_cast<int>(ARRAYSIZE(kStoredKeys)) + 1) / 2;
-
-int CountStoredKeys(const std::wstring& json) {
-    int found = 0;
-    for (const wchar_t* key : kStoredKeys) {
-        if (json.find(L"\"" + std::wstring(key) + L"\"") != std::wstring::npos) ++found;
-    }
-    return found;
-}
+// context_menu.json "pulse_order" keys, indexed by BuiltinMenuSurface.
+constexpr const wchar_t* kOrderKeys[] = { L"item", L"background", L"row_buttons" };
+static_assert(std::size(kOrderKeys) == static_cast<size_t>(BuiltinMenuSurface::Count));
 
 } // namespace
 
@@ -71,6 +48,7 @@ void ContextMenuPrefs::ResetToDefaults() {
     seen.clear();
     slow_ext.clear();
     builtin_hidden = 0;
+    ResetBuiltinOrder();
 }
 
 bool ContextMenuPrefs::CategoryEnabled(ipc::CtxMenuCategory c) const {
@@ -117,9 +95,34 @@ bool ContextMenuPrefs::ItemEnabled(const std::wstring& key, ipc::CtxMenuCategory
     return CategoryEnabled(c);
 }
 
+bool ContextMenuPrefs::RowEnabled(const std::wstring& key, ipc::CtxMenuCategory c,
+                                  bool from_com) const {
+    return ItemEnabled(key, c, from_com) && !ComDisabled(key);
+}
+
 void ContextMenuPrefs::SetBuiltinVisible(BuiltinMenuItem item, bool on) {
     if (on) builtin_hidden &= ~BuiltinMenuBit(item);
     else builtin_hidden |= BuiltinMenuBit(item);
+}
+
+BuiltinMenuOrder ContextMenuPrefs::BuiltinOrder(BuiltinMenuSurface surface) const {
+    if (surface >= BuiltinMenuSurface::Count) return {};
+    return NormalizeBuiltinMenuOrder(surface, builtin_order[static_cast<size_t>(surface)]);
+}
+
+bool ContextMenuPrefs::BuiltinOrderCustom(BuiltinMenuSurface surface) const {
+    return surface < BuiltinMenuSurface::Count && BuiltinOrder(surface) != BuiltinMenuDefaultOrder(surface);
+}
+
+void ContextMenuPrefs::SetBuiltinOrder(BuiltinMenuSurface surface, const BuiltinMenuOrder& order) {
+    if (surface >= BuiltinMenuSurface::Count) return;
+    auto normalized = NormalizeBuiltinMenuOrder(surface, order);
+    if (normalized == BuiltinMenuDefaultOrder(surface)) normalized.clear();
+    builtin_order[static_cast<size_t>(surface)] = std::move(normalized);
+}
+
+void ContextMenuPrefs::ResetBuiltinOrder() {
+    for (auto& order : builtin_order) order.clear();
 }
 
 void ContextMenuPrefs::SetItemEnabled(const std::wstring& key, bool on) {
@@ -173,7 +176,10 @@ bool ContextMenuPrefs::RecordSeen(const std::wstring& key, const std::wstring& t
 }
 
 bool ContextMenuPrefs::RecordComTiming(const std::wstring& key, uint32_t elapsed_ms) {
-    if (key.empty()) return false;
+    // SendTo never feeds the slow-extension auto-disable (#77): it serializes
+    // the whole default menu, so it is structurally the last worker home and
+    // would be permanently killed after three slow right-clicks.
+    if (key.empty() || key == ipc::SendToHandlerCatalogKey()) return false;
     SlowComExt& st = slow_ext[key];
     st.last_ms = elapsed_ms;
     bool changed = false;
@@ -211,7 +217,9 @@ void ContextMenuPrefs::SetComDisabled(const std::wstring& key, bool on) {
 
 std::wstring ContextMenuPrefs::ToJson() const {
     std::wstring out;
-    out += L"{\n  \"version\":1,\n";
+    out += L"{\n  \"version\":";
+    out += std::to_wstring(kPrefsVersion);
+    out += L",\n";
     out += L"  \"explorer_cap\":";
     out += std::to_wstring(explorer_cap);
     out += L",\n  \"open_with_mru\":";
@@ -243,7 +251,26 @@ std::wstring ContextMenuPrefs::ToJson() const {
         out += L"\":false";
         first_builtin = false;
     }
-    out += first_builtin ? L"},\n  \"items\":{\n" : L"\n  },\n  \"items\":{\n";
+    out += first_builtin ? L"},\n" : L"\n  },\n";
+    // "pulse_order": comma-joined keys per surface, only when moved.
+    out += L"  \"pulse_order\":{";
+    bool first_order = true;
+    for (int s = 0; s < static_cast<int>(BuiltinMenuSurface::Count); ++s) {
+        const auto surface = static_cast<BuiltinMenuSurface>(s);
+        if (!BuiltinOrderCustom(surface)) continue;
+        out += first_order ? L"\n    \"" : L",\n    \"";
+        out += kOrderKeys[s];
+        out += L"\":\"";
+        bool first_key = true;
+        for (const auto item : BuiltinOrder(surface)) {
+            if (!first_key) out += L",";
+            out += BuiltinMenuKey(item);
+            first_key = false;
+        }
+        out += L"\"";
+        first_order = false;
+    }
+    out += first_order ? L"},\n  \"items\":{\n" : L"\n  },\n  \"items\":{\n";
     size_t n = 0;
     for (const auto& kv : item_enabled) {
         std::wstring key;
@@ -301,7 +328,7 @@ std::wstring ContextMenuPrefs::ToJson() const {
 }
 
 bool ContextMenuPrefs::FromJson(const std::wstring& json) {
-    if (json.empty()) return false;
+    if (!pulse::json::ValidConfigObject(json)) return false;
     explorer_cap = ClampCap(pulse::json::ExtractInt(json, L"explorer_cap", ipc::kDefaultExplorerCap),
                             1, 48, ipc::kDefaultExplorerCap);
     open_with_mru = ClampCap(pulse::json::ExtractInt(json, L"open_with_mru", 2), 0, 8, 2);
@@ -325,67 +352,49 @@ bool ContextMenuPrefs::FromJson(const std::wstring& json) {
         if (!pulse::json::ExtractBool(builtin, std::wstring(BuiltinMenuKey(item)), true))
             builtin_hidden |= BuiltinMenuBit(item);
     }
-
-    item_enabled.clear();
-    const std::wstring items = ExtractObject(json, L"items");
-    if (!items.empty()) {
-        size_t pos = 1;
-        while (pos < items.size()) {
-            while (pos < items.size() && items[pos] != L'"' && items[pos] != L'}') ++pos;
-            if (pos >= items.size() || items[pos] == L'}') break;
-            ++pos;
-            const std::wstring key = pulse::json::UnescapeString(items, pos);
-            size_t obj = items.find(L'{', pos);
-            if (obj == std::wstring::npos) break;
-            size_t end = items.find(L'}', obj);
-            if (end == std::wstring::npos) break;
-            const std::wstring block = items.substr(obj, end - obj + 1);
-            item_enabled[key] = pulse::json::ExtractBool(block, L"enabled", true);
-            pos = end + 1;
+    ResetBuiltinOrder();
+    const std::wstring orders = ExtractObject(json, L"pulse_order");
+    for (int s = 0; s < static_cast<int>(BuiltinMenuSurface::Count) && !orders.empty(); ++s) {
+        const std::wstring keys = pulse::json::ExtractString(orders, kOrderKeys[s]);
+        BuiltinMenuOrder order;
+        for (size_t at = 0; at < keys.size();) {
+            size_t end = keys.find(L',', at);
+            if (end == std::wstring::npos) end = keys.size();
+            const std::wstring_view key(keys.data() + at, end - at);
+            for (int i = 0; i < kBuiltinMenuItemCount; ++i)
+                if (BuiltinMenuKey(static_cast<BuiltinMenuItem>(i)) == key) order.push_back(static_cast<BuiltinMenuItem>(i));
+            at = end + 1;
         }
+        SetBuiltinOrder(static_cast<BuiltinMenuSurface>(s), order);
     }
+
+    // Keys are menu ids such as "h:{GUID}" and texts are whatever the menu
+    // shows, so values are walked with the shared string-aware readers.
+    item_enabled.clear();
+    pulse::json::ForEachMember(ExtractObject(json, L"items"),
+        [&](const std::wstring& key, const std::wstring& block) {
+            item_enabled[key] = pulse::json::ExtractBool(block, L"enabled", true);
+        });
 
     seen.clear();
-    size_t pos = json.find(L"\"seen\"");
-    if (pos != std::wstring::npos) pos = json.find(L'[', pos);
-    if (pos != std::wstring::npos) {
-        ++pos;
-        while (pos < json.size() && json[pos] != L']') {
-            const size_t obj = json.find(L'{', pos);
-            if (obj == std::wstring::npos) break;
-            const size_t close_arr = json.find(L']', pos);
-            if (close_arr != std::wstring::npos && obj > close_arr) break;
-            const size_t end = json.find(L'}', obj);
-            if (end == std::wstring::npos) break;
-            const std::wstring block = json.substr(obj, end - obj + 1);
-            SeenMenuItem item;
-            item.key = pulse::json::ExtractString(block, L"key");
-            item.text = pulse::json::ExtractString(block, L"text");
-            item.flyout = pulse::json::ExtractString(block, L"kind") == L"flyout";
-            item.from_com = pulse::json::ExtractString(block, L"source") == L"com";
-            item.category = ipc::ParseCtxMenuCategory(pulse::json::ExtractString(block, L"category"));
-            if (!item.key.empty() && !item.text.empty()) seen.push_back(std::move(item));
-            pos = end + 1;
-        }
-    }
+    pulse::json::ForEachElement(pulse::json::ExtractArray(json, L"seen"), [&](const std::wstring& block) {
+        if (block.empty() || block.front() != L'{') return;
+        SeenMenuItem item;
+        item.key = pulse::json::ExtractString(block, L"key");
+        item.text = pulse::json::ExtractString(block, L"text");
+        item.flyout = pulse::json::ExtractString(block, L"kind") == L"flyout";
+        item.from_com = pulse::json::ExtractString(block, L"source") == L"com";
+        item.category = ipc::ParseCtxMenuCategory(pulse::json::ExtractString(block, L"category"));
+        if (!item.key.empty() && !item.text.empty()) seen.push_back(std::move(item));
+    });
 
     MigrateSeenKeys();
     CoalesceCompressCatalog();
 
     slow_ext.clear();
-    const std::wstring slow = ExtractObject(json, L"slow_ext");
-    if (!slow.empty()) {
-        size_t p = 1;
-        while (p < slow.size()) {
-            while (p < slow.size() && slow[p] != L'"' && slow[p] != L'}') ++p;
-            if (p >= slow.size() || slow[p] == L'}') break;
-            ++p;
-            const std::wstring key = pulse::json::UnescapeString(slow, p);
-            size_t obj = slow.find(L'{', p);
-            if (obj == std::wstring::npos) break;
-            size_t end = slow.find(L'}', obj);
-            if (end == std::wstring::npos) break;
-            const std::wstring block = slow.substr(obj, end - obj + 1);
+    pulse::json::ForEachMember(ExtractObject(json, L"slow_ext"),
+        [&](const std::wstring& key, const std::wstring& block) {
+            if (key.empty() || block.empty() || block.front() != L'{') return;
             SlowComExt st;
             st.last_ms = static_cast<uint32_t>(
                 std::max(0, pulse::json::ExtractInt(block, L"ms", 0)));
@@ -395,27 +404,77 @@ bool ContextMenuPrefs::FromJson(const std::wstring& json) {
                 std::max(0, pulse::json::ExtractInt(block, L"timeout", 0)));
             st.deferred = pulse::json::ExtractBool(block, L"deferred", false);
             st.disabled = pulse::json::ExtractBool(block, L"disabled", false);
-            if (!key.empty()) slow_ext[key] = st;
-            p = end + 1;
+            slow_ext[key] = st;
+        });
+    // Purge disable state older builds persisted for SendTo (#77): the
+    // exemption above keeps it clear, so this migration is idempotent.
+    slow_ext.erase(ipc::SendToHandlerCatalogKey());
+    migrated = false;
+    if (pulse::json::ExtractInt(json, L"version", 1) < kPrefsVersion) {
+        // Drop the old heuristic's verdicts (every entry there was recorded
+        // as a synthetic 1000 ms "timeout") and the per-type timings nothing
+        // reads. Explicit switches in "items" are the user's and stay.
+        for (auto it = slow_ext.begin(); it != slow_ext.end();) {
+            if (!ipc::IsHandlerCatalogKey(it->first)) {
+                it = slow_ext.erase(it);
+                continue;
+            }
+            it->second.slow_hits = 0;
+            it->second.timeout_hits = 0;
+            it->second.deferred = false;
+            it->second.disabled = false;
+            ++it;
         }
+        // Explorer's 打开方式 flyout now stands in for Pulse's static row and
+        // follows the 打开方式 switch; older catalogs filed it as a COM row.
+        for (auto& item : seen) {
+            if (item.flyout && item.category == ipc::CtxMenuCategory::OpenWith)
+                item.from_com = false;
+        }
+        migrated = true;
     }
     return true;
 }
 
 // Older builds keyed the catalog by raw display text, so one verb showed up once
 // per file type ("新建(N)" / "新建(W)", "用 X 打开" with and without spaces) and
-// switching one of them off left its siblings on. Re-key every row through
-// CatalogKey, merge the duplicates, and move the stored overrides onto the
-// normalized keys so a switch the user already flipped keeps applying.
+// switching one of them off left its siblings on. Only display-text identities
+// are migrated; command and handler identities must remain language independent.
 void ContextMenuPrefs::MigrateSeenKeys() {
+    constexpr std::wstring_view quick_access = L"pulse:quick-access";
+    const auto display_key = [](std::wstring_view key) {
+        return key.starts_with(L"v:") || key.starts_with(L"f:");
+    };
+    const auto old_quick_access = [&](const SeenMenuItem& item) {
+        if (!item.key.starts_with(L"v:") || item.flyout || item.from_com ||
+            item.category != ipc::CtxMenuCategory::Software) return false;
+        const auto normalized = ipc::NormalizeCatalogText(item.text);
+        for (const auto label : {L"Pin to Quick access", L"固定到快速访问", L"固定到快速存取"}) {
+            if (normalized == ipc::NormalizeCatalogText(label) &&
+                ipc::NormalizeCatalogText(item.key.substr(2)) == normalized) return true;
+        }
+        return false;
+    };
+    std::unordered_set<std::wstring> repaired_aliases;
+    std::unordered_set<std::wstring> observed_keys;
+    for (const auto& item : seen) observed_keys.insert(item.key);
+    // Older preferences can retain an override after its seen row was evicted.
+    // Only infer the legacy Pulse alias when no row identifies it as COM/other.
+    for (const auto& [key, enabled] : item_enabled) {
+        (void)enabled;
+        if (observed_keys.contains(key) || !key.starts_with(L"v:")) continue;
+        const auto normalized = ipc::NormalizeCatalogText(key.substr(2));
+        for (const auto label : {L"Pin to Quick access", L"固定到快速访问", L"固定到快速存取"})
+            if (normalized == ipc::NormalizeCatalogText(label)) repaired_aliases.insert(key);
+    }
     std::vector<SeenMenuItem> merged;
     merged.reserve(seen.size());
     for (auto& item : seen) {
-        if (ipc::IsHandlerCatalogKey(item.key)) {
-            merged.push_back(std::move(item));
-            continue;
-        }
-        const std::wstring canonical = ipc::CatalogKey(item.text, item.flyout);
+        std::wstring canonical = item.key;
+        if (old_quick_access(item)) {
+            repaired_aliases.insert(item.key);
+            canonical = quick_access;
+        } else if (display_key(item.key)) canonical = ipc::CatalogKey(item.text, item.flyout);
         if (canonical.empty()) continue;
         bool duplicate = false;
         for (const auto& kept : merged) {
@@ -432,13 +491,17 @@ void ContextMenuPrefs::MigrateSeenKeys() {
 
     std::unordered_map<std::wstring, bool> moved;
     moved.reserve(item_enabled.size());
+    const bool has_stable_choice = item_enabled.contains(std::wstring(quick_access));
     for (const auto& kv : item_enabled) {
         std::wstring key = kv.first;
-        if (!ipc::IsHandlerCatalogKey(key) && key.size() > 2 && key[1] == L':' &&
-            (key[0] == L'v' || key[0] == L'f')) {
+        if (repaired_aliases.contains(key)) {
+            if (has_stable_choice) continue;
+            key = quick_access;
+        } else if (display_key(key)) {
             key = key.substr(0, 2) + ipc::NormalizeCatalogText(key.substr(2));
         }
-        moved[key] = kv.second;
+        const auto [it, inserted] = moved.emplace(key, kv.second);
+        if (!inserted) it->second = it->second && kv.second;
     }
     item_enabled = std::move(moved);
 }
@@ -482,118 +545,33 @@ void ContextMenuPrefs::CoalesceCompressCatalog() {
         item_enabled[ipc::CompressCatalogKey()] = false;
 }
 
-// The main file first, its backup when the main one is missing, unreadable, or too
-// incomplete to trust. This file is a setting like app.json, so it gets the same set
-// of guarantees: a merge instead of a whole-file overwrite, a backup one step back, a
-// completeness gate on the key count, and no write at all when nothing can be read. A
-// backed-up file also heals a truncated one: the next Save() writes the merged state
-// back over the damaged main file.
-bool ContextMenuPrefs::ReadDiskState(ContextMenuPrefsValues& values, bool& main_exists,
-                                     bool* used_backup) const {
-    main_exists = false;
-    if (used_backup) *used_backup = false;
-    const std::wstring dir = GetPulseDataDir();
-    if (dir.empty()) return false;
-    const std::wstring main_path = dir + L"\\context_menu.json";
-    const std::wstring backup_path = main_path + L".bak";
-    main_exists = GetFileAttributesW(main_path.c_str()) != INVALID_FILE_ATTRIBUTES;
-
-    std::wstring main_json;
-    std::wstring backup_json;
-    const bool main_read = ReadUtf8File(main_path, main_json) && !main_json.empty();
-    const bool backup_read = ReadUtf8File(backup_path, backup_json) && !backup_json.empty();
-    const int main_keys = main_read ? CountStoredKeys(main_json) : 0;
-    const int backup_keys = backup_read ? CountStoredKeys(backup_json) : 0;
-
-    // A complete main file wins outright; anything else is compared key by key, so a
-    // half-written file never hides the copy that still has the settings in it.
-    const std::wstring* source = nullptr;
-    if (main_read && main_keys >= kMinStoredKeys) source = &main_json;
-    else if (backup_read && backup_keys >= kMinStoredKeys) source = &backup_json;
-    else if (main_read && backup_read)
-        source = main_keys >= backup_keys ? &main_json : &backup_json;
-    else if (main_read) source = &main_json;
-    else if (backup_read) source = &backup_json;
-    if (!source) return false;
-    if (used_backup) *used_backup = source == &backup_json;
-
-    ContextMenuPrefs parsed;
-    parsed.persist = false;
-    if (!parsed.FromJson(*source)) return false;
-    values = parsed;
-    return true;
-}
-
-ContextMenuPrefsValues ContextMenuPrefs::MergedWithDisk(
-    const ContextMenuPrefsValues& disk) const {
-    const ContextMenuPrefsValues& mine = *this;
-    const ContextMenuPrefsValues& baseline = disk_state_;
-    ContextMenuPrefsValues merged = mine;
-    if (mine.software == baseline.software) merged.software = disk.software;
-    if (mine.share == baseline.share) merged.share = disk.share;
-    if (mine.wallpaper == baseline.wallpaper) merged.wallpaper = disk.wallpaper;
-    if (mine.rotate == baseline.rotate) merged.rotate = disk.rotate;
-    if (mine.shortcut == baseline.shortcut) merged.shortcut = disk.shortcut;
-    if (mine.open_with == baseline.open_with) merged.open_with = disk.open_with;
-    if (mine.open_with_com == baseline.open_with_com) merged.open_with_com = disk.open_with_com;
-    if (mine.system_extra == baseline.system_extra) merged.system_extra = disk.system_extra;
-    if (mine.print == baseline.print) merged.print = disk.print;
-    if (mine.explorer_cap == baseline.explorer_cap) merged.explorer_cap = disk.explorer_cap;
-    if (mine.open_with_mru == baseline.open_with_mru) merged.open_with_mru = disk.open_with_mru;
-    if (mine.item_enabled == baseline.item_enabled) merged.item_enabled = disk.item_enabled;
-    if (mine.seen == baseline.seen) merged.seen = disk.seen;
-    if (mine.slow_ext == baseline.slow_ext) merged.slow_ext = disk.slow_ext;
-    return merged;
-}
-
 bool ContextMenuPrefs::Load() {
     const std::wstring dir = GetPulseDataDir();
-    if (dir.empty()) {
-        disk_state_ = *this;
-        loaded_from_file_ = false;
+    if (dir.empty()) { load_failed = true; return false; }
+    const std::wstring file = dir + L"\\context_menu.json";
+    const DWORD attributes = GetFileAttributesW(file.c_str());
+    const DWORD code = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    const bool missing = attributes == INVALID_FILE_ATTRIBUTES &&
+        (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND);
+    std::wstring json;
+    if (!missing && (!ReadUtf8File(file, json) || !FromJson(json))) {
+        load_failed = true;
         return false;
     }
-    ContextMenuPrefsValues disk;
-    bool main_exists = false;
-    loaded_from_file_ = ReadDiskState(disk, main_exists);
-    if (loaded_from_file_) static_cast<ContextMenuPrefsValues&>(*this) = disk;
-    // What this process runs with is the state the next merge compares against.
-    disk_state_ = *this;
-    return loaded_from_file_;
+    load_failed = false;
+    if (migrated) {
+        Save();
+        migrated = false;
+    }
+    return true;
 }
 
 bool ContextMenuPrefs::Save() const {
     if (!persist) return true;
+    if (load_failed) return false;
     const std::wstring dir = GetPulseDataDir();
     if (dir.empty()) return false;
-    const std::wstring path = dir + L"\\context_menu.json";
-
-    ContextMenuPrefsValues disk;
-    bool main_exists = false;
-    bool used_backup = false;
-    const bool disk_known = ReadDiskState(disk, main_exists, &used_backup);
-
-    bool quarantined = false;
-    if (!disk_known && main_exists) {
-        // The file is there but nothing in it (or its backup) can be read: keep those
-        // bytes as context_menu.json.bad instead of overwriting the only copy. A
-        // failing rename means another process holds the file, so leave it alone.
-        if (!QuarantineUnreadableFile(path)) return false;
-        quarantined = true;
-    }
-
-    ContextMenuPrefs out = *this;
-    if (disk_known) static_cast<ContextMenuPrefsValues&>(out) = MergedWithDisk(disk);
-
-    // One step back for the next Load(); skipped when that file became the .bad
-    // evidence, and when the values came from the backup that just saved us. The
-    // policy has a single copy in utf8_file.h (KeepPreviousFileCopy), shared with
-    // app.json.
-    if (!quarantined && main_exists && !used_backup) KeepPreviousFileCopy(path);
-
-    if (!WriteUtf8FileAtomic(path, out.ToJson())) return false;
-    disk_state_ = *this;
-    return true;
+    return WriteUtf8FileAtomic(dir + L"\\context_menu.json", ToJson());
 }
 
 } // namespace pulse::app

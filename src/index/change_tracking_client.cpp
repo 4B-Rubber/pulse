@@ -165,15 +165,17 @@ bool IsNetworkPath(const std::wstring& path) {
            (path.starts_with(L"\\\\") && !path.starts_with(L"\\\\?\\") && !path.starts_with(L"\\\\.\\"));
 }
 bool NetworkExchange(uint32_t type, const std::vector<uint8_t>& payload, std::vector<uint8_t>& reply, HANDLE cancel = nullptr, DWORD timeout_ms = 1500) {
-    HANDLE pipe = CreateFileW(agent::kPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                               OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    const auto pipe_name = agent::PipeName();
+    if (pipe_name.empty()) return false;
+    HANDLE pipe = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
     if (pipe == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY &&
-        WaitNamedPipeW(agent::kPipeName, 200)) {
-        pipe = CreateFileW(agent::kPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        WaitNamedPipeW(pipe_name.c_str(), 200)) {
+        pipe = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
     }
     if (pipe == INVALID_HANDLE_VALUE) return false;
-    const bool ok = Exchange(pipe, type, payload, reply, agent::kMagic, nullptr, timeout_ms, cancel);
+    const bool ok = agent::AuthorizedServer(pipe) && Exchange(pipe, type, payload, reply, agent::kMagic, nullptr, timeout_ms, cancel);
     CloseHandle(pipe);
     return ok;
 }

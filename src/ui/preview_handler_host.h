@@ -27,6 +27,7 @@ public:
     void SetNotifyWindow(HWND hwnd);
     void Hide();
     void Reset();
+    uint64_t NextWatchdogDeadline() const;
     // Re-evaluates the popup overlay's screen position after its owner moves.
     // This only wakes the STA worker; it does not reopen the preview content.
     void Reposition();
@@ -41,6 +42,10 @@ public:
               bool immediate = false);
 
     State state() const;
+    uint64_t NextDeadline() const;
+#ifdef PULSE_WITH_SELFTEST
+    void PrimeStalledOpenForTest();
+#endif
     static bool CanHost(const std::wstring& path);
 
 #ifdef PULSE_PREVIEW_HANDLER_TESTING

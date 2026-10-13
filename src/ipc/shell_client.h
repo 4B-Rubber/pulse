@@ -3,7 +3,8 @@
 // Owns the child process lifetime: pipe connects to \\.\pipe\pulse_shell_<pid>;
 // on send/receive failure the child is restarted (CreateProcess) and the
 // in-flight request is retried exactly once, then reported as failed.
-// All callbacks fire on the client's reader thread — never block the UI.
+// Callbacks run on the reader or synchronously on submit failure. A caller
+// must register ownership before sending, not after the request method returns.
 #pragma once
 #include "protocol.h"
 #include <windows.h>
@@ -32,6 +33,7 @@ struct CtxMenuItem {
     std::wstring text;
     std::wstring clsid;
     std::wstring handler;
+    wchar_t mnemonic = 0;         // access key ("&X" of the raw label), 0 = none
 };
 
 class ShellClient {
@@ -45,17 +47,22 @@ public:
                            std::vector<std::wstring> slow_clsids)> ctx_items;
     };
 
+    // Invoked once after ID allocation, before any send or completion callback.
+    // Only register ownership here; do not throw or perform blocking work.
+    // A zero return means not accepted and this callback was not invoked.
+    using Accepted = std::function<void(uint32_t)>;
+    using Reserved = Accepted;
     static ShellClient& Instance();
 
     void Start(Callbacks cb);
     void Stop();
 
-    uint32_t DeleteRecycle(const std::vector<std::wstring>& paths);
-    uint32_t RealDelete(const std::vector<std::wstring>& paths);
-    uint32_t RestoreRecycle(const std::vector<std::wstring>& paths);
-    uint32_t Rename(const std::wstring& path, const std::wstring& new_name);
-    uint32_t CreateFolder(const std::wstring& path);
-    uint32_t CreateNewFile(const std::wstring& path);
+    uint32_t DeleteRecycle(const std::vector<std::wstring>& paths, const Accepted& accepted = {});
+    uint32_t RealDelete(const std::vector<std::wstring>& paths, const Accepted& accepted = {});
+    uint32_t RestoreRecycle(const std::vector<std::wstring>& paths, const Accepted& accepted = {});
+    uint32_t Rename(const std::wstring& path, const std::wstring& new_name, const Accepted& accepted = {});
+    uint32_t CreateFolder(const std::wstring& path, const Accepted& accepted = {});
+    uint32_t CreateNewFile(const std::wstring& path, const Accepted& accepted = {});
     void Cancel(uint32_t id);
     void Abort(uint32_t id);
     bool Ping();
@@ -66,30 +73,49 @@ public:
     // sessions dismissed without invoking.
     uint32_t QueryContextMenu(const std::vector<std::wstring>& paths,
                               uint32_t owner_hwnd, bool background, bool extended,
-                              const std::vector<std::wstring>& disabled_clsids = {});
+                              const std::vector<std::wstring>& disabled_clsids = {}, const Accepted& accepted = {});
     uint32_t InvokeContextMenu(uint32_t session_id, uint32_t item_id,
                                const std::wstring& verb = {},
-                               const std::wstring& text = {});
+                               const std::wstring& text = {}, const Accepted& accepted = {});
     void CloseContextMenu(uint32_t session_id);
 
 private:
+#ifdef PULSE_SHELL_CLIENT_TEST
+    friend struct ShellClientTestAccess;
+#endif
+#ifdef PULSE_ELEVATED_TEST_CLIENT
+    friend struct ShellClientReviewTestAccess;
+#endif
     ShellClient() = default;
     ~ShellClient();
 
+    struct Connection {
+        Connection() = default;
+        Connection(const Connection&) = delete;
+        Connection& operator=(const Connection&) = delete;
+        HANDLE pipe = INVALID_HANDLE_VALUE;
+        uint64_t generation = 0;
+        bool retired = false; // send_mutex_ held for every access
+        ~Connection() { if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe); }
+    };
     struct Pending {
         uint32_t type = 0;
         uint32_t id = 0;
         std::vector<uint8_t> payload;
         bool retried = false;
+        bool retrying = false; // remains in pending_ so Abort can remove it
+        uint64_t generation = 0;
     };
 
-    uint32_t Submit(uint32_t type, const std::vector<uint8_t>& payload);
+    uint32_t Submit(uint32_t type, const std::vector<uint8_t>& payload, const Accepted& accepted = {});
     bool EnsureConnected();
     bool SpawnChild();
     void KillChild();
     bool SendFrame(uint32_t type, uint32_t id, const std::vector<uint8_t>& payload);
     void ReaderThread();
-    void HandleDisconnect();
+    void RetireConnectionLocked(const std::shared_ptr<Connection>& connection);
+    bool ReadFull(const std::shared_ptr<Connection>& connection, void* out, DWORD size);
+    void HandleDisconnect(const std::shared_ptr<Connection>& connection);
     void FireDone(uint32_t id, uint32_t hr, bool cancelled, const std::wstring& error);
     const std::wstring& UnreachableMessage() const;
 
@@ -98,7 +124,8 @@ private:
     std::mutex pending_mutex_;
     std::map<uint32_t, Pending> pending_;
 
-    HANDLE pipe_ = INVALID_HANDLE_VALUE;
+    std::shared_ptr<Connection> connection_;
+    uint64_t next_generation_ = 1;
     PROCESS_INFORMATION child_{};
     bool child_started_ = false;
     std::wstring last_error_;

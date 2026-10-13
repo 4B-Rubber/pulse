@@ -237,10 +237,18 @@ void ShowAddressSearchHistory(AppState& s) {
             app::AdvancedSearchSpec spec;
             std::wstring rest;
             app::ExtractSmartFilters(draft, spec, rest);
-            spec.name = rest;
-            spec.current_folder = s.addressSearchRoot;
-            spec.location = s.addressSearchCurrent && !spec.current_folder.empty()
-                ? app::LocationScope::CurrentFolder : app::LocationScope::Indexed;
+            const auto filters = spec;
+            spec = app::ParseSearchQuery(app::CompileNameQueryInput(rest,
+                s.addressSearchCurrent ? s.addressSearchRoot : L""));
+            if (filters.kind != index::SearchKind::Any) {
+                spec.kind = filters.kind;
+                spec.custom_exts = filters.custom_exts;
+            }
+            if (filters.date != app::DatePreset::Any) spec.date = filters.date;
+            if (filters.size != app::SizePreset::Any) {
+                spec.size = filters.size;
+                spec.size_custom = filters.size_custom;
+            }
             const auto path = app::MakeSearchPath(app::CompileSearchQuery(spec));
             s.addressLiveDue = s.addressHistoryDue = 0;
             HideAddressEditor(s, false);

@@ -25,6 +25,188 @@ struct ContentRefreshTestPeer {
 }
 
 namespace {
+std::vector<std::pair<std::wstring, bool>> recorded_opens;
+void RecordOpen(std::wstring path, bool location) { recorded_opens.emplace_back(std::move(path), location); }
+
+int RunSelectionIdentityTests() {
+    using State = pulse::GlobalSearchWindowTestPeer::State;
+    using pulse::index::SearchResult;
+    pulse::l10n::Initialize(GetModuleHandleW(nullptr), L"en-US");
+    int failures = 0;
+    auto check = [&](bool ok, const char* label) {
+        std::cout << (ok ? "[PASS] " : "[FAIL] ") << label << '\n';
+        if (!ok) ++failures;
+    };
+    auto results = [](std::initializer_list<const wchar_t*> names, DWORD error = 0) {
+        SearchResult result;
+        result.error = error;
+        for (const auto* name : names) {
+            pulse::index::Hit hit;
+            hit.name = name;
+            hit.path = L"C:\\synthetic-global-search\\" + hit.name;
+            result.hits.push_back(std::move(hit));
+        }
+        result.total = result.hits.size();
+        return result;
+    };
+    auto selected_path = [](const State& state) {
+        return state.selected >= 0 && static_cast<size_t>(state.selected) < state.rows.size()
+            ? state.rows[static_cast<size_t>(state.selected)].path : std::wstring{};
+    };
+    for (bool network_first : {false, true}) {
+        State state;
+        state.AcceptFilenames(network_first, state.generation, results({L"b.txt", L"c.txt"}));
+        state.Key(VK_DOWN);
+        const auto selected = selected_path(state);
+        state.AcceptFilenames(!network_first, state.generation, results({L"a.txt"}));
+        check(selected.ends_with(L"c.txt") && selected_path(state) == selected && state.rows.size() == 3,
+              "both provider arrival orders preserve keyboard-selected path");
+        recorded_opens.clear();
+        state.Open(false, RecordOpen);
+        state.Open(true, RecordOpen);
+        check(recorded_opens == std::vector<std::pair<std::wstring, bool>>{{selected, false}, {selected, true}},
+              "open and open-location dispatch the retained identity only");
+    }
+    {
+        State state;
+        auto first = results({L"same.txt", L"same.txt"});
+        first.hits[1].path = L"D:\\synthetic-global-search\\same.txt";
+        state.AcceptFilenames(true, state.generation, first);
+        // The production mouse handler computes this displayed row from y.
+        state.Message(WM_LBUTTONDOWN, 0, MAKELPARAM(30, 136 + static_cast<int>(pulse::kRow) + 10));
+        const auto selected = selected_path(state);
+        state.AcceptFilenames(false, state.generation, results({L"inserted.txt", L"same.txt"}));
+        check(selected.starts_with(L"D:") && selected_path(state) == selected && state.rows.size() == 3,
+              "same names in different directories retain mouse-selected full path");
+    }
+    {
+        State state;
+        auto original = results({L"UPPER.TXT"});
+        state.AcceptFilenames(true, state.generation, original);
+        state.AcceptFilenames(false, state.generation, results({L"upper.txt"}));
+        check(state.rows.size() == 1 && state.selected == 0 && selected_path(state).ends_with(L"upper.txt"),
+              "case-insensitive dedup retains selected Windows path identity");
+    }
+    {
+        State state;
+        SearchResult many;
+        for (int i = 0; i < 20; ++i) {
+            auto row = results({L"row.txt"}).hits.front();
+            row.path += std::to_wstring(i);
+            many.hits.push_back(std::move(row));
+        }
+        many.total = many.hits.size();
+        state.AcceptFilenames(true, state.generation, many);
+        state.first = 5; state.selected = 7;
+        const auto anchor = state.rows[5].path;
+        const auto selection = selected_path(state);
+        state.AcceptFilenames(false, state.generation, results({L"before.txt"}));
+        check(state.rows[static_cast<size_t>(state.first)].path == anchor && selected_path(state) == selection,
+              "provider insertion preserves scroll anchor without forcing selection into view");
+    }
+    {
+        State state;
+        state.AcceptFilenames(true, state.generation, results({L"evicted.txt"}));
+        SearchResult full;
+        for (size_t i = 0; i < pulse::kMaximumResults; ++i) {
+            auto row = results({L"local.txt"}).hits.front();
+            row.path += std::to_wstring(i);
+            full.hits.push_back(std::move(row));
+        }
+        full.total = full.hits.size();
+        state.AcceptFilenames(false, state.generation, std::move(full));
+        recorded_opens.clear();
+        state.Open(false, RecordOpen); state.Open(true, RecordOpen);
+        check(state.selected == -1 && recorded_opens.empty() && state.truncated,
+              "cap-evicted selection cannot silently open a replacement result");
+        state.Key(VK_RETURN);
+        check(state.selected == -1, "Enter remains inert until user reselects after eviction");
+        state.Key(VK_DOWN);
+        state.Open(false, RecordOpen);
+        check(recorded_opens.size() == 1 && recorded_opens.front().first == state.rows.front().path,
+              "explicit keyboard movement establishes a new actionable selection");
+    }
+    {
+        State state;
+        state.AcceptFilenames(false, state.generation, results({L"first.txt"}));
+        const auto old_generation = state.generation;
+        state.Cancel();
+        state.AcceptFilenames(true, old_generation, results({L"stale.txt"}));
+        check(state.rows.size() == 1 && state.rows.front().name == L"first.txt",
+              "cancelled generation cannot replace filename selection");
+        state.Changed();
+        state.AcceptFilenames(false, state.generation, results({L"fresh.txt"}));
+        check(state.selected == 0 && selected_path(state).ends_with(L"fresh.txt"),
+              "new query resets selection to first new result");
+    }
+    for (bool network_first : {false, true}) {
+        State state;
+        state.providers.ExpectNetwork(false);
+        const auto local = results({L"usable.txt"});
+        const auto failure = results({}, ERROR_CONNECTION_ABORTED);
+        if (network_first) {
+            state.AcceptFilenames(true, state.generation, failure);
+            state.AcceptFilenames(false, state.generation, local);
+        } else {
+            state.AcceptFilenames(false, state.generation, local);
+            state.AcceptFilenames(true, state.generation, failure);
+        }
+        check(!state.busy && state.error.empty() && state.rows.size() == 1u && !state.network_result.error,
+              "no network roots: unreachable agent (1236) leaves a complete local result");
+    }
+    for (bool local_has_hit : {false, true}) for (DWORD error : {DWORD{ERROR_CONNECTION_ABORTED}, DWORD{ERROR_INVALID_DATA}})
+        for (bool network_first : {false, true}) {
+            State state;
+            const auto local = local_has_hit ? results({L"usable.txt"}) : results({});
+            const auto failure = results({}, error);
+            if (network_first) {
+                state.AcceptFilenames(true, state.generation, failure);
+                state.AcceptFilenames(false, state.generation, local);
+            } else {
+                state.AcceptFilenames(false, state.generation, local);
+                state.AcceptFilenames(true, state.generation, failure);
+            }
+            const auto expected = pulse::Text(local_has_hit ? pulse::l10n::StringId::SearchIncomplete
+                                                          : pulse::l10n::StringId::GlobalSearchFailed);
+            check(!state.busy && !state.error.empty() && state.error == expected &&
+                  state.network_result.error == error && state.rows.size() == (local_has_hit ? 1u : 0u),
+                  "provider failure preserves usable rows and distinguishes partial from empty error");
+            state.AcceptFilenames(false, state.generation, local);
+            check(state.error == expected, "unrelated provider success cannot erase network failure");
+            state.AcceptFilenames(true, state.generation, results({}));
+            check(state.error.empty() && !state.busy, "successful retry clears only its provider error");
+        }
+    {
+        State state;
+        state.busy = true;
+        state.Message(WM_TIMER, pulse::kConnectTimeout, 0);
+        check(!state.busy && state.local_result.error == ERROR_TIMEOUT && state.network_result.error == ERROR_TIMEOUT &&
+              !state.error.empty(), "timeout marks every pending provider failed");
+        state.AcceptFilenames(false, state.generation, results({L"late.txt"}));
+        check(state.rows.size() == 1 && state.network_result.error == ERROR_TIMEOUT &&
+              state.error == pulse::Text(pulse::l10n::StringId::SearchIncomplete),
+              "one late success retains the other provider timeout and partial status");
+        state.AcceptFilenames(true, state.generation, results({}));
+        check(!state.busy && state.error.empty(), "both late successes recover timeout state");
+    }
+    {
+        State state;
+        state.AcceptFilenames(false, state.generation, results({}, ERROR_INVALID_DATA));
+        state.AcceptFilenames(true, state.generation, results({L"network.txt"}));
+        check(state.local_result.error == ERROR_INVALID_DATA && state.rows.size() == 1 &&
+              state.error == pulse::Text(pulse::l10n::StringId::SearchIncomplete),
+              "network success preserves independent local provider failure");
+    }
+    {
+        State state;
+        state.AcceptFilenames(false, state.generation, results({}));
+        state.AcceptFilenames(true, state.generation, results({}));
+        check(state.rows.empty() && state.error.empty() && !state.busy,
+              "two successful empty providers remain genuine no-results state");
+    }
+    return failures ? 1 : 0;
+}
+
 void Pump(DWORD milliseconds) {
     const auto end = GetTickCount64() + milliseconds;
     do {
@@ -97,8 +279,96 @@ bool Capture(pulse::GlobalSearchWindowTestPeer::State& state, const std::wstring
     if (FAILED(result)) std::cout << "Capture failure HRESULT=0x" << std::hex << static_cast<unsigned long>(result) << std::dec << '\n';
     return SUCCEEDED(result);
 }
+
+int RunProviderStatusRender(const std::filesystem::path& parent) {
+    using State = pulse::GlobalSearchWindowTestPeer::State;
+    using SetAwareness = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    const auto set_awareness = reinterpret_cast<SetAwareness>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
+    if (set_awareness) set_awareness(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(initialized)) return 2;
+    pulse::l10n::Initialize(GetModuleHandleW(nullptr), L"en-US");
+    const auto output = parent / (L"provider-status-" + std::to_wstring(GetCurrentProcessId()) +
+                                  L"-" + std::to_wstring(GetTickCount64()));
+    std::error_code directory_error;
+    std::filesystem::create_directories(parent, directory_error);
+    if (directory_error || !std::filesystem::create_directory(output, directory_error)) {
+        CoUninitialize();
+        return 2;
+    }
+    std::wcout << L"[ARTIFACT] " << output.wstring() << L'\n';
+    int failures = 0;
+    const auto check = [&](bool ok, const char* label) {
+        std::cout << (ok ? "[PASS] " : "[FAIL] ") << label << '\n';
+        if (!ok) ++failures;
+    };
+    for (bool dark : {false, true}) for (float scale : {1.0f, 1.5f}) {
+        State state;
+        state.dark = dark;
+        state.scale = scale;
+        // A private hidden HWND supplies the real compositor target. Never call
+        // GlobalSearchWindow::Show, which would start the provider clients.
+        state.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP, L"STATIC",
+            L"Pulse provider-status render fixture", WS_POPUP | WS_CLIPCHILDREN, 0, 0,
+            state.Px(780), state.Px(488), nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (state.hwnd) state.edit = pulse::ui::CreateChildEdit(state.hwnd);
+        const bool ready = state.hwnd && state.edit && state.EnsureTarget();
+        check(ready, "private hidden window initializes real compositor without providers");
+        if (!ready) continue;
+        SetWindowTheme(state.edit, L"", L"");
+        SetLayeredWindowAttributes(state.edit, 0, 255, LWA_ALPHA);
+        ShowWindow(state.edit, SW_SHOW);
+        SetWindowTextW(state.edit, L"report");
+        state.query = L"report";
+        state.Layout();
+        state.ApplyAppearance();
+        auto text_fits = [&](float width, float height, float size) {
+            Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
+            Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+            HRESULT result = state.write_factory->CreateTextFormat(L"Segoe UI", nullptr,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                size * pulse::ui::typography::UiFontScale(), pulse::l10n::LocaleName(), &format);
+            if (SUCCEEDED(result)) {
+                format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                result = state.write_factory->CreateTextLayout(state.error.c_str(),
+                    static_cast<UINT32>(state.error.size()), format.Get(), width, height, &layout);
+            }
+            DWRITE_TEXT_METRICS metrics{};
+            if (SUCCEEDED(result)) result = layout->GetMetrics(&metrics);
+            return SUCCEEDED(result) && metrics.widthIncludingTrailingWhitespace <= width && metrics.height <= height;
+        };
+        for (bool partial : {true, false}) {
+            pulse::index::SearchResult local, network;
+            if (partial) {
+                pulse::index::Hit hit;
+                hit.name = L"report.txt";
+                hit.path = (output / L"synthetic-report.txt").wstring();
+                local.hits.push_back(std::move(hit));
+                local.total = 1;
+            }
+            network.error = ERROR_CONNECTION_ABORTED;
+            state.AcceptFilenames(false, state.generation, std::move(local));
+            state.AcceptFilenames(true, state.generation, std::move(network));
+            const std::wstring name = std::wstring(partial ? L"partial-" : L"empty-error-") +
+                (dark ? L"dark-" : L"light-") + (scale == 1.0f ? L"100.png" : L"150.png");
+            check(!state.busy && !state.error.empty() && state.rows.size() == (partial ? 1u : 0u),
+                  "real merge supplies requested provider error rendering state");
+            check(partial ? state.FooterStatus() == pulse::Text(pulse::l10n::StringId::SearchIncomplete)
+                          : state.FooterStatus().empty(),
+                  "production footer shows partial status and leaves empty error to the center");
+            check(partial ? text_fits(130, 32, 12) : text_fits(state.width - 32, state.height - pulse::kFooter - 144, 16),
+                  "partial footer or empty-state error text fits its production bounds");
+            check(Capture(state, (output / name).wstring()), "capture provider error with production Paint");
+        }
+    }
+    CoUninitialize();
+    return failures ? 1 : 0;
+}
 }
 int wmain(int argc, wchar_t** argv) {
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--selection-identity") return RunSelectionIdentityTests();
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--provider-status-render")
+        return RunProviderStatusRender(argc > 2 ? argv[2] : L"bench_data/global-search-provider-status");
     using SetAwareness = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
     const auto set_awareness = reinterpret_cast<SetAwareness>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
     if (set_awareness) set_awareness(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -127,7 +397,7 @@ int wmain(int argc, wchar_t** argv) {
     state.rows = {
         {L"2026 年第三季度预算.xlsx", L"D:\\工作\\财务\\2026 年第三季度预算.xlsx", L"本次季度预算总额为 128 万元，主要用于产品研发…", false},
         {L"项目预算评审.pdf", L"D:\\工作\\项目资料\\项目预算评审.pdf", L"季度预算调整方案已通过评审，将于下周执行。", false},
-        {L"预算会议纪要.docx", L"C:\\Users\\SS\\Documents\\预算会议纪要.docx", L"会议确认季度预算与部门年度计划保持一致。", false}
+        {L"预算会议纪要.docx", L"C:\\Users\\Example\\Documents\\预算会议纪要.docx", L"会议确认季度预算与部门年度计划保持一致。", false}
     };
     state.total = state.rows.size();
     check(Capture(state, (output / L"content-dark.png").wstring()), "Capture content dark");
@@ -223,7 +493,7 @@ int wmain(int argc, wchar_t** argv) {
     state.local_result.hits = {{L"C:\\fixture\\same.txt", L"same.txt", false}};
     state.local_result.total = 1;
     state.network_result.hits = {{L"c:\\FIXTURE\\SAME.txt", L"SAME.txt", false}, {L"\\\\server\\share\\network.txt", L"network.txt", false}};
-    state.network_result.total = 2; state.local_ready = state.network_ready = true;
+    state.network_result.total = 2; state.providers.local_ready = state.providers.network_ready = true;
     state.MergeFilenames();
     check(state.rows.size() == 2 && state.total == 2 && !state.busy, "Local and network merge deduplicates Windows paths");
     state.error.clear(); state.content_mode = true; state.current_only = true;

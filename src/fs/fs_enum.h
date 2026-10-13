@@ -1,11 +1,12 @@
 // fs_enum.h — Directory enumeration: NtQueryDirectoryFile primary,
 // FindFirstFileExW+LARGE_FETCH fallback. No Shell COM, no reparse following.
 #pragma once
+#include <atomic>
 #include <windows.h>
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <vector>
+#include <functional>
 
 namespace pulse::fs {
 
@@ -48,6 +49,7 @@ struct DirEntry {
     // (no media). Read on the worker thread with the rest of the listing.
     uint64_t drive_total = 0;
     uint64_t drive_free = 0;
+    bool drive_locked = false; // "This PC" rows: BitLocker volume not unlocked yet
 };
 
 // pulse:tag: / pulse:search: / pulse:workspace: — not filesystem paths.
@@ -66,15 +68,21 @@ std::wstring ParentPath(const std::wstring& path);
 // "计算图形.dwg.lnk" -> "计算图形.dwg" for display.
 std::wstring StripLnkSuffix(const std::wstring& name);
 
+// Enumerate a directory into out. Throws std::runtime_error on failure.
+void EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out, const std::atomic_bool* cancelled = nullptr);
 // Progress hook for a long enumeration: called between batches with everything
 // gathered so far (the vector being filled; do not modify it). Returning false stops
 // the scan, and the call then reports false as well. Failures still throw.
 using EnumerateProgress = std::function<bool(const std::vector<DirEntry>&)>;
-
-// Enumerate a directory into out. Throws std::runtime_error on failure.
-// Returns false when a progress callback asked to stop.
-bool EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out,
-                        const EnumerateProgress& progress = {});
+// Enumerate with a progress hook. Returns false when the hook asked to stop.
+bool EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out, const EnumerateProgress& progress);
+struct EnumerationOptions {
+    std::function<bool()> cancelled;
+    DWORD timeout_ms = 15000;
+};
+// Bounded caller wait. Retired I/O retains its own buffers until the provider
+// completes; callbacks are consulted only by the caller, never by retired work.
+void EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out, const EnumerationOptions& options);
 
 // Metadata-only lookup for worker-side updates; never follows the target.
 DWORD ReadReparseTag(const std::wstring& path);

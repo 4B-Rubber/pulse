@@ -25,6 +25,8 @@ private:
     ContentResultSort sort_ = ContentResultSort::Index;
     bool descending_ = false;
     std::vector<ContentHit> changes_;
+    std::vector<ContentHit> pending_hits_;
+    ULONGLONG last_publish_ = 0;
     std::shared_ptr<ContentResultStore> results_;
     std::shared_ptr<ContentResultStore> previous_;
 };

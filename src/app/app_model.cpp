@@ -1,5 +1,9 @@
 // app_model.cpp
 #include "app_model.h"
+#include "split_tree_shape.h"
+#include "layout_pane_selection.h"
+#include "network_sidebar.h"
+#include "../common/config_json.h"
 #include "search_query.h"
 #include "entry_group.h"
 #include "../common/json_utils.h"
@@ -219,6 +223,11 @@ void Tab::MaterializeSelection() {
     for (int i = 0; i < n; ++i) if (EntryVisible(i)) selected.insert(i);
 }
 
+void Tab::FocusFirstEntry() {
+    ClearSelection();
+    focus_hint_revision = selection_revision;
+}
+
 void Tab::SelectOnly(int index) {
     RememberSelection remember{*this};
     ++selection_revision;
@@ -252,7 +261,7 @@ void Tab::ToggleSelect(int index) {
     }
 }
 
-void Tab::SelectRange(int from, int to) {
+void Tab::SelectRange(int from, int to, const ui::PaneViewModel* view) {
     RememberSelection remember{*this};
     ++selection_revision;
     const int n = CountBound();
@@ -264,11 +273,44 @@ void Tab::SelectRange(int from, int to) {
     to = std::clamp(to, 0, n - 1);
     all_selected = false;
     selected.clear();
-    const int lo = std::min(from, to);
-    const int hi = std::max(from, to);
+    int first = view ? view->ViewIndex(from) : from;
+    const int last = view ? view->ViewIndex(to) : to;
+    if (last < 0 || (view && static_cast<size_t>(last) >= view->EntryCount())) {
+        ClearSelection();
+        return;
+    }
+    // A filter or collapsed group can remove the old anchor. Start a new
+    // range at the target instead of widening it across invisible entries.
+    const auto* groups = view ? view->Groups() : nullptr;
+    const auto collapsed = [&](int row) {
+        if (groups) for (const auto& group : *groups) {
+            if (row >= group.first && row < group.first + group.count) return group.collapsed;
+        }
+        return false;
+    };
+    if (collapsed(last)) {
+        ClearSelection();
+        return;
+    }
+    if (first < 0 || collapsed(first)) {
+        first = last;
+        from = to;
+        selection_anchor = from;
+    }
+    const int lo = std::min(first, last);
+    const int hi = std::max(first, last);
     selected.reserve(static_cast<size_t>(hi - lo + 1));
-    for (int i = lo; i <= hi; ++i) if (EntryVisible(i)) selected.insert(i);
-    selected_index = to;
+    size_t group_index = 0;
+    for (int row = lo; row <= hi; ++row) {
+        if (groups) {
+            while (group_index < groups->size() &&
+                   row >= (*groups)[group_index].first + (*groups)[group_index].count) ++group_index;
+            if (group_index < groups->size() && (*groups)[group_index].collapsed) continue;
+        }
+        const int source = view ? view->SourceIndex(row) : row;
+        if (EntryVisible(source)) selected.insert(source);
+    }
+    selected_index = selected.contains(to) ? to : -1;
     if (selection_anchor < 0) selection_anchor = from;
 }
 
@@ -364,7 +406,7 @@ void Tab::InvertIndices(const std::vector<int>& universe) {
     }
 }
 
-void Tab::MoveFocus(int index, bool extend) {
+void Tab::MoveFocus(int index, bool extend, const ui::PaneViewModel* view) {
     const int n = CountBound();
     if (n <= 0) {
         ClearSelection();
@@ -374,7 +416,7 @@ void Tab::MoveFocus(int index, bool extend) {
     if (extend) {
         if (selection_anchor < 0)
             selection_anchor = selected_index >= 0 ? selected_index : index;
-        SelectRange(selection_anchor, index);
+        SelectRange(selection_anchor, index, view);
     } else {
         SelectOnly(index);
     }
@@ -437,32 +479,22 @@ void Tab::SelectionSizeSummary(uint64_t* bytes, int* files, int* folders) const 
     if (folders) *folders = c.folders;
 }
 
-void Tab::RemapSelection(const std::vector<std::wstring>& names, const std::wstring& focus_name) {
+void Tab::RemapSelection(const std::vector<std::wstring>& names, const std::wstring& focus_name,
+                         bool select_first_if_missing) {
     ClearSelection();
     const int n = CountBound();
     if (n <= 0 || names.empty()) {
-        if (n > 0) SelectOnly(0);
+        if (n > 0 && select_first_if_missing) SelectOnly(0);
         return;
     }
     std::unordered_set<std::wstring> want(names.begin(), names.end());
     for (int i = 0; i < n; ++i) {
-        if (!EntryVisible(i)) continue;
-        const fs::DirEntry& entry = EntryAt(static_cast<size_t>(i));
-        // Entry names for a real folder; full paths for a virtual view (Recent, starred, a
-        // tag): those rows have no folder to join a leaf name onto, and two of them may share
-        // one. A hand-off from another window lands here, so both keys are accepted.
-        if (!want.contains(entry.name) &&
-            (entry.full_path.empty() || !want.contains(entry.full_path))) {
-            continue;
-        }
+        if (!EntryVisible(i) || !want.contains(EntryAt(static_cast<size_t>(i)).name)) continue;
         selected.insert(i);
-        if (entry.name == focus_name ||
-            (!entry.full_path.empty() && entry.full_path == focus_name)) {
-            selected_index = i;
-        }
+        if (EntryAt(static_cast<size_t>(i)).name == focus_name) selected_index = i;
     }
     if (selected.empty()) {
-        SelectOnly(0);
+        if (select_first_if_missing) SelectOnly(0);
         return;
     }
     if (selected_index < 0) selected_index = *selected.begin();
@@ -580,12 +612,22 @@ std::unique_ptr<LayoutTab> MakeSingleLayoutTab(const std::wstring& path, const T
 }
 
 void RebuildLayoutRoot(LayoutTab& tab) {
+    if (tab.layout == LayoutPreset::Custom) {
+        // A free tree has no preset to be rebuilt from (M7k): it stays while
+        // every leaf is a pane of the tab, else the tab takes a preset.
+        std::vector<Pane*> leaves;
+        if (tab.root) tab.root->CollectPanes(leaves);
+        const bool owned = !leaves.empty() && std::all_of(leaves.begin(), leaves.end(), [&](const Pane* leaf) {
+            return std::any_of(tab.panes.begin(), tab.panes.end(),
+                               [&](const std::unique_ptr<Pane>& pane) { return pane.get() == leaf; });
+        });
+        if (owned) return;
+        tab.layout = PresetForPaneCount(tab.panes.size());
+    }
     const size_t n = LayoutPresetCount(tab.layout);
-    std::vector<Pane*> used;
-    used.reserve(n);
-    for (size_t i = 0; i < n && i < tab.panes.size(); ++i)
-        used.push_back(tab.panes[i].get());
-    if (used.empty() && !tab.panes.empty()) used.push_back(tab.panes[0].get());
+    std::vector<Pane*> visible;
+    if (tab.root) tab.root->CollectPanes(visible);
+    const auto used = SelectLayoutPanes(tab.panes, tab.FocusedPane(), n, visible);
     tab.root = used.empty() ? nullptr : MakePresetTree(tab.layout, used);
 }
 
@@ -617,13 +659,44 @@ LayoutTab& WindowTabs::NewTabAt(size_t index, const std::wstring& path) {
 }
 
 void WindowTabs::CloseTab(size_t idx) {
-    // Never empty the window: the last tab goes away by closing the window
-    // (see WindowTabs::ClosingLastTab), and a pinned tab is not closable.
     if (idx >= items.size() || items.size() <= 1) return;
     if (items[idx]->pinned) return;
     items.erase(items.begin() + static_cast<ptrdiff_t>(idx));
     if (active >= items.size()) active = items.size() - 1;
     else if (idx < active) --active;
+}
+
+std::unique_ptr<LayoutTab> WindowTabs::TakeTab(size_t idx, bool allow_last) {
+    if (idx >= items.size() || (items.size() <= 1 && !allow_last) || !items[idx]) return nullptr;
+    std::unique_ptr<LayoutTab> tab = std::move(items[idx]);
+    items.erase(items.begin() + static_cast<ptrdiff_t>(idx));
+    if (items.empty()) active = 0;
+    else if (active >= items.size()) active = items.size() - 1;
+    else if (idx < active) --active;
+    const int group = tab->tab_group;
+    tab->tab_group = 0;
+    if (group && std::none_of(items.begin(), items.end(),
+                              [group](const auto& other) { return other->tab_group == group; })) {
+        tab_groups.erase(std::remove_if(tab_groups.begin(), tab_groups.end(),
+                                        [group](const TabGroup& g) { return g.id == group; }),
+                         tab_groups.end());
+    }
+    return tab;
+}
+
+size_t WindowTabs::InsertTab(std::unique_ptr<LayoutTab> tab, size_t index) {
+    if (!tab) return active;
+    tab->tab_group = 0;
+    size_t first_unpinned = 0;
+    while (first_unpinned < items.size() && items[first_unpinned]->pinned) ++first_unpinned;
+    index = tab->pinned ? (std::min)(index, first_unpinned)
+                        : std::clamp(index, first_unpinned, items.size());
+    while (index > 0 && index < items.size() && items[index - 1]->tab_group != 0 &&
+           items[index - 1]->tab_group == items[index]->tab_group)
+        ++index;
+    items.insert(items.begin() + static_cast<ptrdiff_t>(index), std::move(tab));
+    active = index;
+    return index;
 }
 
 void WindowTabs::SwitchTab(size_t idx) {
@@ -632,6 +705,14 @@ void WindowTabs::SwitchTab(size_t idx) {
 
 void WindowTabs::MoveTab(size_t from, size_t to) {
     if (from >= items.size() || to >= items.size() || from == to) return;
+
+    // TogglePin changes the moved tab's flag before moving it to its new region.
+    // Count the other pins so that transition and ordinary dragging share a boundary.
+    size_t other_pins = 0;
+    for (size_t i = 0; i < items.size(); ++i)
+        if (i != from && items[i]->pinned) ++other_pins;
+    to = items[from]->pinned ? (std::min)(to, other_pins) : (std::max)(to, other_pins);
+    if (from == to) return;
 
     auto moved = std::move(items[from]);
     items.erase(items.begin() + static_cast<std::ptrdiff_t>(from));
@@ -681,6 +762,7 @@ size_t LayoutPresetCount(LayoutPreset preset) {
     case LayoutPreset::TwoHorizontal: return 2;
     case LayoutPreset::Three: return 3;
     case LayoutPreset::FourGrid: return 4;
+    case LayoutPreset::Custom: return 0;  // its tree's leaves
     }
     return 1;
 }
@@ -709,22 +791,6 @@ std::unique_ptr<SplitContainer> MakePresetTree(LayoutPreset preset,
     default:
         return leaf(panes[0]);
     }
-}
-
-float ClampSplitRatio(float ratio, const D2D1_RECT_F& bounds, SplitOrientation orientation,
-                      float gap) {
-    const float g = std::max(0.0f, gap);
-    const float span = (orientation == SplitOrientation::Vertical)
-        ? std::max(0.0f, bounds.right - bounds.left - g)
-        : std::max(0.0f, bounds.bottom - bounds.top - g);
-    const float minPx = std::min(std::max(80.0f, g * 20.0f), span * 0.35f);
-    float lo = span > 1.0f ? std::clamp(minPx / span, 0.08f, 0.45f) : 0.12f;
-    float hi = 1.0f - lo;
-    if (lo >= hi) {
-        lo = 0.12f;
-        hi = 0.88f;
-    }
-    return std::clamp(ratio, lo, hi);
 }
 
 void ApplySplitRatio(SplitContainer& node, const D2D1_RECT_F& parent_bounds, float gap,
@@ -758,50 +824,6 @@ static void ApplySplitRatiosAt(SplitContainer& node, const std::vector<float>& r
 void ApplySplitRatios(SplitContainer& node, const std::vector<float>& ratios) {
     size_t index = 0;
     ApplySplitRatiosAt(node, ratios, index);
-}
-
-void LayoutSplitTree(const SplitContainer& node, const D2D1_RECT_F& bounds, float gap,
-                     std::vector<std::pair<Pane*, D2D1_RECT_F>>& out,
-                     std::vector<SplitterLayout>* splitters) {
-    if (node.is_leaf) {
-        if (node.pane) out.push_back({node.pane, bounds});
-        return;
-    }
-    const float g = std::max(0.0f, gap);
-    const float span = (node.orientation == SplitOrientation::Vertical)
-        ? std::max(0.0f, bounds.right - bounds.left - g)
-        : std::max(0.0f, bounds.bottom - bounds.top - g);
-    const float ratio = ClampSplitRatio(node.ratio, bounds, node.orientation, gap);
-    D2D1_RECT_F a = bounds;
-    D2D1_RECT_F b = bounds;
-    D2D1_RECT_F hit = bounds;
-    if (node.orientation == SplitOrientation::Vertical) {
-        const float mid = bounds.left + span * ratio;
-        a.right = mid;
-        b.left = mid + g;
-        const float hitHalf = std::max(g, 8.0f) * 0.5f;
-        const float center = mid + g * 0.5f;
-        hit.left = center - hitHalf;
-        hit.right = center + hitHalf;
-    } else {
-        const float mid = bounds.top + span * ratio;
-        a.bottom = mid;
-        b.top = mid + g;
-        const float hitHalf = std::max(g, 8.0f) * 0.5f;
-        const float center = mid + g * 0.5f;
-        hit.top = center - hitHalf;
-        hit.bottom = center + hitHalf;
-    }
-    if (splitters) {
-        SplitterLayout slot;
-        slot.node = const_cast<SplitContainer*>(&node);
-        slot.hit_rect = hit;
-        slot.parent_bounds = bounds;
-        slot.orientation = node.orientation;
-        splitters->push_back(slot);
-    }
-    if (node.first) LayoutSplitTree(*node.first, a, gap, out, splitters);
-    if (node.second) LayoutSplitTree(*node.second, b, gap, out, splitters);
 }
 
 // ---------------------------------------------------------------------------
@@ -862,10 +884,12 @@ static std::wstring DisplayPath(const std::wstring& path) {
 void StagingTray::Collect(const std::vector<std::wstring>& paths, bool move_intent) {
     if (paths.empty()) return;
     TrayBatch batch;
+    batch.id = next_id_++;
     batch.move_intent = move_intent;
     batch.total_size = 0;
     for (const auto& p : paths) {
         TrayItem it;
+        it.id = next_id_++;
         it.path = fs::NormalizePath(p);
         // One probe covers existence, icon attrs and the rough size sum.
         WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -890,9 +914,58 @@ void StagingTray::Collect(const std::vector<std::wstring>& paths, bool move_inte
 
 void StagingTray::ReplacePath(const std::wstring& from, const std::wstring& to) {
     const std::wstring key = fs::NormalizePath(from);
-    for (auto& batch : batches_)
-        for (auto& item : batch.items)
-            if (_wcsicmp(item.path.c_str(), key.c_str()) == 0) item.path = fs::NormalizePath(to);
+    std::wstring target = fs::NormalizePath(to);
+    if (key.empty() || target.empty()) return;
+    for (auto& batch : batches_) {
+        for (auto& item : batch.items) {
+            if (item.inflight_task != 0) continue;
+            if (_wcsicmp(item.path.c_str(), key.c_str()) == 0) {
+                item.path = target;
+                continue;
+            }
+            // Items staged from inside a renamed or moved folder follow it.
+            const bool child = item.path.size() > key.size() &&
+                _wcsnicmp(item.path.c_str(), key.c_str(), key.size()) == 0 &&
+                (key.back() == L'\\' || item.path[key.size()] == L'\\');
+            if (!child) continue;
+            std::wstring rest = item.path.substr(key.size());
+            if (rest.empty() || rest.front() != L'\\') rest.insert(rest.begin(), L'\\');
+            std::wstring base = target;
+            while (!base.empty() && base.back() == L'\\') base.pop_back();
+            item.path = base + rest;
+        }
+    }
+}
+
+void StagingTray::MarkPendingMove(uint64_t task_id, const std::vector<std::wstring>& paths,
+                                  std::optional<size_t> batch) {
+    std::vector<uint64_t> ids;
+    for (size_t b = 0; b < batches_.size(); ++b) {
+        if (batch && b != *batch) continue;
+        for (const auto& item : batches_[b].items)
+            if (std::any_of(paths.begin(), paths.end(), [&](const auto& path) {
+                return _wcsicmp(item.path.c_str(), fs::NormalizePath(path).c_str()) == 0;
+            })) ids.push_back(item.id);
+    }
+    MarkInFlight(task_id, ids, true);
+}
+void StagingTray::CompleteMove(uint64_t task_id, const std::vector<std::wstring>& moved) {
+    CompleteTask(task_id, moved);
+}
+
+void StagingTray::ApplyMetadata(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& data) {
+    for (auto& batch : batches_) {
+        for (auto& item : batch.items) {
+            if (item.path != path) continue;
+            batch.total_size -= std::min(batch.total_size, item.size);
+            item.exists = true;
+            item.attrs = data.dwFileAttributes;
+            item.is_dir = (item.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            item.size = item.is_dir ? 0 :
+                (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+            batch.total_size += item.size;
+        }
+    }
 }
 
 bool StagingTray::RefreshExists() {
@@ -948,6 +1021,52 @@ void StagingTray::RemoveItem(size_t batch_idx, size_t item_idx) {
 
 void StagingTray::Clear() { batches_.clear(); }
 
+void StagingTray::MarkInFlight(uint64_t task_id, const std::vector<uint64_t>& item_ids, bool move) {
+    if (!task_id) return;
+    for (auto& batch : batches_)
+        for (auto& item : batch.items)
+            if (!item.inflight_task && std::find(item_ids.begin(), item_ids.end(), item.id) != item_ids.end()) {
+                item.inflight_task = task_id;
+                item.inflight_move = move;
+                item.inflight_source = item.path;
+                inflight_sources_[task_id].push_back(item.path);
+            }
+}
+
+void StagingTray::CompleteTask(uint64_t task_id, const std::vector<std::wstring>& moved_sources) {
+    if (!task_id) return;
+    inflight_sources_.erase(task_id);
+    for (size_t b = batches_.size(); b-- > 0;) {
+        auto& batch = batches_[b];
+        for (size_t i = batch.items.size(); i-- > 0;) {
+            auto& item = batch.items[i];
+            if (item.inflight_task != task_id) continue;
+            const bool consume = item.inflight_move && std::any_of(moved_sources.begin(), moved_sources.end(),
+                [&](const auto& source) {
+                    return _wcsicmp(fs::NormalizePath(source).c_str(), item.inflight_source.c_str()) == 0;
+                });
+            item.inflight_task = 0;
+            item.inflight_move = false;
+            item.inflight_source.clear();
+            if (consume) {
+                batch.total_size -= std::min(batch.total_size, item.size);
+                batch.items.erase(batch.items.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+        }
+        if (batch.items.empty()) batches_.erase(batches_.begin() + static_cast<std::ptrdiff_t>(b));
+    }
+}
+
+bool StagingTray::IsInFlight(const std::wstring& path) const {
+    const auto normalized = fs::NormalizePath(path);
+    for (const auto& [task, sources] : inflight_sources_) {
+        (void)task;
+        for (const auto& source : sources)
+            if (_wcsicmp(source.c_str(), normalized.c_str()) == 0) return true;
+    }
+    return false;
+}
+
 void StagingTray::RemoveDeleted(const std::vector<std::wstring>& paths) {
     for (const auto& path : paths) {
         if (path.empty()) continue;
@@ -986,74 +1105,35 @@ void StagingTray::ToJson(std::wstring& out) const {
 }
 
 bool StagingTray::FromJson(const std::wstring& in) {
-    batches_.clear();
-    // Minimal parser: enough for our own serialization.
-    size_t i = in.find(L'[');
-    if (i == std::wstring::npos) return false;
-    ++i;
-    while (i < in.size()) {
-        while (i < in.size() && (in[i] == L' ' || in[i] == L'\n' || in[i] == L'\r' || in[i] == L'\t' || in[i] == L',')) ++i;
-        if (i >= in.size() || in[i] == L']') break;
-        if (in[i] != L'{') return false;
-        ++i;
+    if (!pulse::json::ValidConfigArray(in)) return false;
+    std::vector<TrayBatch> parsed;
+    const size_t open = in.find(L'[');
+    if (open == std::wstring::npos) return false;
+    const size_t close = pulse::json::MatchingClose(in, open);
+    if (close == std::wstring::npos) return false;
+    const bool ok = pulse::json::ForEachElement(in.substr(open, close - open + 1), [&](const std::wstring& block) {
+        if (block.empty() || block.front() != L'{') return;
         TrayBatch batch;
-        while (i < in.size() && in[i] != L'}') {
-            while (i < in.size() && (in[i] == L' ' || in[i] == L'\n' || in[i] == L'\r' || in[i] == L'\t' || in[i] == L',')) ++i;
-            size_t keyEnd = in.find(L'"', i + 1);
-            if (keyEnd == std::wstring::npos) return false;
-            std::wstring key = in.substr(i + 1, keyEnd - i - 1);
-            i = keyEnd + 1;
-            while (i < in.size() && in[i] != L':') ++i;
-            if (i >= in.size()) return false;
-            ++i;
-            while (i < in.size() && (in[i] == L' ' || in[i] == L'\n' || in[i] == L'\r' || in[i] == L'\t')) ++i;
-            if (key == L"move") {
-                batch.move_intent = (i + 4 <= in.size() && in.compare(i, 4, L"true") == 0);
-                if (batch.move_intent) i += 4; else i += 5;
-            } else if (key == L"items") {
-                while (i < in.size() && in[i] != L'[') ++i;
-                if (i >= in.size()) return false;
-                ++i;
-                while (i < in.size() && in[i] != L']') {
-                    while (i < in.size() && (in[i] == L' ' || in[i] == L'\n' || in[i] == L'\r' || in[i] == L'\t' || in[i] == L',')) ++i;
-                    if (in[i] != L'"') { ++i; continue; }
-                    ++i;
-                    std::wstring path;
-                    while (i < in.size() && in[i] != L'"') {
-                        if (in[i] == L'\\' && i + 1 < in.size()) {
-                            ++i;
-                            if (in[i] == L'n') path += L'\n';
-                            else if (in[i] == L'r') path += L'\r';
-                            else if (in[i] == L't') path += L'\t';
-                            else path += in[i];
-                        } else {
-                            path += in[i];
-                        }
-                        ++i;
-                    }
-                    if (i < in.size()) ++i;
-                    TrayItem it;
-                    it.path = fs::NormalizePath(path);
-                    WIN32_FILE_ATTRIBUTE_DATA data{};
-                    it.exists = GetFileAttributesExW(it.path.c_str(),
-                        GetFileExInfoStandard, &data) != FALSE;
-                    it.attrs = it.exists ? data.dwFileAttributes : 0;
-                    it.is_dir = it.exists && (it.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                    if (it.exists && !it.is_dir) {
-                        it.size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) |
-                            data.nFileSizeLow;
-                        batch.total_size += it.size;
-                    }
-                    batch.items.push_back(std::move(it));
-                }
-                if (i < in.size()) ++i;
-            } else {
-                while (i < in.size() && in[i] != L',' && in[i] != L'}') ++i;
+        batch.id = next_id_++;
+        batch.move_intent = pulse::json::ExtractBool(block, L"move");
+        for (const std::wstring& path : pulse::json::ExtractStringArray(block, L"items")) {
+            TrayItem it;
+            it.id = next_id_++;
+            it.path = fs::NormalizePath(path);
+            WIN32_FILE_ATTRIBUTE_DATA data{};
+            it.exists = GetFileAttributesExW(it.path.c_str(), GetFileExInfoStandard, &data) != FALSE;
+            it.attrs = it.exists ? data.dwFileAttributes : 0;
+            it.is_dir = it.exists && (it.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (it.exists && !it.is_dir) {
+                it.size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+                batch.total_size += it.size;
             }
+            batch.items.push_back(std::move(it));
         }
-        if (i < in.size()) ++i;
-        if (!batch.items.empty()) batches_.push_back(std::move(batch));
-    }
+        if (!batch.items.empty()) parsed.push_back(std::move(batch));
+    });
+    if (!ok) return false;
+    batches_ = std::move(parsed);
     return true;
 }
 
@@ -1185,6 +1265,28 @@ std::vector<int> NormalizeSidebarOrder(const std::vector<int>& order) {
     return out;
 }
 
+void RefreshSidebarDriveCapacity(std::vector<SidebarEntry>& drives) {
+    DWORD old_mode = 0;
+    const BOOL changed = SetThreadErrorMode(SEM_FAILCRITICALERRORS, &old_mode);
+    for (auto& entry : drives) {
+        ULARGE_INTEGER free_bytes{}, total_bytes{};
+        entry.detail.clear();
+        entry.used_ratio = 0.0f;
+        entry.danger = false;
+        if (!GetDiskFreeSpaceExW(entry.path.c_str(), &free_bytes, &total_bytes, nullptr))
+            continue;
+        const uint64_t total = total_bytes.QuadPart;
+        const uint64_t free = std::min(free_bytes.QuadPart, total_bytes.QuadPart);
+        entry.detail = pulse::format::ByteSize(free, false, pulse::format::ByteSizeStyle::Compact)
+            + L" / " + pulse::format::ByteSize(total, false, pulse::format::ByteSizeStyle::Compact);
+        if (total > 0) {
+            entry.used_ratio = static_cast<float>(static_cast<double>(total - free) / static_cast<double>(total));
+            entry.danger = static_cast<double>(free) / static_cast<double>(total) < 0.10;
+        }
+    }
+    if (changed) SetThreadErrorMode(old_mode, nullptr);
+}
+
 SidebarModel BuildSidebarModel(const fs::RecycleBinInfo* recycle) {
     SidebarModel m;
     // Starred items lead their own section, next to (not inside) quick access.
@@ -1263,27 +1365,17 @@ SidebarModel BuildSidebarModel(const fs::RecycleBinInfo* recycle) {
         wchar_t volName[MAX_PATH + 1] = {};
         DWORD sn = 0;
         GetVolumeInformationW(root, volName, MAX_PATH, &sn, nullptr, nullptr, nullptr, 0);
-        ULARGE_INTEGER freeBytes{}, totalBytes{};
-        GetDiskFreeSpaceExW(root, &freeBytes, &totalBytes, nullptr);
         SidebarEntry e;
         e.label = std::wstring(volName[0] ? volName : l10n::Get(l10n::StringId::LocalDisk).c_str()) +
                   L" (" + root[0] + L":)";
-        uint64_t total = totalBytes.QuadPart;
-        uint64_t free = freeBytes.QuadPart;
-        e.detail = pulse::format::ByteSize(free, false, pulse::format::ByteSizeStyle::Compact)
-                 + L" / " + pulse::format::ByteSize(total, false,
-                                                     pulse::format::ByteSizeStyle::Compact);
         e.glyph = L"\xE7F1"; // HardDrive (Segoe Fluent Icons)
         e.fallback = L"Drive";
         e.path = fs::NormalizePath(std::wstring(root));
         e.is_drive = true;
         e.color = ui::HexColor(kDrivePalette[m.drives.size() % 4]);
-        if (total > 0) {
-            e.used_ratio = (float)((double)(total - free) / (double)total);
-            if ((double)free / (double)total < 0.10) e.danger = true;
-        }
         m.drives.push_back(std::move(e));
     }
+    RefreshSidebarDriveCapacity(m.drives);
     return m;
 }
 
@@ -1565,6 +1657,7 @@ void FillPaneViewModel(ui::PaneViewModel& out, const Pane& pane, const PlacesCat
     out.selected_count = tab->SelectedCount();
     out.all_selected = tab->all_selected;
     out.selected_indices = tab->all_selected ? nullptr : &tab->selected;
+    out.focus_first_hint = tab->HasFocusHint();
     out.scroll_y = tab->scroll_y;
     out.scroll_x = tab->scroll_x;
     out.view_mode = tab->view_mode;
@@ -1783,7 +1876,7 @@ std::wstring LayoutTabTitle(const LayoutTab& tab) {
     if (!view) return {};
     std::wstring name = view->virtual_title.empty()
         ? TabTitle(view->current_path) : view->virtual_title;
-    const size_t n = LayoutPresetCount(tab.layout);
+    const size_t n = tab.layout == LayoutPreset::Custom ? tab.VisiblePanes().size() : LayoutPresetCount(tab.layout);
     if (n > 1) {
         name += L" · ";
         name += std::to_wstring(n);
@@ -1822,57 +1915,7 @@ void FillWindowTabStrip(ui::WindowViewModel& vm, const WindowTabs& tabs) {
         }
         vm.tabs.push_back(std::move(tv));
     }
-    // A collapsed chip hides its members, so record which group owns the active
-    // tab: the chip renders itself as the selected tab for that group.
-    if (tabs.active < tabs.items.size()) {
-        const int active_group = tabs.items[tabs.active]->tab_group;
-        if (active_group != 0) {
-            for (auto& gv : vm.tab_groups) {
-                if (gv.id == active_group) { gv.has_active = true; break; }
-            }
-        }
-    }
     vm.active_tab = static_cast<int>(tabs.active);
-}
-
-std::vector<ui::TabGroupCardRow> TabGroupCardRows(const WindowTabs& tabs, int group_id,
-                                                  const LayoutTab* group_last_active) {
-    std::vector<ui::TabGroupCardRow> rows;
-    if (group_id == 0) return rows;
-    const TabGroup* group = nullptr;
-    for (const auto& candidate : tabs.tab_groups) {
-        if (candidate.id == group_id) { group = &candidate; break; }
-    }
-    if (!group) return rows;
-    // An expanded group already shows its tabs in the strip; only a collapsed
-    // chip needs the card to name them.
-    if (group->collapsed) {
-        const bool owns_active =
-            tabs.active < tabs.items.size() && tabs.items[tabs.active]->tab_group == group_id;
-        for (size_t i = 0; i < tabs.items.size(); ++i) {
-            if (tabs.items[i]->tab_group != group_id) continue;
-            ui::TabGroupCardRow row;
-            row.text = LayoutTabTitle(*tabs.items[i]);
-            row.tab_index = static_cast<int>(i);
-            // "You are here" wins over "you were here": the memory of the
-            // previous tab only shows while this group has no active tab.
-            row.active = i == tabs.active;
-            row.was_active = !owns_active && tabs.items[i].get() == group_last_active;
-            rows.push_back(std::move(row));
-        }
-        if (!rows.empty()) rows.back().separator_after = true;
-    }
-    ui::TabGroupCardRow new_tab;
-    new_tab.text = pulse::l10n::Get(pulse::l10n::StringId::TabGroupNew);
-    new_tab.glyph = L"\xE710";
-    new_tab.new_tab = true;
-    rows.push_back(std::move(new_tab));
-    ui::TabGroupCardRow edit;
-    edit.text = pulse::l10n::Get(pulse::l10n::StringId::TabGroupEdit);
-    edit.glyph = L"\xE70F";
-    edit.edit = true;
-    rows.push_back(std::move(edit));
-    return rows;
 }
 
 ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
@@ -2014,9 +2057,20 @@ ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
             ++starred_insert;
         }
     }
-    // The git repository a tab happens to sit in is not a quick-access entry:
-    // the section is what the user pinned, and the command palette's project
-    // search already offers the repository that contains the current folder.
+    const std::wstring& gitRoot = tab->git_root;
+    if (!gitRoot.empty() && (!places || !places->IsStarred(gitRoot))) {
+        ui::SidebarItem project;
+        wchar_t project_label[512]{};
+        swprintf_s(project_label, l10n::Get(l10n::StringId::ProjectFormat).c_str(),
+                   TabTitle(gitRoot).c_str());
+        project.label = project_label;
+        project.path = gitRoot;
+        project.icon_glyph = L"\xE8B7";
+        project.fallback_text = L"Repo";
+        project.icon_color = ui::HexColor(0x34D399);
+        project.badge = L"Git";
+        access.items.push_back(std::move(project));
+    }
     if (places) {
         for (const auto& path : places->quick_access_paths) {
             ui::SidebarItem item;
@@ -2090,6 +2144,7 @@ ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
             nets.items.push_back(std::move(it));
         }
     }
+    AppendSystemNetworkLocations(nets, sidebar.system_networks);
     // Emit the sections in the user's order. Ids and the collapse/hide bits are
     // re-applied here because ConvertGroup builds fresh groups.
     vm.sidebar.reserve(sections.size());

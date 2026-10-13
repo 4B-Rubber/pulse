@@ -7,6 +7,8 @@
 // as a ShellSelectRequest. When no pane shows the folder, the shell runs the
 // folder's open verb (Pulse, with the takeover on) and waits for a window
 // registered as pending for that folder — so a new pane registers at once.
+// The shell matches the folder's ID list byte for byte, so a folder below a
+// known folder (Desktop, Downloads…) is registered under both of its forms.
 //
 // Every call into Explorer runs on the registry's own STA thread; the UI
 // thread only publishes the wanted set and never blocks on the shell.
@@ -17,6 +19,8 @@
 #include <memory>
 #include <vector>
 
+struct IShellWindows;
+
 namespace pulse::app {
 
 // Selftest builds: appends a line to PULSE_TEST_SHELL_WINDOWS_LOG, if set.
@@ -26,13 +30,17 @@ class ShellWindowRegistry {
 public:
     // Selection requests are posted to `window` as `select_message` with a
     // heap-allocated ShellSelectRequest* in lParam (the receiver deletes it).
-    ShellWindowRegistry(HWND window, UINT select_message);
+    using CreateWindows = HRESULT (*)(IShellWindows**);
+    ShellWindowRegistry(HWND window, UINT select_message, CreateWindows create = nullptr);
+    bool Running() const;
     ~ShellWindowRegistry();
     ShellWindowRegistry(const ShellWindowRegistry&) = delete;
     ShellWindowRegistry& operator=(const ShellWindowRegistry&) = delete;
 
     // Replaces the wanted set; the thread applies the latest one it sees.
     void Publish(std::vector<ShellWindowEntry> wanted);
+    // UI-side liveness check only; failed thread creation is retried with backoff.
+    void EnsureRunning();
     // Revokes every registration and ends the thread, waiting at most
     // `timeout_ms` (a hung Explorer must not hold up closing Pulse).
     void Stop(DWORD timeout_ms = 2000);
@@ -42,6 +50,8 @@ public:
 private:
     std::shared_ptr<Shared> shared_;
     HANDLE thread_ = nullptr;
+    ULONGLONG next_start_ = 0;
+    DWORD start_retry_ms_ = 250;
 };
 
 } // namespace pulse::app

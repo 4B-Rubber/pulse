@@ -1,6 +1,7 @@
 #pragma once
 
 #include "app_prefs.h"
+#include "pack_installer.h"
 #include "context_menu_prefs.h"
 
 #include <cstdint>
@@ -11,6 +12,9 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+namespace pulse::ui { struct MediaPackOffer; }
+namespace pulse::packs { enum class PackId : uint32_t; }
 
 namespace pulse::index { class IndexClient; class NetworkAgentClient; }
 
@@ -32,7 +36,6 @@ enum class SettingsEffect : uint32_t {
     FolderSort = 1u << 11,
     TextRendering = 1u << 12,
     UiFontSize = 1u << 13,
-    MultiInstance = 1u << 14,
 };
 
 constexpr SettingsEffect operator|(SettingsEffect left, SettingsEffect right) noexcept {
@@ -54,6 +57,7 @@ enum class SettingsTaskKind : uint8_t {
     NetworkRebuild,
     NetworkRemove,
     DiagnosticsExport,
+    SystemExclusion,
 };
 
 constexpr bool IsNetworkTask(SettingsTaskKind kind) noexcept {
@@ -98,8 +102,8 @@ public:
         std::function<void(const std::wstring&)> open_path;
         std::function<void()> open_diagnostics;
         std::function<bool(std::wstring&)> clear_diagnostics;
-        std::function<bool(std::wstring&, bool&)> prepare_diagnostics_export;
-        std::function<bool(const std::wstring&, bool, std::wstring&)>
+        std::function<bool(std::wstring&, bool&, bool&)> prepare_diagnostics_export;
+        std::function<bool(const std::wstring&, bool, bool, std::wstring&)>
             export_diagnostics;
     };
 
@@ -116,6 +120,62 @@ public:
     float scroll() const noexcept { return scroll_; }
     void SetScroll(float value, float maximum) noexcept;
     void ScrollBy(float delta, float scale, float maximum) noexcept;
+
+    // Settings > 预览增强包 (page 5). The disk is read at most every 2 s while
+    // the page is shown; actions write packs.json and re-read at once.
+    struct PackState {
+        uint32_t ffmpeg = 0;              // packs::ToolSource: 0 none, 1 pack, 2 own FFmpeg
+        bool media_available = false, images_available = false;
+        bool media_installed = false;     // the FFmpeg pack itself is on disk
+        bool enabled = true, use_custom = false, remove_on_uninstall = true;
+        uint32_t installed = 0;
+        uint64_t bytes = 0;
+        std::wstring version, custom_path, detected_path, root, notice;
+        bool installing = false;          // a download is running
+        float progress = 0.0f;            // 0..1 while installing
+        // The image pack (现代图像格式): its own card, download and message.
+        bool images_installed = false, images_enabled = true;
+        bool images_installing = false;
+        float images_progress = 0.0f;
+        std::wstring images_version, images_notice;
+        bool raw_installed = false, raw_enabled = true, raw_installing = false;
+        bool raw_available = false;
+        float raw_progress = 0.0f;
+        std::wstring raw_version, raw_notice;
+        bool archive_installed = false, archive_enabled = true, archive_installing = false;
+        bool archive_available = false;
+        float archive_progress = 0.0f;
+        std::wstring archive_version, archive_notice;
+    };
+    const PackState& Packs();
+    // Each returns true when thumbnails have to be decoded again.
+    // Starts the download, or cancels the running one. `notify` repaints.
+    bool InstallMediaPack(HWND notify);
+    // Once per finished download: true when a pack was installed.
+    bool TakeMediaPackResult();
+    // What Quick Look's codec cards offer. Cheap enough for every repaint:
+    // the disk is read at most every 2 s and after each pack action.
+    void FillMediaPackOffer(ui::MediaPackOffer& offer);
+    bool RemoveMediaPack();
+    bool ToggleMediaPack();
+    // The same for the image pack.
+    bool InstallImagePack(HWND notify);
+    bool TakeImagePackResult();
+    void FillImagePackOffer(ui::MediaPackOffer& offer);
+    bool RemoveImagePack();
+    bool ToggleImagePack();
+    bool InstallRawPack(HWND notify);
+    bool TakeRawPackResult();
+    bool RemoveRawPack();
+    bool ToggleRawPack();
+    bool InstallArchivePack(HWND notify);
+    bool TakeArchivePackResult();
+    bool RemoveArchivePack();
+    bool ToggleArchivePack();
+    bool ToggleCustomFfmpeg();
+    bool SetCustomFfmpeg(const std::wstring& path);
+    bool UseDetectedFfmpeg();
+    void ToggleRemovePacksOnUninstall();
 
     bool VolumePending(std::wstring_view id) const;
     bool network_pending() const noexcept;
@@ -145,6 +205,7 @@ public:
     void StartupOpen(int index);
     void NotifyIcon(int index);
     void NewTabOpen(int index);
+    void ExternalOpen(int index);  // plan §6 policy (multi-window M7b)
     void BlankClick(int index);   // 0 nothing, 1 back, 2 up
     // 0 picks the default location's folder, 1 resets it to This PC.
     void HomeFolder(int action);
@@ -160,6 +221,19 @@ public:
     void Language(std::wstring_view language_id);
     void Wallpaper(int action);
     void ToggleUi(int index);
+    // 本地右键菜单 › Pulse 菜单 tab: 0 on a file, 1 blank area, 2 row buttons.
+    int ContextTab() const { return context_tab_; }
+    // Pulse menu preview: a row pressed for dragging (BuiltinMenuItem), live
+    // once the pointer moved 3 px along the tab's axis. EndMenuDrag drops
+    // the drag; SetMenuOrder saves the order for the current tab.
+    void BeginMenuDrag(int item, float pos, float grab) noexcept;
+    bool MenuDragMove(float pos) noexcept;
+    void EndMenuDrag() noexcept { menu_drag_item_ = -1; menu_drag_live_ = false; }
+    int menu_drag_item() const noexcept { return menu_drag_item_; }
+    bool menu_drag_live() const noexcept { return menu_drag_item_ >= 0 && menu_drag_live_; }
+    float menu_drag_pos() const noexcept { return menu_drag_pos_; }
+    float menu_drag_grab() const noexcept { return menu_drag_grab_; }
+    void SetMenuOrder(const BuiltinMenuOrder& order);
     void IntegrationAction(int index);
     int IntegrationState() const noexcept;
     std::wstring IntegrationSummary() const;
@@ -176,12 +250,17 @@ public:
     void ToggleVolume(int index);
     void AddExclude();
     void RemoveExclude(int index);
+    // 1 toggles the system folder switch, 2 expands its group list, and
+    // 10 + i toggles index::kSystemExclusionGroups[i].
+    void SystemExclusionAction(int action);
+    bool system_exclusion_expanded() const noexcept { return system_exclusion_expanded_; }
     void IndexAction(int action);
     void NetworkAction(int action, bool pin_after_add = false);
     void RemoveNetwork(int index);
     void DiagnosticsAction(int action);
 
 private:
+    int context_tab_ = 0;
     friend struct SettingsControllerTestPeer;
 
     struct TaskState {
@@ -194,10 +273,29 @@ private:
     };
 
     bool global_search_capturing_ = false;
+    bool system_exclusion_expanded_ = false;
     int slider_drag_ = -1;
+    int menu_drag_item_ = -1;
+    bool menu_drag_live_ = false;
+    float menu_drag_start_ = 0.0f, menu_drag_pos_ = 0.0f, menu_drag_grab_ = 0.0f;
     std::wstring global_search_error_;
     int page_ = 0;
     float scroll_ = 0.0f;
+    PackState packs_;
+    uint64_t packs_checked_ = 0;
+    uint64_t offer_checked_ = 0;
+    bool offer_missing_ = false;   // published, not installed, no own FFmpeg
+    void RefreshPacks();
+    PackInstaller media_installer_;
+    uint64_t image_offer_checked_ = 0;
+    bool image_offer_missing_ = false;   // published, not installed
+    PackInstaller image_installer_;
+    PackInstaller raw_installer_, archive_installer_;
+    PackInstaller& InstallerFor(packs::PackId id);
+    std::wstring& NoticeFor(packs::PackId id);
+    bool InstallPack(packs::PackId id, HWND notify);
+    bool TakePackResult(packs::PackId id);
+    bool RemovePack(packs::PackId id);
     std::shared_ptr<TaskState> task_state_ = std::make_shared<TaskState>();
     std::mutex workers_mutex_;
     std::vector<std::thread> workers_;

@@ -14,12 +14,31 @@
 #include <vector>
 
 namespace pulse::fs {
+struct DirNotifyEvent;
+// Overflow supersedes all pending details for this path. Keep one queue item
+// while a UI consumer is paused, instead of accumulating repeated refreshes.
+template<class Queue>
+void QueueDirectoryNotification(Queue& queue, const std::wstring& path, bool overflow,
+                                std::vector<DirNotifyEvent> events);
+
 
 struct DirNotifyEvent {
     DWORD action = 0;
     std::wstring name;
     std::wstring old_name;
 };
+template<class Queue>
+void QueueDirectoryNotification(Queue& queue, const std::wstring& path, bool overflow,
+                                std::vector<DirNotifyEvent> events) {
+    for (auto it = queue.begin(); it != queue.end();) {
+        if (it->path != path) { ++it; continue; }
+        if (!overflow && it->overflow) return;
+        if (overflow) it = queue.erase(it);
+        else ++it;
+    }
+    queue.push_back({path, overflow, std::move(events)});
+}
+
 
 class DirWatch {
 public:

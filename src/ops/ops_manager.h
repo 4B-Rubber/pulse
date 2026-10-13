@@ -36,6 +36,8 @@ enum class CollisionPolicy { System, Replace, KeepBoth };
 enum class OpPhase { Queued, Scanning, WaitingForConflict, Running, Paused,
                      Verifying, Cancelling, Completed, Failed };
 enum class ConflictChoice { Cancel, Replace, Skip, KeepBoth };
+enum class AuthorizationState { None, Requesting, ActionRequired };
+enum class AuthorizationChoice { Cancel, Retry, Skip };
 // Every task reports speed in exactly one unit; the transfer dialog labels the history
 // graph, the current speed and the peak from it. Empty-recycle counts as bytes because
 // its poller tracks recycled bytes.
@@ -71,7 +73,7 @@ struct OpRequest {
     OpType type = OpType::Copy;
     std::vector<std::wstring> sources;
     std::wstring dest_dir;    // Copy / Move
-    std::wstring new_name;    // Rename
+    std::wstring new_name;    // Rename, or explicit leaf name for a single-root Move
     std::vector<std::wstring> new_names; // BatchRename, parallel to sources
     CollisionPolicy collision_policy = CollisionPolicy::System; // Copy / Move
     bool is_undo = false;     // undo-originated ops do not re-enter the stack
@@ -96,6 +98,13 @@ struct UndoEntry {
 
 struct OpStatus {
     bool active = false;
+    bool can_pause = true;
+    AuthorizationState authorization = AuthorizationState::None;
+    bool can_skip_authorization = false;
+    // ActionRequired only: "Retry" was chosen and the attempt is in flight
+    // without a UAC prompt (reused elevated session). The dialog keeps the
+    // same view and disables its actions instead of switching views.
+    bool authorization_retrying = false;
     OpType type = OpType::Copy;
     OpPhase phase = OpPhase::Completed;
     uint64_t task_id = 0;
@@ -122,10 +131,23 @@ struct OpStatus {
 };
 
 struct CompletedOperation {
+    uint64_t task_id = 0;
     OpType type = OpType::Copy;
     std::vector<std::wstring> sources;
     std::vector<std::wstring> destinations;
+    bool refresh_only = false;
+    std::vector<std::wstring> refresh_directories;
 };
+
+struct FinishedTask {
+    uint64_t task_id = 0;
+    std::vector<std::wstring> moved_sources; // Confirmed whole request roots, never descendants alone.
+    OpType type = OpType::Copy;
+    bool success = false;
+    std::vector<std::wstring> sources;
+};
+
+using TaskResult = FinishedTask;
 
 struct RecoveryEntry {
     uint64_t sequence = 0;
@@ -150,15 +172,21 @@ struct ShellMenuItem {
     std::wstring text;
     std::wstring clsid;
     std::wstring handler;
+    wchar_t mnemonic = 0;        // access key from the Explorer label, 0 = none
 };
 
 class OpsManager {
+#ifdef PULSE_ELEVATED_TEST_CLIENT
+    friend struct OpsManagerReviewTestAccess;
+#endif
 public:
     OpsManager() = default;
     ~OpsManager();
 
     // notify is invoked from worker/IPC threads whenever status changes.
-    void Start(std::function<void()> notify);
+    // A picker uses a private copy/move/rename queue without taking ownership
+    // of the main window's singleton Shell client or its callbacks.
+    void Start(std::function<void()> notify, bool own_shell_client = true);
     void Stop();
 
     void SetJournalPath(std::wstring path);
@@ -183,6 +211,7 @@ public:
     void ResumeCurrent();
     std::optional<ConflictItemInfo> PendingConflict() const;
     void ResolveConflict(uint64_t token, ConflictChoice choice, bool apply_to_all);
+    void ResolveAuthorization(uint64_t task_id, bool retry);
     // Re-queue the operation that failed on a locked item (status.task_id).
     // close_owners = end the closable lock owners on the worker first. Items
     // that are already gone are skipped for delete/move.
@@ -241,22 +270,33 @@ public:
 
     OpStatus Status() const;
     std::vector<CompletedOperation> DrainCompletions();
+    std::vector<FinishedTask> DrainFinishedTasks();
+    std::vector<TaskResult> DrainTaskResults() { return DrainFinishedTasks(); }
 
     // Session persistence of the undo stack (JSON, same style as StagingTray).
     std::wstring UndoToJson() const;
     bool UndoFromJson(const std::wstring& in);
 
 private:
+    friend struct OpsManagerAuditAccess;
+    void RecordShellDone(uint32_t id, uint32_t hr, bool cancelled, std::wstring error);
     struct QueueItem {
         OpRequest req;
         std::wstring open_path;   // non-empty => ShellExecuteEx instead
-        std::wstring open_verb;   // "open" (default) / "properties" / ...
+        std::wstring open_verb;   // empty = default action; "open" / "properties" / ...
         std::wstring open_args;   // e.g. -d "<dir>" for wt.exe
         std::wstring open_file;   // explicit program (empty => open_path is the file)
         std::vector<std::wstring> open_paths; // multi-item "properties"
         uint64_t seq = 0;
+        // Request-owned control survives queue acceptance -> worker startup.
+        // Guarded by mutex_; never inherited by a subsequent request.
+        bool cancel_requested = false;
+        bool transfer_cancelled = false;
+        bool transfer_paused = false;
         ULONGLONG enqueued_at = 0; // diagnostics: queue wait vs shell cost
     };
+
+    QueueItem* CurrentTransferLocked(); // mutex_ held; active request or queue front
 
     struct MenuJob {
         enum class Kind { Query, Invoke, Close } kind = Kind::Query;
@@ -271,6 +311,9 @@ private:
         std::wstring text;
     };
 
+    void ConfigureShellCallbacks();
+    void DispatchMenuJob(const MenuJob& job);
+    void RegisterShellRequest(uint32_t id);
     void WorkerThread();
     void MenuThread();
     void OpenThread();
@@ -280,15 +323,20 @@ private:
     void RunShellOp(const OpRequest& req, uint64_t task_id);
     bool WaitShellDone(uint32_t id, uint32_t& hr, bool& cancelled, std::wstring& error);
     void RunTransfer(const OpRequest& req, uint64_t task_id);
+    void RunAuthorizedTransfer(const OpRequest& req, uint64_t task_id);
+    void RunAuthorizedDelete(const OpRequest& req, uint64_t task_id);
+    AuthorizationChoice WaitForAuthorization(uint64_t task_id, const std::wstring& error,
+                                            const std::wstring& source);
     LockReport ProbeLock(const OpRequest& req, uint64_t task_id, HRESULT hr,
                          const std::wstring& error);
     bool PrepareLockRetry(OpRequest& req, uint64_t task_id);
     void SetStatus(const std::function<void(OpStatus&)>& fn);
-    void PushUndo(const OpRequest& req,
+    void PushUndo(const OpRequest& req, uint64_t task_id,
                   const std::vector<std::wstring>* actual_destinations = nullptr);
     void LoadRecoveryJournal();
     void PersistJournal();
     std::wstring JournalJsonLocked() const;
+    bool ConsumeCtxQueryDone(uint32_t id);
     bool ConsumeCtxInvokeDone(uint32_t id);   // true = RSP_DONE was a menu invoke
     void OnCtxItems(uint32_t client_id, std::vector<ShellMenuItem> items, bool partial,
                     std::vector<std::wstring> slow_clsids);
@@ -313,6 +361,8 @@ private:
     OpStatus status_;
     std::deque<UndoEntry> undo_;
     std::deque<CompletedOperation> completions_;
+    std::deque<FinishedTask> finished_tasks_;
+    std::vector<std::wstring> moved_sources_; // Worker-owned until terminal publication.
 
     std::thread thread_;
     bool running_ = false;
@@ -334,19 +384,25 @@ private:
     uint64_t resolved_conflict_token_ = 0;
     ConflictChoice resolved_conflict_choice_ = ConflictChoice::Cancel;
     bool resolved_conflict_apply_all_ = false;
+    uint64_t authorization_task_ = 0;
+    std::optional<AuthorizationChoice> authorization_choice_;
 
     // Completion sync for the op currently in flight.
     std::mutex done_mutex_;
     std::condition_variable done_cv_;
-    bool done_ready_ = false;
-    uint32_t done_id_ = 0;
-    uint32_t done_hr_ = 0;
-    bool done_cancelled_ = false;
-    std::wstring done_error_;
+    struct ShellDoneResult {
+        uint32_t hr = 0;
+        bool cancelled = false;
+        std::wstring error;
+    };
+    std::set<uint32_t> shell_request_ids_;
+    std::set<uint32_t>& file_op_ids_ = shell_request_ids_;
+    std::map<uint32_t, ShellDoneResult> done_results_;
 
     // Context-menu forwarding thread + token <-> pipe-request-id bookkeeping.
     std::thread menu_thread_;
     bool menu_running_ = false;
+    bool own_shell_client_ = true;
     mutable std::mutex menu_mutex_;
     std::condition_variable menu_cv_;
     std::deque<MenuJob> menu_queue_;

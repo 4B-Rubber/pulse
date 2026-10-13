@@ -113,13 +113,12 @@ void PlaceHostedEdit(HWND hwnd, HWND owner, const D2D1_RECT_F& cell, float scale
 
 HWND CreateHostedEdit(AppState& s, SUBCLASSPROC proc) {
     EnsureEditVisuals(s);
-    HWND hwnd = ui::CreateChildEdit(s.hwnd);
+    HWND hwnd = ui::CreateRedirectedChildEdit(s.hwnd);
     if (!hwnd) return nullptr;
     SetWindowTheme(hwnd, L"", L"");
     // All hosted editors use redirected surfaces: uploaded
     // layered bitmaps can disappear under the main composition surface.
     // Their procedures suppress native drawing and present LumaText to the DC.
-    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
     SendMessageW(hwnd, WM_SETFONT, (WPARAM)s.editFont, TRUE);
     SetWindowSubclass(hwnd, proc, 1, reinterpret_cast<DWORD_PTR>(&s));
     return hwnd;
@@ -143,19 +142,7 @@ void LayoutAddressEditor(AppState& s) {
 }
 
 void EnsureEditVisuals(AppState& s) {
-    if (!s.editFont) {
-        const int height = -std::max(1, static_cast<int>(std::lround(
-            14.0f * ui::typography::UiFontScale() * s.scale)));
-        const wchar_t* family = ui::typography::PreferredTextFamily();
-        s.editFont = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE, family);
-        if (!s.editFont) {
-            s.editFont = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        }
-    }
+    if (!s.editFont) s.editFont = ui::typography::CreateEditFont(s.scale);
     if (!s.editBrush) {
         s.editBrush = CreateSolidBrush(s.darkMode ? RGB(30, 30, 30) : RGB(255, 255, 255));
     }
@@ -463,6 +450,7 @@ void HideRenameOverlay(AppState& s, bool commit) {
                 req.new_name = buf;
                 tab->pending_selected_name = buf;
                 tab->pending_selected_names = { buf };
+                tab->pending_selection_revision = tab->selection_revision;
                 // The renamed row keeps its place even if the refresh beats
                 // the watcher event (#13).
                 tab->held_renames.push_back({tab->EntryAt(index).name, buf});
@@ -475,6 +463,11 @@ void HideRenameOverlay(AppState& s, bool commit) {
     if (s.hwnd) SetFocus(s.hwnd);
     s.renameIgnoreKillFocus = false;
     InvalidateRect(s.hwnd, nullptr, FALSE);
+    // Start no editor here: a fresh snapshot will choose the next successful
+    // creation after this editor and its kill-focus handling are fully closed.
+    if (auto* tab = ActiveTab(s); tab && app::PendingCreateRenameIntent(
+        tab->create_rename_intents, tab->current_path, tab->view_generation))
+        RefreshActiveTab(s, RefreshReason::OperationCompleted);
 }
 
 bool TagRenameCell(AppState& s, const app::TagId& tag_id, D2D1_RECT_F& cell) {

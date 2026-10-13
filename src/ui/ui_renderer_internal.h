@@ -7,6 +7,7 @@
 #include "typography.h"
 #include "name_highlight.h"
 #include "../app/places.h"
+#include "../app/builtin_menu_items.h"
 #include "../app/search_query.h"
 #include "../common/text_format.h"
 #include "../common/display_path.h"
@@ -19,6 +20,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <wrl/client.h>
 
 namespace pulse::ui {
 
@@ -159,6 +161,9 @@ void ClearTextWidthCache() {
     constexpr float kTabPinnedW = 36.0f; // Chrome pinned tab: icon-only square
     constexpr float kTabPinnedNamedW = 112.0f;
     constexpr float kTabCloseAlwaysW = 96.0f;
+    constexpr float kTabCompactW = 40.0f;     // icon-only inactive tab when crowded
+    constexpr float kTabActiveMinW = 120.0f;  // active tab keeps its title and close
+    constexpr float kTabScrollArrowW = 24.0f;
     constexpr float kTabClosePadDip = 10.0f;
     constexpr float kTabCloseSizeDip = 16.0f;
     constexpr float kCommandIconButtonDip = 32.0f;
@@ -198,6 +203,7 @@ void ClearTextWidthCache() {
     constexpr const wchar_t* kIconFile = L"\xE8A5";
     constexpr const wchar_t* kIconTray = L"\xE8A1";
     constexpr const wchar_t* kIconChevronRight = L"\xE76C";
+    constexpr const wchar_t* kIconChevronLeft = L"\xE76B";
     constexpr const wchar_t* kIconChevronUp = L"\xE70E";
     constexpr const wchar_t* kIconChevronDown = L"\xE70D";
     constexpr const wchar_t* kIconCloseSmall = L"\xE711";
@@ -239,6 +245,76 @@ void ClearTextWidthCache() {
         case DRIVE_RAMDISK: return pulse::l10n::Get(StringId::RamDisk);
         default: return pulse::l10n::Get(StringId::Drive);
         }
+    }
+
+    // Protected operating-system items are hidden *and* system (Explorer's
+    // "protected operating system files"). A folder with only the system bit is
+    // just a customized folder and stays normal.
+    inline bool IsProtectedSystemEntry(DWORD attrs) noexcept {
+        constexpr DWORD kMask = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+        return (attrs & kMask) == kMask;
+    }
+
+    // Hidden entries render faded (icon and name) so they read as background
+    // content; protected system items fade further and carry a shield badge.
+    inline float HiddenEntryAlpha(DWORD attrs) noexcept {
+        if (IsProtectedSystemEntry(attrs)) return 0.42f;
+        return (attrs & FILE_ATTRIBUTE_HIDDEN) ? 0.50f : 1.0f;
+    }
+
+    // Name color that matches HiddenEntryAlpha: secondary text for hidden items,
+    // a step lighter for protected system items.
+    inline D2D1_COLOR_F HiddenEntryNameColor(DWORD attrs, const Theme& theme,
+                                             D2D1_COLOR_F normal) noexcept {
+        if (IsProtectedSystemEntry(attrs)) {
+            D2D1_COLOR_F c = theme.text_secondary;
+            c.a *= 0.78f;
+            return c;
+        }
+        if (attrs & FILE_ATTRIBUTE_HIDDEN) return theme.text_secondary;
+        return normal;
+    }
+
+    // Opaque shield badge on the bottom-right of a protected item's artwork.
+    inline void DrawProtectedBadge(ID2D1DeviceContext* dc, const D2D1_RECT_F& art,
+                                   float scale, const Theme& theme) {
+        if (!dc) return;
+        const float art_size = (std::min)(art.right - art.left, art.bottom - art.top);
+        if (art_size <= 0.0f) return;
+        const float d = std::clamp(art_size * 0.42f, 11.0f * scale, 18.0f * scale);
+        const float cx = art.right - d * 0.25f;
+        const float cy = art.bottom - d * 0.25f;
+        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+        D2D1_COLOR_F plate = theme.surface_flyout;
+        plate.a = 1.0f;
+        if (FAILED(dc->CreateSolidColorBrush(plate, &brush))) return;
+        const D2D1_ELLIPSE circle = D2D1::Ellipse(D2D1::Point2F(cx, cy), d * 0.5f, d * 0.5f);
+        dc->FillEllipse(circle, brush.Get());
+        D2D1_COLOR_F ring = theme.text;
+        ring.a = 0.16f;
+        brush->SetColor(ring);
+        dc->DrawEllipse(circle, brush.Get(), (std::max)(1.0f, scale));
+        Microsoft::WRL::ComPtr<ID2D1Factory> factory;
+        dc->GetFactory(&factory);
+        Microsoft::WRL::ComPtr<ID2D1PathGeometry> shield;
+        if (!factory || FAILED(factory->CreatePathGeometry(&shield))) return;
+        Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+        if (FAILED(shield->Open(&sink))) return;
+        // Shield outline in a 12-unit box, scaled into the badge.
+        const float u = d * 0.62f / 12.0f;
+        const float ox = cx - 6.0f * u;
+        const float oy = cy - 6.0f * u;
+        const auto P = [&](float x, float y) { return D2D1::Point2F(ox + x * u, oy + y * u); };
+        sink->BeginFigure(P(6.0f, 0.8f), D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddLine(P(10.4f, 2.4f));
+        sink->AddLine(P(10.4f, 5.7f));
+        sink->AddBezier(D2D1::BezierSegment(P(10.4f, 8.5f), P(8.5f, 10.5f), P(6.0f, 11.2f)));
+        sink->AddBezier(D2D1::BezierSegment(P(3.5f, 10.5f), P(1.6f, 8.5f), P(1.6f, 5.7f)));
+        sink->AddLine(P(1.6f, 2.4f));
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        if (FAILED(sink->Close())) return;
+        brush->SetColor(theme.text_secondary);
+        dc->FillGeometry(shield.Get(), brush.Get());
     }
 
     const ListEntryView& MakeVisibleEntry(const PaneViewModel& vm, size_t index) {
@@ -308,6 +384,8 @@ void ClearTextWidthCache() {
                 penetrated ? fs::StripLnkSuffix(source.name) : source.name, entry.is_dir);
         }
         if (source.drive_type != 0) entry.type_text = DriveTypeText(source.drive_type);
+        if (source.drive_type != 0 && source.drive_locked)
+            entry.type_text += L" \u00B7 " + pulse::l10n::Get(pulse::l10n::StringId::DriveBitLockerLocked);
         if (entry.link_kind != fs::LinkKind::None) entry.type_text = LinkTypeText(entry.link_kind);
         if (source.drive_type != 0 && source.drive_total > 0) {
             const uint64_t free_bytes = std::min(source.drive_free, source.drive_total);
@@ -351,6 +429,9 @@ void ClearTextWidthCache() {
             // Rail only: a section's own icon row (always present, so the icon
             // never disappears and the section can be folded from it).
             Rail,
+            // Rail only: "+N" chip standing in for section rows that do not fit
+            // (batch = how many rows it replaces). Drawn, never hit.
+            RailMore,
             TrayPanel,
             TrayRelease,
             TrayClear
@@ -493,6 +574,7 @@ void ClearTextWidthCache() {
     }
 
     float ExpandedTrayHeight(const WindowViewModel& vm, const SidebarMetrics& m) {
+        if (vm.tray_deck.hidden) return 0.0f;
         if (vm.tray_deck.cards.empty())
             return 112.0f * m.scale; // header + dashed empty state
         // Card stack: header (38) + top card + peeking layers when fanned
@@ -553,7 +635,7 @@ void ClearTextWidthCache() {
 
         if (compact) {
             const float rowH = 38.0f * scale;
-            const float trayH = 44.0f * scale;
+            const float trayH = vm.tray_deck.hidden ? 0.0f : 44.0f * scale;
             float y = sb.top;
             int run = 0;
             for (int g = 0; g < static_cast<int>(vm.sidebar.size()); ++g) {
@@ -579,23 +661,44 @@ void ClearTextWidthCache() {
                 }
                 for (int i = 0; i < static_cast<int>(group.items.size()); ++i) {
                     if (group.items[i].starred_child) continue;
-                    if (y + rowH > sb.bottom - trayH) break;
+                    // Tags are a colored dot each, so their rail rows are shorter.
+                    const float itemH = group.items[i].is_tag ? 32.0f * scale : rowH;
+                    if (y + itemH > sb.bottom - trayH) {
+                        if (group.items[i].is_tag) {
+                            // The last fitting tag row becomes "+N" for the rest.
+                            int rest = static_cast<int>(group.items.size()) - i;
+                            if (!out.empty() && out.back().kind == SidebarSlot::Tag &&
+                                out.back().group == g) {
+                                out.back().kind = SidebarSlot::RailMore;
+                                out.back().batch = rest + 1;
+                            } else if (y + 26.0f * scale <= sb.bottom - trayH) {
+                                SidebarSlot more;
+                                more.kind = SidebarSlot::RailMore;
+                                more.rc = D2D1::RectF(4.0f * scale, y, width - 4.0f * scale,
+                                                      y + 26.0f * scale);
+                                more.group = g;
+                                more.batch = rest;
+                                out.push_back(more);
+                            }
+                        }
+                        break;
+                    }
                     SidebarSlot slot;
                     slot.kind = group.items[i].is_drive ? SidebarSlot::Drive
                               : group.items[i].is_tag ? SidebarSlot::Tag : SidebarSlot::Item;
-                    slot.rc = D2D1::RectF(4.0f * scale, y, width - 4.0f * scale, y + rowH);
+                    slot.rc = D2D1::RectF(4.0f * scale, y, width - 4.0f * scale, y + itemH);
                     slot.group = g;
                     slot.item = i;
                     slot.run = run++;
                     out.push_back(slot);
-                    y += rowH;
+                    y += itemH;
                 }
             }
             SidebarSlot tray;
             tray.kind = SidebarSlot::TrayPanel;
             tray.rc = D2D1::RectF(4.0f * scale, sb.bottom - trayH,
                                   width - 4.0f * scale, sb.bottom - 4.0f * scale);
-            out.push_back(tray);
+            if (!vm.tray_deck.hidden) out.push_back(tray);
             return;
         }
 
@@ -699,6 +802,7 @@ void ClearTextWidthCache() {
             }
         }
 
+        if (vm.tray_deck.hidden) return;
         SidebarSlot tray;
         tray.kind = SidebarSlot::TrayPanel;
         tray.rc = D2D1::RectF(innerL, trayTop, innerR, sb.bottom - m.pad);
@@ -1714,7 +1818,159 @@ TitleChrome MakeTitleChrome(float window_w, float scale, float title_h) {
 }
 
 constexpr float kSettingsNavW = 200.0f;
-constexpr int kSettingsNavCount = 5;
+constexpr int kSettingsNavCount = 6;  // 5: 预览增强包
+
+// System folder groups shown under Settings > Exclusions: 0-4 follow
+// index::kSystemExclusionGroups, 5-6 are always skipped by the index.
+constexpr int kSystemGroupRows = 7;
+constexpr int kSystemGroupConfigurable = 5;
+inline pulse::l10n::StringId SystemGroupLabel(int group) {
+    using I = pulse::l10n::StringId;
+    static constexpr I kLabels[kSystemGroupRows] = {I::SystemGroupWindows, I::SystemGroupTemp,
+                                    I::SystemGroupOld, I::SystemGroupProgramData,
+                                    I::SystemGroupNodeModules, I::SystemGroupRecycle,
+                                    I::SystemGroupComponents};
+    return kLabels[group < 0 || group >= kSystemGroupRows ? 0 : group];
+}
+inline const wchar_t* SystemGroupDetail(int group) {
+    static constexpr const wchar_t* kDetails[] = {
+        L"C:\\Windows",
+        L"Windows\\Temp \u00b7 AppData\\Local\\Temp \u00b7 INetCache \u00b7 CrashDumps",
+        L"Windows.old \u00b7 $WINDOWS.~BT \u00b7 $Windows.~WS \u00b7 $WinREAgent",
+        L"C:\\ProgramData",
+        L"node_modules",
+        L"$Recycle.Bin \u00b7 System Volume Information",
+        L"WinSxS \u00b7 servicing"};
+    static_assert(sizeof(kDetails) / sizeof(kDetails[0]) == kSystemGroupRows);
+    return kDetails[group < 0 || group >= kSystemGroupRows ? 0 : group];
+}
+inline bool SystemGroupEnabled(const WindowViewModel& vm, int group) {
+    return group >= kSystemGroupConfigurable || (vm.settings_index_system_groups & (1u << group)) != 0;
+}
+inline bool SystemGroupChipVisible(const WindowViewModel& vm, int group) {
+    return SystemGroupEnabled(vm, group);
+}
+
+inline app::BuiltinMenuSurface PulseMenuSurface(const WindowViewModel& vm) {
+    return vm.settings_context_tab == 1 ? app::BuiltinMenuSurface::Background
+         : vm.settings_context_tab == 2 ? app::BuiltinMenuSurface::RowButtons
+                                        : app::BuiltinMenuSurface::Item;
+}
+// Preview metrics (DIP), shared by layout and drawing.
+inline constexpr float kPulsePreviewTitle = 24.0f, kPulsePreviewRow = 34.0f,
+    kPulsePreviewSwatches = 34.0f, kPulsePreviewSeparator = 9.0f, kPulsePreviewPad = 5.0f;
+// Hint line under the preview box ("drag to reorder").
+inline constexpr float kPulsePreviewHint = 26.0f;
+inline const app::BuiltinMenuOrder& PulseMenuOrder(const WindowViewModel& vm) {
+    return vm.settings_builtin_order[static_cast<size_t>(PulseMenuSurface(vm))];
+}
+inline bool PulseMenuOrderCustom(const WindowViewModel& vm, app::BuiltinMenuSurface surface) {
+    const auto& order = vm.settings_builtin_order[static_cast<size_t>(surface)];
+    return !order.empty() && app::NormalizeBuiltinMenuOrder(surface, order) != app::BuiltinMenuDefaultOrder(surface);
+}
+inline float PulseMenuPreviewHeight(const WindowViewModel& vm, float scale) {
+    if (vm.settings_context_tab == 2) return (kPulsePreviewTitle + 56.0f + kPulsePreviewHint) * scale;
+    float h = 2 * kPulsePreviewPad;
+    for (const auto& r : app::BuiltinMenuVisibleRows(PulseMenuSurface(vm), vm.settings_builtin_hidden, PulseMenuOrder(vm))) {
+        h += kPulsePreviewRow;
+        if (r.row.item == app::BuiltinMenuItem::Tags) h += kPulsePreviewSwatches;
+        if (r.separator_after) h += kPulsePreviewSeparator;
+    }
+    return (kPulsePreviewTitle + h + kPulsePreviewHint) * scale;
+}
+// The menu box inside l.pulse_preview (below the title, above the hint).
+inline D2D1_RECT_F PulsePreviewBox(const D2D1_RECT_F& preview, float scale) {
+    return D2D1::RectF(preview.left, preview.top + kPulsePreviewTitle * scale,
+                       preview.right, preview.bottom - kPulsePreviewHint * scale);
+}
+inline int PulseMenuRowHit(const app::BuiltinMenuRow& row) {
+    return row.fixed != app::BuiltinFixedRow::None ? kSettingsMenuFixedHit + static_cast<int>(row.fixed)
+                                                   : kSettingsMenuRowHit + static_cast<int>(row.item);
+}
+
+// One preview row (the tag swatches belong to the 标签... row) or, on the
+// row-buttons tab, one hover button.
+struct PulsePreviewRow {
+    app::BuiltinMenuRow row{};
+    D2D1_RECT_F rect{};
+    bool separator_after = false;
+};
+struct PulsePreviewLayout {
+    std::vector<PulsePreviewRow> rows; // without the dragged row while dragging
+    bool dragging = false;
+    app::BuiltinMenuRow drag_row{};
+    D2D1_RECT_F ghost{}, gap{};        // floating row; the slot it would land in
+    app::BuiltinMenuOrder order;       // order a drop now would give
+};
+inline std::vector<PulsePreviewRow> LayoutPulsePreviewRows(const WindowViewModel& vm, const app::BuiltinMenuOrder& order,
+                                                           const D2D1_RECT_F& box, float s) {
+    std::vector<PulsePreviewRow> out;
+    if (vm.settings_context_tab == 2) {
+        const auto visible = app::BuiltinMenuVisibleRows(app::BuiltinMenuSurface::RowButtons, vm.settings_builtin_hidden, order);
+        const auto row = D2D1::RectF(box.left + 8 * s, box.top + 12 * s, box.right - 8 * s, box.bottom - 12 * s);
+        out.resize(visible.size());
+        float bx = row.right - 28 * s;
+        for (size_t k = visible.size(); k-- > 0;) {
+            out[k] = { visible[k].row, D2D1::RectF(bx, row.top + 4 * s, bx + 24 * s, row.bottom - 4 * s), false };
+            bx -= 26 * s;
+        }
+        return out;
+    }
+    float y = box.top + kPulsePreviewPad * s;
+    const float x0 = box.left + 6 * s, x1 = box.right - 6 * s;
+    for (const auto& v : app::BuiltinMenuVisibleRows(PulseMenuSurface(vm), vm.settings_builtin_hidden, order)) {
+        const float h = (kPulsePreviewRow + (v.row.item == app::BuiltinMenuItem::Tags ? kPulsePreviewSwatches : 0.0f)) * s;
+        out.push_back({ v.row, D2D1::RectF(x0, y, x1, y + h), v.separator_after });
+        y += h;
+        if (v.separator_after) y += kPulsePreviewSeparator * s;
+    }
+    return out;
+}
+// While a row is dragged, every landing place is tried and the one whose
+// slot is nearest the floating row wins; the rows are laid out as that drop
+// would leave them, so separators and groups preview truthfully.
+inline PulsePreviewLayout LayoutPulsePreview(const WindowViewModel& vm, const D2D1_RECT_F& box, float s) {
+    PulsePreviewLayout l;
+    const auto surface = PulseMenuSurface(vm);
+    const bool horizontal = vm.settings_context_tab == 2;
+    l.order = app::NormalizeBuiltinMenuOrder(surface, PulseMenuOrder(vm));
+    l.rows = LayoutPulsePreviewRows(vm, l.order, box, s);
+    if (vm.settings_menu_drag < 0 || vm.settings_menu_drag >= app::kBuiltinMenuItemCount) return l;
+    const auto dragged = static_cast<app::BuiltinMenuItem>(vm.settings_menu_drag);
+    auto movable = [&](const PulsePreviewRow& r) { return r.row.fixed == app::BuiltinFixedRow::None && r.row.item < app::BuiltinMenuItem::Count; };
+    const auto held = std::find_if(l.rows.begin(), l.rows.end(), [&](const PulsePreviewRow& r) { return movable(r) && r.row.item == dragged; });
+    if (held == l.rows.end()) return l;
+    app::BuiltinMenuOrder rest = l.order;
+    rest.erase(std::remove(rest.begin(), rest.end(), dragged), rest.end());
+    std::vector<app::BuiltinMenuItem> rest_visible;
+    for (const auto& r : l.rows) if (movable(r) && r.row.item != dragged) rest_visible.push_back(r.row.item);
+    if (rest_visible.empty()) return l;
+    const float size = horizontal ? held->rect.right - held->rect.left : held->rect.bottom - held->rect.top;
+    const float lo = horizontal ? box.left : box.top, hi = horizontal ? box.right : box.bottom;
+    const float start = std::clamp(vm.settings_menu_drag_pos - vm.settings_menu_drag_grab, lo, std::max(lo, hi - size));
+    float best = 1e30f;
+    for (size_t p = 0; p <= rest_visible.size(); ++p) {
+        app::BuiltinMenuOrder candidate = rest;
+        auto at = p < rest_visible.size() ? std::find(candidate.begin(), candidate.end(), rest_visible[p])
+                                          : std::find(candidate.begin(), candidate.end(), rest_visible.back()) + 1;
+        candidate.insert(at, dragged);
+        auto rows = LayoutPulsePreviewRows(vm, candidate, box, s);
+        const auto slot = std::find_if(rows.begin(), rows.end(), [&](const PulsePreviewRow& r) { return movable(r) && r.row.item == dragged; });
+        if (slot == rows.end()) continue;
+        const float d = std::abs((horizontal ? slot->rect.left : slot->rect.top) - start);
+        if (d >= best) continue;
+        best = d;
+        l.order = std::move(candidate);
+        l.gap = slot->rect;
+        l.drag_row = slot->row;
+        rows.erase(slot);
+        l.rows = std::move(rows);
+    }
+    l.dragging = true;
+    l.ghost = horizontal ? D2D1::RectF(start, l.gap.top, start + size, l.gap.bottom)
+                         : D2D1::RectF(l.gap.left, start, l.gap.right, start + size);
+    return l;
+}
 
 struct SettingsLayout {
     // Cards 0-4: Explorer groups (with a master switch). Card 5: Pulse's own
@@ -1723,6 +1979,10 @@ struct SettingsLayout {
     D2D1_RECT_F context_cards[kContextCards]{}, context_header[kContextCards]{}, context_toggle[kContextCards]{},
         context_empty[kContextCards]{}, context_restore{};
     std::vector<D2D1_RECT_F> context_rows;
+    // Pulse menu card (first on the page): presets (3 = 自定义, display
+    // only), surface tabs, fixed rows of the current tab, live preview.
+    D2D1_RECT_F pulse_card{}, pulse_restore{}, pulse_preset[4]{}, pulse_tabs{}, pulse_tab[3]{},
+        pulse_fixed[2]{}, pulse_preview{}, pulse_order_reset{}, context_other{};
     D2D1_RECT_F duplicate_options{};
     D2D1_RECT_F section[4]{}, group[3]{}, footer{};
     D2D1_RECT_F theme_row{}, theme_tile[3]{}, effect_choice{}, language_choice{};
@@ -1732,9 +1992,25 @@ struct SettingsLayout {
     D2D1_RECT_F integration_section{}, integration_badge{}, integration_bar{}, integration_list_head{};
     D2D1_RECT_F integration_chip[4]{};
     float integration_text_right = 0.0f;
-    // General > Quick Look: supported formats card (disclosure[2]).
-    D2D1_RECT_F preview_section{}, preview_group{}, preview_formats{};
+    // Quick Look page: formats, source legend and system extensions.
+    D2D1_RECT_F preview_section{}, preview_group{}, preview_formats{}, preview_legend{}, preview_legend_note{};
+    D2D1_RECT_F preview_header_title{}, preview_header_summary{};
+    D2D1_RECT_F preview_legend_chip[3]{}, preview_codec_section{}, preview_codec_group{}, preview_codec_hint{}, pack_section{};
+    D2D1_RECT_F preview_codec_text[kPreviewCodecCount]{}, preview_codec_badge[kPreviewCodecCount]{};
     D2D1_RECT_F preview_codec_row[kPreviewCodecCount]{}, preview_codec_button[kPreviewCodecCount]{};
+    // 预览增强包 page (5), see LayoutSettingsPacks.
+    D2D1_RECT_F pack_summary{}, pack_open{}, pack_media_section{}, pack_card{}, pack_badge{}, pack_enable{},
+        pack_primary{}, pack_notice{}, pack_advanced_section{}, pack_custom_row{}, pack_path_row{},
+        pack_detect{}, pack_browse{}, pack_remove_row{}, pack_group{}, pack_note{}, pack_source_group{}, pack_source_status{};
+    float pack_desc_h = 0.0f;
+    // The image pack card (same parts as the FFmpeg one).
+    D2D1_RECT_F pack_images_section{}, pack_images_card{}, pack_images_badge{}, pack_images_enable{},
+        pack_images_primary{}, pack_images_notice{};
+    float pack_images_desc_h = 0.0f;
+    D2D1_RECT_F pack_raw_card{}, pack_raw_badge{}, pack_raw_enable{}, pack_raw_primary{}, pack_raw_notice{};
+    float pack_raw_desc_h = 0.0f;
+    D2D1_RECT_F pack_archive_section{}, pack_archive_card{}, pack_archive_badge{}, pack_archive_enable{}, pack_archive_primary{}, pack_archive_notice{};
+    float pack_archive_desc_h = 0.0f;
     D2D1_RECT_F content_header{}, content_types{}, content_pause{}, content_options{}, content_rebuild{}, content_empty{};
     D2D1_RECT_F body{};
     D2D1_RECT_F nav{};
@@ -1745,7 +2021,7 @@ struct SettingsLayout {
     D2D1_RECT_F effect_card{};
     D2D1_RECT_F effect_row[kWindowEffectCount]{};
     D2D1_RECT_F density_card{};
-    D2D1_RECT_F list_style_row[5]{};
+    D2D1_RECT_F list_style_row[6]{};
     D2D1_RECT_F density_row[3]{};
     D2D1_RECT_F folder_sort_card{};
     D2D1_RECT_F folder_sort_row[3]{};
@@ -1758,7 +2034,10 @@ struct SettingsLayout {
     D2D1_RECT_F notify_icon_row[3]{};
     D2D1_RECT_F new_tab_open_card{};
     D2D1_RECT_F new_tab_open_row[2]{};
+    D2D1_RECT_F external_open_card{};
+    D2D1_RECT_F external_open_row[3]{};
     D2D1_RECT_F close_last_tab_row{};
+    D2D1_RECT_F close_tab_double_click_row{};
     D2D1_RECT_F confirm_delete_row{};
     D2D1_RECT_F start_in_tray_row{};
     D2D1_RECT_F text_render_card{};
@@ -1781,7 +2060,6 @@ struct SettingsLayout {
     D2D1_RECT_F hidden_files_row{};
     D2D1_RECT_F protected_files_row{};
     D2D1_RECT_F pinned_names_row{};
-    D2D1_RECT_F multi_instance_row{};
     D2D1_RECT_F vertical_tabs_row{};
     D2D1_RECT_F hints_row{};
     D2D1_RECT_F hints_reset_row{};
@@ -1790,6 +2068,7 @@ struct SettingsLayout {
     D2D1_RECT_F blank_click_choice[3]{};
     D2D1_RECT_F win_e_row{};
     D2D1_RECT_F this_pc_row{};
+    D2D1_RECT_F recycle_bin_row{};
     D2D1_RECT_F explorer_windows_row{};
     D2D1_RECT_F default_manager_row{};
     D2D1_RECT_F shell_tags_row{};
@@ -1804,6 +2083,11 @@ struct SettingsLayout {
     std::vector<D2D1_RECT_F> index_volume_rows;
     D2D1_RECT_F index_exclude_action{};
     D2D1_RECT_F index_exclude_empty{};
+    // System folder switch: card spans the switch row, chips, group rows and
+    // the user's exclusion rows below them.
+    D2D1_RECT_F index_system_card{}, index_system_row{}, index_system_more{};
+    D2D1_RECT_F index_system_chip[kSystemGroupRows]{};
+    D2D1_RECT_F index_system_group[kSystemGroupRows]{};
     std::vector<D2D1_RECT_F> index_exclude_rows;
     std::vector<D2D1_RECT_F> index_exclude_remove;
     D2D1_RECT_F network_action[2]{};
@@ -1889,7 +2173,7 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
     l.nav = D2D1::RectF(l.body.left, l.body.top, l.body.left + nav_width, l.body.bottom);
     l.content = D2D1::RectF(l.nav.right, l.body.top, l.body.right, l.body.bottom);
     for (int i = 0; i < kSettingsNavCount; ++i) {
-        const int position = i == 4 ? 3 : i;
+        const int position = i == 4 ? 3 : i == 5 ? 4 : i;
         const float top = i == 3 ? l.nav.bottom - 92*scale : l.nav.top + (20 + position*46)*scale;
         l.nav_row[i] = D2D1::RectF(l.nav.left + 8*scale, top, l.nav.right - 8*scale, top + 40*scale);
     }
@@ -1970,6 +2254,40 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         l.index_exclude_action = D2D1::RectF(card_right - add_folder_w, y - 36.0f * scale,
                                              card_right, y - 36.0f * scale + section_btn_h);
         const float remove_w = label_btn_w(pulse::l10n::Get(pulse::l10n::StringId::Remove));
+        const float system_top = y;
+        if (vm.settings_index_system_known) {
+            l.index_system_row = D2D1::RectF(card_left, y, card_right, y + 64.0f * scale);
+            y += 60.0f * scale;
+            const float chips_left = card_left + 48.0f * scale;
+            const float chips_right = card_right - 16.0f * scale;
+            float x = chips_left, chip_y = y;
+            auto place = [&](float w, float h) {
+                w = (std::min)(w, chips_right - chips_left);
+                if (x > chips_left && x + w > chips_right) { x = chips_left; chip_y += 28.0f * scale; }
+                const D2D1_RECT_F r = D2D1::RectF(x, chip_y + (22.0f * scale - h) * 0.5f,
+                                                  x + w, chip_y + (22.0f * scale + h) * 0.5f);
+                x += w + 6.0f * scale;
+                return r;
+            };
+            for (int g = 0; g < kSystemGroupRows; ++g) {
+                if (!SystemGroupChipVisible(vm, g)) continue;
+                l.index_system_chip[g] = place(painter
+                    ? painter->MeasureBadgeWidth(pulse::l10n::Get(SystemGroupLabel(g))) : 120.0f * scale,
+                    22.0f * scale);
+            }
+            const float more_w = (painter ? painter->MeasureBadgeWidth(
+                pulse::l10n::Get(pulse::l10n::StringId::SettingsSystemCustomize)) : 60.0f * scale) + 16.0f * scale;
+            l.index_system_more = place(more_w, 28.0f * scale);
+            y = chip_y + 22.0f * scale + 14.0f * scale;
+            if (vm.settings_index_system_expanded) {
+                for (int g = 0; g < kSystemGroupRows; ++g) {
+                    l.index_system_group[g] = D2D1::RectF(card_left + 36.0f * scale, y,
+                                                          card_right - 12.0f * scale, y + 52.0f * scale);
+                    y += 52.0f * scale;
+                }
+                y += 8.0f * scale;
+            }
+        }
         l.index_exclude_rows.reserve(vm.settings_index_excluded_paths.size());
         l.index_exclude_remove.reserve(vm.settings_index_excluded_paths.size());
         for (size_t i = 0; i < vm.settings_index_excluded_paths.size(); ++i) {
@@ -1980,7 +2298,10 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
                 row.right - 12.0f * scale, row.top + 44.0f * scale));
             y += 56.0f * scale;
         }
-        if (vm.settings_index_excluded_paths.empty()) {
+        if (vm.settings_index_system_known) {
+            l.index_system_card = D2D1::RectF(card_left, system_top, card_right, y + 4.0f * scale);
+            y += 4.0f * scale;
+        } else if (vm.settings_index_excluded_paths.empty()) {
             const float empty_h = 168.0f * scale;
             l.index_exclude_empty = D2D1::RectF(card_left, y, card_right, y + empty_h);
             y += empty_h;
@@ -2009,10 +2330,69 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
     } else if (vm.settings_page == 2) {
         y += 30*scale;
         l.context_rows.resize(vm.settings_items.size());
-        for(int g=0;g<SettingsLayout::kContextCards;++g) {
+        {
+            // Pulse menu card: header, presets, surface tabs, then the
+            // switch list with a live menu preview on the right.
+            const float left=l.content.left+pad,right=l.content.right-pad,top=y;
+            const float inner=left+54*scale;
+            const float link_w=label_btn_w(l10n::Get(l10n::StringId::RestoreDefaults))-8*scale;
+            l.pulse_restore=D2D1::RectF(right-16*scale-link_w,top+18*scale,right-16*scale,top+46*scale);
+            y=top+72*scale;
+            static constexpr l10n::StringId kPresetDesc[]={l10n::StringId::ContextPresetSlimDesc,l10n::StringId::ContextPresetStandardDesc,
+                l10n::StringId::ContextPresetFullDesc,l10n::StringId::ContextPresetCustomDesc};
+            float px=inner;
+            for(int i=0;i<4;++i) {
+                // Fit the longer caption line (small text is narrower than the button font).
+                const float w=std::max(80*scale,label_btn_w(l10n::Get(kPresetDesc[i]))*0.92f);
+                l.pulse_preset[i]=D2D1::RectF(px,y,px+w,y+48*scale);
+                px+=w+8*scale;
+            }
+            y+=60*scale;
+            static constexpr l10n::StringId kTabs[]={l10n::StringId::ContextTabItem,l10n::StringId::ContextTabBackground,l10n::StringId::ContextTabRow};
+            float tx=inner+3*scale;
+            for(int i=0;i<3;++i) {
+                const float w=std::max(72*scale,label_btn_w(l10n::Get(kTabs[i])));
+                l.pulse_tab[i]=D2D1::RectF(tx,y+3*scale,tx+w,y+33*scale);
+                tx+=w;
+            }
+            l.pulse_tabs=D2D1::RectF(inner,y,tx+3*scale,y+36*scale);
+            y+=52*scale;
+            const bool preview=right-left>=700*scale;
+            const float preview_w=244*scale;
+            const float list_right=preview ? right-24*scale-preview_w-28*scale : right-24*scale;
+            const float list_top=y;
+            const auto rows=app::BuiltinMenuOrderedRows(PulseMenuSurface(vm),PulseMenuOrder(vm));
+            for(size_t k=0;k<rows.size();++k) {
+                const auto& row=rows[k];
+                const auto row_rc=D2D1::RectF(inner,y,list_right,y+44*scale);
+                if(row.fixed!=app::BuiltinFixedRow::None) {
+                    l.pulse_fixed[row.fixed==app::BuiltinFixedRow::Open ? 0 : 1]=row_rc;
+                } else {
+                    const size_t i=vm.settings_builtin_first+static_cast<size_t>(row.item);
+                    if(i<l.context_rows.size()) l.context_rows[i]=row_rc;
+                }
+                y+=44*scale;
+            }
+            float bottom=y;
+            if(preview) {
+                const float h=PulseMenuPreviewHeight(vm,scale);
+                l.pulse_preview=D2D1::RectF(right-24*scale-preview_w,list_top,right-24*scale,list_top+h);
+                if(PulseMenuOrderCustom(vm,PulseMenuSurface(vm))) {
+                    const float order_w=label_btn_w(l10n::Get(l10n::StringId::ContextOrderReset))-8*scale;
+                    l.pulse_order_reset=D2D1::RectF(l.pulse_preview.right-order_w,list_top-4*scale,l.pulse_preview.right,list_top+20*scale);
+                }
+                bottom=std::max(bottom,l.pulse_preview.bottom);
+            }
+            y=bottom+16*scale;
+            l.pulse_card=D2D1::RectF(left,top,right,y);
+            y+=20*scale;
+            l.context_other=D2D1::RectF(left,y,right,y+20*scale);
+            y+=30*scale;
+        }
+        for(int g=0;g<5;++g) {
             const float top=y;
             l.context_header[g]=D2D1::RectF(l.content.left+pad,y,l.content.right-pad,y+76*scale);
-            if(g<5) l.context_toggle[g]=D2D1::RectF(l.content.right-pad-100*scale,y+20*scale,l.content.right-pad-56*scale,y+52*scale);
+            l.context_toggle[g]=D2D1::RectF(l.content.right-pad-100*scale,y+20*scale,l.content.right-pad-56*scale,y+52*scale);
             y+=76*scale;
             if(vm.settings_expanded & (1u<<(g+8))) {
                 for(size_t i=0;i<vm.settings_items.size();++i) if(vm.settings_items[i].group==g) {
@@ -2148,6 +2528,8 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         }
         l.release_card = D2D1::RectF(card_left, release_top, card_right, ry + 10.0f * scale);
         y = l.release_card.bottom + 24.0f * scale;
+    } else if (vm.settings_page == 5) {
+        y = LayoutSettingsPacks(l, vm, scale, y, painter);
     } else if (vm.settings_page == 4) {
         const float card_left = l.content.left + pad;
         const float card_right = l.content.right - pad;
@@ -2485,17 +2867,23 @@ NameTrail LayoutNameTrail(float name_x, float text_y, float text_h,
     t.show_star = show_star;
     t.show_more = show_more;
     t.show_new_tab = show_new_tab;
-    if ((allowed_actions & 4u) && (show_more || reserve_actions)) {
-        t.more = D2D1::RectF(dock - btn, by, dock, by + btn);
-        dock = t.more.left - gap;
-    }
-    if ((allowed_actions & 1u) && (show_star || reserve_actions)) {
-        t.star = D2D1::RectF(dock - btn, by, dock, by + btn);
-        dock = t.star.left - gap;
-    }
-    if ((allowed_actions & 2u) && (show_new_tab || (reserve_actions && !compact_actions))) {
-        t.new_tab = D2D1::RectF(dock - btn, by, dock, by + btn);
-        dock = t.new_tab.left - gap;
+    // Left-to-right order from bits 3-8 (0 star, 1 new tab, 2 more); the
+    // rightmost button docks first. Default: new tab, star, more.
+    int order[3] = { 1, 0, 2 };
+    if (const unsigned code = (allowed_actions >> 3) & 0x3Fu; code != 0)
+        for (int i = 0; i < 3; ++i) order[i] = static_cast<int>((code >> (2 * i)) & 3u);
+    for (int i = 2; i >= 0; --i) {
+        if (order[i] == 2 && (allowed_actions & 4u) && (show_more || reserve_actions)) {
+            t.more = D2D1::RectF(dock - btn, by, dock, by + btn);
+            dock = t.more.left - gap;
+        } else if (order[i] == 0 && (allowed_actions & 1u) && (show_star || reserve_actions)) {
+            t.star = D2D1::RectF(dock - btn, by, dock, by + btn);
+            dock = t.star.left - gap;
+        } else if (order[i] == 1 && (allowed_actions & 2u) &&
+                   (show_new_tab || (reserve_actions && !compact_actions))) {
+            t.new_tab = D2D1::RectF(dock - btn, by, dock, by + btn);
+            dock = t.new_tab.left - gap;
+        }
     }
     t.line_w = std::max(0.0f, dock - name_x);
 
@@ -2593,88 +2981,6 @@ D2D1_RECT_F ChangePopoverRect(const ChangePopover& popup, const D2D1_RECT_F& bou
     const float x = std::clamp(popup.x, bounds.left + 8 * scale, std::max(bounds.left + 8 * scale, bounds.right - w - 8 * scale));
     const float y = std::clamp(popup.y + 10 * scale, bounds.top + 8 * scale, std::max(bounds.top + 8 * scale, bounds.bottom - h - 8 * scale));
     return D2D1::RectF(x, y, x + w, y + h);
-}
-
-// Group hover card: fixed row/pad metrics shared by the draw and hit-test
-// paths so a click always lands on the row it appears to.
-constexpr float kTabGroupCardRowDip = 32.0f;
-constexpr float kTabGroupCardPadDip = 4.0f;
-constexpr float kTabGroupCardMinWidthDip = 200.0f;
-constexpr float kTabGroupCardInsetDip = 4.0f; // hover fill off the card edge
-constexpr float kTabGroupCardGapDip = 8.0f;   // margin kept to the window
-
-// Top of the first row: the padding below the card's top edge.
-float TabGroupCardRowTop(const D2D1_RECT_F& card, float scale) {
-    return card.top + kTabGroupCardPadDip * scale;
-}
-
-// Rect of the row drawn at display position (0-based). The hover fill and the
-// clickable area are the same rectangle, so a row lights up exactly where it
-// can be hit.
-D2D1_RECT_F TabGroupCardRowRect(const D2D1_RECT_F& card, int row, float scale) {
-    const float row_h = kTabGroupCardRowDip * scale;
-    const float top = TabGroupCardRowTop(card, scale) + static_cast<float>(row) * row_h;
-    return D2D1::RectF(card.left + kTabGroupCardInsetDip * scale, top,
-                       card.right - kTabGroupCardInsetDip * scale, top + row_h);
-}
-
-// Display position of the row under a point, or -1 in the padding or in the
-// insets beside a row.
-int TabGroupCardRowAt(const D2D1_RECT_F& card, float x, float y, float scale) {
-    const float row_h = kTabGroupCardRowDip * scale;
-    if (row_h <= 0.0f) return -1;
-    if (x < card.left + kTabGroupCardInsetDip * scale ||
-        x >= card.right - kTabGroupCardInsetDip * scale) return -1;
-    const float rel = y - TabGroupCardRowTop(card, scale);
-    if (rel < 0.0f) return -1;
-    return static_cast<int>(rel / row_h);
-}
-
-// Index into TabGroupCardView::rows of the row drawn at display position
-// display_row, for a card showing visible_rows of them. A capped card drops
-// member rows from the middle and keeps the trailing action rows pinned last.
-int TabGroupCardRowIndex(const TabGroupCardView& card, int display_row, int visible_rows) {
-    const int total = static_cast<int>(card.rows.size());
-    if (visible_rows >= total) return display_row;
-    const int kept_members = std::max(0, visible_rows - std::min(total, 2));
-    if (display_row < kept_members) return display_row;
-    return total - (visible_rows - display_row);
-}
-
-// Card left edge follows the chip and its top edge is flush with the chip's
-// bottom edge (a gap there would swallow the pointer on its way from the chip
-// into the card and close it). The row count is capped so the card stays below
-// the chip and inside the window; *visible_rows receives how many rows are
-// drawn and hit-tested.
-D2D1_RECT_F TabGroupCardRect(const TabGroupCardView& card, const D2D1_RECT_F& chip_rc,
-                             const D2D1_RECT_F& bounds, float scale,
-                             int* visible_rows = nullptr) {
-    const int total = static_cast<int>(card.rows.size());
-    const float pad = kTabGroupCardPadDip * scale;
-    const float row_h = kTabGroupCardRowDip * scale;
-    const float gap = kTabGroupCardGapDip * scale;
-    // Everything between the chip's bottom edge and the window's bottom margin
-    // can hold rows.
-    const float avail = chip_rc.bottom < bounds.bottom - gap
-        ? bounds.bottom - gap - chip_rc.bottom : 0.0f;
-    int visible = total;
-    if (row_h > 0.0f) {
-        visible = std::min(total,
-            static_cast<int>(std::floor((avail - 2 * pad) / row_h)));
-    }
-    visible = std::max(0, visible);
-    if (visible < total) {
-        // Member rows are the ones that give way: a card that cannot show its
-        // actions is a card that cannot be used.
-        visible = std::max(visible, std::min(total, 2));
-    }
-    const float w = std::min(kTabGroupCardMinWidthDip * scale,
-                             std::max(0.0f, bounds.right - bounds.left - 16 * scale));
-    const float h = 2 * pad + row_h * static_cast<float>(visible);
-    const float x = std::clamp(chip_rc.left, bounds.left + 8 * scale,
-        std::max(bounds.left + 8 * scale, bounds.right - w - 8 * scale));
-    if (visible_rows) *visible_rows = visible;
-    return D2D1::RectF(x, chip_rc.bottom, x + w, chip_rc.bottom + h);
 }
 struct ScrollbarMetrics {
     float thumbY, thumbH;

@@ -8,21 +8,27 @@
 #include <dwrite_2.h>
 #include <wrl/client.h>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "FluentTokens.h"
+#include "markdown_image_metadata.h"
 
 namespace pulse::ui {
 
 class ThumbnailCache;
+struct DocumentImageSession;
 
 class MarkdownView {
+    friend struct ThumbnailCacheTestAccess;
 public:
+    ~MarkdownView();
     // Parses the payload; a repeat of the same payload keeps scroll and layout.
     // Returns false for anything that is not a Markdown payload.
     bool SetPayload(const std::wstring& payload, const std::wstring& file_path);
     void Clear();
+    void SetNotifyWindow(HWND hwnd) noexcept { notify_ = hwnd; }
     bool HasData() const noexcept { return parsed_; }
     const std::wstring& Source() const noexcept { return source_; }
     // Block texts joined by newlines (table cells by tabs): what find, select
@@ -62,6 +68,7 @@ public:
               const std::vector<Highlight>& matches);
 
     bool Scroll(float wheel_steps);
+    bool ScrollHorizontal(float wheel_steps);
     bool Key(UINT vk);  // PgUp / PgDn / Home / End / Up / Down
     void Reveal(uint32_t offset);
     // Plain-text offset under a point (clamped into the nearest block).
@@ -81,6 +88,7 @@ private:
         uint32_t plain_start = 0;
         // Image paragraph: resolved local path, or empty for a placeholder.
         bool image = false;
+        bool image_metadata_ready = false;
         std::wstring image_path;
         DWORD image_attrs = 0;
         uint64_t image_size = 0, image_modified = 0;
@@ -117,12 +125,14 @@ private:
     Microsoft::WRL::ComPtr<IDWriteTextLayout> MakeLayout(IDWriteFactory2* factory, const Block& block,
                                                          float width, bool wrap = true);
     void EnsureBrushes(ID2D1DeviceContext* dc, bool dark);
-    void ResolveImage(Block& block);
+    std::shared_ptr<DocumentImageSession> image_session_;
     void DrawRanges(ID2D1DeviceContext* dc, const Block& block, float ox, float oy,
                     uint32_t start, uint32_t end, const D2D1_COLOR_F& color);
     int BlockAt(float x, float doc_y) const;
     void ClampScroll();
 
+    MarkdownImageMetadata image_metadata_;
+    HWND notify_ = nullptr;
     bool parsed_ = false;
     std::wstring payload_, path_, base_dir_;
     std::wstring source_, plain_;
@@ -157,6 +167,7 @@ private:
     bool relayout_ = true;
     float doc_height_ = 0.0f;
     float scroll_ = 0.0f;
+    float scroll_x_ = 0.0f, doc_width_ = 0.0f;
     D2D1_RECT_F view_{};
     float origin_x_ = 0.0f;
     float scale_ = 1.0f;

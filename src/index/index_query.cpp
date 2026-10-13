@@ -13,12 +13,6 @@ namespace {
 
 const wchar_t* Lut() { return FoldTable(); }
 
-int CountChar(std::wstring_view s, wchar_t c) {
-    int n = 0;
-    for (wchar_t ch : s) if (ch == c) ++n;
-    return n;
-}
-
 bool HasWild(std::wstring_view s) {
     return s.find(L'*') != std::wstring_view::npos || s.find(L'?') != std::wstring_view::npos;
 }
@@ -637,6 +631,50 @@ bool QueryHasFolderFilter(const CompiledQuery& q) {
     return false;
 }
 
+bool MatchTerm(std::wstring_view path, std::wstring_view name, bool is_dir,
+               uint64_t size, uint64_t modified, const Term& term) {
+    if (term.folder && !is_dir) return false;
+    if (term.file && is_dir) return false;
+    if (!term.exts.empty()) {
+        bool ok = MatchExt(name.data(), static_cast<uint32_t>(name.size()), term);
+        if (term.ext_not) ok = !ok;
+        if (!ok) return false;
+    }
+    if (term.size_how != SizeHow::Any) {
+        bool ok = MatchSize(size, term);
+        if (term.size_not) ok = !ok;
+        if (!ok) return false;
+    }
+    if (term.date_how != DateHow::Any) {
+        bool ok = modified && MatchDate(modified, term);
+        if (term.date_not) ok = !ok;
+        if (!ok) return false;
+    }
+    if (term.name_how != NameHow::Any) {
+        bool ok = false;
+        if (!term.name_in_path) {
+            ok = MatchName(name.data(), static_cast<uint32_t>(name.size()), term);
+        } else if (term.name_how == NameHow::Wildcard) {
+            ok = WildcardFolded(path.data(), static_cast<uint32_t>(path.size()), term.name);
+        } else {
+            size_t begin = 0;
+            while (begin < path.size()) {
+                const size_t end = path.find_first_of(L"\\/", begin);
+                const size_t length = (end == std::wstring_view::npos ? path.size() : end) - begin;
+                if (length && MatchName(path.data() + begin, static_cast<uint32_t>(length), term)) {
+                    ok = true;
+                    break;
+                }
+                if (end == std::wstring_view::npos) break;
+                begin = end + 1;
+            }
+        }
+        if (term.name_not) ok = !ok;
+        if (!ok) return false;
+    }
+    return true;
+}
+
 int RankName(const wchar_t* s, uint32_t n, bool is_dir, const CompiledQuery& q) {
     int best = 0;
     for (const auto& g : q.groups) {
@@ -668,17 +706,19 @@ int RankName(const wchar_t* s, uint32_t n, bool is_dir, const CompiledQuery& q) 
 }
 
 bool QueryCanNarrow(std::wstring_view prev, std::wstring_view next) {
-    if (prev.empty() || next.size() < prev.size()) return false;
+    if (prev.empty()) return false;
     const auto previous = ParseQuery(prev);
     const auto following = ParseQuery(next);
-    if (!QueryHasPinyin(previous) && QueryHasPinyin(following)) return false;
-    for (const auto& group : previous.groups)
-        for (const auto& term : group)
-            if (term.pinyin && term.name_not) return false; // extending an exclusion broadens results
-    if (next.substr(0, prev.size()) != prev) return false;
-    if (CountChar(next, L'|') != CountChar(prev, L'|')) return false;
-    if (CountChar(next, L'!') < CountChar(prev, L'!')) return false;
-    return true;
+    // Only a positive literal substring extension proves set containment.
+    // Textual prefixes of filters, exclusions and exact names can broaden it.
+    if (!QueryIsSimpleName(previous) || !QueryIsSimpleName(following) ||
+        previous.content.present() || following.content.present() ||
+        previous.path_prefix != following.path_prefix) return false;
+    const auto& before = previous.groups[0][0];
+    const auto& after = following.groups[0][0];
+    if (before.name_how != NameHow::Substring || after.name_how != NameHow::Substring ||
+        before.pinyin || after.pinyin || before.name.empty()) return false;
+    return after.name.starts_with(before.name);
 }
 
 CompiledQuery ParseQuery(std::wstring_view raw) {
@@ -706,7 +746,7 @@ CompiledQuery ParseQuery(std::wstring_view raw) {
     return q;
 }
 
-std::wstring FilenameQueryText(std::wstring_view raw) {
+static std::wstring QueryTextWithoutScope(std::wstring_view raw, bool filename_only) {
     std::vector<size_t> or_breaks;
     const auto tokens = TokenizeQuery(raw, &or_breaks);
     std::wstring out;
@@ -731,7 +771,7 @@ std::wstring FilenameQueryText(std::wstring_view raw) {
             skipped_path_prefix = true;
             continue;
         }
-        if (SkipFromFilenameNeedle(tokens[i])) continue;
+        if (filename_only && SkipFromFilenameNeedle(tokens[i])) continue;
         if (!out.empty() && (group_has || out.ends_with(L'|') || out.ends_with(L' '))) {
             if (!out.ends_with(L' ') && !out.ends_with(L'|')) out.push_back(L' ');
             else if (out.ends_with(L'|')) out.push_back(L' ');
@@ -750,6 +790,14 @@ std::wstring FilenameQueryText(std::wstring_view raw) {
     }
     while (!out.empty() && (out.back() == L' ' || out.back() == L'|')) out.pop_back();
     return out;
+}
+
+std::wstring FilenameQueryText(std::wstring_view raw) {
+    return QueryTextWithoutScope(raw, true);
+}
+
+std::wstring QueryWithoutPathPrefix(std::wstring_view raw) {
+    return QueryTextWithoutScope(raw, false);
 }
 
 } // namespace pulse::index

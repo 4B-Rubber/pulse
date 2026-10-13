@@ -28,8 +28,7 @@ bool MainRenderer::TabItemRect(const WindowViewModel& vm, float window_w, int in
     const TabStripMetrics m = ComputeTabStrip(vm, window_w);
     const float left = m.x0 + static_cast<float>(index) * m.pitch
         + (index < static_cast<int>(m.extra.size()) ? m.extra[static_cast<size_t>(index)] : 0.0f);
-    const float w = vm.tabs[static_cast<size_t>(index)].pinned
-        ? (vm.show_pinned_tab_names ? kTabPinnedNamedW : kTabPinnedW) * scale_ : m.w;
+    const float w = m.Width(vm, static_cast<size_t>(index));
     *out = D2D1::RectF(left, m.y, left + w, m.y + m.h);
     return true;
 }
@@ -93,31 +92,8 @@ int MainRenderer::SettingsSliderValueAt(const WindowViewModel& vm, const D2D1_RE
 HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F& rect, float x, float y) const {
     HitTestResult r;
     if (x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) return r;
-
-    // The group hover card floats over the strip and the content area, so it
-    // must win every hit before the title-bar/settings/pane branches.
-    if (vm.tab_group_card.visible && !vm.tab_group_card.rows.empty()) {
-        D2D1_RECT_F chip_rc{};
-        if (vm.tab_group_card.chip_index >= 0 &&
-            TabGroupChipRect(vm, rect.right, vm.tab_group_card.chip_index, &chip_rc)) {
-            int visible = 0;
-            const D2D1_RECT_F card =
-                TabGroupCardRect(vm.tab_group_card, chip_rc, rect, scale_, &visible);
-            if (ContainsPt(card, x, y)) {
-                const int display = TabGroupCardRowAt(card, x, y, scale_);
-                if (display >= 0 && display < visible) {
-                    r.region = HitTestResult::TabGroupCardRow;
-                    // Rows are reported by their index in tab_group_card.rows,
-                    // not by the position they are drawn at: a capped card skips
-                    // the member rows it had to drop.
-                    r.index = TabGroupCardRowIndex(vm.tab_group_card, display, visible);
-                } else {
-                    r.region = HitTestResult::TabGroupCard;
-                }
-                return r;
-            }
-        }
-    }
+    // Embedded hosts own the title strip and footer controls.
+    if (embedded_ && (y < title_bar_height_ || y >= rect.bottom - status_height_)) return r;
 
     if (vm.change_popover.visible) {
         const auto popup = ChangePopoverRect(vm.change_popover, rect, scale_);
@@ -151,6 +127,11 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
     if (y < title_bar_height_ && !titleToolbar) {
         const float ctrlW = 46.0f * scale_;
         const TitleChrome chrome = MakeTitleChrome(rect.right, scale_, title_bar_height_);
+        // Before the toggle: on the rail the window dot sits on its corner (M7c).
+        if (ContainsPt(WindowIdentityRect(vm, rect.right), x, y)) {
+            r.region = HitTestResult::WindowIdentity;
+            return r;
+        }
         if (ContainsPt(SidebarToggleRect(rect.right), x, y)) {
             r.region = HitTestResult::SidebarToggle;
             return r;
@@ -158,8 +139,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
         const TabStripMetrics strip = ComputeTabStrip(vm, rect.right);
         auto hitTab = [&](int i) -> bool {
             if (vm.tabs[static_cast<size_t>(i)].hidden) return false;
-            const float tabW = vm.tabs[static_cast<size_t>(i)].pinned
-                ? (vm.show_pinned_tab_names ? kTabPinnedNamedW : kTabPinnedW) * scale_ : strip.w;
+            // A scrolling strip only shows tabs between its arrows.
+            if (strip.overflow && (x < strip.view_left || x >= strip.view_right)) return false;
+            const float tabW = strip.Width(vm, static_cast<size_t>(i));
             const float extra = i < static_cast<int>(strip.extra.size())
                 ? strip.extra[static_cast<size_t>(i)] : 0.0f;
             float tabLeft = strip.x0
@@ -176,13 +158,22 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             }
             if (x < tabLeft || x >= tabLeft + tabW) return false;
             r.index = i;
-            const bool show_close = TabCloseVisible(vm, i, tabW, scale_);
+            const bool compact = strip.compact && !vm.tabs[static_cast<size_t>(i)].pinned && i != strip.active;
+            const bool show_close = !compact && TabCloseVisible(vm, i, tabW, scale_);
             const float close_hit = (kTabClosePadDip + kTabCloseSizeDip) * scale_;
             r.region = show_close && x >= tabLeft + tabW - close_hit
                 ? HitTestResult::TabClose : HitTestResult::Tab;
             return true;
         };
         if (!vertical_tabs_) {
+        if (strip.overflow && y >= strip.y && y < strip.y + strip.h) {
+            if (x >= strip.view_left - strip.arrow_w && x < strip.view_left) {
+                r.region = HitTestResult::TabScroll; r.index = -1; return r;
+            }
+            if (x >= strip.view_right && x < strip.view_right + strip.arrow_w) {
+                r.region = HitTestResult::TabScroll; r.index = 1; return r;
+            }
+        }
         // Raised run is on top, so it wins overlapping hits.
         if (vm.tab_drag_index >= 0 && vm.tab_drag_index < static_cast<int>(vm.tabs.size())) {
             const int dragN = std::max(1, vm.tab_drag_count);
@@ -192,6 +183,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
         }
         // Group chips: strip slots between tabs, click opens the group popup.
         for (const auto& chip : strip.chips) {
+            if (strip.overflow && (x < strip.view_left || x >= strip.view_right)) break;
             if (x >= chip.left && x < chip.left + chip.width &&
                 y >= strip.y + 4.0f * scale_ && y < strip.y + strip.h - 4.0f * scale_) {
                 r.region = HitTestResult::TabGroup;
@@ -204,7 +196,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 i < vm.tab_drag_index + std::max(1, vm.tab_drag_count)) continue;
             if (hitTab(i)) return r;
         }
-        const float cx = strip.end_x;
+        const float cx = strip.new_x;
         if (x >= cx && x < cx + 32.0f * scale_) {
             r.region = HitTestResult::TabNew;
             return r;
@@ -256,8 +248,8 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 r.region=HitTestResult::SettingsDropdown;r.index=ContainsPt(lay.effect_choice,x,y) ? 0 : 1;return r;
             }
             if(ContainsPt(lay.performance_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=4;return r;}
-            for(int list_row=0;list_row<5;++list_row)
-                if(ContainsPt(lay.list_style_row[list_row],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=list_row<3 ? 17+list_row : (list_row==3 ? 22 : 33);return r;}
+            for(int list_row=0;list_row<6;++list_row)
+                if(ContainsPt(lay.list_style_row[list_row],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=list_row<3 ? 17+list_row : (list_row==3 ? 22 : list_row==4 ? 33 : 34);return r;}
             const D2D1_RECT_F actions[]={lay.content_pause,lay.content_options,lay.content_rebuild};
             for(int i=0;i<3;++i) if(ContainsPt(actions[i],x,y)) {r.region=HitTestResult::SettingsContentAction;r.index=i+1;return r;}
 
@@ -267,6 +259,8 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 for(int i=0;i<5;++i) if(ContainsPt(integration_rows[i],x,y)) {
                     r.region=HitTestResult::SettingsIntegration;r.index=i;return r;
                 }
+                // Added after retry (5) and restore (6), so it takes the next action index.
+                if(ContainsPt(lay.recycle_bin_row,x,y)) {r.region=HitTestResult::SettingsIntegration;r.index=7;return r;}
                 if(vm.settings_integration_can_retry && ContainsPt(lay.integration_retry,x,y)) {
                     r.region=HitTestResult::SettingsIntegration;r.index=5;return r;
                 }
@@ -313,6 +307,11 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 for (int i = 0; i < 3; ++i) {
                     if (ContainsPt(lay.notify_icon_row[i], x, y)) {
                         r.region = HitTestResult::SettingsNotifyIcon;
+                        r.index = i;
+                        return r;
+                    }
+                    if (ContainsPt(lay.external_open_row[i], x, y)) {
+                        r.region = HitTestResult::SettingsExternalOpen;
                         r.index = i;
                         return r;
                     }
@@ -400,11 +399,6 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     r.index = 6;
                     return r;
                 }
-                if (ContainsPt(lay.multi_instance_row, x, y)) {
-                    r.region = HitTestResult::SettingsToggle;
-                    r.index = 34;
-                    return r;
-                }
                 if (ContainsPt(lay.vertical_tabs_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 23; return r;
                 }
@@ -435,6 +429,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 }
                 if (ContainsPt(lay.close_last_tab_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 26; return r;
+                }
+                if (ContainsPt(lay.close_tab_double_click_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 35; return r;
                 }
                 if (ContainsPt(lay.confirm_delete_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 32; return r;
@@ -474,6 +471,25 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     r.index = 0;
                     return r;
                 }
+                // System folder switch shares the region: 1 switch row,
+                // 2 customize, 10 + i group i (only the configurable 0-4).
+                if (ContainsPt(lay.index_system_more, x, y)) {
+                    r.region = HitTestResult::SettingsIndexExcludeAction;
+                    r.index = 2;
+                    return r;
+                }
+                if (ContainsPt(lay.index_system_row, x, y)) {
+                    r.region = HitTestResult::SettingsIndexExcludeAction;
+                    r.index = 1;
+                    return r;
+                }
+                for (int g = 0; g < kSystemGroupConfigurable; ++g) {
+                    if (ContainsPt(lay.index_system_group[g], x, y)) {
+                        r.region = HitTestResult::SettingsIndexExcludeAction;
+                        r.index = 10 + g;
+                        return r;
+                    }
+                }
                 for (size_t i = 0; i < lay.index_exclude_remove.size(); ++i) {
                     if (ContainsPt(lay.index_exclude_remove[i], x, y)) {
                         r.region = HitTestResult::SettingsIndexExcludeRemove;
@@ -496,6 +512,20 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                     }
                 }
             } else if (vm.settings_page == 2) {
+                // Pulse menu card: presets 60-62, tabs 64-66, restore 67.
+                for(int i=0;i<3;++i) {
+                    if(ContainsPt(lay.pulse_preset[i],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=60+i;return r;}
+                    if(ContainsPt(lay.pulse_tab[i],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=64+i;return r;}
+                }
+                if(ContainsPt(lay.pulse_restore,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=67;return r;}
+                // Preview rows: press to drag (kSettingsMenuRowHit + item);
+                // the fixed rows only report hover. 68 restores the tab's order.
+                if(ContainsPt(lay.pulse_order_reset,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=kSettingsMenuOrderReset;return r;}
+                if(ContainsPt(lay.pulse_preview,x,y)) {
+                    WindowViewModel still=vm;still.settings_menu_drag=-1;
+                    for(const auto& row:LayoutPulsePreview(still,PulsePreviewBox(lay.pulse_preview,scale_),scale_).rows)
+                        if(ContainsPt(row.rect,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=PulseMenuRowHit(row.row);return r;}
+                }
                 for(int g=0;g<SettingsLayout::kContextCards;++g) {
                     if(g<5 && ContainsPt(lay.context_toggle[g],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=10+g;return r;}
                     if(ContainsPt(lay.context_header[g],x,y)) {r.region=HitTestResult::SettingsDisclosure;r.index=8+g;return r;}
@@ -552,6 +582,42 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 }
                 if (ContainsPt(lay.update_auto_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 31; return r;
+                }
+            } else if (vm.settings_page == 5) {
+                // Buttons first: they sit inside the clickable rows.
+                const std::pair<const D2D1_RECT_F*, PackAction> pack_targets[] = {
+                    {&lay.pack_open, PackAction::OpenFolder},
+                    {&lay.pack_primary, vm.settings_pack_media_installed && !vm.settings_pack_installing
+                                            ? PackAction::Remove : PackAction::Install},
+                    {&lay.pack_enable, PackAction::Enable},
+                    {&lay.pack_images_primary, vm.settings_pack_images_installed && !vm.settings_pack_images_installing
+                                                   ? PackAction::ImagesRemove : PackAction::ImagesInstall},
+                    {&lay.pack_images_enable, PackAction::ImagesEnable},
+                    {&lay.pack_raw_primary, vm.settings_pack_raw_installed && !vm.settings_pack_raw_installing
+                        ? PackAction::RawRemove : PackAction::RawInstall},
+                    {&lay.pack_raw_enable, PackAction::RawEnable},
+                    {&lay.pack_archive_primary, vm.settings_pack_archive_installed && !vm.settings_pack_archive_installing
+                        ? PackAction::ArchiveRemove : PackAction::ArchiveInstall},
+                    {&lay.pack_archive_enable, PackAction::ArchiveEnable},
+                    {&lay.pack_detect, PackAction::UseDetected},
+                    {&lay.pack_browse, PackAction::Browse},
+                    {&lay.pack_custom_row, PackAction::UseCustom},
+                    {&lay.pack_remove_row, PackAction::RemoveOnUninstall},
+                };
+                for (const auto& [bounds, action] : pack_targets) {
+                    if (action == PackAction::Install && !pack_text::PrimaryEnabled(vm.settings_pack_media_available,
+                        vm.settings_pack_media_installed, vm.settings_pack_installing)) continue;
+                    if (action == PackAction::ImagesInstall && !pack_text::PrimaryEnabled(vm.settings_pack_images_available,
+                        vm.settings_pack_images_installed, vm.settings_pack_images_installing)) continue;
+                    if (action == PackAction::RawInstall && !pack_text::PrimaryEnabled(vm.settings_pack_raw_available,
+                        vm.settings_pack_raw_installed, vm.settings_pack_raw_installing)) continue;
+                    if (action == PackAction::ArchiveInstall && !pack_text::PrimaryEnabled(vm.settings_pack_archive_available,
+                        vm.settings_pack_archive_installed, vm.settings_pack_archive_installing)) continue;
+                    if (bounds->right > bounds->left && ContainsPt(*bounds, x, y)) {
+                        r.region = HitTestResult::SettingsPackAction;
+                        r.index = static_cast<int>(action);
+                        return r;
+                    }
                 }
             } else if (vm.settings_page == 4) {
                 for (int i = 0; i < 3; ++i) {
@@ -709,6 +775,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
         for (int i = static_cast<int>(slots.size()) - 1; i >= 0; --i) {
             const auto& slot = slots[i];
             if (!ContainsPt(slot.rc, x, y)) continue;
+            if (slot.kind == SidebarSlot::RailMore) continue; // decoration only
             if (slot.kind == SidebarSlot::TrayRelease) {
                 r.region = HitTestResult::TrayRelease;
                 r.index = slot.batch;
@@ -930,6 +997,21 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
     D2D1_RECT_F content = ContentRect(rect.right, rect.bottom);
     if (x < content.left || x >= content.right || y < content.top || y >= content.bottom) return r;
 
+    // The swap button only exists while its divider (or the button) is hovered,
+    // so it never takes clicks meant for the pane edges underneath.
+    if (vm.hover_region == static_cast<int>(HitTestResult::Splitter) && !vm.splitter_pressed) {
+        for (int i = 0; i < static_cast<int>(vm.splitters.size()); ++i) {
+            const auto& sp = vm.splitters[static_cast<size_t>(i)];
+            if (sp.swap_rect.right <= sp.swap_rect.left) continue;
+            if (vm.hover_control_index != i && vm.hover_control_index != kSplitterSwapIndex + i) continue;
+            if (x >= sp.swap_rect.left && x < sp.swap_rect.right &&
+                y >= sp.swap_rect.top && y < sp.swap_rect.bottom) {
+                r.region = HitTestResult::Splitter;
+                r.index = kSplitterSwapIndex + i;
+                return r;
+            }
+        }
+    }
     for (int i = 0; i < static_cast<int>(vm.splitters.size()); ++i) {
         const auto& sp = vm.splitters[static_cast<size_t>(i)];
         if (x >= sp.hit_rect.left && x < sp.hit_rect.right &&

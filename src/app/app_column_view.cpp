@@ -222,12 +222,14 @@ bool ScrollStripBy(AppState& s, const ui::WindowViewModel& vm, int pane_index, f
 void SelectByName(AppState& s, app::Tab& tab, const std::wstring& name) {
     tab.pending_selected_names = {name};
     tab.pending_selected_name = name;
+    tab.pending_selection_revision = tab.selection_revision;
     tab.pending_ensure_selection_visible = true;
     if (!tab.snapshot) return;
     const auto& entries = *tab.snapshot;
     for (size_t i = 0; i < entries.size(); ++i) {
         if (!SamePath(entries[i].name, name) || !tab.EntryVisible(static_cast<int>(i))) continue;
         tab.SelectOnly(static_cast<int>(i));
+        tab.pending_selection_revision = tab.selection_revision;
         EnsureRowVisible(s, tab, static_cast<int>(i));
         s.scrollTargetY = tab.scroll_y;
         s.scrollAnimating = false;
@@ -474,10 +476,6 @@ void ToggleColumnLayout(AppState& s, int pane_index) {
     tab->column_layout = !tab->column_layout;
     if (!tab->column_layout) {
         tab->column_strip = {};
-    } else if (!s.showDetailsPanel) {
-        // Preview and tags of the selected file live in the details panel.
-        s.showDetailsPanel = true;
-        s.renderer.SetDetailsPanelVisible(true);
     }
     SyncColumnStrips(s);
     if (s.hwnd) InvalidateRect(s.hwnd, nullptr, FALSE);

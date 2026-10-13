@@ -23,7 +23,7 @@ std::wstring Unescape(std::wstring_view field) {
     for (size_t i = 0; i < field.size(); ++i) {
         if (field[i] == L'\\' && i + 1 < field.size()) {
             const wchar_t n = field[++i];
-            out += n == L't' ? L'\t' : n == L'n' ? L'\n' : n;
+            out += n == L't' ? L'\t' : n == L'n' ? L'\n' : n == L'r' ? L'\r' : n;
         } else {
             out += field[i];
         }
@@ -86,6 +86,28 @@ std::wstring JsonQuote(const std::wstring& s) {
     return out;
 }
 
+std::wstring XmlAttributeDisplay(std::wstring_view value) {
+    std::wstring out;
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == L'&') {
+            const size_t end = value.find(L';', i + 1);
+            if (end != value.npos) {
+                const auto entity = value.substr(i, end - i + 1);
+                wchar_t decoded = 0;
+                if (entity == L"&amp;") decoded = L'&';
+                else if (entity == L"&quot;") decoded = L'"';
+                else if (entity == L"&lt;") decoded = L'<';
+                else if (entity == L"&#9;") decoded = L'\t';
+                else if (entity == L"&#10;") decoded = L'\n';
+                else if (entity == L"&#13;") decoded = L'\r';
+                if (decoded) { out += decoded; i = end; continue; }
+            }
+        }
+        out += value[i];
+    }
+    return out;
+}
+
 std::wstring XmlEscape(const std::wstring& s) {
     std::wstring out;
     for (const wchar_t c : s) {
@@ -143,6 +165,7 @@ bool TreeView::SetPayload(const std::wstring& payload) {
             n.value = Unescape(f[4]);
             n.children = ToU32(f[5]);
             n.text = Unescape(f[6]);
+            n.attributes_known = f.size() >= 8 && f[7] == L"attributes-v1";
             // Depth may only grow by one; anything else is a broken payload.
             if (nodes_.empty() ? n.depth != 0 : n.depth > nodes_.back().depth + 1) continue;
             if (!nodes_.empty() && n.depth == 0) continue;  // one root
@@ -153,6 +176,8 @@ bool TreeView::SetPayload(const std::wstring& payload) {
             siblings[n.depth + 1] = 0;  // a new parent starts counting afresh
             stack.push_back(static_cast<int>(nodes_.size()));
             nodes_.push_back(std::move(n));
+        } else if (tag == L'A' && f.size() == 3 && !nodes_.empty() && nodes_.back().type == L'e' && nodes_.back().attributes_known) {
+            nodes_.back().attributes.emplace_back(Unescape(f[1]), Unescape(f[2]));
         } else if (tag == L'X' && f.size() >= 2) {
             source_ = Unescape(line.substr(2));
         }
@@ -302,12 +327,12 @@ std::wstring TreeView::RowText(size_t i, std::vector<Piece>* pieces) const {
             if (q < a.size() && a[q] == L'"') {
                 const size_t close = a.find(L'"', q + 1);
                 const size_t stop = close == std::wstring::npos ? a.size() : close + 1;
-                put(a.substr(q, stop - q), kString);
+                put(Visible(XmlAttributeDisplay(std::wstring_view(a).substr(q, stop - q))), kString);
                 p = stop;
             } else {
                 const size_t sp = a.find(L' ', q);
                 const size_t stop = sp == std::wstring::npos ? a.size() : sp;
-                put(a.substr(q, stop - q), kString);
+                put(Visible(XmlAttributeDisplay(std::wstring_view(a).substr(q, stop - q))), kString);
                 p = stop;
             }
         }
@@ -460,12 +485,39 @@ void TreeView::AppendJson(size_t i, int indent, std::wstring& out) const {
     out += object ? L'}' : L']';
 }
 
-void TreeView::AppendXml(size_t i, int indent, std::wstring& out) const {
+void TreeView::AppendXml(size_t i, int indent, std::wstring& out, bool subtree_root) const {
     const Node& n = nodes_[i];
     out.append(static_cast<size_t>(indent), L' ');
     switch (n.type) {
-    case L'e':
-        out += L"<" + n.key + (n.value.empty() ? L"" : L" " + n.value);
+    case L'e': {
+        out += L"<" + n.key;
+        const auto append_attribute = [&](const auto& attribute) {
+            out += L" " + attribute.first + L"=\"";
+            for (wchar_t c : attribute.second) {
+                switch (c) {
+                case L'&': out += L"&amp;"; break;
+                case L'<': out += L"&lt;"; break;
+                case L'"': out += L"&quot;"; break;
+                case L'\r': out += L"&#13;"; break;
+                case L'\n': out += L"&#10;"; break;
+                case L'\t': out += L"&#9;"; break;
+                default: out += c; break;
+                }
+            }
+            out += L'"';
+        };
+        for (const auto& attribute : n.attributes) append_attribute(attribute);
+        if (subtree_root) {
+            std::vector<std::wstring> declared;
+            const auto is_namespace = [](const std::wstring& key) { return key == L"xmlns" || key.starts_with(L"xmlns:"); };
+            for (const auto& attribute : n.attributes) if (is_namespace(attribute.first)) declared.push_back(attribute.first);
+            for (int ancestor = n.parent; ancestor >= 0; ancestor = nodes_[ancestor].parent) {
+                for (const auto& attribute : nodes_[ancestor].attributes) {
+                    if (!is_namespace(attribute.first) || std::find(declared.begin(), declared.end(), attribute.first) != declared.end()) continue;
+                    append_attribute(attribute); declared.push_back(attribute.first);
+                }
+            }
+        }
         if (!n.text.empty()) { out += L">" + XmlEscape(n.text) + L"</" + n.key + L">"; break; }
         if (n.end == i + 1) { out += L" />"; break; }
         out += L">\n";
@@ -473,6 +525,7 @@ void TreeView::AppendXml(size_t i, int indent, std::wstring& out) const {
         out.append(static_cast<size_t>(indent), L' ');
         out += L"</" + n.key + L">";
         break;
+    }
     case L'c': out += L"<!-- " + n.value + L" -->"; break;
     case L'd': out += L"<![CDATA[" + n.value + L"]]>"; break;
     case L'p': out += L"<?" + n.key + (n.value.empty() ? L"" : L" " + n.value) + L"?>"; break;
@@ -492,7 +545,13 @@ std::wstring TreeView::CurrentValue() const {
     }
     if (n.type == L'e' && !n.text.empty()) return n.text;
     if (n.type != L'e') return n.value;
-    AppendXml(i, 0, out);
+    // Old payloads flatten attribute delimiters and decoded values together;
+    // they cannot be reconstructed without inventing attribute boundaries.
+    for (size_t j = i; j < n.end; ++j)
+        if (nodes_[j].type == L'e' && !nodes_[j].attributes_known && !nodes_[j].value.empty()) return {};
+    for (int ancestor = n.parent; ancestor >= 0; ancestor = nodes_[ancestor].parent)
+        if (!nodes_[ancestor].attributes_known && !nodes_[ancestor].value.empty()) return {};
+    AppendXml(i, 0, out, true);
     return out;
 }
 

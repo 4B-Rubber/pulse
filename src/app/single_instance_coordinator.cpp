@@ -4,17 +4,17 @@
 #include <algorithm>
 #include <cstring>
 #include <objbase.h>
+#include "../common/current_user_security.h"
+#include "default_file_manager.h"
 
 namespace pulse::app {
 namespace {
 
 constexpr wchar_t kMutexName[] = L"Local\\Pulse.Singleton";
 constexpr wchar_t kWindowClass[] = L"PulseMainWindow";
+constexpr wchar_t kPrimaryProperty[] = L"Pulse.Singleton.PrimaryPid";
 constexpr ULONG_PTR kOpenPathMessage = 0x50554C53; // 'PULS'
 constexpr ULONG_PTR kOpenRequestMessage = 0x50554C32; // 'PUL2'
-constexpr ULONG_PTR kTabTransferMessage = 0x50544254; // 'PTBT'
-constexpr ULONG_PTR kTabTransferSelectionMessage = 0x50544253; // 'PTBS'
-constexpr ULONG_PTR kDrainRequestMessage = 0x50554452; // 'PUDR'
 constexpr size_t kMaxForwardedPathChars = 32768;
 struct OpenRequestHeader {
     uint32_t version = 2;
@@ -23,54 +23,24 @@ struct OpenRequestHeader {
     std::array<unsigned char, 16> id{};
 };
 static_assert(sizeof(OpenRequestHeader) == 32);
-// Room for a folder, a focus name and a few hundred entry names.
-constexpr size_t kMaxTabTransferChars = 1u << 18;
-
-// One COPYDATASTRUCT of UTF-16 text to one window.
-bool SendBlobPayload(HWND target, ULONG_PTR id, const void* bytes, size_t size, DWORD timeout_ms) {
-    if (!target || !IsWindow(target)) return false;
-    if (!bytes || size < sizeof(wchar_t) || size % sizeof(wchar_t) != 0 ||
-        size > (std::numeric_limits<DWORD>::max)()) {
-        return false;
-    }
+struct EndpointRecord {
+    volatile LONG published = 0;
+    DWORD version = 1;
     DWORD pid = 0;
-    GetWindowThreadProcessId(target, &pid);
-    if (pid && pid != GetCurrentProcessId()) AllowSetForegroundWindow(pid);
-    COPYDATASTRUCT data{};
-    data.dwData = id;
-    data.cbData = static_cast<DWORD>(size);
-    data.lpData = const_cast<void*>(bytes);
-    DWORD_PTR result = 0;
-    SetLastError(ERROR_SUCCESS);
-    const LRESULT sent = SendMessageTimeoutW(target, WM_COPYDATA, 0,
-                                             reinterpret_cast<LPARAM>(&data),
-                                             SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                                             timeout_ms, &result);
-    if (sent) return result != FALSE;
-    // A receiver busy with the message has taken it: the path arrives even
-    // though the reply did not, so only a delivery failure is a real failure.
-    return GetLastError() == ERROR_TIMEOUT;
+    FILETIME created{};
+    uint64_t window = 0;
+    wchar_t nonce[40]{};
+};
+std::wstring EndpointName(std::wstring_view requested) {
+    if (!requested.empty()) return std::wstring(requested);
+    DWORD session = 0;
+    const auto sid = CurrentUserSidString();
+    if (sid.empty() || !ProcessIdToSessionId(GetCurrentProcessId(), &session)) return {};
+    return std::wstring(kMutexName) + L"-" + sid + L"-" + std::to_wstring(session);
 }
-
-// A COPYDATASTRUCT carrying one UTF-16 path, terminated, to one window.
-bool SendPathPayload(HWND target, ULONG_PTR id, const std::wstring& path, DWORD timeout_ms) {
-    if (path.size() >= kMaxForwardedPathChars) return false;
-    return SendBlobPayload(target, id, path.c_str(),
-                           (path.size() + 1) * sizeof(wchar_t), timeout_ms);
-}
-
-bool DecodePathPayload(const COPYDATASTRUCT* data, ULONG_PTR id, std::wstring& path) {
-    path.clear();
-    if (!data || data->dwData != id || !data->lpData ||
-        data->cbData < sizeof(wchar_t) || data->cbData % sizeof(wchar_t) != 0) {
-        return false;
-    }
-    const size_t chars = data->cbData / sizeof(wchar_t);
-    if (chars > kMaxForwardedPathChars) return false;
-    const auto* text = static_cast<const wchar_t*>(data->lpData);
-    if (text[chars - 1] != L'\0') return false;
-    path.assign(text, chars - 1);
-    return path.find(L'\0') == std::wstring::npos;
+bool Created(HANDLE process, FILETIME& value) {
+    FILETIME exit{}, kernel{}, user{};
+    return GetProcessTimes(process, &value, &exit, &kernel, &user) != FALSE;
 }
 
 } // namespace
@@ -82,9 +52,15 @@ SingleInstanceCoordinator::~SingleInstanceCoordinator() {
 SingleInstanceCoordinator::AcquireResult SingleInstanceCoordinator::Acquire(
     std::wstring_view mutex_name) {
     if (mutex_) return AcquireResult::Primary;
-    const std::wstring name = mutex_name.empty() ? kMutexName : std::wstring(mutex_name);
+    endpoint_name_ = EndpointName(mutex_name);
+    if (endpoint_name_.empty()) return AcquireResult::Failed;
+    CurrentUserSecurityAttributes security;
+    if (!security) return AcquireResult::Failed;
     SetLastError(ERROR_SUCCESS);
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, name.c_str());
+    // Keep the legacy singleton lock across upgrades. An older owner has no
+    // authenticated endpoint, so forwarding fails instead of starting a peer.
+    const std::wstring mutex_object = mutex_name.empty() ? kMutexName : std::wstring(mutex_name);
+    HANDLE mutex = CreateMutexW(security.get(), TRUE, mutex_object.c_str());
     if (!mutex) return AcquireResult::Failed;
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(mutex);
@@ -95,10 +71,103 @@ SingleInstanceCoordinator::AcquireResult SingleInstanceCoordinator::Acquire(
 }
 
 void SingleInstanceCoordinator::Release() {
+    if (endpoint_view_) {
+        InterlockedExchange(&static_cast<EndpointRecord*>(endpoint_view_)->published, 0);
+        UnmapViewOfFile(endpoint_view_); endpoint_view_ = nullptr;
+    }
+    if (endpoint_window_ && !endpoint_nonce_.empty())
+        RemovePropW(endpoint_window_, endpoint_nonce_.c_str());
+    endpoint_window_ = nullptr;
+    if (endpoint_mapping_) { CloseHandle(endpoint_mapping_); endpoint_mapping_ = nullptr; }
     if (!mutex_) return;
+    EnumWindows([](HWND window, LPARAM) -> BOOL {
+        DWORD pid = 0; GetWindowThreadProcessId(window, &pid);
+        if (pid == GetCurrentProcessId()) RemovePropW(window, kPrimaryProperty);
+        return TRUE;
+    }, 0);
     ReleaseMutex(mutex_);
     CloseHandle(mutex_);
     mutex_ = nullptr;
+}
+
+bool SingleInstanceCoordinator::NormalizeLaunchPath(const std::wstring& input, std::wstring& output) {
+    output.clear();
+    if (input.find(L'\0') != std::wstring::npos || input.size() >= 32768) return false;
+    if (input.empty() || input.starts_with(L"pulse:") || IsThisPcArgument(input)) {
+        output = input; return true;
+    }
+    // The Recycle Bin verb (设为默认文件管理器) opens Pulse's own view.
+    if (IsRecycleBinArgument(input)) { output = L"pulse:recycle"; return true; }
+    auto path = input;
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    if (path.size() == 2 && path[1] == L':') path += L'\\';
+    wchar_t absolute[32768]{};
+    const DWORD n = GetFullPathNameW(path.c_str(), ARRAYSIZE(absolute), absolute, nullptr);
+    if (!n || n >= ARRAYSIZE(absolute)) return false;
+    output.assign(absolute, n);
+    return true;
+}
+
+bool SingleInstanceCoordinator::PublishEndpoint(HWND window) {
+    if (!mutex_ || endpoint_view_ || !window) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid != GetCurrentProcessId()) return false;
+    CurrentUserSecurityAttributes security;
+    if (!security) return false;
+    const auto name = endpoint_name_ + L".Endpoint";
+    endpoint_mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, security.get(), PAGE_READWRITE,
+        0, sizeof(EndpointRecord), name.c_str());
+    if (!endpoint_mapping_) return false;
+    endpoint_view_ = MapViewOfFile(endpoint_mapping_, FILE_MAP_WRITE, 0, 0, sizeof(EndpointRecord));
+    if (!endpoint_view_) { CloseHandle(endpoint_mapping_); endpoint_mapping_ = nullptr; return false; }
+    auto* record = static_cast<EndpointRecord*>(endpoint_view_);
+    InterlockedExchange(&record->published, 0);
+    GUID id{};
+    wchar_t nonce[40]{};
+    FILETIME created{};
+    if (FAILED(CoCreateGuid(&id)) || !StringFromGUID2(id, nonce, ARRAYSIZE(nonce)) ||
+        !Created(GetCurrentProcess(), created) || !SetPropW(window, nonce, reinterpret_cast<HANDLE>(1))) {
+        UnmapViewOfFile(endpoint_view_); endpoint_view_ = nullptr;
+        CloseHandle(endpoint_mapping_); endpoint_mapping_ = nullptr; return false;
+    }
+    endpoint_window_ = window; endpoint_nonce_ = nonce;
+    record->version = 1; record->pid = pid; record->created = created;
+    record->window = reinterpret_cast<uintptr_t>(window);
+    wcscpy_s(record->nonce, nonce);
+    InterlockedExchange(&record->published, 1);
+    return true;
+}
+bool SingleInstanceCoordinator::OwnsEndpoint(HWND window) const {
+    return mutex_ && endpoint_view_ && endpoint_window_ == window &&
+        GetPropW(window, endpoint_nonce_.c_str()) == reinterpret_cast<HANDLE>(1);
+}
+HWND SingleInstanceCoordinator::FindPrimaryWindow(std::wstring_view endpoint_name) {
+    const auto base = EndpointName(endpoint_name);
+    if (base.empty()) return nullptr;
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, (base + L".Endpoint").c_str());
+    if (!mapping) return nullptr;
+    auto* record = static_cast<const EndpointRecord*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(EndpointRecord)));
+    EndpointRecord copy{};
+    bool valid = record && record->published == 1;
+    if (valid) { MemoryBarrier(); std::memcpy(&copy, record, sizeof(copy)); MemoryBarrier();
+        valid = record->published == 1 && copy.version == 1 && copy.nonce[39] == 0; }
+    if (record) UnmapViewOfFile(record);
+    CloseHandle(mapping);
+    if (!valid) return nullptr;
+    HWND window = reinterpret_cast<HWND>(static_cast<uintptr_t>(copy.window));
+    DWORD pid = 0, session = 0, own_session = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (!pid || pid != copy.pid || !ProcessIdToSessionId(pid, &session) ||
+        !ProcessIdToSessionId(GetCurrentProcessId(), &own_session) || session != own_session ||
+        GetPropW(window, copy.nonce) != reinterpret_cast<HANDLE>(1)) return nullptr;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    if (!process) return nullptr;
+    FILETIME created{};
+    valid = WaitForSingleObject(process, 0) == WAIT_TIMEOUT && Created(process, created) &&
+        CompareFileTime(&created, &copy.created) == 0 && ProcessUserSidString(process) == CurrentUserSidString();
+    CloseHandle(process);
+    return valid ? window : nullptr;
 }
 
 bool SingleInstanceCoordinator::ForwardOpenPath(const std::wstring& path,
@@ -108,7 +177,7 @@ bool SingleInstanceCoordinator::ForwardOpenPath(const std::wstring& path,
     if (FAILED(CoCreateGuid(&id))) return false;
     std::memcpy(request.id.data(), &id, sizeof(id));
     request.deadline = GetTickCount64() + timeout_ms;
-    request.path = path;
+    if (!NormalizeLaunchPath(path, request.path)) return false;
     auto payload = EncodeOpenRequest(request);
     if (payload.empty()) return false;
     COPYDATASTRUCT data{};
@@ -118,7 +187,7 @@ bool SingleInstanceCoordinator::ForwardOpenPath(const std::wstring& path,
     // All attempts use the same ID and deadline. A timeout may mean that the
     // first message was accepted, so never retry with a fresh ID.
     while (GetTickCount64() < request.deadline) {
-        if (HWND hwnd = FindWindowW(kWindowClass, nullptr)) {
+        if (HWND hwnd = FindPrimaryWindow(endpoint_name_)) {
             DWORD pid = 0;
             GetWindowThreadProcessId(hwnd, &pid);
             if (pid) AllowSetForegroundWindow(pid);
@@ -133,21 +202,6 @@ bool SingleInstanceCoordinator::ForwardOpenPath(const std::wstring& path,
         Sleep(25);
     }
     return false;
-}
-
-bool SingleInstanceCoordinator::SendOpenPathToWindow(HWND target, const std::wstring& path,
-                                                     DWORD timeout_ms) {
-    return SendPathPayload(target, kOpenPathMessage, path, timeout_ms);
-}
-
-bool SingleInstanceCoordinator::SendTabTransfer(HWND target, const std::wstring& path,
-                                                DWORD timeout_ms) {
-    return SendPathPayload(target, kTabTransferMessage, path, timeout_ms);
-}
-
-bool SingleInstanceCoordinator::DecodeTabTransfer(const COPYDATASTRUCT* data,
-                                                  std::wstring& path) {
-    return DecodePathPayload(data, kTabTransferMessage, path);
 }
 
 std::vector<unsigned char> SingleInstanceCoordinator::EncodeOpenRequest(const OpenRequest& request) {
@@ -196,73 +250,19 @@ SingleInstanceCoordinator::OpenAcceptance SingleInstanceCoordinator::AcceptOpenR
 
 ULONG_PTR SingleInstanceCoordinator::OpenRequestMessageId() noexcept { return kOpenRequestMessage; }
 
-bool SingleInstanceCoordinator::SendTabTransfer(HWND target, const TabTransfer& transfer,
-                                                DWORD timeout_ms) {
-    // folder\0 focus\0 name\0 name\0 ... : every field terminated, so no entry
-    // name can smuggle itself into the next field.
-    std::wstring blob;
-    auto append = [&blob](const std::wstring& field) {
-        blob.append(field);
-        blob.push_back(L'\0');
-    };
-    append(transfer.path);
-    append(transfer.focus_name);
-    for (const auto& name : transfer.selected_names) append(name);
-    if (blob.size() > kMaxTabTransferChars) return false;
-    return SendBlobPayload(target, kTabTransferSelectionMessage, blob.data(),
-                           blob.size() * sizeof(wchar_t), timeout_ms);
-}
-
-bool SingleInstanceCoordinator::DecodeTabTransfer(const COPYDATASTRUCT* data,
-                                                  TabTransfer& transfer) {
-    transfer = {};
-    if (!data || data->dwData != kTabTransferSelectionMessage || !data->lpData ||
-        data->cbData < 2 * sizeof(wchar_t) || data->cbData % sizeof(wchar_t) != 0) {
+bool SingleInstanceCoordinator::DecodeOpenPath(const COPYDATASTRUCT* data,
+                                               std::wstring& path) {
+    path.clear();
+    if (!data || data->dwData != kOpenPathMessage || !data->lpData ||
+        data->cbData < sizeof(wchar_t) || data->cbData % sizeof(wchar_t) != 0) {
         return false;
     }
     const size_t chars = data->cbData / sizeof(wchar_t);
-    if (chars > kMaxTabTransferChars) return false;
+    if (chars > kMaxForwardedPathChars) return false;
     const auto* text = static_cast<const wchar_t*>(data->lpData);
     if (text[chars - 1] != L'\0') return false;
-    size_t pos = 0;
-    const auto next = [&](std::wstring& field) {
-        const size_t end = std::wstring_view(text + pos, chars - pos).find(L'\0');
-        if (end == std::wstring_view::npos) return false;
-        field.assign(text + pos, end);
-        pos += end + 1;
-        return true;
-    };
-    if (!next(transfer.path) || !next(transfer.focus_name)) return false;
-    while (pos < chars) {
-        std::wstring name;
-        if (!next(name)) return false;
-        if (!name.empty()) transfer.selected_names.push_back(std::move(name));
-    }
-    return !transfer.path.empty();
-}
-
-bool SingleInstanceCoordinator::DecodeOpenPath(const COPYDATASTRUCT* data,
-                                               std::wstring& path) {
-    return DecodePathPayload(data, kOpenPathMessage, path);
-}
-
-bool SingleInstanceCoordinator::SendDrainRequest(HWND target, HWND sink, DWORD timeout_ms) {
-    if (!sink) return false;
-    return SendBlobPayload(target, kDrainRequestMessage, &sink, sizeof(sink), timeout_ms);
-}
-
-bool SingleInstanceCoordinator::DecodeDrainRequest(const COPYDATASTRUCT* data, HWND& sink) {
-    sink = nullptr;
-    if (!data || data->dwData != kDrainRequestMessage || !data->lpData ||
-        data->cbData != sizeof(HWND)) {
-        return false;
-    }
-    std::memcpy(&sink, data->lpData, sizeof(sink));
-    return sink != nullptr && IsWindow(sink);
-}
-
-ULONG_PTR SingleInstanceCoordinator::DrainRequestMessageId() noexcept {
-    return kDrainRequestMessage;
+    path.assign(text, chars - 1);
+    return path.find(L'\0') == std::wstring::npos;
 }
 
 const wchar_t* SingleInstanceCoordinator::WindowClassName() noexcept {

@@ -83,6 +83,11 @@ bool WaitDone(OpsManager& ops, uint64_t before) {
         if (st.completed_ops > before && !st.active) return true;
         Sleep(5);
     }
+    const OpStatus st = ops.Status();
+    std::printf("[INFO] timeout task=%llu phase=%d authorization=%d completed=%llu active=%d\n",
+                static_cast<unsigned long long>(st.task_id), static_cast<int>(st.phase),
+                static_cast<int>(st.authorization), static_cast<unsigned long long>(st.completed_ops),
+                st.active ? 1 : 0);
     return false;
 }
 
@@ -313,6 +318,8 @@ int wmain(int argc, wchar_t** argv) {
                     st.lock_owners.size());
         Check(st.phase == OpPhase::Failed && FindPid(st.lock_owners, holder.pi.dwProcessId),
               "locked file inside a moved folder reports the owner");
+        Check(st.authorization == AuthorizationState::None,
+              "locked folder move does not request administrator permission");
         st = Retry(ops, st.task_id, true);
         Check(st.phase == OpPhase::Completed && fsys::exists(dest / L"project" / L"doc.txt"),
               "folder move completes after ending the owner");

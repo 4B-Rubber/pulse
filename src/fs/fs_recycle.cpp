@@ -1,5 +1,6 @@
 // fs_recycle.cpp
 #include "fs_recycle.h"
+#include "../common/recycle_index.h"
 #include "../common/current_user_security.h"
 #include <shellapi.h>
 #include <algorithm>
@@ -17,48 +18,6 @@ std::wstring FileNameOf(const std::wstring& path) {
     const size_t slash = view.find_last_of(L"\\/");
     return slash == std::wstring_view::npos ? std::wstring(view)
                                             : std::wstring(view.substr(slash + 1));
-}
-
-bool ParseIndexBytes(const BYTE* data, size_t size, RecycleItem& out) {
-    if (!data || size < 24) return false;
-    uint64_t ver = 0;
-    memcpy(&ver, data, 8);
-    if (ver == 2) {
-        if (size < 28) return false;
-        uint64_t file_size = 0;
-        memcpy(&file_size, data + 8, 8);
-        FILETIME deleted{};
-        memcpy(&deleted, data + 16, 8);
-        uint32_t nchars = 0;
-        memcpy(&nchars, data + 24, 4);
-        if (nchars == 0 || nchars > 32768) return false;
-        const size_t need = 28ull + static_cast<size_t>(nchars) * 2ull;
-        size_t bytes = static_cast<size_t>(nchars) * 2ull;
-        if (need > size) {
-            if (size <= 28) return false;
-            bytes = size - 28;
-            nchars = static_cast<uint32_t>(bytes / 2);
-        }
-        out.original_path.assign(reinterpret_cast<const wchar_t*>(data + 28), nchars);
-        while (!out.original_path.empty() && out.original_path.back() == L'\0')
-            out.original_path.pop_back();
-        out.size = file_size;
-        out.deleted = deleted;
-        out.name = FileNameOf(out.original_path);
-        return !out.original_path.empty() && !out.name.empty();
-    }
-    if (ver == 1) {
-        const size_t maxn = (std::min)((size - 24) / 2, static_cast<size_t>(260));
-        const wchar_t* p = reinterpret_cast<const wchar_t*>(data + 24);
-        out.original_path.assign(p, wcsnlen(p, maxn));
-        uint64_t file_size = 0;
-        memcpy(&file_size, data + 8, 8);
-        memcpy(&out.deleted, data + 16, 8);
-        out.size = file_size;
-        out.name = FileNameOf(out.original_path);
-        return !out.original_path.empty() && !out.name.empty();
-    }
-    return false;
 }
 
 DirEntry ToDirEntry(const RecycleItem& item) {
@@ -101,21 +60,13 @@ bool ReadRecycleIndex(const std::wstring& index_path, RecycleItem& out) {
     if (name.size() < 3 || name[0] != L'$' || (name[1] != L'I' && name[1] != L'i'))
         return false;
     out.index_path = index_path;
-    HANDLE handle = CreateFileW(index_path.c_str(), GENERIC_READ,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(handle, &size) || size.QuadPart < 24 || size.QuadPart > 64 * 1024) {
-        CloseHandle(handle);
-        return false;
-    }
-    std::vector<BYTE> buf(static_cast<size_t>(size.QuadPart));
-    DWORD read = 0;
-    const BOOL ok = ReadFile(handle, buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr);
-    CloseHandle(handle);
-    if (!ok || read < 24) return false;
-    if (!ParseIndexBytes(buf.data(), read, out)) return false;
+    pulse::recycle::IndexRecord record;
+    if (!pulse::recycle::ReadIndex(index_path, record)) return false;
+    out.original_path = std::move(record.original_path);
+    out.size = record.size;
+    out.deleted = record.deleted;
+    out.name = FileNameOf(out.original_path);
+    if (out.name.empty()) return false;
 
     std::wstring r_name = FileNameOf(index_path);
     if (r_name.size() >= 2) r_name[1] = (r_name[1] == L'I') ? L'R' : L'r';
@@ -139,7 +90,9 @@ bool EnumerateRecycleBinAtRoot(const std::wstring& recycle_root, std::vector<Dir
                                const RecycleProgress& progress) {
     const std::wstring sid = CurrentUserSidString();
     if (sid.empty()) return false; // Never fall back to scanning other users.
-    const std::wstring sid_dir = NormalizePath(recycle_root) + L"\\" + sid;
+    const std::wstring normalized = NormalizePath(recycle_root);
+    if (normalized.empty()) return false;
+    const std::wstring sid_dir = normalized + L"\\" + sid;
     WIN32_FIND_DATAW index{};
     HANDLE find = FindFirstFileW((sid_dir + L"\\$I*").c_str(), &index);
     if (find == INVALID_HANDLE_VALUE) {
@@ -171,6 +124,8 @@ bool EnumerateRecycleBinAtRoot(const std::wstring& recycle_root, std::vector<Dir
 bool EnumerateRecycleBin(std::vector<DirEntry>& out, RecycleBinInfo* info,
                          const RecycleProgress& progress) {
     out.clear();
+    // The listing never blocks on SHQueryRecycleBinW: occupancy has its own query,
+    // and a big bin must show rows while it is still being read.
     bool stopped = false;
     const auto gate = [&](const std::vector<DirEntry>& gathered) {
         if (!progress) return true;

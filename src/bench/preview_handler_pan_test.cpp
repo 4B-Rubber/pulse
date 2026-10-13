@@ -51,6 +51,7 @@ struct PreviewHandlerPanTest {
         pan.input_ = std::make_shared<PreviewHandlerPan::InputState>();
         auto& input = *pan.input_;
         input.host = host;
+        input.desired_hook = true;
         input.generation = 1;
         input.active = true;
         input.suppress_left_up = true;
@@ -119,6 +120,7 @@ struct PreviewHandlerPanTest {
             "hiding or switching the preview cancels an unstarted gesture");
         pan.host_ = host;
         input.host = host;
+        input.desired_hook = true; // Restore the Enable precondition after the preceding Disable.
 
         check(PreviewHandlerPan::QueueBegin(input, host, POINT{100, 100}) &&
               !pan.dragging_ && GetCapture() != host &&

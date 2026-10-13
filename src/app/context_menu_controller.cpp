@@ -16,6 +16,7 @@ ShellMenuEntry ComEntry(const ops::ShellMenuItem& item, int command = 0) {
     ShellMenuEntry entry;
     entry.command = command;
     entry.text = item.text;
+    entry.mnemonic = item.mnemonic;
     entry.enabled = item.enabled;
     entry.verb = item.verb;
     entry.from_com = true;
@@ -49,6 +50,7 @@ void AppendShellSection(std::vector<ui::FluentMenuItem>& items,
         ui::FluentMenuItem row;
         row.command = e.command;
         row.text = e.text;
+        row.mnemonic = e.mnemonic;
         row.enabled = e.enabled;
         // Software-owned submenu: keep the hierarchy as a one-level flyout.
         for (const auto& c : e.children) {
@@ -56,6 +58,7 @@ void AppendShellSection(std::vector<ui::FluentMenuItem>& items,
             ui::FluentMenuItem child;
             child.command = c.command;
             child.text = c.text;
+            child.mnemonic = c.mnemonic;
             child.enabled = c.enabled;
             row.children.push_back(std::move(child));
         }
@@ -165,7 +168,10 @@ void ContextMenuController::StartQuery(
     if (normalize_path) {
         for (auto& path : paths) path = normalize_path(path);
     }
-    if (token_ != 0 && background_ == background && paths_ == paths) {
+    auto disabled_handlers = prefs.DisabledHandlerClsids();
+    std::sort(disabled_handlers.begin(), disabled_handlers.end());
+    if (token_ != 0 && background_ == background && paths_ == paths &&
+        extended_ == extended && disabled_handlers_ == disabled_handlers) {
         if (prefetch_static) prefetch_static(extension);
         return;
     }
@@ -173,9 +179,11 @@ void ContextMenuController::StartQuery(
     uint32_t token = 0;
     if (operations_.query)
         token = operations_.query(paths, hwnd, background, extended,
-                                  prefs.DisabledHandlerClsids());
+                                  disabled_handlers);
     paths_ = std::move(paths);
     background_ = background;
+    extended_ = extended;
+    disabled_handlers_ = std::move(disabled_handlers);
     extension_ = std::move(extension);
     if (background && extension_.empty()) extension_ = ipc::kBackgroundVerbKey;
     token_ = token;
@@ -190,9 +198,14 @@ void ContextMenuController::StartQuery(
 
 void ContextMenuController::Close() {
     const uint32_t live = token_;
+    display_snapshot_valid_ = false;
+    menu_com_items_.clear();
+    menu_static_verbs_.clear();
     token_ = 0;
     paths_.clear();
     background_ = false;
+    extended_ = false;
+    disabled_handlers_.clear();
     com_ready_ = false;
     com_items_.clear();
     static_verbs_.clear();
@@ -247,8 +260,8 @@ bool ContextMenuController::ExecuteShellCommand(
         }
         if (!com_ready_ && wait_until_ready) wait_until_ready();
         uint32_t live = FindLiveComId(verb, text);
-        if (live == 0 && com_ready_) live = clicked;
-        if (token_ && (live != 0 || !text.empty() || !verb.empty())) {
+        // A recycled session-local ID cannot stand in for a missing action.
+        if (token_ && (live != 0 || (!com_ready_ && (!text.empty() || !verb.empty())))) {
             if (operations_.invoke) operations_.invoke(token_, live, verb, text);
             token_ = 0;
         }
@@ -260,13 +273,25 @@ bool ContextMenuController::ExecuteShellCommand(
         const int packed = command - CmdShellStaticBase;
         const size_t index = static_cast<size_t>(packed / ipc::kStaticVerbStride);
         const int child = packed % ipc::kStaticVerbStride;
-        if (index < static_verbs_.size()) {
-            const StaticVerb* verb = &static_verbs_[index];
+        const auto& displayed = display_snapshot_valid_ ? menu_static_verbs_ : static_verbs_;
+        if (index < displayed.size()) {
+            const StaticVerb* verb = &displayed[index];
+            const auto same = [](const StaticVerb& a, const StaticVerb& b) {
+                return a.verb == b.verb && a.command == b.command &&
+                       a.app_path == b.app_path && a.display == b.display;
+            };
+            const auto live = std::find_if(static_verbs_.begin(), static_verbs_.end(),
+                [&](const StaticVerb& candidate) { return same(*verb, candidate); });
             if (child > 0) {
                 const size_t ci = static_cast<size_t>(child - 1);
                 if (ci < verb->children.size()) verb = &verb->children[ci];
                 else verb = nullptr;
             }
+            // An asynchronous refresh may reorder or remove the shown command.
+            // Keep its displayed identity; never reinterpret an old position.
+            if (live == static_verbs_.end()) verb = nullptr;
+            else if (verb && child > 0 && std::none_of(live->children.begin(), live->children.end(),
+                [&](const StaticVerb& candidate) { return same(*verb, candidate); })) verb = nullptr;
             constexpr size_t kMaxTargets = 16;
             if (verb) {
                 for (size_t i = 0; i < paths_.size() && i < kMaxTargets; ++i) {
@@ -375,11 +400,22 @@ std::vector<ShellMenuEntry> ContextMenuController::ComposeEntries(
     ContextMenuPrefs& prefs, bool& prefs_changed) const {
     std::vector<ShellMenuEntry> entries;
     entries.reserve(static_verbs_.size() + com_items_.size());
+    // Explorer's own 打开方式 flyout (recommended apps + 选择其他应用) replaces
+    // the static 打开方式… row once the host delivered it with its apps; until
+    // then the static row is the instant fallback.
+    bool com_open_with = false;
+    for (size_t i = 0; i + 1 < com_items_.size() && !com_open_with; ++i) {
+        com_open_with = !com_items_[i].child && com_items_[i].has_children &&
+                        com_items_[i + 1].child &&
+                        ipc::IsOpenWithSubmenuVerb(com_items_[i].verb);
+    }
     for (size_t i = 0; i < static_verbs_.size() && i < static_cast<size_t>(ipc::kMaxStaticVerbParents);
          ++i) {
         const auto& verb = static_verbs_[i];
+        if (com_open_with && ipc::ToLowerVerb(verb.verb) == L"openas") continue;
         ShellMenuEntry entry;
         entry.text = verb.display;
+        entry.mnemonic = verb.mnemonic;
         entry.verb = verb.verb;
         if (!verb.children.empty()) {
             entry.command = 0;
@@ -390,6 +426,7 @@ std::vector<ShellMenuEntry> ContextMenuController::ComposeEntries(
                 child.command = CmdShellStaticBase +
                     static_cast<int>(i) * ipc::kStaticVerbStride + static_cast<int>(j) + 1;
                 child.text = verb.children[j].display;
+                child.mnemonic = verb.children[j].mnemonic;
                 child.verb = verb.children[j].verb;
                 entry.children.push_back(std::move(child));
             }
@@ -404,6 +441,9 @@ std::vector<ShellMenuEntry> ContextMenuController::ComposeEntries(
         if (item.child) continue;
         if (item.has_children) {
             ShellMenuEntry parent = ComEntry(item);
+            // It stands in for the static row, so the 打开方式 group switch
+            // governs it rather than the COM-sourced "open with" rows switch.
+            if (ipc::IsOpenWithSubmenuVerb(item.verb)) parent.from_com = false;
             for (size_t j = i + 1; j < com_items_.size() && com_items_[j].child; ++j) {
                 if (com_items_[j].id > 0x7FFF) continue;
                 parent.children.push_back(ComEntry(com_items_[j],
@@ -439,7 +479,7 @@ std::vector<ShellMenuEntry> ContextMenuController::ComposeEntries(
             const std::wstring name = !entry.text.empty() ? entry.text : entry.handler;
             const auto category = ipc::ClassifyExplorerItem(entry.verb, entry.text, flyout);
             if (prefs.RecordSeen(ipc::HandlerCatalogKey(entry.clsid), name, flyout,
-                                 category, true))
+                                 category, entry.from_com))
                 prefs_changed = true;
             continue;
         }
@@ -485,6 +525,8 @@ uint32_t ContextMenuController::FindLiveComId(const std::wstring& verb,
 void ContextMenuController::OpenMenu(std::vector<ui::FluentMenuItem> base_items) {
     base_items_ = std::move(base_items);
     menu_com_items_ = com_items_;
+    menu_static_verbs_ = static_verbs_;
+    display_snapshot_valid_ = true;
     menu_open_ = true;
 }
 

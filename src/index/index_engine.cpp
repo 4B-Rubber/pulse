@@ -5,10 +5,13 @@
 #include "../common/runtime_log.h"
 #include "search_trace.h"
 #include "index_parent_chain.h"
+#include "index_path_builder.h"
 #include "index_name_pool.h"
 #include "index_config.h"
 #include "index_query.h"
 #include "index_mft.h"
+#include "index_volume_fault_hooks.h"
+#include "index_mft_enum_page.h"
 #include "index_paths.h"
 #include "index_delta.h"
 #include "index_shard.h"
@@ -24,6 +27,7 @@
 #include <queue>
 #include <numeric>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -32,20 +36,54 @@
 
 namespace pulse::index {
 
+#ifdef PULSE_INDEX_VOLUME_FAULT_TEST
+namespace volume_fault_test {
+bool SnapshotFault(uint32_t stage);
+}
+#endif
+
 namespace {
 
-// Five million entries remain within signed node IDs and uint32 pool offsets.
-constexpr size_t kIndexCap = 5000000;
+// Rebuild work is synchronous on its worker. Thread-local correlation avoids
+// attributing concurrent query-side cache reads to that rebuild.
+thread_local uint64_t index_operation = 0;
+struct IndexOperationScope {
+    uint64_t previous = index_operation;
+    explicit IndexOperationScope(uint64_t operation) { index_operation = operation; }
+    ~IndexOperationScope() { index_operation = previous; }
+};
+
+diagnostics::runtime::Level IndexErrorLevel(DWORD error) {
+    return error == ERROR_OPERATION_ABORTED ? diagnostics::runtime::Level::Info :
+        diagnostics::runtime::Level::Error;
+}
+
+bool IndexFailure(const char* event, DWORD error, const std::wstring& path) {
+    TraceSearch(event, error, path);
+    diagnostics::runtime::Event(event, {{"operation", index_operation}, {"error", error}}, IndexErrorLevel(error));
+    SetLastError(error);
+    return false;
+}
+
+uint64_t MergeTriggerCode(const char* reason) noexcept {
+    if (!reason) return 0;
+    static constexpr const char* names[] = {"forced", "deleted_ratio", "structural_threshold", "delta_threshold", "quiet_changes"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+        if (std::strcmp(reason, names[i]) == 0) return i + 1;
+    return 0;
+}
+
+// Capacity follows the on-disk signed node IDs, not a workload-sized limit.
+// Real installations exceed five million entries; keep the root headroom.
+constexpr size_t kIndexCap = static_cast<size_t>((std::numeric_limits<int32_t>::max)()) - 64;
 constexpr size_t kFrnMergeThreshold = 4096;
 constexpr ULONGLONG kMinMergeIntervalMs = 10ull * 60ull * 1000ull;
-constexpr ULONGLONG kMergeFailureRetryMs = 5000;
 constexpr ULONGLONG kNamePoolIntervalMs = 60000;
 constexpr size_t kNamePoolWasteChars = 1ull << 20;
 constexpr ULONGLONG kIdleMergeQuietMs = 10ull * 60ull * 1000ull;
 constexpr ULONGLONG kDeltaFlushMs = 15ull * 1000ull;
 constexpr size_t kMergeStructChanges = 100000;
 constexpr uint64_t kMergeDeltaBytes = 64ull * 1024ull * 1024ull;
-constexpr uint64_t kCacheFreshSecs = 24ull * 60 * 60;
 constexpr uint32_t kIndexVer = kIndexSnapshotVersion;
 constexpr uint32_t kIndexVerMin = 7;
 constexpr uint64_t kUnixFtEpoch = 116444736000000000ull;
@@ -106,6 +144,22 @@ bool EqualsI(std::wstring_view a, std::wstring_view b) {
         if (FoldChar(a[i]) != FoldChar(b[i])) return false;
     }
     return true;
+}
+
+// File reference number of the file currently at `path`, 0 when absent. Hard
+// link journal records name one link; this tells whether it still exists.
+uint64_t FileFrnAt(const std::wstring& path) {
+    if (path.empty()) return 0;
+    const std::wstring open_path = path.size() >= MAX_PATH && path.rfind(L"\\\\", 0) != 0
+        ? L"\\\\?\\" + path : path;
+    HANDLE h = CreateFileW(open_path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const BOOL ok = GetFileInformationByHandle(h, &info);
+    CloseHandle(h);
+    return ok ? (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow : 0;
 }
 
 uint32_t NameHash(std::wstring_view name) {
@@ -211,15 +265,16 @@ uint64_t RootFrn(wchar_t letter) {
     return frn;
 }
 
-std::vector<VolumeInfo> ConfiguredVolumes() {
-    IndexConfig config;
-    if (MachineIndexScope()) LoadMachineConfig(config, nullptr);
+std::vector<VolumeInfo> ConfiguredVolumes(const IndexConfig& config) {
     auto volumes = EnumerateLocalVolumes(config);
     volumes.erase(std::remove_if(volumes.begin(), volumes.end(), [](const VolumeInfo& volume) {
         return !volume.enabled || !volume.online || volume.mount_point.size() < 2;
     }), volumes.end());
     return volumes;
 }
+
+
+
 
 int CompareFolded(std::wstring_view a, std::wstring_view b) {
     const size_t n = (std::min)(a.size(), b.size());
@@ -299,11 +354,15 @@ uint64_t FileIndexFrn(const std::wstring& path) {
 uint64_t AlignUp(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
 bool WriteAll(HANDLE h, const void* p, size_t n) {
+#ifdef PULSE_INDEX_VOLUME_FAULT_TEST
+    if (volume_fault_test::SnapshotFault(1)) return false;
+#endif
     const BYTE* b = static_cast<const BYTE*>(p);
     while (n) {
         DWORD w = 0;
         DWORD chunk = n > 1u << 20 ? (1u << 20) : static_cast<DWORD>(n);
-        if (!WriteFile(h, b, chunk, &w, nullptr) || w == 0) return false;
+        if (!WriteFile(h, b, chunk, &w, nullptr)) return false;
+        if (w == 0) { SetLastError(ERROR_WRITE_FAULT); return false; }
         b += w;
         n -= w;
     }
@@ -419,6 +478,7 @@ FileFeedPage Engine::ReadFeed(bool changes, const std::wstring& root, uint64_t e
         const auto id=static_cast<int32_t>(scan);
         if(IsTomb(id) || (NodeAt(id).flags & (kFlagHidden|kFlagDir))) continue;
         const auto path=BuildPathLocked(id);
+        if (path.empty()) { page.gap = true; continue; }
         if(IsExcludedPath(path) || (!root.empty() && !(path.size()>=root.size() &&
             CompareStringOrdinal(path.data(),static_cast<int>(root.size()),root.data(),static_cast<int>(root.size()),TRUE)==CSTR_EQUAL &&
             (path.size()==root.size() || root.back()==L'\\' || path[root.size()]==L'\\')))) continue;
@@ -426,6 +486,17 @@ FileFeedPage Engine::ReadFeed(bool changes, const std::wstring& root, uint64_t e
         page.records.push_back(std::move(record));
     }
     page.next=scan;page.done=scan>=count;return page;
+}
+
+void Engine::PublishExcludedPaths(const IndexConfig& config,
+                                 const std::function<void()>& locked_action) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    excluded_paths_ = config.excluded_paths;
+    for (auto& path : SystemExclusionPaths(config)) excluded_paths_.push_back(std::move(path));
+    hide_node_modules_ = HidesNodeModules(config);
+    // Rebuild initialization remains atomic with configuration publication.
+    InvalidateFilterLocked();
+    if (locked_action) locked_action();
 }
 
 bool Engine::IsExcludedPath(std::wstring_view path) const {
@@ -446,7 +517,14 @@ std::wstring Engine::Status() const {
 }
 
 void Engine::RequestRebuild() {
-    const auto active = ConfiguredVolumes();
+    IndexConfig config;
+    std::wstring config_error;
+    if (MachineIndexScope() && !LoadMachineConfig(config, &config_error)) {
+        SetStatus(config_error);
+        PingNotify(true);
+        return;
+    }
+    const auto active = ConfiguredVolumes(config);
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         UpdateVolumeVisibilityLocked(active, true);
@@ -459,7 +537,7 @@ void Engine::RequestRebuild() {
 
 std::vector<VolumeInfo> Engine::Volumes() const {
     IndexConfig config;
-    if (MachineIndexScope()) LoadMachineConfig(config, nullptr);
+    if (MachineIndexScope() && !LoadMachineConfig(config, nullptr)) return {};
     auto result = EnumerateLocalVolumes(config);
     std::shared_lock<std::shared_mutex> lock(mutex_);
     for (auto& volume : result) {
@@ -551,6 +629,7 @@ void Engine::SeedChanges(const std::wstring& owner) {
             const auto attr = AttrAt(i);
             if (attr.mtime < since) continue;
             ChangeRecord event; event.path = BuildPathLocked(i); event.time = attr.mtime;
+            if (event.path.empty()) continue;
             event.is_dir = (NodeAt(i).flags & kFlagDir) != 0;
             baseline.push_back(std::move(event));
         }
@@ -565,6 +644,7 @@ void Engine::Start(HWND notify, UINT msg) {
     notify_msg_ = msg;
     running_ = true;
     ready_ = false;
+    folder_size_background_ = true;
     change_signal_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     thread_ = std::thread(&Engine::Worker, this);
 }
@@ -774,18 +854,9 @@ int32_t Engine::EnsureChainLocked(Store& s, const std::wstring& path, bool leaf_
 }
 
 std::wstring Engine::BuildPathLocked(int32_t node) const {
-    int32_t chain[64];
-    int depth = 0;
-    for (int32_t i = node; i >= 0 && depth < 64; i = NodeAt(i).parent)
-        chain[depth++] = i;
-    std::wstring out;
-    for (int k = depth - 1; k >= 0; --k) {
-        std::wstring_view seg = NameOf(chain[k]);
-        if (!out.empty() && out.back() != L'\\') out += L'\\';
-        out.append(seg.data(), seg.size());
-        if (k == depth - 1 && seg.size() == 2 && seg[1] == L':') out += L'\\';
-    }
-    return out;
+    return BuildCompleteIndexPath(node, LiveCount(),
+        [&](int32_t id) { return NodeAt(id).parent; },
+        [&](int32_t id) { return NameOf(id); });
 }
 
 bool Engine::IsUnderLocked(int32_t node, int32_t ancestor) const {
@@ -793,7 +864,9 @@ bool Engine::IsUnderLocked(int32_t node, int32_t ancestor) const {
 }
 
 int32_t Engine::SubtreeEndLocked(int32_t node) const {
-    if (node < 0) return -1;
+    // DFS intervals describe the immutable snapshot, not overlay parent links.
+    // Until the overlay is merged, use the current parent chain for membership.
+    if (node < 0 || !subtree_intervals_valid_ || !patches_.empty()) return -1;
     const Node n = NodeAt(node);
     if (n.unused > static_cast<uint32_t>(node) &&
         n.unused <= static_cast<uint32_t>(LiveCount()))
@@ -992,12 +1065,15 @@ void Engine::CollectMatchesLocked(const CompiledQuery& cq, int32_t prefix_node,
             if (!starts || !postings || (single_char && !mapped.prefix1_all_chars)) return;
             const uint32_t first = starts[bucket];
             const uint32_t last = starts[bucket + 1];
+            if (first > last || last > starts[kPrefixBuckets]) return;
             for (uint32_t p = first; p < last; ++p) {
                 if ((p & 0x3ffu) == 0 && latest && latest->load() != expected) return;
                 const int32_t local_id = postings[p];
+                if (local_id < 0 || static_cast<uint32_t>(local_id) >= mapped.n ||
+                    global_first < 0 || local_id >= BaseCount() - global_first) continue;
                 const int32_t id = global_first + local_id;
                 if (id < 0 || id >= BaseCount()) continue;
-                if (term.pinyin && !patches_.empty() && patches_.contains(id)) continue;
+                if (patches_.contains(id)) continue;
                 if (direct_literal) {
                     if (local_id < 0 || local_id >= static_cast<int32_t>(mapped.n)) continue;
                     const Node& node = mapped.nodes[static_cast<size_t>(local_id)];
@@ -1064,7 +1140,7 @@ void Engine::CollectMatchesLocked(const CompiledQuery& cq, int32_t prefix_node,
             scoped = true;
         }
     }
-    if (!scoped && map_ && map_->hdr && map_->hdr->ver >= 8 && !vols_.empty()) {
+    if (!scoped && patches_.empty() && map_ && map_->hdr && map_->hdr->ver >= 8 && !vols_.empty()) {
         std::vector<char> skip(vols_.size(), 0);
         for (size_t vi = 0; vi < vols_.size(); ++vi) {
             for (int32_t root : inactive_volume_roots_)
@@ -1516,6 +1592,7 @@ SearchResult Engine::Search(const Query& q, const std::atomic<uint32_t>* latest,
         const Attr a = QueryAttrAtLocked(chosen[k]);
         Hit h;
         h.path = BuildQueryPathLocked(chosen[k]);
+        if (h.path.empty()) continue;
         h.name.assign(QueryNameOfLocked(chosen[k]));
         h.is_dir = (n.flags & kFlagDir) != 0;
         h.size = a.size;
@@ -1528,28 +1605,31 @@ SearchResult Engine::Search(const Query& q, const std::atomic<uint32_t>* latest,
 bool Engine::WriteIndexFile(const std::wstring& path, const Store& s,
                             const std::vector<VolState>& vols, uint64_t built_unix) const {
     if (s.nodes.size() > kIndexCap + 64 || s.pool.size() > UINT32_MAX) {
-        TraceSearch("filename_write_limit_failed", ERROR_FILE_TOO_LARGE, path);
-        return false;
+        return IndexFailure("filename_write_limit_failed", ERROR_FILE_TOO_LARGE, path);
     }
+    HierarchyIssue hierarchy_issue;
     if (!ValidateIndexHierarchy(static_cast<int32_t>(s.nodes.size()),
-            [&](int32_t i) { return s.nodes[static_cast<size_t>(i)]; })) {
-        SetLastError(ERROR_INVALID_DATA);
-        TraceSearch("filename_write_hierarchy_failed", ERROR_INVALID_DATA, path);
-        diagnostics::runtime::Event("index_write_invalid_hierarchy", {{"nodes", s.nodes.size()}, {"error", ERROR_INVALID_DATA}});
-        return false;
+            [&](int32_t i) { return s.nodes[static_cast<size_t>(i)]; }, &hierarchy_issue)) {
+        diagnostics::runtime::Event("index_write_invalid_hierarchy", {{"operation", index_operation},
+            {"nodes", s.nodes.size()}, {"error", ERROR_INVALID_DATA},
+            {"reason", static_cast<uint64_t>(hierarchy_issue.error)},
+            {"node", static_cast<uint32_t>(hierarchy_issue.node)},
+            {"parent", static_cast<uint32_t>(hierarchy_issue.parent)}}, diagnostics::runtime::Level::Error);
+        return IndexFailure("filename_write_hierarchy_failed", ERROR_INVALID_DATA, path);
     }
     std::wstring tmp = path + L".tmp";
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        TraceSearch("filename_write_open_failed", GetLastError(), tmp);
-        return false;
+        const DWORD error = GetLastError();
+        return IndexFailure("filename_write_open_failed", error, tmp);
     }
 
     auto name_of = [&](int32_t id) -> std::wstring_view {
         const Node& node = s.nodes[static_cast<size_t>(id)];
         return { s.pool.data() + node.off, node.len };
     };
+    bool prefix_overflow = false;
     auto build_prefix = [&](bool pair) {
         std::vector<uint32_t> counts(kPrefixBuckets, 0);
         std::vector<uint32_t> local;
@@ -1576,8 +1656,15 @@ bool Engine::WriteIndexFile(const std::wstring& path, const Store& s,
             visit(name_of(i), [&](uint32_t bucket) { ++counts[bucket]; });
 
         std::vector<uint32_t> start(kPrefixBuckets + 1, 0);
-        for (uint32_t i = 0; i < kPrefixBuckets; ++i)
-            start[i + 1] = start[i] + counts[i];
+        uint64_t posting_count = 0;
+        for (uint32_t i = 0; i < kPrefixBuckets; ++i) {
+            posting_count += counts[i];
+            if (posting_count > UINT32_MAX) {
+                prefix_overflow = true;
+                return std::make_pair(std::vector<uint32_t>{}, std::vector<int32_t>{});
+            }
+            start[i + 1] = static_cast<uint32_t>(posting_count);
+        }
         std::vector<uint32_t> cursor(start.begin(), start.end() - 1);
         std::vector<int32_t> ids(start.back(), -1);
         for (int32_t i = 0; i < static_cast<int32_t>(s.nodes.size()); ++i)
@@ -1586,6 +1673,11 @@ bool Engine::WriteIndexFile(const std::wstring& path, const Store& s,
     };
     const auto prefix1 = build_prefix(false);
     const auto prefix2 = build_prefix(true);
+    if (prefix_overflow) {
+        CloseHandle(h);
+        DeleteFileW(tmp.c_str());
+        return IndexFailure("filename_write_prefix_limit_failed", ERROR_FILE_TOO_LARGE, path);
+    }
 
     uint64_t off = 128;
     DiskHeader hdr{};
@@ -1635,31 +1727,36 @@ bool Engine::WriteIndexFile(const std::wstring& path, const Store& s,
 
     std::vector<BYTE> pad(128, 0);
     memcpy(pad.data(), &hdr, sizeof(hdr));
-    bool ok = WriteAll(h, pad.data(), pad.size());
+    DWORD write_error = ERROR_SUCCESS;
+    auto checked = [&](bool result) {
+        if (!result) write_error = GetLastError();
+        return result;
+    };
+    bool ok = checked(WriteAll(h, pad.data(), pad.size()));
     if (ok && !s.nodes.empty())
-        ok = WriteAll(h, s.nodes.data(), s.nodes.size() * sizeof(Node));
+        ok = checked(WriteAll(h, s.nodes.data(), s.nodes.size() * sizeof(Node)));
     if (ok) {
         const uint64_t at = hdr.nodes_off + s.nodes.size() * sizeof(Node);
         if (hdr.attrs_off > at) {
             std::vector<BYTE> z(static_cast<size_t>(hdr.attrs_off - at), 0);
-            ok = WriteAll(h, z.data(), z.size());
+            ok = checked(WriteAll(h, z.data(), z.size()));
         }
     }
     if (ok && !s.attrs.empty())
-        ok = WriteAll(h, s.attrs.data(), s.attrs.size() * sizeof(Attr));
+        ok = checked(WriteAll(h, s.attrs.data(), s.attrs.size() * sizeof(Attr)));
     if (ok) {
         LARGE_INTEGER pos{};
         pos.QuadPart = static_cast<LONGLONG>(hdr.pool_off);
-        ok = SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0;
+        ok = checked(SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0);
     }
     if (ok && !s.pool.empty())
-        ok = WriteAll(h, s.pool.data(), s.pool.size() * sizeof(wchar_t));
+        ok = checked(WriteAll(h, s.pool.data(), s.pool.size() * sizeof(wchar_t)));
     auto write_order = [&](uint64_t position, const std::vector<int32_t>& order) {
         if (!ok) return;
         LARGE_INTEGER pos{};
         pos.QuadPart = static_cast<LONGLONG>(position);
-        ok = SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0;
-        if (ok && !order.empty()) ok = WriteAll(h, order.data(), order.size() * sizeof(int32_t));
+        ok = checked(SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0);
+        if (ok && !order.empty()) ok = checked(WriteAll(h, order.data(), order.size() * sizeof(int32_t)));
     };
     write_order(hdr.child_order_off, child_order);
     auto write_prefix = [&](uint64_t position, const std::vector<uint32_t>& start,
@@ -1667,16 +1764,16 @@ bool Engine::WriteIndexFile(const std::wstring& path, const Store& s,
         if (!ok) return;
         LARGE_INTEGER pos{};
         pos.QuadPart = static_cast<LONGLONG>(position);
-        ok = SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0;
-        if (ok) ok = WriteAll(h, start.data(), start.size() * sizeof(uint32_t));
-        if (ok && !ids.empty()) ok = WriteAll(h, ids.data(), ids.size() * sizeof(int32_t));
+        ok = checked(SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0);
+        if (ok) ok = checked(WriteAll(h, start.data(), start.size() * sizeof(uint32_t)));
+        if (ok && !ids.empty()) ok = checked(WriteAll(h, ids.data(), ids.size() * sizeof(int32_t)));
     };
     write_prefix(prefix1_position, prefix1.first, prefix1.second);
     write_prefix(hdr.prefix2_off, prefix2.first, prefix2.second);
     if (ok) {
         LARGE_INTEGER pos{};
         pos.QuadPart = static_cast<LONGLONG>(hdr.vols_off);
-        ok = SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0;
+        ok = checked(SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0);
     }
     std::vector<DiskVol> dvols(vols.size());
     uint64_t frn_cur = hdr.frn_off;
@@ -1694,11 +1791,11 @@ bool Engine::WriteIndexFile(const std::wstring& path, const Store& s,
         frn_cur += dvols[i].frn_count * sizeof(DiskFrn);
     }
     if (ok && !dvols.empty())
-        ok = WriteAll(h, dvols.data(), dvols.size() * sizeof(DiskVol));
+        ok = checked(WriteAll(h, dvols.data(), dvols.size() * sizeof(DiskVol)));
     if (ok) {
         LARGE_INTEGER pos{};
         pos.QuadPart = static_cast<LONGLONG>(hdr.frn_off);
-        ok = SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0;
+        ok = checked(SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0);
     }
     if (ok) {
         for (const auto& v : vols) {
@@ -1710,18 +1807,16 @@ bool Engine::WriteIndexFile(const std::wstring& path, const Store& s,
             }
             std::sort(rows.begin(), rows.end(),
                       [](const DiskFrn& a, const DiskFrn& b) { return a.frn < b.frn; });
-            if (!WriteAll(h, rows.data(), rows.size() * sizeof(DiskFrn))) { ok = false; break; }
+            if (!checked(WriteAll(h, rows.data(), rows.size() * sizeof(DiskFrn)))) { ok = false; break; }
         }
     }
     // Seeking beyond EOF does not extend the file when the final tables are
     // empty. Persist their aligned endpoint so the reader's range checks hold.
-    if (ok) ok = SetEndOfFile(h) != FALSE;
-    const DWORD write_error = ok ? ERROR_SUCCESS : GetLastError();
+    if (ok) ok = checked(SetEndOfFile(h) != FALSE);
     CloseHandle(h);
     if (!ok) {
-        TraceSearch("filename_write_data_failed", write_error, tmp);
         DeleteFileW(tmp.c_str());
-        return false;
+        return IndexFailure("filename_write_data_failed", write_error, tmp);
     }
     return true;
 }
@@ -1729,17 +1824,29 @@ bool Engine::WriteIndexFile(const std::wstring& path, const Store& s,
 bool Engine::CommitMappedFile(const std::wstring& path) {
     const std::wstring tmp = path + L".tmp";
     std::unique_ptr<MappedFile> mapped;
+    auto fail = [&](const char* event, DWORD error) {
+        mapped.reset();
+        return IndexFailure(event, error, path);
+    };
+    auto move = [](const std::wstring& source, const std::wstring& target, uint32_t stage) {
+#ifdef PULSE_INDEX_VOLUME_FAULT_TEST
+        if (volume_fault_test::SnapshotFault(stage)) return false;
+#else
+        (void)stage;
+#endif
+        return MoveFileExW(source.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE;
+    };
     if (!MapIndexFile(tmp, mapped)) {
-        TraceSearch("filename_publish_map_failed", 0, tmp);
-        return false;
+        const DWORD error = GetLastError();
+        return fail("filename_publish_map_failed", error);
     }
     std::wstring retired;
     if (MachineIndexScope()) {
         const ShardPaths paths = AggregateShardPaths();
         ShardManifest published;
         if (!PublishShardBase(paths, tmp, built_unix_, 0, published, nullptr)) {
-            TraceSearch("filename_publish_shard_failed", 0, tmp);
-            return false;
+            const DWORD error = GetLastError();
+            return fail("filename_publish_shard_failed", error);
         }
     } else {
         // Windows cannot replace a file with a live mapped view. Rename the
@@ -1747,19 +1854,20 @@ bool Engine::CommitMappedFile(const std::wstring& path) {
         static std::atomic<uint64_t> publication_id{0};
         retired = path + L".previous." + std::to_wstring(GetCurrentProcessId()) + L"." +
             std::to_wstring(GetTickCount64()) + L"." + std::to_wstring(++publication_id);
-        if (!MoveFileExW(path.c_str(), retired.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        if (!move(path, retired, 2)) {
             const DWORD error = GetLastError();
             if (error != ERROR_FILE_NOT_FOUND) {
-                TraceSearch("filename_publish_retire_failed", error, path);
-                return false;
+                return fail("filename_publish_retire_failed", error);
             }
             retired.clear();
         }
-        if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH)) {
-            TraceSearch("filename_publish_replace_failed", GetLastError(), path);
-            if (!retired.empty() && !MoveFileExW(retired.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH))
-                TraceSearch("filename_publish_rollback_failed", GetLastError(), retired);
-            return false;
+        if (!move(tmp, path, 3)) {
+            const DWORD error = GetLastError();
+            if (!retired.empty() && !move(retired, path, 4)) {
+                const DWORD rollback_error = GetLastError();
+                IndexFailure("filename_publish_rollback_failed", rollback_error, retired);
+            }
+            return fail("filename_publish_replace_failed", error);
         }
     }
     AdoptMappedLocked(std::move(mapped));
@@ -1816,17 +1924,19 @@ void Engine::WriteVolumeShards(const Store& aggregate, const std::vector<VolStat
         DeleteFileW(temp.c_str());
         if (!WriteIndexFile(paths.base_a, shard, {v}, built_unix)) continue;
         ShardManifest published;
-        PublishShardBase(paths, temp, built_unix, 0, published, nullptr, source.volume_id);
+        if (!PublishShardBase(paths, temp, built_unix, 0, published, nullptr, source.volume_id)) {
+            const DWORD error = GetLastError();
+            IndexFailure("filename_publish_volume_shard_failed", error, temp);
+        }
     }
 }
 
 bool Engine::MapIndexFile(const std::wstring& path, std::unique_ptr<MappedFile>& out) const {
-    auto fail = [&](const char* stage, DWORD error) {
-        TraceSearch(stage, error, path);
-        diagnostics::runtime::Event(stage, {{"error", error}});
-        return false;
-    };
     auto m = std::make_unique<MappedFile>();
+    auto fail = [&](const char* stage, DWORD error) {
+        m.reset();
+        return IndexFailure(stage, error, path);
+    };
     m->file = CreateFileW(path.c_str(), GENERIC_READ,
                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1843,9 +1953,10 @@ bool Engine::MapIndexFile(const std::wstring& path, std::unique_ptr<MappedFile>&
     m->hdr = reinterpret_cast<const DiskHeader*>(m->view);
     if (memcmp(m->hdr->magic, "PIDX", 4) != 0 ||
         m->hdr->ver < kIndexVerMin || m->hdr->ver > kIndexVer) return fail("filename_map_validation_failed", ERROR_INVALID_DATA);
-    if (m->hdr->node_count > kIndexCap + 64) return fail("filename_map_validation_failed", ERROR_INVALID_DATA);
+    if (m->hdr->node_count > kIndexCap + 64 || m->hdr->pool_chars > UINT32_MAX)
+        return fail("filename_map_validation_failed", ERROR_INVALID_DATA);
     auto in_range = [&](uint64_t o, uint64_t n) {
-        return o <= m->size && n <= m->size && o + n <= m->size;
+        return o <= m->size && n <= m->size - o;
     };
     if (!in_range(m->hdr->nodes_off, sizeof(Node) * m->hdr->node_count)) return fail("filename_map_validation_failed", ERROR_INVALID_DATA);
     if (!in_range(m->hdr->attrs_off, sizeof(Attr) * m->hdr->node_count)) return fail("filename_map_validation_failed", ERROR_INVALID_DATA);
@@ -1861,15 +1972,24 @@ bool Engine::MapIndexFile(const std::wstring& path, std::unique_ptr<MappedFile>&
     auto prefix_in_range = [&](uint64_t raw_off, bool allow_all_chars_flag,
                                const uint32_t*& starts, const int32_t*& ids,
                                bool& all_chars) {
-        if (!allow_all_chars_flag && (raw_off & kPrefixAllCharsFlag)) return fail("filename_map_validation_failed", ERROR_INVALID_DATA);
+        if (!allow_all_chars_flag && (raw_off & kPrefixAllCharsFlag)) return false;
         all_chars = allow_all_chars_flag && (raw_off & kPrefixAllCharsFlag) != 0;
         const uint64_t off = raw_off & ~kPrefixAllCharsFlag;
         if (!off || !in_range(off, prefix_start_bytes)) return !off;
         starts = reinterpret_cast<const uint32_t*>(m->view + off);
         const uint32_t count = starts[kPrefixBuckets];
         if (!in_range(off + prefix_start_bytes,
-                      static_cast<uint64_t>(count) * sizeof(int32_t))) return fail("filename_map_validation_failed", ERROR_INVALID_DATA);
+                      static_cast<uint64_t>(count) * sizeof(int32_t))) return false;
         ids = reinterpret_cast<const int32_t*>(m->view + off + prefix_start_bytes);
+        if (starts[0] != 0) return false;
+        for (uint32_t bucket = 0; bucket < kPrefixBuckets; ++bucket) {
+            if (starts[bucket] > starts[bucket + 1] || starts[bucket + 1] > count)
+                return false;
+        }
+        for (uint32_t p = 0; p < count; ++p) {
+            if (ids[p] < 0 || static_cast<uint32_t>(ids[p]) >= m->hdr->node_count)
+                return false;
+        }
         return true;
     };
     if (!prefix_in_range(m->hdr->prefix1_off, true, m->prefix1_start, m->prefix1_ids,
@@ -1893,9 +2013,9 @@ bool Engine::MapIndexFile(const std::wstring& path, std::unique_ptr<MappedFile>&
     HierarchyIssue hierarchy_issue;
     if (!ValidateIndexHierarchy(static_cast<int32_t>(m->n),
             [&](int32_t i) { return m->nodes[i]; }, &hierarchy_issue)) {
-        diagnostics::runtime::Event("index_hierarchy_rejected", {{"reason", static_cast<uint64_t>(hierarchy_issue.error)},
+        diagnostics::runtime::Event("index_hierarchy_rejected", {{"operation", index_operation}, {"reason", static_cast<uint64_t>(hierarchy_issue.error)},
             {"node", static_cast<uint32_t>(hierarchy_issue.node)}, {"parent", static_cast<uint32_t>(hierarchy_issue.parent)},
-            {"nodes", m->n}, {"cache_version", m->hdr->ver}});
+            {"nodes", m->n}, {"cache_version", m->hdr->ver}}, diagnostics::runtime::Level::Error);
         return fail("filename_map_hierarchy_failed", ERROR_INVALID_DATA);
     }
     m->frns = m->hdr->frn_count
@@ -1943,6 +2063,7 @@ void Engine::AdoptMappedLocked(std::unique_ptr<MappedFile> mapped) {
     deleted_ = 0;
     pool_waste_ = 0;
     struct_changes_ = 0;
+    subtree_intervals_valid_ = true;
     last_struct_tick_ = 0;
     built_unix_ = map_ && map_->hdr ? map_->hdr->built_unix : 0;
     if (map_) {
@@ -2040,18 +2161,9 @@ std::wstring_view Engine::QueryNameOfLocked(int32_t id) const {
 }
 
 std::wstring Engine::BuildQueryPathLocked(int32_t id) const {
-    std::vector<std::wstring_view> parts;
-    for (int32_t current = id; current >= 0 && parts.size() < 256;) {
-        parts.push_back(QueryNameOfLocked(current));
-        current = QueryNodeAtLocked(current).parent;
-    }
-    std::wstring path;
-    for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
-        if (!path.empty() && path.back() != L'\\') path += L'\\';
-        path.append(it->data(), it->size());
-        if (it == parts.rbegin() && it->size() == 2 && (*it)[1] == L':') path += L'\\';
-    }
-    return path;
+    return BuildCompleteIndexPath(id, LiveCount(),
+        [&](int32_t current) { return QueryNodeAtLocked(current).parent; },
+        [&](int32_t current) { return QueryNameOfLocked(current); });
 }
 
 bool Engine::MatchQueryNodeLocked(int32_t id, const CompiledQuery& query,
@@ -2143,7 +2255,7 @@ void Engine::PreserveOfflineVolumesLocked(const std::vector<VolumeInfo>& active,
             const bool excluded_parent = source.parent >= 0 && source.parent != old.root_idx &&
                 (build_.nodes[static_cast<size_t>(node.parent)].flags & kFlagHidden) != 0;
             node.flags &= static_cast<uint8_t>(~kFlagHidden);
-            if (i == old.root_idx || excluded_parent || ShouldSkipName(name) ||
+            if (i == old.root_idx || excluded_parent || ShouldSkipChild(source.parent == old.root_idx, name) ||
                 IsExcludedPath(BuildPathLocked(i))) node.flags |= kFlagHidden;
             build_.pool.insert(build_.pool.end(), name.begin(), name.begin() + node.len);
             remap[static_cast<size_t>(i)] = static_cast<int32_t>(build_.nodes.size());
@@ -2441,6 +2553,7 @@ bool Engine::ReplayDeltasLocked() {
             if (idx >= LiveCount()) return;
             Patch& p = patches_[idx];
             if (which & static_cast<uint8_t>(PatchBits::Meta)) {
+                if (NodeAt(idx).parent != parent) subtree_intervals_valid_ = false;
                 p.parent = parent;
                 p.flags = flags;
                 p.has_meta = true;
@@ -2472,11 +2585,20 @@ bool Engine::ReplayDeltasLocked() {
             return false;
         }
     }
+    HierarchyIssue hierarchy_issue;
     if (!ValidateIndexHierarchy(LiveCount(), [this](int32_t id) {
             auto node = NodeAt(id);
             if (IsTomb(id)) node.flags |= kFlagDeleted;
             return node;
-        })) return false;
+        }, &hierarchy_issue)) {
+        diagnostics::runtime::Event("index_replay_invalid_hierarchy", {{"operation", index_operation},
+            {"reason", static_cast<uint64_t>(hierarchy_issue.error)},
+            {"node", static_cast<uint32_t>(hierarchy_issue.node)},
+            {"parent", static_cast<uint32_t>(hierarchy_issue.parent)},
+            {"nodes", static_cast<uint64_t>(LiveCount())}}, diagnostics::runtime::Level::Error);
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+    }
     RebuildChildMapLocked();
     indexed_.store(static_cast<size_t>(LiveCount()) > deleted_ ? LiveCount() - deleted_ : 0);
     InvalidateFilterLocked();
@@ -2546,6 +2668,9 @@ void Engine::MergeBase(bool force, const char* reason) {
         merging_ = false;
         return;
     }
+    const uint64_t operation = diagnostics::runtime::NextId();
+    const IndexOperationScope operation_scope(operation);
+    const ULONGLONG merge_started = GetTickCount64();
     Store snap;
     const auto timing = FilenameTiming::Begin();
     const auto pending = struct_changes_;
@@ -2604,10 +2729,19 @@ void Engine::MergeBase(bool force, const char* reason) {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         RefreshQueryShardsLocked();
     }
-    merge_retry_after_tick_ = committed ? 0 : GetTickCount64() + kMergeFailureRetryMs;
+    merge_failures_ = committed ? 0 : merge_failures_ + 1;
+    const ULONGLONG retry_ms = MergeRetryDelayMs(merge_failures_);
+    merge_retry_after_tick_ = committed ? 0 : GetTickCount64() + retry_ms;
+    const DWORD merge_error = committed ? ERROR_SUCCESS : (save_error ? save_error : ERROR_WRITE_FAULT);
     TraceSearch(committed ? "filename_merge_done" : "filename_merge_failed", revision_.load());
-    filename_timing_.End(FilenameStage::Merge, timing, pending,
-        committed ? ERROR_SUCCESS : (save_error ? save_error : ERROR_WRITE_FAULT), reason);
+    // Terminal record for every attempted merge; repeats aggregate in the
+    // critical sidecar because only the error code splits the pattern.
+    diagnostics::runtime::Event("index_merge_end", {{"operation", operation},
+        {"trigger", MergeTriggerCode(reason)}, {"outcome", committed ? 0ull : 1ull},
+        {"error", merge_error}, {"pending", pending}, {"elapsed_ms", GetTickCount64() - merge_started},
+        {"failures", merge_failures_}, {"retry_ms", retry_ms}},
+        committed ? diagnostics::runtime::Level::Info : diagnostics::runtime::Level::Error);
+    filename_timing_.End(FilenameStage::Merge, timing, pending, merge_error, reason);
     if (IndexDiagnosticsEnabled()) {
         auto& merge_stats = filename_timing_.Maintenance().merge;
         merge_stats.last_wall_us = FilenameTiming::Begin().wall - timing.wall;
@@ -2647,7 +2781,7 @@ bool Engine::TryLoadCache() {
     AdoptMappedLocked(std::move(mapped));
     if (!ReplayDeltasLocked()) {
         diagnostics::runtime::Event("index_replay_rejected", {{"nodes", static_cast<uint64_t>(LiveCount())},
-            {"elapsed_ms", GetTickCount64() - load_started}, {"rebuild_required", 1}});
+            {"elapsed_ms", GetTickCount64() - load_started}, {"rebuild_required", 1}}, diagnostics::runtime::Level::Error);
         // A rejected/partial replay must not be exposed while Worker rebuilds.
         AdoptMappedLocked(nullptr);
         ready_ = false;
@@ -2697,6 +2831,26 @@ int32_t Engine::FindByFrnLocked(const VolState& v, uint64_t frn) const {
     return -1;
 }
 
+void Engine::CollectFrnLocked(const VolState& v, uint64_t frn, std::vector<int32_t>& out) const {
+    out.clear();
+    const int32_t live = LiveCount();
+    auto add = [&](int32_t idx) {
+        if (idx < 0 || idx >= live || IsTomb(idx)) return;
+        if (std::find(out.begin(), out.end(), idx) == out.end()) out.push_back(idx);
+    };
+    for (const auto& entry : v.frn_new)
+        if (entry.frn == frn) add(entry.idx);
+    if (v.frn_base && v.frn_base_n) {
+        const DiskFrn* b = v.frn_base;
+        const DiskFrn* e = v.frn_base + v.frn_base_n;
+        for (auto it = std::lower_bound(b, e, frn, [](const DiskFrn& a, uint64_t k) { return a.frn < k; });
+             it != e && it->frn == frn; ++it)
+            add(it->idx);
+    }
+    for (const auto& entry : v.frn_build)
+        if (entry.first == frn) add(entry.second);
+}
+
 void Engine::MapFrnLocked(VolState& v, uint64_t frn, int32_t idx) {
     v.frn_new.push_back(DiskFrn{ frn, idx, 0 });
     if (v.frn_build.size() || (!v.frn_base && v.frn_new.size() < kFrnMergeThreshold)) {
@@ -2733,16 +2887,68 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
         reinterpret_cast<const wchar_t*>(reinterpret_cast<const BYTE*>(rec) + rec->FileNameOffset),
         rec->FileNameLength / sizeof(WCHAR));
     if (name.empty()) return UsnApply::None;
-    const DWORD reason = rec->Reason;
-    const bool structural_reason = (reason & (USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE |
-                                              USN_REASON_RENAME_NEW_NAME)) != 0;
-    const bool attr_reason = (reason & (USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION |
-                                        USN_REASON_DATA_OVERWRITE | USN_REASON_BASIC_INFO_CHANGE)) != 0;
-    if (!structural_reason && !attr_reason) return UsnApply::None;
+    DWORD reason = rec->Reason;
+    const bool is_dir = (rec->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    constexpr DWORD kAttrReasons = USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION |
+                                   USN_REASON_DATA_OVERWRITE | USN_REASON_BASIC_INFO_CHANGE;
+    // The last link going away is FILE_DELETE; adding or removing any other
+    // link is HARD_LINK_CHANGE naming that link.
+    const bool delete_all = (reason & USN_REASON_FILE_DELETE) != 0;
+    const bool link_change = !is_dir && !delete_all && (reason & USN_REASON_HARD_LINK_CHANGE) != 0;
+    bool structural_reason = (reason & (USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE |
+                                        USN_REASON_RENAME_NEW_NAME)) != 0;
+    const bool attr_reason = (reason & kAttrReasons) != 0;
+    if (!structural_reason && !attr_reason && !link_change) return UsnApply::None;
 
     const uint64_t frn = rec->FileReferenceNumber;
-    const bool is_dir = (rec->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     int32_t idx = FindByFrnLocked(v, frn);
+    // Files keep one node per hard link, so pick the node this record names.
+    std::vector<int32_t> links;
+    if (!is_dir) {
+        CollectFrnLocked(v, frn, links);
+        if (!links.empty() && (idx < 0 || IsTomb(idx) ||
+                               std::find(links.begin(), links.end(), idx) == links.end()))
+            idx = links.front();
+    }
+    if (link_change || (links.size() > 1 && !delete_all &&
+                        (reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME)))) {
+        const int32_t link_parent = FindByFrnLocked(v, rec->ParentFileReferenceNumber);
+        int32_t named = -1;
+        if (link_parent >= 0) {
+            for (const int32_t i : links) {
+                if (NodeAt(i).parent == link_parent && EqualsI(NameOf(i), name)) { named = i; break; }
+            }
+        }
+        if (link_change) {
+            if (link_parent < 0) return UsnApply::None;
+            std::wstring link_path = BuildPathLocked(link_parent);
+            if (link_path.empty()) return UsnApply::None;
+            if (link_path.back() != L'\\') link_path += L'\\';
+            link_path += name;
+            const bool exists = FileFrnAt(link_path) == frn;
+            if (exists && named < 0) {
+                idx = -1;                                  // a new name appeared
+                reason = USN_REASON_FILE_CREATE | (reason & kAttrReasons);
+                structural_reason = true;
+            } else if (!exists && named >= 0) {
+                idx = named;                               // this name went away
+                reason = USN_REASON_FILE_DELETE;
+                structural_reason = true;
+            } else if (exists && attr_reason) {
+                idx = named;
+            } else {
+                return UsnApply::None;
+            }
+        } else if (named >= 0) {
+            idx = named;
+        } else {
+            // A rename moves exactly one link: the one whose path is gone.
+            idx = -1;
+            for (const int32_t i : links) {
+                if (FileFrnAt(BuildPathLocked(i)) != frn) { idx = i; break; }
+            }
+        }
+    }
     const auto size_before = FolderSizeItem(idx);
     folder_size_usn_update_ = true;
     struct SizeUpdate {
@@ -2750,6 +2956,7 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
         ~SizeUpdate() { finish(); }
     } size_update{[&] {
         folder_size_usn_update_ = false;
+        ++folder_size_mutations_;
         if (idx >= 0) folder_sizes_.Replace(idx, size_before, FolderSizeItem(idx),
             [this](int32_t id) { return FolderSizeItem(id); });
     }};
@@ -2799,6 +3006,7 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
             } else v.tracking_paths.erase(frn);
         }
         if (kind != ChangeKind::Renamed && had_tracking_path) event.path = previous_path;
+        if (event.path.empty()) { GapFeed(); return; }
         const bool visible = target >= 0 && !(NodeAt(target).flags & kFlagHidden) && !IsExcludedPath(event.path);
         if (!visible && !previous_visible) return;
         if (kind == ChangeKind::Renamed && !previous_visible && !had_tracking_path) {
@@ -2811,6 +3019,7 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
 
     auto refresh = [&](int32_t i) {
         std::wstring path = BuildPathLocked(i);
+        if (path.empty()) return;
         WIN32_FILE_ATTRIBUTE_DATA fad{};
         if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return;
         Attr a;
@@ -2838,7 +3047,36 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
         if (effect == UsnApply::None) effect = UsnApply::Attr;
     };
 
+    // Other hard link names of the same file share its data and lifetime.
+    auto other_link = [&](int32_t i, bool remove) {
+        if (i == idx || i < 0 || i >= LiveCount() || IsTomb(i)) return;
+        const auto before = FolderSizeItem(i);
+        if (remove) {
+            const std::wstring path = BuildPathLocked(i);
+            if (!path.empty() && !(NodeAt(i).flags & kFlagHidden) && !IsExcludedPath(path)) {
+                ChangeRecord event;
+                event.time = FtToUnix(static_cast<uint64_t>(rec->TimeStamp.QuadPart));
+                event.kind = ChangeKind::Deleted;
+                event.file_id = frn ^ (static_cast<uint64_t>(v.letter) << 56);
+                event.path = path;
+                RecordFeed(event); changes_.Record(std::move(event));
+            }
+            ChildMapRemove(NodeAt(i).parent, NameOf(i), i);
+            tombstones_.insert(i);
+            ++deleted_;
+            InvalidateFilterLocked();
+            if (delta) delta->QueueTomb(i);
+        } else {
+            refresh(i);
+        }
+        ++folder_size_mutations_;
+        folder_sizes_.Replace(i, before, FolderSizeItem(i),
+            [this](int32_t id) { return FolderSizeItem(id); });
+    };
+
     if (reason & USN_REASON_FILE_DELETE) {
+        if (delete_all)
+            for (const int32_t i : links) other_link(i, true);
         if (idx >= 0 && idx < LiveCount() && !IsTomb(idx)) {
             track(ChangeKind::Deleted, idx);
             v.tracking_paths.erase(frn);
@@ -2851,7 +3089,10 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
         }
         return UsnApply::None;
     }
-    if (idx >= 0 && idx < LiveCount() && attr_reason) refresh(idx);
+    if (idx >= 0 && idx < LiveCount() && attr_reason) {
+        refresh(idx);
+        for (const int32_t i : links) other_link(i, false);
+    }
     if (!structural_reason) { if (effect != UsnApply::None) track(ChangeKind::Modified, idx); return effect; }
 
     int32_t parent = FindByFrnLocked(v, rec->ParentFileReferenceNumber);
@@ -2860,7 +3101,7 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
     uint8_t flags = is_dir ? kFlagDir : 0;
     // A root fallback is not a real indexed location for an unresolved parent.
     if ((reason & USN_REASON_RENAME_NEW_NAME) && FindByFrnLocked(v, rec->ParentFileReferenceNumber) < 0) flags |= kFlagHidden;
-    if (ShouldSkipName(name)) flags |= kFlagHidden;
+    if (ShouldSkipChild(parent == v.root_idx, name)) flags |= kFlagHidden;
     std::wstring parent_path = BuildPathLocked(parent);
     if (!parent_path.empty() && parent_path.back() != L'\\') parent_path += L'\\';
     if (IsExcludedPath((resolved_parent.empty() ? parent_path : resolved_parent + L"\\") + std::wstring(name))) flags |= kFlagHidden;
@@ -2886,6 +3127,7 @@ Engine::UsnApply Engine::ApplyUsnLocked(VolState& v, const USN_RECORD_V2* rec) {
 
     if (idx >= 0 && idx < LiveCount()) {
         const Node old = NodeAt(idx);
+        if (old.parent != parent) subtree_intervals_valid_ = false;
         ChildMapRemove(old.parent, NameOf(idx), idx);
         if (tombstones_.erase(idx)) --deleted_;
         const int32_t base = BaseCount();
@@ -3065,10 +3307,33 @@ bool Engine::CatchUpVolume(VolState& v, bool* changed, bool* structural) {
 }
 
 bool Engine::IndexVolumeMft(const VolumeInfo& volume) {
-    if (volume.mount_point.size() < 2) return false;
+#ifdef PULSE_INDEX_VOLUME_FAULT_TEST
+    using volume_fault_test::OpenVolume;
+    using volume_fault_test::CloseHandle;
+    using volume_fault_test::QueryJournal;
+    using volume_fault_test::RootFrn;
+    const auto enumerate_mft = &volume_fault_test::EnumerateMft;
+    const auto enum_usn = &volume_fault_test::DeviceIoControl;
+#else
+    const auto enumerate_mft = &EnumerateMft;
+    const auto enum_usn = &::DeviceIoControl;
+#endif
+    if (volume.mount_point.size() < 2) { SetLastError(ERROR_INVALID_NAME); return false; }
     const wchar_t letter = towupper(volume.mount_point[0]);
+    size_t scan_records = 0;
+    // Phase: 1=open, 2=MFT stopped, 3=USN read, 4=USN page,
+    // 5=capacity, 6=empty/cancelled scan, 7=tree construction.
+    auto fail = [&](DWORD error, uint64_t phase) {
+        if (!error) error = ERROR_READ_FAULT;
+        diagnostics::runtime::Event(error == ERROR_OPERATION_ABORTED ? "index_volume_scan_cancelled" : "index_volume_scan_failed", {
+            {"operation", index_operation},
+            {"drive", static_cast<uint64_t>(letter)}, {"phase", phase},
+            {"records", scan_records}, {"limit", kIndexCap}, {"error", error}}, IndexErrorLevel(error));
+        SetLastError(error);
+        return false;
+    };
     HANDLE h = OpenVolume(letter);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) return fail(GetLastError(), 1);
 
     VolState vol;
     vol.letter = letter;
@@ -3086,8 +3351,9 @@ bool Engine::IndexVolumeMft(const VolumeInfo& volume) {
         SetStatus(StatusDriveProgress(letter, n));
         PingNotify();
     };
-    bool from_mft = EnumerateMft(h, &running_, progress, [&](MftFile&& f) {
-        if (frn_nodes.size() >= kIndexCap) return false;
+    bool capacity_reached = false;
+    const MftReadResult mft_result = enumerate_mft(h, &running_, progress, [&](MftFile&& f) {
+        if (frn_nodes.size() >= kIndexCap) { capacity_reached = true; return false; }
         FrnNode node;
         node.frn = f.frn;
         node.parent = f.parent;
@@ -3097,10 +3363,32 @@ bool Engine::IndexVolumeMft(const VolumeInfo& volume) {
         node.is_dir = f.is_dir;
         node.name_type = f.name_type;
         frn_nodes.push_back(std::move(node));
+        // Hard links (pnpm stores, WeChat files, WinSxS) are searchable under
+        // every name, like Explorer and Everything list them.
+        for (auto& link : f.links) {
+            if (frn_nodes.size() >= kIndexCap) { capacity_reached = true; return false; }
+            FrnNode extra;
+            extra.frn = f.frn;
+            extra.parent = link.parent;
+            extra.size = f.size;
+            extra.mtime = f.mtime;
+            extra.name = std::move(link.name);
+            extra.extra_link = true;
+            frn_nodes.push_back(std::move(extra));
+        }
         return true;
     });
+    scan_records = frn_nodes.size();
 
-    if (!from_mft) {
+    if (mft_result == MftReadResult::Stopped || !running_) {
+        CloseHandle(h);
+        return fail(capacity_reached ? ERROR_FILE_TOO_LARGE : ERROR_OPERATION_ABORTED,
+            capacity_reached ? 5 : 2);
+    }
+    if (mft_result == MftReadResult::Failed) {
+        // A fallback must not inherit records from a failed partial scan.
+        frn_nodes.clear();
+        scan_records = 0;
         MFT_ENUM_DATA_V0 med{};
         med.StartFileReferenceNumber = 0;
         med.LowUsn = 0;
@@ -3108,43 +3396,70 @@ bool Engine::IndexVolumeMft(const VolumeInfo& volume) {
         std::vector<BYTE> buffer(1024 * 1024);
         DWORD br = 0;
         while (running_) {
-            if (!DeviceIoControl(h, FSCTL_ENUM_USN_DATA, &med, sizeof(med),
+            if (!enum_usn(h, FSCTL_ENUM_USN_DATA, &med, sizeof(med),
                                  buffer.data(), static_cast<DWORD>(buffer.size()), &br, nullptr)) {
                 DWORD err = GetLastError();
                 if (err != ERROR_HANDLE_EOF) {
                     CloseHandle(h);
-                    return false;
+                    return fail(err, 3);
                 }
                 break;
             }
-            if (br <= sizeof(USN)) break;
-            med.StartFileReferenceNumber = *reinterpret_cast<USN*>(buffer.data());
+            MftEnumPage page;
+            if (br > buffer.size() ||
+                !ParseMftEnumPage({buffer.data(), br}, med.StartFileReferenceNumber, page)) {
+                CloseHandle(h);
+                return fail(ERROR_INVALID_DATA, 4);
+            }
+            if (page.records > kIndexCap - frn_nodes.size()) {
+                CloseHandle(h);
+                return fail(ERROR_FILE_TOO_LARGE, 5);
+            }
+            med.StartFileReferenceNumber = page.next_cursor;
             auto* rec = reinterpret_cast<PUSN_RECORD_V2>(buffer.data() + sizeof(USN));
             BYTE* end = buffer.data() + br;
-            while (reinterpret_cast<BYTE*>(rec) + sizeof(USN_RECORD_V2) <= end) {
+            while (reinterpret_cast<BYTE*>(rec) < end) {
                 FrnNode n;
                 n.frn = rec->FileReferenceNumber;
                 n.parent = rec->ParentFileReferenceNumber;
-                n.name.assign(rec->FileName, rec->FileNameLength / sizeof(WCHAR));
+                n.name.assign(reinterpret_cast<const WCHAR*>(reinterpret_cast<const BYTE*>(rec) +
+                    rec->FileNameOffset), rec->FileNameLength / sizeof(WCHAR));
                 n.is_dir = (rec->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                 frn_nodes.push_back(std::move(n));
-                if (rec->RecordLength == 0) break;
                 rec = reinterpret_cast<PUSN_RECORD_V2>(reinterpret_cast<BYTE*>(rec) + rec->RecordLength);
             }
-            if (frn_nodes.size() >= kIndexCap) break;
+            scan_records = frn_nodes.size();
             SetStatus(StatusDriveProgress(letter, frn_nodes.size()));
             PingNotify();
         }
     }
     CloseHandle(h);
-    if (!running_ || frn_nodes.empty()) return !frn_nodes.empty();
+    if (!running_ || frn_nodes.empty())
+        return fail(running_ ? ERROR_NO_MORE_FILES : ERROR_OPERATION_ABORTED, 6);
 
-    return BuildMftTree(std::move(vol), RootFrn(letter), std::move(frn_nodes));
+    if (!BuildMftTree(std::move(vol), RootFrn(letter), std::move(frn_nodes)))
+        return fail(running_ ? ERROR_INVALID_DATA : ERROR_OPERATION_ABORTED, 7);
+    return true;
 }
 
 bool Engine::BuildMftTree(VolState vol, uint64_t root_frn, std::vector<FrnNode> frn_nodes) {
     const wchar_t letter = vol.letter;
     auto rank = [](uint8_t t) { return (t == 1 || t == 3) ? 0 : (t == 0 ? 1 : 2); };
+    // Extra hard link names never take part in FRN parent resolution; they are
+    // attached below their own directory once the primary tree exists.
+    std::vector<FrnNode> links;
+    {
+        size_t kept = 0;
+        for (size_t read = 0; read < frn_nodes.size(); ++read) {
+            if (frn_nodes[read].extra_link) {
+                links.push_back(std::move(frn_nodes[read]));
+                continue;
+            }
+            if (kept != read) frn_nodes[kept] = std::move(frn_nodes[read]);
+            ++kept;
+        }
+        frn_nodes.resize(kept);
+    }
     std::sort(frn_nodes.begin(), frn_nodes.end(),
               [](const FrnNode& a, const FrnNode& b) { return a.frn < b.frn; });
     size_t unique_count = 0;
@@ -3183,33 +3498,30 @@ bool Engine::BuildMftTree(VolState vol, uint64_t root_frn, std::vector<FrnNode> 
     }
 
     std::vector<FrnNode*> stack;
+    std::unordered_set<uint64_t> seen;  // only for walks deeper than kCheckedHops
     auto build_name = [&](int32_t id) -> std::wstring_view {
         const Node& node = build_.nodes[static_cast<size_t>(id)];
         return std::wstring_view(build_.pool.data() + node.off, node.len);
     };
     auto build_path = [&](int32_t id) {
-        int32_t chain[64];
-        int depth = 0;
-        for (int32_t current = id; current >= 0 && depth < 64;
-             current = build_.nodes[static_cast<size_t>(current)].parent)
-            chain[depth++] = current;
-        std::wstring path;
-        for (int k = depth - 1; k >= 0; --k) {
-            const std::wstring_view part = build_name(chain[k]);
-            if (!path.empty() && path.back() != L'\\') path += L'\\';
-            path.append(part.data(), part.size());
-            if (k == depth - 1 && part.size() == 2 && part[1] == L':') path += L'\\';
-        }
-        return path;
+        return BuildCompleteIndexPath(id, static_cast<int32_t>(build_.nodes.size()),
+            [&](int32_t current) { return build_.nodes[static_cast<size_t>(current)].parent; },
+            build_name);
     };
     size_t added = 0;
     for (FrnNode& node : frn_nodes) {
         if (!running_ || added >= kIndexCap) break;
         if (node.index >= 0) continue;
         stack.clear();
+        if (!seen.empty()) seen.clear();
         uint64_t cur = node.frn;
         int32_t parent_idx = vol.root_idx;
-        for (int hop = 0; hop < 48; ++hop) {
+        // Walk to the nearest placed ancestor. Reused MFT slots can give a deep
+        // folder a lower FRN than its ancestors, so this is not depth-limited
+        // (a limit re-rooted the rest of the chain below the volume root); only
+        // a parent cycle in a damaged MFT stops the walk early.
+        constexpr size_t kCheckedHops = 64;
+        for (;;) {
             if (index_dir_frn_ && cur == index_dir_frn_ && letter == index_dir_letter_) {
                 stack.clear();
                 break;
@@ -3218,11 +3530,17 @@ bool Engine::BuildMftTree(VolState vol, uint64_t root_frn, std::vector<FrnNode> 
             FrnNode* current = find_node(cur);
             if (!current || current->name.empty()) break;
             if (current->index >= 0) { parent_idx = current->index; break; }
+            if (stack.size() >= kCheckedHops) {
+                if (seen.empty())
+                    for (const FrnNode* walked : stack) seen.insert(walked->frn);
+                if (!seen.insert(current->frn).second) break;
+            }
             stack.push_back(current);
             if (current->parent == cur) break;
             cur = current->parent;
         }
         std::wstring candidate = build_path(parent_idx);
+        if (candidate.empty()) return false;
         bool hidden_parent = parent_idx >= 0 && parent_idx != vol.root_idx &&
             (build_.nodes[static_cast<size_t>(parent_idx)].flags & kFlagHidden) != 0;
         for (auto rit = stack.rbegin(); rit != stack.rend(); ++rit) {
@@ -3231,7 +3549,8 @@ bool Engine::BuildMftTree(VolState vol, uint64_t root_frn, std::vector<FrnNode> 
             uint8_t flags = n.is_dir ? kFlagDir : 0;
             if (!candidate.empty() && candidate.back() != L'\\') candidate += L'\\';
             candidate += n.name;
-            if (hidden_parent || ShouldSkipName(n.name) || IsExcludedPath(candidate))
+            if (candidate.size() > 32766) return false;
+            if (hidden_parent || ShouldSkipChild(parent_idx == vol.root_idx, n.name) || IsExcludedPath(candidate))
                 flags |= kFlagHidden;
             parent_idx = AddNodeLocked(build_, parent_idx, n.name, flags, n.frn, n.size, n.mtime);
             n.index = parent_idx;
@@ -3242,6 +3561,42 @@ bool Engine::BuildMftTree(VolState vol, uint64_t root_frn, std::vector<FrnNode> 
         indexed_.store(build_.nodes.size());
         if ((added & 0x3FFF) == 0) PingNotify();
     }
+    for (FrnNode& link : links) {
+        if (!running_ || added >= kIndexCap) break;
+        if (link.name.empty() || IsIndexArtifactName(link.name)) continue;
+        int32_t parent_idx = -1;
+        if (root_frn && link.parent == root_frn) {
+            parent_idx = vol.root_idx;
+        } else if (const FrnNode* parent = find_node(link.parent); parent && parent->is_dir) {
+            parent_idx = parent->index;
+        }
+        if (parent_idx < 0) continue;
+        if (const FrnNode* primary = find_node(link.frn)) {
+            if (primary->is_dir) continue;
+            if (primary->index >= 0 &&
+                build_.nodes[static_cast<size_t>(primary->index)].parent == parent_idx &&
+                EqualsI(build_name(primary->index), link.name)) continue;
+            link.size = primary->size;
+            link.mtime = primary->mtime;
+        }
+        std::wstring path = build_path(parent_idx);
+        if (path.empty()) continue;
+        if (path.back() != L'\\') path += L'\\';
+        path += link.name;
+        if (path.size() > 32766) continue;
+        const bool hidden_parent = parent_idx != vol.root_idx &&
+            (build_.nodes[static_cast<size_t>(parent_idx)].flags & kFlagHidden) != 0;
+        const uint8_t flags = hidden_parent || ShouldSkipChild(parent_idx == vol.root_idx, link.name) || IsExcludedPath(path)
+            ? kFlagHidden : 0;
+        const int32_t idx = AddNodeLocked(build_, parent_idx, link.name, flags, link.frn, link.size, link.mtime);
+        vol.frn_build.emplace_back(link.frn, idx);
+        ++added;
+        if ((added & 0x3FFF) == 0) {
+            indexed_.store(build_.nodes.size());
+            PingNotify();
+        }
+    }
+    indexed_.store(build_.nodes.size());
     if (added == 0) return false;
     vol.item_count = added + 1;
     build_vols_.push_back(std::move(vol));
@@ -3422,41 +3777,83 @@ void Engine::WalkTree(int32_t parent, const std::wstring& dir, int depth) {
 }
 
 void Engine::FullRebuild(const char* reason) {
+#ifdef PULSE_INDEX_VOLUME_FAULT_TEST
+    using volume_fault_test::ConfiguredVolumes;
+    using volume_fault_test::IsAdmin;
+#endif
     const auto operation = diagnostics::runtime::NextId();
+    const IndexOperationScope operation_scope(operation);
     const auto started = GetTickCount64();
     const uint64_t reason_code = !strcmp(reason, "cold_start") ? 1 : !strcmp(reason, "startup_stale") ? 2 :
         !strcmp(reason, "snapshot_upgrade") ? 3 : 0;
     diagnostics::runtime::Event("index_rebuild_begin", {{"operation", operation}, {"reason", reason_code}, {"nodes", indexed_.load()}});
     const auto timing = FilenameTiming::Begin();
     DWORD build_error = ERROR_SUCCESS;
-    const auto configured_volumes = ConfiguredVolumes();
+    bool used_mft = false;
+    auto finish = [&] {
+        const DWORD error = running_ ? build_error : ERROR_OPERATION_ABORTED;
+        filename_timing_.End(FilenameStage::Rebuild, timing, indexed_.load(), error, reason);
+        diagnostics::runtime::Event("index_rebuild_end", {{"operation", operation}, {"nodes", indexed_.load()},
+            {"elapsed_ms", GetTickCount64() - started}, {"error", error},
+            {"outcome", error == ERROR_OPERATION_ABORTED ? 2ull : error ? 1ull : 0ull},
+            {"used_mft", used_mft ? 1ull : 0ull}});
+        if (error && error != ERROR_OPERATION_ABORTED)
+            diagnostics::runtime::Event("index_rebuild_failed", {{"operation", operation}, {"error", error}},
+                diagnostics::runtime::Level::Error);
+        filename_timing_.Flush();
+    };
     IndexConfig config;
-    if (MachineIndexScope()) LoadMachineConfig(config, nullptr);
-    excluded_paths_ = config.excluded_paths;
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::wstring config_error;
+    bool config_loaded = true;
+#ifdef PULSE_INDEX_VOLUME_FAULT_TEST
+    config_loaded = !volume_fault_test::SnapshotFault(5);
+#endif
+    if (config_loaded && MachineIndexScope()) config_loaded = LoadMachineConfig(config, &config_error);
+    if (!config_loaded) {
+        build_error = GetLastError();
+        if (!build_error) build_error = ERROR_INVALID_DATA;
+        IndexFailure("index_rebuild_config_failed", build_error, {});
+        SetStatus(config_error);
+        PingNotify(true);
+        finish();
+        return;
+    }
+#ifdef PULSE_INDEX_VOLUME_FAULT_TEST
+    const auto configured_volumes = ConfiguredVolumes();
+#else
+    const auto configured_volumes = ConfiguredVolumes(config);
+#endif
+    PublishExcludedPaths(config, [&] {
         build_.Clear();
         build_.pool.reserve(1u << 20);
         build_.nodes.reserve(1u << 16);
         building_ = true;
         build_vols_.clear();
         if (MachineIndexScope()) PreserveOfflineVolumesLocked(configured_volumes, config);
-    }
+    });
     if (indexed_.load() == 0) SetStatus(L"正在建立索引…");
     else SetStatus(L"已索引 " + std::to_wstring(indexed_.load()) + L" 项，正在重建…");
     PingNotify(true);
 
-    bool used_mft = false;
+    bool incomplete = false;
+    const auto previous_count = indexed_.load();
     if (IsAdmin() && fixture_root_.empty()) {
         for (const auto& volume : configured_volumes) {
             if (!running_) break;
             if (IndexVolumeMft(volume)) used_mft = true;
+            else {
+                const DWORD error = GetLastError();
+                if (!incomplete) build_error = error ? error : ERROR_READ_FAULT;
+                incomplete = true;
+            }
         }
     }
-    if (!used_mft && running_ && !MachineIndexScope()) {
+    if (!used_mft && !incomplete && running_ && !MachineIndexScope()) {
         walk_roots_.clear();
         auto walk_root = [this](const std::wstring& path) {
             walk_roots_.push_back(path);
+            // Arm before scanning so changes during reconciliation are retained.
+            StartWalkWatches(walk_roots_);
             int32_t parent = EnsureChainLocked(build_, path, true, false);
             if (parent >= 0) WalkTree(parent, path, 0);
         };
@@ -3467,9 +3864,10 @@ void Engine::FullRebuild(const char* reason) {
         // R2: non-admin default is the user profile only (RDCW can actually watch it).
     }
 
-    if (running_) {
-        const uint64_t built = static_cast<uint64_t>(std::time(nullptr));
+    if (running_ && !incomplete) {
+        const uint64_t built = (std::max)(static_cast<uint64_t>(std::time(nullptr)), built_unix_ + 1);
         const std::wstring path = CachePath();
+        if (path.empty()) IndexFailure("filename_write_path_failed", ERROR_PATH_NOT_FOUND, path);
         const bool wrote = !path.empty() && WriteIndexFile(path, build_, build_vols_, built);
         if (!wrote) build_error = GetLastError() ? GetLastError() : ERROR_WRITE_FAULT;
         bool committed = false;
@@ -3521,7 +3919,7 @@ void Engine::FullRebuild(const char* reason) {
             folder_size_gap_ = false;
         }
         if (used_mft) StopWalkWatches();
-        else StartWalkWatches(walk_roots_);
+        else PollWalkWatches();
         PingNotify(true);
         if (notify_ && notify_msg_) PostMessageW(notify_, notify_msg_, 1, 0);
     } else {
@@ -3531,12 +3929,14 @@ void Engine::FullRebuild(const char* reason) {
         build_vols_.clear();
         building_ = false;
     }
-    filename_timing_.End(FilenameStage::Rebuild, timing, indexed_.load(),
-        running_ ? build_error : ERROR_OPERATION_ABORTED, reason);
-    diagnostics::runtime::Event("index_rebuild_end", {{"operation", operation}, {"nodes", indexed_.load()},
-        {"elapsed_ms", GetTickCount64() - started}, {"error", running_ ? build_error : ERROR_OPERATION_ABORTED},
-        {"used_mft", used_mft ? 1ull : 0ull}});
-    filename_timing_.Flush();
+    if (incomplete) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        indexed_.store(previous_count);
+        folder_size_gap_ = true;
+        SetStatus(L"索引扫描未完成，保留上次结果，请稍后重试");
+        PingNotify(true);
+    }
+    finish();
 }
 
 bool Engine::NeedsSearchRebuildLocked() const {
@@ -3600,16 +4000,25 @@ void Engine::Worker() {
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     ResolveIndexDirFrn();
     IndexConfig startup_config;
-    if (MachineIndexScope()) LoadMachineConfig(startup_config, nullptr);
-    excluded_paths_ = startup_config.excluded_paths;
+    std::wstring config_error;
+    if (MachineIndexScope() && !LoadMachineConfig(startup_config, &config_error)) {
+        SetStatus(config_error); PingNotify(true);
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END); return;
+    }
+    PublishExcludedPaths(startup_config);
     const bool have_cache = TryLoadCache();
-    const auto initial_drives = ConfiguredVolumes();
+    const auto initial_drives = ConfiguredVolumes(startup_config);
     bool needs_search_rebuild = false;
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         UpdateVolumeVisibilityLocked(initial_drives);
         needs_search_rebuild = NeedsSearchRebuildLocked();
     }
+    // A config from before the system folder exclusions gets the defaults
+    // persisted once; its snapshot still shows those folders, so rebuild it.
+    if (MachineIndexScope() && !startup_config.system_groups_saved &&
+        SaveMachineConfig(startup_config) && have_cache)
+        needs_search_rebuild = true;
     PingNotify(true);
 
     bool fresh = false;
@@ -3621,9 +4030,7 @@ void Engine::Worker() {
         }
         if (have_vols) {
             auto drives = initial_drives;
-            IndexConfig configured;
-            if (MachineIndexScope()) LoadMachineConfig(configured, nullptr);
-            const auto mounted = EnumerateLocalVolumes(configured);
+            const auto mounted = EnumerateLocalVolumes(startup_config);
             fresh = true;
             {
                 std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -3668,11 +4075,10 @@ void Engine::Worker() {
             if (fresh)
                 SetStatus(StatusItemCount(indexed_.load(), L"实时更新"));
         }
-    } else if (have_cache && !needs_search_rebuild && !IsAdmin()) {
-        const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
-        if (built_unix_ && now >= built_unix_ && now - built_unix_ < kCacheFreshSecs)
-            fresh = true;
     }
+    // Walk snapshots have no offline journal cursor. Replay provides a useful
+    // initial view, but every startup must reconcile changes while we were away.
+
     if (fresh) {
         if (notify_ && notify_msg_) PostMessageW(notify_, notify_msg_, 1, 0);
     } else if (running_) {
@@ -3725,6 +4131,9 @@ void Engine::Worker() {
             topology_tick = 0;
             continue;
         }
+        // Clients asked for folder totals: aggregate here, never in a pipe thread
+        // that would exceed the client's IPC deadline.
+        if (folder_size_wanted_ && ready_ && !building_ && !folder_size_gap_) BuildFolderTotals();
         bool changed = false;
         bool structural = false;
         bool failed = false;
@@ -3732,7 +4141,9 @@ void Engine::Worker() {
         const auto loop_tick = GetTickCount64();
         if (fixture_root_.empty() && loop_tick - topology_tick >= 30000) {
             const auto timing = FilenameTiming::Begin();
-            online = ConfiguredVolumes();
+            IndexConfig topology_config;
+            if (!MachineIndexScope() || LoadMachineConfig(topology_config, nullptr))
+                online = ConfiguredVolumes(topology_config);
             topology_tick = loop_tick;
             filename_timing_.End(FilenameStage::Topology, timing, online.size(), ERROR_SUCCESS, "periodic");
         }
@@ -3934,6 +4345,9 @@ uint64_t Engine::ApplyNotifyLocked(const std::wstring& root, const BYTE* buf, DW
             if (old_index >= 0) event.is_dir = (NodeAt(old_index).flags & kFlagDir) != 0;
             else GapFeed(); }
         if (info->Action != FILE_ACTION_RENAMED_OLD_NAME) { RecordFeed(event); changes_.Record(std::move(event)); }
+        const int32_t previous_count = LiveCount();
+        const int32_t changed_id = info->Action == FILE_ACTION_RENAMED_NEW_NAME
+            ? ResolvePathLocked(pending_old) : known;
         switch (info->Action) {
         case FILE_ACTION_ADDED: {
             WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -3980,6 +4394,7 @@ uint64_t Engine::ApplyNotifyLocked(const std::wstring& root, const BYTE* buf, DW
                     a.size = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
                     a.mtime = FtToUnix((static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
                                        fad.ftLastWriteTime.dwLowDateTime);
+                    const Attr previous = AttrAt(idx);
                     const int32_t base = BaseCount();
                     if (idx >= base) live_.attrs[static_cast<size_t>(idx - base)] = a;
                     else {
@@ -3991,6 +4406,8 @@ uint64_t Engine::ApplyNotifyLocked(const std::wstring& root, const BYTE* buf, DW
                         pt.has_attr = true;
                         pt.attr = a;
                     }
+                    if (previous.size != a.size || previous.mtime != a.mtime)
+                        InvalidateFilterLocked();
                 }
             }
             break;
@@ -4006,6 +4423,7 @@ uint64_t Engine::ApplyNotifyLocked(const std::wstring& root, const BYTE* buf, DW
                     ? std::wstring_view(full) : std::wstring_view(full).substr(slash + 1);
                 const Node old = NodeAt(idx);
                 const int32_t new_parent = slash == std::wstring::npos ? old.parent : EnsureChainLocked(live_, full.substr(0, slash), true, true);
+                if (old.parent != new_parent) subtree_intervals_valid_ = false;
                 ChildMapRemove(old.parent, NameOf(idx), idx);
                 const int32_t base = BaseCount();
                 if (idx >= base) {
@@ -4036,6 +4454,32 @@ uint64_t Engine::ApplyNotifyLocked(const std::wstring& root, const BYTE* buf, DW
             break;
         }
         default: break;
+        }
+        if (info->Action != FILE_ACTION_RENAMED_OLD_NAME &&
+            info->Action >= FILE_ACTION_ADDED && info->Action <= FILE_ACTION_RENAMED_NEW_NAME) {
+            if (auto* delta = DeltaFor(0)) {
+                // EnsureChain may create missing ancestors: persist each new ID
+                // in order before records that refer to it.
+                for (int32_t id = previous_count; id < LiveCount(); ++id) {
+                    const auto node = NodeAt(id);
+                    const auto attr = AttrAt(id);
+                    delta->QueueAdd(id, node.parent, node.flags, attr.mtime, attr.size, NameOf(id), 0);
+                }
+                if (changed_id >= 0 && changed_id < previous_count) {
+                    if (IsTomb(changed_id)) delta->QueueTomb(changed_id);
+                    else {
+                        const auto node = NodeAt(changed_id);
+                        const auto attr = AttrAt(changed_id);
+                        delta->QueuePatch(changed_id,
+                            static_cast<uint8_t>(PatchBits::Meta) | static_cast<uint8_t>(PatchBits::Name) |
+                            static_cast<uint8_t>(PatchBits::Attr), node.parent, node.flags,
+                            attr.mtime, attr.size, NameOf(changed_id));
+                    }
+                }
+            } else {
+                rebuild_requested_ = true;
+                SetStatus(L"索引更新尚未保存，需要重新扫描；请检查索引目录权限及磁盘空间");
+            }
         }
         if (info->NextEntryOffset == 0) break;
         if (info->NextEntryOffset < sizeof(FILE_NOTIFY_INFORMATION) || info->NextEntryOffset > static_cast<size_t>(end - p)) { GapFeed(); break; }

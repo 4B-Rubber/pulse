@@ -5,6 +5,8 @@
 #include "entry_group.h"
 #include "link_resolve.h"
 #include "../fs/fs_enum.h"
+#include "../fs/bitlocker_volume.h"
+#include "../fs/bounded_enumeration.h"
 #include "../fs/fs_recycle.h"
 #include "../fs/fs_net_cache.h"
 #include "../common/runtime_log.h"
@@ -45,6 +47,8 @@ void WorkerPool::Start(ResultCallback cb) {
     stopped_ = false;
     const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
     const unsigned count = std::min(4u, hw);
+    active_network_jobs_ = 0;
+    max_network_jobs_ = count - 1;
     threads_.reserve(count);
     for (unsigned i = 0; i < count; ++i)
         threads_.emplace_back(&WorkerPool::WorkerThread, this);
@@ -55,10 +59,23 @@ void WorkerPool::Stop() {
         std::lock_guard<std::mutex> lock(mutex_);
         running_ = false;
         stopped_ = true;
+        queue_ = {};
+        current_gen_.clear();
     }
     cv_.notify_all();
     for (auto& thread : threads_) if (thread.joinable()) thread.join();
     threads_.clear();
+}
+
+void WorkerPool::CancelGeneration(uint64_t generation) {
+    std::lock_guard lock(mutex_);
+    std::erase_if(current_gen_, [=](const auto& item) { return item.second == generation; });
+    std::deque<WorkItem> remaining;
+    while (!queue_.empty()) {
+        if (queue_.front().generation != generation) remaining.push_back(std::move(queue_.front()));
+        queue_.pop_front();
+    }
+    queue_ = std::move(remaining);
 }
 
 uint64_t WorkerPool::Refresh(const std::wstring& path, ui::SortColumn col,
@@ -70,17 +87,18 @@ uint64_t WorkerPool::Refresh(const std::wstring& path, ui::SortColumn col,
     current_gen_[key] = gen;
     // Only supersede the same path+sort request. Separate panes may show the
     // same directory with different sort orders.
-    std::queue<WorkItem> filtered;
+    std::deque<WorkItem> filtered;
     while (!queue_.empty()) {
-        if (queue_.front().request_key != key) filtered.push(std::move(queue_.front()));
+        if (queue_.front().request_key != key) filtered.push_back(std::move(queue_.front()));
         else diagnostics::runtime::Event("navigation_superseded", {{"generation", queue_.front().generation}});
-        queue_.pop();
+        queue_.pop_front();
     }
     queue_ = std::move(filtered);
     WorkItem work{ path, key, gen, col, dir };
+    work.cache_write = fs::BeginNetSnapshotWrite(path);
     work.group_by = group_by;
     work.folder_sizes = std::move(folder_sizes);
-    queue_.push(std::move(work));
+    queue_.push_back(std::move(work));
     diagnostics::runtime::Event("navigation_request", {{"generation", gen}, {"load_paths", 0}});
     cv_.notify_one();
     return gen;
@@ -94,22 +112,18 @@ uint64_t WorkerPool::LoadPaths(const std::wstring& view_path,
                                int group_by) {
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t gen = ++global_gen_;
-    const std::wstring key = WorkKey(view_path, col, dir, group_by);
+    // Virtual consumers can share a path/sort but have different Recent
+    // filters and payloads. Each request owns its cancellation identity.
+    const std::wstring key = WorkKey(view_path, col, dir, group_by) +
+        L"\x1fpaths:" + std::to_wstring(gen);
     current_gen_[key] = gen;
-    std::queue<WorkItem> filtered;
-    while (!queue_.empty()) {
-        if (queue_.front().request_key != key) filtered.push(std::move(queue_.front()));
-        else diagnostics::runtime::Event("navigation_superseded", {{"generation", queue_.front().generation}});
-        queue_.pop();
-    }
-    queue_ = std::move(filtered);
     WorkItem item{ view_path, key, gen, col, dir };
     item.load_paths = true;
     item.preserve_order = preserve_order;
     item.group_by = group_by;
     item.paths = std::move(paths);
     item.display_times = std::move(display_times);
-    queue_.push(std::move(item));
+    queue_.push_back(std::move(item));
     diagnostics::runtime::Event("navigation_request", {{"generation", gen}, {"load_paths", 1}});
     cv_.notify_one();
     return gen;
@@ -135,51 +149,69 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
     WorkResult res;
     res.path = item.path;
     res.generation = item.generation;
-    if (!fs::IsVirtualPath(item.path) && !fs::IsUncPath(item.path))
-        res.git_root = FindGitRoot(item.path);
+    const auto cancelled = [&] {
+        std::lock_guard lock(mutex_);
+        auto it = current_gen_.find(item.request_key);
+        return !running_ || it == current_gen_.end() || it->second != item.generation;
+    };
 
+    if (item.load_paths && !fs::IsVirtualPath(item.path) && !fs::IsUncPath(item.path))
+        res.git_root = FindGitRoot(item.path);
     auto t0 = std::chrono::steady_clock::now();
     auto entries = std::make_shared<std::vector<fs::DirEntry>>();
     // A big folder or bin publishes what it has while the scan runs, so the list fills
     // in instead of staying empty for the whole read. The first batch is small (the
     // skeleton is replaced quickly); every next one may grow by half again, which
     // bounds the total copy/sort work on both threads no matter how many rows there
-    // are. At most one batch goes out per kStreamMinIntervalMs.
-    constexpr size_t kStreamFirstBatch = 2048;
-    constexpr size_t kStreamGrowthNumerator = 3;
-    constexpr size_t kStreamGrowthDenominator = 2;
-    constexpr ULONGLONG kStreamMinIntervalMs = 120;
-    size_t emitted_items = 0;
-    ULONGLONG last_emit_tick = GetTickCount64();
-    const auto emit_partial = [&]() -> bool {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            const auto it = current_gen_.find(item.request_key);
-            if (!running_ || it == current_gen_.end() || it->second != item.generation)
-                return false; // Navigating away: stop the scan instead of feeding rows.
-        }
-        if (!emit) return true;
-        const size_t gathered = entries->size();
-        if (gathered < emitted_items + kStreamFirstBatch ||
-            gathered * kStreamGrowthDenominator < emitted_items * kStreamGrowthNumerator)
-            return true;
-        const ULONGLONG now = GetTickCount64();
-        if (now - last_emit_tick < kStreamMinIntervalMs) return true;
-        last_emit_tick = now;
-        emitted_items = gathered;
-        auto snapshot = std::make_shared<std::vector<fs::DirEntry>>(*entries);
-        std::sort(snapshot->begin(), snapshot->end(),
-            [&](const fs::DirEntry& a, const fs::DirEntry& b) {
-                return EntryLess(a, b, item.sort_column, item.sort_direction);
-            });
-        WorkResult part;
-        part.path = item.path;
-        part.generation = item.generation;
-        part.snapshot = std::move(snapshot);
-        part.partial = true;
-        try { emit(std::move(part)); } catch (...) {}
-        return true;
+    // are. At most one batch goes out per kStreamMinIntervalMs. The state lives in a
+    // shared_ptr because a retired provider thread may still call the hook after
+    // Process has returned; it must not touch this frame then.
+    struct StreamState {
+        std::atomic_bool abandoned{false};
+        size_t emitted_items = 0;
+        ULONGLONG last_emit_tick = GetTickCount64();
     };
+    const auto stream = std::make_shared<StreamState>();
+    struct AbandonOnExit {
+        StreamState* state;
+        ~AbandonOnExit() { state->abandoned.store(true); }
+    } abandon_stream{stream.get()};
+    const auto emit_partial = std::make_shared<std::function<bool()>>(
+        [this, item, entries, emit, stream]() -> bool {
+            if (stream->abandoned.load()) return false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto it = current_gen_.find(item.request_key);
+                if (!running_ || it == current_gen_.end() || it->second != item.generation)
+                    return false; // Navigating away: stop the scan instead of feeding rows.
+            }
+            if (!emit) return true;
+            constexpr size_t kStreamFirstBatch = 2048;
+            constexpr size_t kStreamGrowthNumerator = 3;
+            constexpr size_t kStreamGrowthDenominator = 2;
+            constexpr ULONGLONG kStreamMinIntervalMs = 120;
+            const size_t gathered = entries->size();
+            if (gathered < stream->emitted_items + kStreamFirstBatch ||
+                gathered * kStreamGrowthDenominator <
+                    stream->emitted_items * kStreamGrowthNumerator)
+                return true;
+            const ULONGLONG now = GetTickCount64();
+            if (now - stream->last_emit_tick < kStreamMinIntervalMs) return true;
+            stream->last_emit_tick = now;
+            stream->emitted_items = gathered;
+            auto snapshot = std::make_shared<std::vector<fs::DirEntry>>(*entries);
+            std::sort(snapshot->begin(), snapshot->end(),
+                [&](const fs::DirEntry& a, const fs::DirEntry& b) {
+                    return EntryLess(a, b, item.sort_column, item.sort_direction);
+                });
+            WorkResult part;
+            part.path = item.path;
+            part.generation = item.generation;
+            part.snapshot = std::move(snapshot);
+            part.partial = true;
+            try { emit(std::move(part)); } catch (...) {}
+            return true;
+        });
     if (item.load_paths) {
         entries->reserve(item.paths.size());
         for (size_t i = 0; i < item.paths.size(); ++i) {
@@ -227,7 +259,7 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
     } else if (fs::IsRecycleViewPath(item.path)) {
         try {
             const bool completed = fs::EnumerateRecycleBin(*entries, &res.recycle_info,
-                [&](const std::vector<fs::DirEntry>&) { return emit_partial(); });
+                [emit_partial](const std::vector<fs::DirEntry>&) { return (*emit_partial)(); });
             if (!completed) {
                 res.cancelled = true;
                 return res;
@@ -239,14 +271,40 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
         }
     } else {
         try {
-            const bool completed = fs::EnumerateDirectory(item.path, *entries,
-                [&](const std::vector<fs::DirEntry>&) { return emit_partial(); });
-            if (!completed) {
-                res.cancelled = true;
-                return res;
-            }
+            struct Listing {
+                std::vector<fs::DirEntry> entries;
+                fs::DirectoryIdentity identity;
+                std::wstring git_root;
+            };
+            auto listing = fs::RunBoundedEnumeration<Listing>(fs::IsUncPath(item.path),
+                [path = item.path, emit_partial](const std::atomic_bool& cancel) {
+                    Listing result;
+                    const bool completed = fs::EnumerateDirectory(path, result.entries,
+                        [emit_partial](const std::vector<fs::DirEntry>&) {
+                            return (*emit_partial)();
+                        });
+                    if (!completed) throw fs::EnumerationCancelled();
+                    if (cancel) throw fs::EnumerationCancelled();
+                    fs::QueryDirectoryIdentity(path, result.identity);
+                    if (cancel) throw fs::EnumerationCancelled();
+                    if (!fs::IsVirtualPath(path) && !fs::IsUncPath(path))
+                        result.git_root = FindGitRoot(path);
+                    return result;
+                }, cancelled);
+            *entries = std::move(listing.entries);
+            res.identity = listing.identity;
+            res.git_root = std::move(listing.git_root);
+        } catch (const fs::EnumerationCancelled&) {
+            res.cancelled = true;
+            return res;
         } catch (...) {
-            res.error = true;
+            {
+                std::lock_guard lock(mutex_);
+                const auto current = current_gen_.find(item.request_key);
+                res.cancelled = !running_ || current == current_gen_.end() || current->second != item.generation;
+            }
+            res.error = !res.cancelled;
+            res.bitlocker_locked = res.error && fs::IsBitLockerLocked(item.path);
             res.snapshot = nullptr;
             return res;
         }
@@ -258,7 +316,7 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = current_gen_.find(item.request_key);
-        if (it == current_gen_.end() || it->second != item.generation) {
+        if (!running_ || it == current_gen_.end() || it->second != item.generation) {
             res.cancelled = true;
             return res;
         }
@@ -292,11 +350,7 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
             if (item.folder_sizes && item.sort_column == ui::SortColumn::Size) {
                 SortEntriesBySize(*entries, item.sort_direction, *item.folder_sizes, tick);
             } else {
-                std::sort(entries->begin(), entries->end(),
-                    [&](const fs::DirEntry& a, const fs::DirEntry& b) {
-                        tick();
-                        return EntryLess(a, b, item.sort_column, item.sort_direction);
-                    });
+                SortEntries(*entries, item.sort_column, item.sort_direction, tick);
             }
         } catch (const SortCancelled&) {
             res.cancelled = true;
@@ -309,14 +363,15 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = current_gen_.find(item.request_key);
-        if (it == current_gen_.end() || it->second != item.generation) {
+        if (!running_ || it == current_gen_.end() || it->second != item.generation) {
             res.cancelled = true;
             return res;
         }
     }
 
     res.snapshot = std::move(entries);
-    fs::QueryDirectoryIdentity(item.path, res.identity);
+    if (item.load_paths || fs::IsRecycleViewPath(item.path))
+        fs::QueryDirectoryIdentity(item.path, res.identity);
 
     // Timing output for large directories (visible in a debugger or ETW).
     if (res.snapshot && res.snapshot->size() >= 10000) {
@@ -333,15 +388,23 @@ void WorkerPool::WorkerThread() {
     while (running_) {
         WorkItem item;
         IoTaskQueue::Job io_job;
+        bool network_job = false;
         {
             std::unique_lock<std::mutex> lock(mutex_);
+            const auto eligible = [&](const WorkItem& candidate) {
+                return !fs::IsUncPath(candidate.path) || active_network_jobs_ < max_network_jobs_;
+            };
             cv_.wait(lock, [&] {
-                return stopped_ || !queue_.empty() || io_queue_.Ready() || !running_;
+                return stopped_ || !running_ || io_queue_.Ready() ||
+                    std::any_of(queue_.begin(), queue_.end(), eligible);
             });
             if (!running_ || stopped_) return;
-            if (!queue_.empty()) {
-                item = std::move(queue_.front());
-                queue_.pop();
+            const auto next = std::find_if(queue_.begin(), queue_.end(), eligible);
+            if (next != queue_.end()) {
+                item = std::move(*next);
+                queue_.erase(next);
+                network_job = fs::IsUncPath(item.path);
+                if (network_job) ++active_network_jobs_;
             } else if (io_queue_.Ready()) {
                 io_job = io_queue_.Pop();
             } else {
@@ -357,30 +420,37 @@ void WorkerPool::WorkerThread() {
         const auto started = GetTickCount64();
         diagnostics::runtime::Event("navigation_start", {{"generation", item.generation}, {"load_paths", item.load_paths}});
         WorkResult res = Process(item, callback_);
+        {
+            std::lock_guard lock(mutex_);
+            const auto it = current_gen_.find(item.request_key);
+            if (!running_ || it == current_gen_.end() || it->second != item.generation)
+                res.cancelled = true;
+        }
         diagnostics::runtime::Event("navigation_end", {{"generation", item.generation},
             {"cancelled", res.cancelled}, {"error", res.error},
             {"entries", res.snapshot ? res.snapshot->size() : 0},
             {"has_snapshot", res.snapshot != nullptr}, {"elapsed_ms", GetTickCount64() - started}});
         if (!res.cancelled && callback_) {
-            const std::wstring cache_path = res.path;
             fs::SnapshotPtr cache_snapshot = res.snapshot;
             try {
                 callback_(std::move(res));
             } catch (...) {
                 // Ignore.
             }
-            if (cache_snapshot && fs::IsUncPath(cache_path))
-                fs::SaveNetSnapshot(cache_path, cache_snapshot);
+            if (cache_snapshot)
+                fs::SaveNetSnapshot(item.cache_write, cache_snapshot);
         }
         // Completed generations no longer participate in cancellation checks.
         // Remove only when no newer request replaced this key while we were
         // processing, so a concurrent refresh remains authoritative.
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (network_job) --active_network_jobs_;
             const auto it = current_gen_.find(item.request_key);
             if (it != current_gen_.end() && it->second == item.generation)
                 current_gen_.erase(it);
         }
+        cv_.notify_all();
     }
 }
 

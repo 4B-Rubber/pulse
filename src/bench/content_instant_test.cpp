@@ -156,6 +156,88 @@ int RunInstantGapTests(const std::filesystem::path& base) {
         "bounded default subscription diagnostics distinguish phases without query text or paths");
     return failures ? 1 : 0;
 }
+int RunInstantReconcileAudit(const std::filesystem::path& base) {
+    const auto root = base / L"reconcile-files";
+    std::filesystem::create_directories(root / L"imported");
+    Write(root / L"changed.txt", "new marker"); Write(root / L"imported" / L"child.txt", "new marker");
+    SetEnvironmentVariableW(L"PULSE_CONTENT_TIMING_DIR", (base / L"reconcile-logs").c_str());
+    std::filesystem::create_directories(base / L"reconcile-profile");
+    ContentIndex index((base / L"reconcile-profile" / L"content.sqlite").wstring(), ContentAgentMode::Instant);
+    ContentIndexConfig config; config.roots = {{root.wstring()}};
+    // This isolated test runs below the build tree, which the default user policy excludes.
+    config.excluded_directories.clear();
+    const bool configured = index.Configure(config);
+    Check(configured, "configure isolated reconciliation fixture");
+    if (!configured) return 1;
+    for (int scenario = 0; scenario < 5; ++scenario) {
+        const bool imported = scenario == 2;
+        const bool permanent = scenario == 3;
+        const bool cancel_retry = scenario == 4;
+        const auto changed = imported ? root / L"imported" / L"child.txt" : root / L"changed.txt";
+        ContentSearchRequest request; request.root = root.wstring(); request.generation = 993000 + scenario;
+        request.task_scan = request.subscribe = request.paged_results = true;
+        ContentSearchSession session(request, nullptr, 0);
+        std::atomic<bool> cancelled = false;
+        ContentInstantSessionHooks hooks;
+        int attempts = 0, notifications = 0, full_scans = 0, delta_scans = 0;
+        hooks.arm = [&](auto enqueue, auto) {
+            ++notifications; enqueue((imported ? root / L"imported" : changed).wstring(), imported);
+        };
+        hooks.attributes = [&](const std::wstring& path) {
+            if (ContentScopeKey(path) == ContentScopeKey(changed.wstring())) {
+                ++attempts;
+                if (permanent || attempts == 1) {
+                    if (cancel_retry) cancelled = true;
+                    SetLastError(ERROR_ACCESS_DENIED); return DWORD{INVALID_FILE_ATTRIBUTES};
+                }
+            }
+            return GetFileAttributesW(path.c_str());
+        };
+        hooks.search = [&](const auto& query, const auto&, auto deliver) {
+            ContentSearchProgress progress; progress.generation = query.generation; progress.done = true;
+            ContentHit hit;
+            if (query.candidate_paths.empty()) { ++full_scans; hit.path = scenario == 0 ? changed.wstring() : (root / L"kept.txt").wstring(); }
+            else { ++delta_scans; hit.path = query.candidate_paths.front(); hit.size = 99; }
+            hit.name = std::filesystem::path(hit.path).filename().wstring();
+            return deliver(progress, {std::move(hit)});
+        };
+        bool updated = false, paused = false; std::shared_ptr<ContentResultStore> original, current;
+        std::atomic<bool> completed = false;
+        std::jthread watchdog([&] {
+            for (int i = 0; i < 50 && !completed; ++i) Sleep(100);
+            if (!completed) cancelled = true;
+        });
+        RunInstantContentSession(index, request, cancelled, [&](const auto& progress, auto hits) {
+            updated |= progress.delta && !hits.empty() && hits.front().size == 99;
+            ContentSearchUpdate raw; raw.progress = progress; raw.hits = std::move(hits);
+            if (const auto update = session.Accept(std::move(raw))) {
+                current = update->results;
+                if (!progress.delta) original = current;
+            }
+            if (progress.subscription_error) {
+                paused = progress.subscription_error == ERROR_ACCESS_DENIED && !progress.live &&
+                    progress.subscription_failure == ContentSubscriptionFailure::Reconcile;
+                pulse::ipc::PayloadWriter writer; content::PutSubscriptionStatus(writer, progress);
+                pulse::ipc::PayloadReader reader(writer.data().data(), writer.data().size()); ContentSearchProgress decoded;
+                Check(content::GetSubscriptionStatus(reader, decoded) && decoded.subscription_failure == ContentSubscriptionFailure::Reconcile,
+                      "reconciliation pause reason survives protocol");
+            }
+            if (updated) cancelled = true;
+            return true;
+        }, &hooks);
+        completed = true;
+        printf("RECONCILE scenario=%d attempts=%d full=%d delta=%d updated=%d paused=%d\n",
+            scenario, attempts, full_scans, delta_scans, updated, paused);
+        Check(notifications == 1 && full_scans == 1, "single change notification never triggers a second full-scope scan");
+        if (permanent) Check(paused && attempts == 3 && delta_scans == 0 && original == current && current->RawCount() == 1,
+                            "permanent metadata failure pauses after three attempts and retains original rows");
+        else if (cancel_retry) Check(attempts == 1 && delta_scans == 0, "cancellation ends metadata retry without consuming a later update");
+        else Check(updated && !paused && attempts == 2 && delta_scans == 1,
+                   "existing/new/imported match recovers after one metadata failure without another notification");
+    }
+    return failures ? 1 : 0;
+}
+
 int RunInstantLifecycleTests(const std::filesystem::path& base) {
     const auto profile = base / L"profile", files = base / L"files";
     std::filesystem::create_directories(profile); std::filesystem::create_directories(files);

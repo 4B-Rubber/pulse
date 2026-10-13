@@ -188,22 +188,24 @@ int ColorChannels(uint16_t mode) {
     }
 }
 
-void PackBits(const unsigned char* src, size_t src_len, unsigned char* dst, size_t dst_len) {
+bool PackBits(const unsigned char* src, size_t src_len, unsigned char* dst, size_t dst_len) {
     size_t i = 0, o = 0;
-    while (i < src_len && o < dst_len) {
+    while (i < src_len) {
         const int n = static_cast<int8_t>(src[i++]);
         if (n >= 0) {
-            const size_t count = (std::min)(static_cast<size_t>(n) + 1, (std::min)(src_len - i, dst_len - o));
+            const size_t count = static_cast<size_t>(n) + 1;
+            if (count > src_len - i || count > dst_len - o) return false;
             std::memcpy(dst + o, src + i, count);
             i += n + 1; o += count;
         } else if (n != -128) {
-            if (i >= src_len) break;
-            const size_t count = (std::min)(static_cast<size_t>(1 - n), dst_len - o);
+            if (i >= src_len) return false;
+            const size_t count = static_cast<size_t>(1 - n);
+            if (count > dst_len - o) return false;
             std::memset(dst + o, src[i++], count);
             o += count;
         }
     }
-    if (o < dst_len) std::memset(dst + o, 0, dst_len - o);
+    return o == dst_len;
 }
 
 // Linear float (32-bit documents) -> display byte.
@@ -256,9 +258,30 @@ bool DecodeComposite(Reader& r, const Header& h, UINT max_edge, std::vector<unsi
 
     std::vector<uint32_t> counts;
     if (compression == 1) {
+        constexpr size_t kCountBudget = 16u * 1024u * 1024u;
+        if (rows_total > kCountBudget / sizeof(uint32_t)) return fail(L"psd-row-table-limit");
+        if (r.tell() > r.size() || rows_total * (h.psb ? 4ull : 2ull) > r.size() - r.tell())
+            return fail(L"psd-truncated");
         counts.resize(rows_total);
-        for (size_t i = 0; i < rows_total; ++i) counts[i] = h.psb ? r.U32() : r.U16();
+        uint64_t packed_total = 0;
+        for (size_t i = 0; i < rows_total; ++i) {
+            counts[i] = h.psb ? r.U32() : r.U16();
+            // A preview does not allocate attacker-controlled multi-gigabyte
+            // rows, even when the file contains enough padding to hold them.
+            if (counts[i] > row_bytes * 2 + 1024) return fail(L"psd-rle-row-limit");
+            packed_total += counts[i];
+        }
         if (!r.ok()) return fail(L"psd-truncated");
+        if (packed_total > r.size() - r.tell()) return fail(L"psd-truncated");
+        // Bound even skipped channels before any row allocation. PackBits can
+        // contain arbitrary no-ops, so this is an explicit preview work budget.
+        const size_t packed_limit = (std::max)(size_t{65536}, row_bytes * 2 + 1024);
+        uint64_t remaining = r.size() - r.tell();
+        for (uint32_t count : counts) {
+            if (count > remaining) return fail(L"psd-truncated");
+            if (count > packed_limit) return fail(L"psd-packed-row-limit");
+            remaining -= count;
+        }
     }
 
     // Column/row -> output cell maps and per-cell sample counts.
@@ -270,7 +293,12 @@ bool DecodeComposite(Reader& r, const Header& h, UINT max_edge, std::vector<unsi
     for (uint32_t y = 0; y < h.height; ++y)
         ++rows_in[(std::min)(out_h - 1, static_cast<UINT>(static_cast<uint64_t>(y) * out_h / h.height))];
 
-    std::vector<std::vector<uint32_t>> acc(used, std::vector<uint32_t>(static_cast<size_t>(out_w) * out_h, 0));
+    const int accumulated = h.mode == Indexed ? 3 : used;
+    constexpr size_t kAccumulatorBudget = 128u * 1024u * 1024u;
+    if (static_cast<uint64_t>(out_w) * out_h >
+        kAccumulatorBudget / sizeof(uint64_t) / static_cast<size_t>(accumulated))
+        return fail(L"psd-output-limit");
+    std::vector<std::vector<uint64_t>> acc(accumulated, std::vector<uint64_t>(static_cast<size_t>(out_w) * out_h, 0));
     std::vector<unsigned char> raw(row_bytes), packed;
     std::vector<uint8_t> row8(h.width);
     const ULONGLONG deadline = GetTickCount64() + kDecodeBudgetMs;
@@ -283,12 +311,12 @@ bool DecodeComposite(Reader& r, const Header& h, UINT max_edge, std::vector<unsi
                 const uint32_t n = counts[index];
                 if (!keep) { r.Skip(n); continue; }
                 if (const unsigned char* p = r.Peek(n)) {
-                    PackBits(p, n, raw.data(), row_bytes);
+                    if (!PackBits(p, n, raw.data(), row_bytes)) return fail(L"psd-bad-packbits");
                     r.Advance(n);
                 } else {
                     packed.resize(n);
                     if (!r.Read(packed.data(), n)) return fail(L"psd-truncated");
-                    PackBits(packed.data(), n, raw.data(), row_bytes);
+                    if (!PackBits(packed.data(), n, raw.data(), row_bytes)) return fail(L"psd-bad-packbits");
                 }
             } else {
                 if (!keep) { r.Skip(row_bytes); continue; }
@@ -314,8 +342,16 @@ bool DecodeComposite(Reader& r, const Header& h, UINT max_edge, std::vector<unsi
                 break;
             }
             const UINT oy = (std::min)(out_h - 1, static_cast<UINT>(static_cast<uint64_t>(y) * out_h / h.height));
-            uint32_t* dst = acc[c].data() + static_cast<size_t>(oy) * out_w;
-            for (uint32_t x = 0; x < h.width; ++x) dst[col_to[x]] += row8[x];
+            if (h.mode == Indexed) {
+                for (int component = 0; component < 3; ++component) {
+                    auto* dst = acc[component].data() + static_cast<size_t>(oy) * out_w;
+                    for (uint32_t x = 0; x < h.width; ++x)
+                        dst[col_to[x]] += h.palette[component * 256 + row8[x]];
+                }
+            } else {
+                auto* dst = acc[c].data() + static_cast<size_t>(oy) * out_w;
+                for (uint32_t x = 0; x < h.width; ++x) dst[col_to[x]] += row8[x];
+            }
         }
     }
 
@@ -324,7 +360,7 @@ bool DecodeComposite(Reader& r, const Header& h, UINT max_edge, std::vector<unsi
     for (UINT oy = 0; oy < out_h; ++oy) {
         for (UINT ox = 0; ox < out_w; ++ox) {
             const size_t i = static_cast<size_t>(oy) * out_w + ox;
-            const uint32_t n = (std::max)(1u, rows_in[oy] * cols_in[ox]);
+            const uint64_t n = (std::max)(uint64_t{1}, uint64_t{rows_in[oy]} * cols_in[ox]);
             auto v = [&](int c) { return static_cast<uint8_t>((acc[c][i] + n / 2) / n); };
             uint8_t R = 0, G = 0, B = 0, A = 255;
             switch (h.mode) {
@@ -337,8 +373,7 @@ bool DecodeComposite(Reader& r, const Header& h, UINT max_edge, std::vector<unsi
                 break;
             }
             case Indexed: {
-                const uint8_t p = v(0);
-                R = h.palette[p]; G = h.palette[256 + p]; B = h.palette[512 + p];
+                R = v(0); G = v(1); B = v(2);
                 break;
             }
             case Lab: LabToRgb(v(0), v(1), v(2), R, G, B); break;

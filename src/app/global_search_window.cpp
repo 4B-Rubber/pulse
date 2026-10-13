@@ -1,4 +1,5 @@
 #include "global_search_window.h"
+#include "global_search_result_state.h"
 #include "../ui/FluentTokens.h"
 #include "resource.h"
 #include "../ui/empty_state_layout.h"
@@ -73,6 +74,9 @@ struct GlobalSearchWindow::Impl {
     HBRUSH background = nullptr;
     bool dark = true, content_mode = false, current_only = false, composing = false, busy = false, truncated = false, search_pinyin = true;
     float scale = 1, width = 780, height = 488;
+    // Extra header height (DIP) when the interface font size makes the query
+    // line taller than the 35 DIP field; everything below moves down by it.
+    float grow = 0;
     std::wstring current_folder, current_folder_tip, query, error;
     struct Row { std::wstring name, path, snippet; bool directory = false; };
     std::vector<Row> rows;
@@ -82,7 +86,7 @@ struct GlobalSearchWindow::Impl {
     index::IndexClient filenames;
     index::NetworkAgentClient network;
     index::SearchResult local_result, network_result;
-    bool local_ready = false, network_ready = false;
+    app::GlobalProviderStatus providers;
     index::ContentSearchClient contents;
     ComPtr<ID2D1Factory> factory;
     ComPtr<ID2D1RenderTarget> target;
@@ -130,10 +134,13 @@ struct GlobalSearchWindow::Impl {
     }
     D2D1_COLOR_F Color(UINT32 value) const { return D2D1::ColorF(value); }
     void Invalidate() { if (hwnd) InvalidateRect(hwnd, nullptr, FALSE); }
-    int PageSize() const { return std::max(1, static_cast<int>((height - kHeader - kTabs - kFooter) / kRow)); }
+    float Header() const { return kHeader + grow; }
+    float ListTop() const { return 136 + grow; }
+    int PageSize() const { return std::max(1, static_cast<int>((height - Header() - kTabs - kFooter) / kRow)); }
     void ClampSelection(bool reveal_selection = true) {
-        selected = std::clamp(selected, 0, std::max(0, static_cast<int>(rows.size()) - 1));
-        if (reveal_selection) {
+        if (rows.empty()) selected = -1;
+        else if (selected >= 0) selected = std::min(selected, static_cast<int>(rows.size()) - 1);
+        if (reveal_selection && selected >= 0) {
             if (selected < first) first = selected;
             if (selected >= first + PageSize()) first = selected - PageSize() + 1;
         }
@@ -159,7 +166,7 @@ struct GlobalSearchWindow::Impl {
         GetWindowTextW(edit, query.data(), count + 1);
         query.resize(static_cast<size_t>(count));
         rows.clear(); selected = first = 0; total = 0; error.clear(); truncated = false;
-        local_result = {}; network_result = {}; local_ready = network_ready = false;
+        local_result = {}; network_result = {}; providers = {};
         if (!query.empty() && !composing) { busy = true; SetTimer(hwnd, kDebounce, 180, nullptr); }
         Invalidate();
     }
@@ -183,30 +190,45 @@ struct GlobalSearchWindow::Impl {
             if (!search_pinyin) request.needle = L"nopinyin: " + request.needle;
             if (current_only) request.path_prefix = current_folder;
             filenames.SearchAsync(request, generation);
+            providers.ExpectNetwork(!network.Roots().empty());
             network.SearchAsync(request, generation);
             SetTimer(hwnd, kConnectTimeout, 10000, nullptr);
         }
     }
     void MergeFilenames() {
+        const auto position = app::GlobalSearchPosition::Capture(rows, selected, first);
         rows.clear();
-        size_t duplicates = 0;
-        for (const auto* source : {&local_result, &network_result}) for (const auto& hit : source->hits) {
-            const bool duplicate = std::any_of(rows.begin(), rows.end(), [&](const auto& row) {
-                return CompareStringOrdinal(row.path.c_str(), -1, hit.path.c_str(), -1, TRUE) == CSTR_EQUAL;
-            });
-            if (duplicate) { ++duplicates; continue; }
-            if (rows.size() < kMaximumResults) rows.push_back({hit.name, hit.path, {}, hit.is_dir});
-        }
-        total = local_result.total + network_result.total;
-        total -= std::min(total, duplicates);
-        truncated = total > rows.size(); busy = !(local_ready && network_ready);
+        index::Query request;
+        request.needle = search_pinyin ? query : L"nopinyin: " + query;
+        request.limit = kMaximumResults;
+        const auto merged = index::MergeSearchResults(request, local_result, network_result, true);
+        for (const auto& hit : merged.hits) rows.push_back({hit.name, hit.path, {}, hit.is_dir});
+        total = merged.total;
+        truncated = total > rows.size(); busy = providers.Busy();
+        error = providers.Error() ? Text(rows.empty() ? StringId::GlobalSearchFailed : StringId::SearchIncomplete) : std::wstring{};
         if (!busy) KillTimer(hwnd, kConnectTimeout);
-        ClampSelection(false); Invalidate();
+        const int restored = position.Selection(rows);
+        selected = restored; first = position.First(rows);
+        ClampSelection(false);
+        if (restored < 0) selected = -1;
+        Invalidate();
     }
-    void Open(bool location) {
+    void TimeoutFilenames() {
+        providers.Timeout();
+        MergeFilenames();
+    }
+    void AcceptFilenames(bool from_network, uint32_t id, index::SearchResult result) {
+        if (id != generation || content_mode) return;
+        if (from_network && result.error && !providers.network_expected) return;
+        providers.Accept(from_network, result.error);
+        if (from_network) network_result = std::move(result);
+        else local_result = std::move(result);
+        MergeFilenames();
+    }
+    void Open(bool location, void (*open_result)(std::wstring, bool) = OpenResult) {
         if (rows.empty() || selected < 0 || selected >= static_cast<int>(rows.size())) return;
         auto path = rows[static_cast<size_t>(selected)].path;
-        Hide(); OpenResult(std::move(path), location);
+        Hide(); open_result(std::move(path), location);
     }
     // Leading/trailing blanks would only make the main window's query differ
     // from what the popup searched for.
@@ -238,7 +260,7 @@ struct GlobalSearchWindow::Impl {
     }
     void UpdateScopeHover(float x, float y) {
         const bool hovered = current_only && !current_folder_tip.empty() &&
-            x >= width - 126 && x < width - 12 && y >= 76 && y < 129;
+            x >= width - 126 && x < width - 12 && y >= Header() && y < 129 + grow;
         scope_pointer_x = x;
         scope_pointer_y = y;
         if (hovered == scope_hover) {
@@ -258,7 +280,8 @@ struct GlobalSearchWindow::Impl {
             return true;
         }
         if (key == VK_UP || key == VK_DOWN || key == VK_PRIOR || key == VK_NEXT) {
-            selected += key == VK_UP ? -1 : key == VK_DOWN ? 1 : key == VK_PRIOR ? -PageSize() : PageSize();
+            if (selected < 0) selected = key == VK_UP || key == VK_PRIOR ? static_cast<int>(rows.size()) - 1 : 0;
+            else selected = std::max(0, selected + (key == VK_UP ? -1 : key == VK_DOWN ? 1 : key == VK_PRIOR ? -PageSize() : PageSize()));
             ClampSelection(); Invalidate(); return true;
         }
         if (key == VK_TAB) { content_mode = !content_mode; Changed(); return true; }
@@ -292,20 +315,28 @@ struct GlobalSearchWindow::Impl {
             ComPtr<ID2D1HwndRenderTarget> window_target;
             if (SUCCEEDED(target.As(&window_target))) window_target->Resize(D2D1::SizeU(static_cast<UINT32>(rect.right), static_cast<UINT32>(rect.bottom)));
         }
-        if (edit_font) DeleteObject(edit_font);
+        // The query line follows the interface font size like every other
+        // hosted edit (UI family, 23 DIP x font size x DPI).
+        if (HFONT font = ui::typography::CreateEditFont(scale, 23.0f)) {
+            if (edit_font) DeleteObject(edit_font);
+            edit_font = font;
+        }
         if (EnsureTarget()) {
             edit_format.Reset();
-            write_factory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 23 * scale, l10n::LocaleName(), &edit_format);
+            write_factory->CreateTextFormat(ui::typography::PreferredTextFamily(), nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                static_cast<float>(ui::typography::EditFontPixels(scale, 23.0f)), l10n::LocaleName(), &edit_format);
         }
-        edit_font = CreateFontW(-Px(23), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(edit_font), TRUE);
+        // One text line plus 4 DIP, never below the original 35 DIP field.
+        const float line_dip = static_cast<float>(ui::EditLineHeight(edit, edit_font, 1 << 16)) / scale;
+        grow = std::max(0.0f, std::ceil(line_dip + 4.0f - 35.0f));
+        const float field_h = 35 + grow;
         const float edit_left = kEditLeft + kEditTextInset;
         const float edit_width = width - kEditRight - edit_left;
-        MoveWindow(edit, Px(edit_left), Px(23), Px(edit_width), Px(35), TRUE);
+        MoveWindow(edit, Px(edit_left), Px(23), Px(edit_width), Px(field_h), TRUE);
         // Clip the redirected child as well as its parent-painted background.
-        const HRGN edit_region = CreateRoundRectRgn(0, 0, Px(edit_width) + 1, Px(35) + 1,
+        const HRGN edit_region = CreateRoundRectRgn(0, 0, Px(edit_width) + 1, Px(field_h) + 1,
             Px(kEditCornerRadius * 2), Px(kEditCornerRadius * 2));
         if (edit_region && !SetWindowRgn(edit, edit_region, TRUE)) DeleteObject(edit_region);
         if (edit_format)
@@ -380,7 +411,7 @@ struct GlobalSearchWindow::Impl {
                 SUCCEEDED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
                 target->CreateBitmapFromWicBitmap(converter.Get(), nullptr, &logo);
         }
-        if (logo) target->DrawBitmap(logo.Get(), {27, 20, 65, 58});
+        if (logo) target->DrawBitmap(logo.Get(), {27, 20 + grow / 2, 65, 58 + grow / 2});
     }
     float TextWidth(const std::wstring& text, float size = 12, bool bold = false) {
         ComPtr<IDWriteTextFormat> format;
@@ -457,6 +488,12 @@ struct GlobalSearchWindow::Impl {
         }
         target->SetDpi(96 * scale, 96 * scale);
     }
+    std::wstring FooterStatus() const {
+        if (!error.empty()) return rows.empty() ? L"" : error;
+        return busy ? Text(StringId::GlobalSearchLoading)
+                    : std::to_wstring(total) + Text(StringId::GlobalSearchResults);
+    }
+
     void Paint() {
         PAINTSTRUCT paint{}; BeginPaint(hwnd, &paint);
         if (EnsureTarget()) {
@@ -477,31 +514,32 @@ struct GlobalSearchWindow::Impl {
             else if (drawn) tint.a = 0;
             else if (live && !ui::IsHighContrast() && backdrop && compositor.UsesTransparentComposition()) tint.a = dark ? 0.72f : 0.78f;
             brush->SetColor(tint); target->FillRectangle({0, 0, width, height}, brush.Get());
-            Fill({kEditLeft, 23, width - kEditRight, 58}, Rgb(theme.header_bg), kEditCornerRadius);
+            Fill({kEditLeft, 23, width - kEditRight, 58 + grow}, Rgb(theme.header_bg), kEditCornerRadius);
+            const float mid = grow / 2;   // header items stay centred on the taller field
             DrawLogo();
-            Fill({80, 24, 81, 54}, line);
-            Label(L"\xE721", {91, 22, 115, 57}, 21, muted, false, L"Segoe Fluent Icons");
-            Keycap(L"Esc", {width - 60, 23, width - 22, 53}, muted);
-            Fill({0, kHeader, width, kHeader + 1}, line);
-            Label(Text(StringId::SearchModeName), {28, 83, 110, 120}, 16, content_mode ? muted : fg, !content_mode);
-            Label(Text(StringId::SearchModeContent), {124, 83, 208, 120}, 16, content_mode ? fg : muted, content_mode);
+            Fill({80, 24 + mid, 81, 54 + mid}, line);
+            Label(L"\xE721", {91, 22 + mid, 115, 57 + mid}, 21, muted, false, L"Segoe Fluent Icons");
+            Keycap(L"Esc", {width - 60, 23 + mid, width - 22, 53 + mid}, muted);
+            Fill({0, Header(), width, Header() + 1}, line);
+            Label(Text(StringId::SearchModeName), {28, 83 + grow, 110, 120 + grow}, 16, content_mode ? muted : fg, !content_mode);
+            Label(Text(StringId::SearchModeContent), {124, 83 + grow, 208, 120 + grow}, 16, content_mode ? fg : muted, content_mode);
             const float tab_center = (content_mode ? 124.0f : 28.0f) +
                 TextWidth(Text(content_mode ? StringId::SearchModeContent : StringId::SearchModeName), 16, true) * 0.5f;
-            Fill({tab_center - 12, 124, tab_center + 12, 127}, accent, 1.5f);
+            Fill({tab_center - 12, 124 + grow, tab_center + 12, 127 + grow}, accent, 1.5f);
             const UINT32 disabled = dark ? 0x6f7279 : 0x9a9da3;
-            Label(Text(StringId::GlobalSearchEverywhere), {width - 230, 83, width - 130, 120}, 15,
+            Label(Text(StringId::GlobalSearchEverywhere), {width - 230, 83 + grow, width - 130, 120 + grow}, 15,
                 current_only ? muted : fg, !current_only, L"Segoe UI", false, DWRITE_TEXT_ALIGNMENT_CENTER);
-            Label(Text(StringId::GlobalSearchCurrentFolder), {width - 122, 83, width - 22, 120}, 15,
+            Label(Text(StringId::GlobalSearchCurrentFolder), {width - 122, 83 + grow, width - 22, 120 + grow}, 15,
                 current_folder.empty() ? disabled : current_only ? fg : muted,
                 current_only && !current_folder.empty(), L"Segoe UI", false, DWRITE_TEXT_ALIGNMENT_CENTER);
             const float scope_center = current_only ? width - 72 : width - 180;
-            Fill({scope_center - 12, 124, scope_center + 12, 127}, accent, 1.5f);
-            Fill({0, 128, width, 129}, line);
+            Fill({scope_center - 12, 124 + grow, scope_center + 12, 127 + grow}, accent, 1.5f);
+            Fill({0, 128 + grow, width, 129 + grow}, line);
             const float bottom = height - kFooter;
-            target->PushAxisAlignedClip({0, 130, width, bottom}, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            target->PushAxisAlignedClip({0, 130 + grow, width, bottom}, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             if (rows.empty()) {
                 const auto& status = !error.empty() ? error : busy ? Text(StringId::GlobalSearchLoading) : query.empty() ? Text(StringId::GlobalSearchEmpty) : Text(StringId::GlobalSearchNoResults);
-                const D2D1_RECT_F bounds{16, 136, width - 16, bottom - 8};
+                const D2D1_RECT_F bounds{16, ListTop(), width - 16, bottom - 8};
                 if (!busy && error.empty()) {
                     const auto layout = ui::MakePaneEmptyLayout(bounds, 1, false);
                     if (empty_art_target != target.Get() || empty_art_scale != scale) {
@@ -516,7 +554,7 @@ struct GlobalSearchWindow::Impl {
                 }
             }
             for (int i = first; i < static_cast<int>(rows.size()) && i < first + PageSize() + 1; ++i) {
-                const float y = 136 + static_cast<float>(i - first) * kRow;
+                const float y = ListTop() + static_cast<float>(i - first) * kRow;
                 const auto& row = rows[static_cast<size_t>(i)];
                 if (i == selected) { Fill({5, y, width - 5, y + kRow - 3}, dark ? 0x293947 : 0xe1effa, 6); Fill({5, y + 9, 8, y + kRow - 12}, accent, 2); }
                 const auto dot = row.name.find_last_of(L'.');
@@ -535,12 +573,12 @@ struct GlobalSearchWindow::Impl {
             }
             target->PopAxisAlignedClip();
             if (rows.size() > static_cast<size_t>(PageSize())) {
-                const float track = bottom - 142, thumb = std::max(20.0f, track * static_cast<float>(PageSize()) / static_cast<float>(rows.size()));
-                const float top = 138 + (track - thumb) * static_cast<float>(first) / static_cast<float>(rows.size() - static_cast<size_t>(PageSize()));
+                const float track = bottom - 142 - grow, thumb = std::max(20.0f, track * static_cast<float>(PageSize()) / static_cast<float>(rows.size()));
+                const float top = 138 + grow + (track - thumb) * static_cast<float>(first) / static_cast<float>(rows.size() - static_cast<size_t>(PageSize()));
                 Fill({width - 4, top, width - 1, top + thumb}, muted, 1.5f);
             }
             Fill({0, bottom, width, bottom + 1}, line);
-            Label(!error.empty() ? error : busy ? Text(StringId::GlobalSearchLoading) : std::to_wstring(total) + Text(StringId::GlobalSearchResults), {25, bottom + 8, 155, height - 8}, 12, muted);
+            Label(FooterStatus(), {25, bottom + 8, 155, height - 8}, 12, muted);
             if (truncated && handoff) {
                 // Too many hits for the popup: point at the main window, which pages through all of them.
                 const float keys_left = DrawKeys(bottom, muted, accent, true);
@@ -585,7 +623,7 @@ struct GlobalSearchWindow::Impl {
             if (wp == kDebounce) Search();
             else if (wp == kConnectTimeout) {
                 KillTimer(hwnd, kConnectTimeout);
-                if (busy && !content_mode) { busy = false; error = Text(StringId::GlobalSearchFailed); Invalidate(); }
+                if (busy && !content_mode) TimeoutFilenames();
             } else if (wp == kScopeTooltipTimer) {
                 KillTimer(hwnd, kScopeTooltipTimer);
                 if (scope_hover && current_only && !current_folder_tip.empty()) {
@@ -615,16 +653,16 @@ struct GlobalSearchWindow::Impl {
         case WM_LBUTTONDOWN: {
             const float x = static_cast<float>(GET_X_LPARAM(lp)) / scale, y = static_cast<float>(GET_Y_LPARAM(lp)) / scale;
             HideScopeTooltip();
-            if (y < 76 && x > width - 70) Hide();
-            else if (y >= 76 && y < 129) {
+            if (y < Header() && x > width - 70) Hide();
+            else if (y >= Header() && y < 129 + grow) {
                 if (x < 220) { content_mode = x >= 114; Changed(); }
                 else if (x >= width - 230 && x < width - 126) {
                     if (current_only) { current_only = false; Changed(); }
                 } else if (x >= width - 126 && x < width - 12 && !current_folder.empty()) {
                     if (!current_only) { current_only = true; Changed(); }
                 }
-            } else if (y >= 136 && y < height - kFooter) {
-                selected = first + static_cast<int>((y - 136) / kRow); ClampSelection(); Invalidate();
+            } else if (y >= ListTop() && y < height - kFooter) {
+                selected = first + static_cast<int>((y - ListTop()) / kRow); ClampSelection(); Invalidate();
             } else if (InHandoff(x, y)) {
                 handoff_hover = false;
                 Handoff();
@@ -632,22 +670,22 @@ struct GlobalSearchWindow::Impl {
             }
             if (IsWindowVisible(hwnd)) SetFocus(edit); return 0;
         }
-        case WM_LBUTTONDBLCLK: if (GET_Y_LPARAM(lp) >= Px(136) && GET_Y_LPARAM(lp) < Px(height - kFooter)) Open(false); return 0;
+        case WM_LBUTTONDBLCLK: if (GET_Y_LPARAM(lp) >= Px(ListTop()) && GET_Y_LPARAM(lp) < Px(height - kFooter)) Open(false); return 0;
         case WM_MOUSEWHEEL:
             first = std::clamp(first - GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 3, 0, std::max(0, static_cast<int>(rows.size()) - PageSize()));
             Invalidate(); return 0;
         case kIndexStatus: Invalidate(); return 0;
         case kIndexResult: {
             index::SearchResult result;
-            if (filenames.TakeResult(static_cast<uint32_t>(wp), result) && wp == generation && !content_mode && IsWindowVisible(hwnd)) {
-                error.clear(); local_result = std::move(result); local_ready = true; MergeFilenames();
+            if (filenames.TakeResult(static_cast<uint32_t>(wp), result) && IsWindowVisible(hwnd)) {
+                AcceptFilenames(false, static_cast<uint32_t>(wp), std::move(result));
             }
             return 0;
         }
         case kNetworkResult: {
             index::SearchResult result;
-            if (network.TakeResult(static_cast<uint32_t>(wp), result) && wp == generation && !content_mode && IsWindowVisible(hwnd)) {
-                error.clear(); network_result = std::move(result); network_ready = true; MergeFilenames();
+            if (network.TakeResult(static_cast<uint32_t>(wp), result) && IsWindowVisible(hwnd)) {
+                AcceptFilenames(true, static_cast<uint32_t>(wp), std::move(result));
             }
             return 0;
         }
@@ -655,6 +693,7 @@ struct GlobalSearchWindow::Impl {
             index::ContentSearchUpdate update;
             while (contents.TakeUpdate(update)) {
                 if (update.progress.generation != generation || !content_mode || !IsWindowVisible(hwnd)) continue;
+                const bool had_rows = !rows.empty();
                 for (auto& hit : update.hits) {
                     if (rows.size() >= kMaximumResults) break;
                     rows.push_back({std::move(hit.name), std::move(hit.path), std::move(hit.snippet), false});
@@ -662,6 +701,7 @@ struct GlobalSearchWindow::Impl {
                 total = rows.size(); truncated = update.progress.truncated;
                 busy = !update.progress.done;
                 if (update.progress.error && update.progress.error != ERROR_CANCELLED) error = Text(StringId::GlobalSearchFailed);
+                if (!had_rows && !rows.empty()) selected = 0;
                 ClampSelection(false); Invalidate();
             }
             return 0;
@@ -708,10 +748,6 @@ struct GlobalSearchWindow::Impl {
             if (!edit) { DestroyWindow(hwnd); hwnd = nullptr; return false; }
             SetWindowTheme(edit, L"", L"");
             EnsureTarget();
-            // Match the address editor: uploaded layered bitmaps can disappear
-            // below the parent's composition surface on some display stacks.
-            // LumaText paints into the redirected child DC instead.
-            SetLayeredWindowAttributes(edit, 0, 255, LWA_ALPHA);
             ShowWindow(edit, SW_SHOW);
             SetWindowSubclass(edit, EditProc, 1, reinterpret_cast<DWORD_PTR>(this));
             SendMessageW(edit, EM_SETLIMITTEXT, 2048, 0);

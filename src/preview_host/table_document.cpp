@@ -24,11 +24,16 @@ constexpr size_t kMaxRows = 5000;
 constexpr size_t kMaxColumns = 256;
 constexpr size_t kMaxCellChars = 2000;
 constexpr size_t kMaxSourceChars = 64u * 1024u;
-constexpr size_t kMaxSheets = 16;
 constexpr size_t kMaxXlsxEntryBytes = 48u * 1024u * 1024u;
 constexpr ULONGLONG kXlsxBudgetMs = 2500;
 
 using Row = std::vector<std::wstring>;
+size_t SafePrefix(std::wstring_view text, size_t limit) {
+    size_t count = (std::min)(text.size(), limit);
+    if (count < text.size() && count && text[count - 1] >= 0xD800 && text[count - 1] <= 0xDBFF &&
+        text[count] >= 0xDC00 && text[count] <= 0xDFFF) --count;
+    return count;
+}
 
 void AppendEscaped(std::wstring& out, std::wstring_view text) {
     for (const wchar_t c : text) {
@@ -191,7 +196,11 @@ bool ParseCsv(std::wstring_view text, wchar_t delimiter, std::vector<Row>& rows,
     auto push = [&](wchar_t c) {
         if (c == L'\x0001') return;  // reserved for the bold marker
         if (cell.size() < kMaxCellChars) cell += c;
-        else if (!capped) { cell += L'\x2026'; capped = true; }
+        else if (!capped) {
+            if (!cell.empty() && cell.back() >= 0xD800 && cell.back() <= 0xDBFF &&
+                c >= 0xDC00 && c <= 0xDFFF) cell.pop_back();
+            cell += L'\x2026'; capped = true; truncated = true;
+        }
     };
     size_t i = 0;
     for (; i < text.size(); ++i) {
@@ -492,7 +501,7 @@ Styles ReadStyles(std::string_view xml) {
 
 // Formats a cell's cached numeric value with the parts of its number format
 // that matter for reading: grouping, decimals, percent, dates and times.
-std::wstring FormatNumber(const std::wstring& raw, const std::wstring& format) {
+std::wstring FormatNumber(const std::wstring& raw, const std::wstring& format, bool date1904) {
     wchar_t* end = nullptr;
     const double value = std::wcstod(raw.c_str(), &end);
     if (!end || *end || !std::isfinite(value)) return raw;
@@ -509,12 +518,15 @@ std::wstring FormatNumber(const std::wstring& raw, const std::wstring& format) {
     }
     const bool has_date = plain.find(L'y') != std::wstring::npos || plain.find(L'd') != std::wstring::npos;
     const bool has_time = plain.find(L'h') != std::wstring::npos || plain.find(L's') != std::wstring::npos;
-    if ((has_date || has_time) && value >= 0 && value < 2958466) {
+    if ((has_date || has_time) && value >= 0 && value < (date1904 ? 2957004 : 2958466)) {
         // Excel serial dates (1900 system; serial 60 is the fictional 1900-02-29).
         const double whole = std::floor(value);
-        const long long serial = static_cast<long long>(whole);
+        long long serial = static_cast<long long>(whole);
+        long long secs = std::llround((value - whole) * 86400.0);
+        if (secs == 86400) { ++serial; secs = 0; }
+        if (serial >= (date1904 ? 2957004 : 2958466)) return raw;
         // Serial 1 is 1900-01-01; Excel counts a fictional 1900-02-29 (serial 60).
-        const long long unix_days = serial - (serial >= 61 ? 25569 : 25568);
+        const long long unix_days = date1904 ? serial - 24107 : serial - (serial >= 61 ? 25569 : 25568);
         const long long z = unix_days + 719468;
         const long long era = (z >= 0 ? z : z - 146096) / 146097;
         const long long doe = z - era * 146097;
@@ -522,10 +534,10 @@ std::wstring FormatNumber(const std::wstring& raw, const std::wstring& format) {
         long long y = yoe + era * 400;
         const long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
         const long long mp = (5 * doy + 2) / 153;
-        const long long d = doy - (153 * mp + 2) / 5 + 1;
-        const long long m = mp < 10 ? mp + 3 : mp - 9;
+        long long d = doy - (153 * mp + 2) / 5 + 1;
+        long long m = mp < 10 ? mp + 3 : mp - 9;
         if (m <= 2) ++y;
-        const long long secs = std::llround((value - whole) * 86400.0);
+        if (!date1904 && serial == 60) { y = 1900; m = 2; d = 29; }
         wchar_t out[48];
         if (has_date && has_time)
             swprintf_s(out, L"%04lld-%02lld-%02lld %02lld:%02lld", y, m, d, secs / 3600, (secs / 60) % 60);
@@ -582,7 +594,7 @@ size_t ColumnIndex(std::string_view ref) {
 }
 
 void ReadSheet(std::string_view xml, const std::vector<std::wstring>& shared, const Styles& styles,
-               std::vector<Row>& rows, size_t& columns, bool& truncated) {
+               std::vector<Row>& rows, size_t& columns, bool& truncated, bool date1904) {
     XmlReader x(xml);
     size_t row_index = 0, next_col = 0;
     bool in_row = false, in_cell = false, in_value = false, in_inline = false, in_t = false;
@@ -606,9 +618,11 @@ void ReadSheet(std::string_view xml, const std::vector<std::wstring>& shared, co
         } else if (type == "str" || type == "inlineStr" || type == "e") {
             text = value;
         } else if (!value.empty()) {
-            text = FormatNumber(value, style < styles.format.size() ? styles.format[style] : std::wstring());
+            text = FormatNumber(value, style < styles.format.size() ? styles.format[style] : std::wstring(), date1904);
         }
-        if (text.size() > kMaxCellChars) { text.resize(kMaxCellChars); text += L'\x2026'; }
+        if (text.size() > kMaxCellChars) {
+            text.resize(SafePrefix(text, kMaxCellChars)); text += L'\x2026'; truncated = true;
+        }
         if (text.empty()) return;
         if (rows.size() <= row_index) rows.resize(row_index + 1);
         Row& row = rows[row_index];
@@ -720,7 +734,8 @@ bool MakeCsvTable(const std::wstring& path, std::wstring_view extension, std::ws
     payload = L"PULSETBL\t1\n";
     const size_t slash = path.find_last_of(L"\\/");
     std::wstring source;
-    AppendEscaped(source, std::wstring_view(text).substr(0, kMaxSourceChars));
+    AppendEscaped(source, std::wstring_view(text).substr(0, SafePrefix(text, kMaxSourceChars)));
+    more |= text.size() > kMaxSourceChars;
     truncated = AppendSheet(payload, L"csv", slash == std::wstring::npos ? path : path.substr(slash + 1), rows,
                 columns, more, detail, GuessHeader(rows),
                 ipc::kPreviewMaxTableChars - source.size() - 64);
@@ -730,11 +745,15 @@ bool MakeCsvTable(const std::wstring& path, std::wstring_view extension, std::ws
     return true;
 }
 
-bool MakeXlsxTable(const std::wstring& path, std::wstring& payload, uint32_t& bytes_read) {
+bool MakeXlsxTable(const std::wstring& path, std::wstring& payload, uint32_t& bytes_read,
+                   uint32_t sheet_index) {
+    payload.clear();
+    bytes_read = 0;
     const ULONGLONG started = GetTickCount64();
     uint64_t total = 0;
     std::string workbook, rels, shared_xml, styles_xml;
-    if (!ReadPart(path, "xl/workbook.xml", workbook, nullptr, total)) return false;
+    bool workbook_cut = false;
+    if (!ReadPart(path, "xl/workbook.xml", workbook, &workbook_cut, total) || workbook_cut) return false;
     ReadPart(path, "xl/_rels/workbook.xml.rels", rels, nullptr, total);
     // Sheet order and names from workbook.xml, targets from its relationships.
     std::map<std::string, std::string> targets;
@@ -744,38 +763,71 @@ bool MakeXlsxTable(const std::wstring& path, std::wstring& payload, uint32_t& by
             if (k == XmlReader::Kind::Open && x.name() == "Relationship")
                 targets[std::string(x.Attr("Id"))] = ResolveTarget(std::string(x.Attr("Target")));
     }
-    struct SheetRef { std::wstring name; std::string part; };
+    struct SheetRef { std::wstring name; std::string part; bool hidden; bool name_cut; };
     std::vector<SheetRef> sheets;
+    size_t total_sheets = 0, metadata_chars = 0;
+    bool metadata_full = false;
+    bool date1904 = false;
     {
         XmlReader x(workbook);
         for (auto k = x.Next(); k != XmlReader::Kind::End; k = x.Next()) {
-            if (k != XmlReader::Kind::Open || x.name() != "sheet") continue;
+            if (k != XmlReader::Kind::Open) continue;
+            if (x.name() == "workbookPr") {
+                const auto value = x.Attr("date1904");
+                date1904 = value == "1" || value == "true";
+            }
+            if (x.name() != "sheet") continue;
             const auto state = x.Attr("state");
-            if (state == "hidden" || state == "veryHidden") continue;
+            ++total_sheets;
             const auto rel = targets.find(std::string(x.Attr("id")));
-            if (rel == targets.end()) continue;
-            sheets.push_back({XmlReader::Unescape(XmlReader::Utf8(x.Attr("name"))), rel->second});
-            if (sheets.size() >= kMaxSheets) break;
+            auto name = XmlReader::Unescape(XmlReader::Utf8(x.Attr("name")));
+            const bool name_cut = name.size() > 256;
+            name.resize(SafePrefix(name, 256));
+            // Reserve metadata before cell data so content cannot displace later tabs.
+            const size_t reserve = name.size() * 2 + 512;
+            if (metadata_full || metadata_chars + reserve > ipc::kPreviewMaxTableChars / 2) {
+                metadata_full = true;
+                continue;
+            }
+            metadata_chars += reserve;
+            sheets.push_back({std::move(name), rel == targets.end() ? std::string() : rel->second,
+                              state == "hidden" || state == "veryHidden", name_cut});
         }
     }
-    if (sheets.empty()) return false;
-    const auto shared = ReadPart(path, "xl/sharedStrings.xml", shared_xml, nullptr, total)
-        ? ReadSharedStrings(shared_xml) : std::vector<std::wstring>{};
-    const Styles styles = ReadPart(path, "xl/styles.xml", styles_xml, nullptr, total)
-        ? ReadStyles(styles_xml) : Styles{};
+    if (sheet_index >= sheets.size()) return false;
+    std::vector<std::wstring> shared;
+    Styles styles;
+    if (!sheets[sheet_index].hidden && !sheets[sheet_index].part.empty()) {
+        if (ReadPart(path, "xl/sharedStrings.xml", shared_xml, nullptr, total)) shared = ReadSharedStrings(shared_xml);
+        if (ReadPart(path, "xl/styles.xml", styles_xml, nullptr, total)) styles = ReadStyles(styles_xml);
+    }
     payload = L"PULSETBL\t1\n";
-    for (const SheetRef& sheet : sheets) {
+    size_t loaded = 0;
+    for (size_t index = 0; index < sheets.size(); ++index) {
+        const SheetRef& sheet = sheets[index];
         std::vector<Row> rows;
         size_t columns = 0;
-        bool truncated = false, cut = false;
+        bool truncated = sheet.name_cut, cut = false;
         std::string xml;
-        // Past the time budget the remaining sheets are listed empty (tabs stay).
-        const bool read = GetTickCount64() - started < kXlsxBudgetMs &&
-                          ReadPart(path, sheet.part, xml, &cut, total);
-        if (read) ReadSheet(xml, shared, styles, rows, columns, truncated);
-        AppendSheet(payload, L"xlsx", sheet.name, rows, columns, truncated || cut || !read, L"", false,
-                    ipc::kPreviewMaxTableChars - 64);
+        std::wstring reason;
+        bool read = false;
+        if (sheet.hidden) reason = L"hidden";
+        else if (sheet.part.empty()) reason = L"missing-relationship";
+        else if (index != sheet_index) reason = L"not-loaded";
+        else if (GetTickCount64() - started >= kXlsxBudgetMs) reason = L"time-limit";
+        else if (payload.size() + metadata_chars + 512 >= ipc::kPreviewMaxTableChars) reason = L"payload-limit";
+        else {
+            read = ReadPart(path, sheet.part, xml, &cut, total);
+            if (!read) reason = L"read-failed";
+        }
+        if (read) { ++loaded; ReadSheet(xml, shared, styles, rows, columns, truncated, date1904); }
+        metadata_chars -= sheet.name.size() * 2 + 512;
+        AppendSheet(payload, L"xlsx", sheet.name, rows, columns,
+                    truncated || cut || (!read && reason != L"not-loaded"), reason, false,
+                    ipc::kPreviewMaxTableChars - metadata_chars - 128);
     }
+    payload += L"W\t" + std::to_wstring(total_sheets) + L'\t' + std::to_wstring(loaded) +
+               L'\t' + std::to_wstring(sheet_index) + L'\n';
     bytes_read = static_cast<uint32_t>((std::min)(total, uint64_t{0xFFFFFFFFu}));
     return true;
 }

@@ -5,6 +5,9 @@
 #include "app_navigation.h"
 #include "app_runtime.h"
 #include "app_state.h"
+#include "open_routing.h"
+#include "tray_reveal.h"
+#include "window_registry.h"
 #include "../common/path_utils.h"
 
 #include <shlobj.h>
@@ -40,7 +43,8 @@ bool ExplorerTakeoverEnabled(const AppState& s) {
 void SyncExplorerTakeover(AppState& s) {
     const bool enabled = ExplorerTakeoverEnabled(s);
     if (enabled && !s.explorer_takeover) {
-        s.explorer_takeover = std::make_unique<app::ExplorerWindowTakeover>(s.hwnd, WM_EXPLORER_TAKEOVER);
+        // Requests reach the most recent window through the host.
+        s.explorer_takeover = std::make_unique<app::ExplorerWindowTakeover>(ServiceWindow(s), WM_EXPLORER_TAKEOVER);
     } else if (!enabled && s.explorer_takeover) {
         s.explorer_takeover->Stop();
         s.explorer_takeover.reset();
@@ -60,7 +64,11 @@ void BringToFront(HWND hwnd) {
     if (attached) AttachThreadInput(self, other, FALSE);
 }
 
-uint64_t PaneKey(const app::Pane& pane) { return reinterpret_cast<uint64_t>(&pane); }
+// A pane in a given window. The window is mixed in (M4b) so that a pane
+// moved to another window becomes a new shell entry with that window's HWND.
+uint64_t PaneKey(const app::Pane& pane, HWND window) {
+    return reinterpret_cast<uint64_t>(&pane) ^ (reinterpret_cast<uint64_t>(window) * 0x9E3779B97F4A7C15ull);
+}
 
 bool SameFolder(const std::wstring& a, const std::wstring& b) {
     return path::EqualInsensitive(path::StripExtendedPathPrefix(fs::NormalizePath(a)),
@@ -72,6 +80,7 @@ bool SameFolder(const std::wstring& a, const std::wstring& b) {
 void AddNameToSelection(AppState& s, app::Tab& tab, const std::wstring& name) {
     tab.pending_selected_names.push_back(name);
     tab.pending_selected_name = name;
+    tab.pending_selection_revision = tab.selection_revision;
     tab.pending_ensure_selection_visible = true;
     if (!tab.snapshot) return;
     const auto& entries = *tab.snapshot;
@@ -79,6 +88,7 @@ void AddNameToSelection(AppState& s, app::Tab& tab, const std::wstring& name) {
         const int index = static_cast<int>(i);
         if (_wcsicmp(entries[i].name.c_str(), name.c_str()) != 0 || !tab.EntryVisible(index)) continue;
         if (!tab.IsSelected(index)) tab.ToggleSelect(index);
+        tab.pending_selection_revision = tab.selection_revision;
         EnsureRowVisible(s, tab, index);
         break;
     }
@@ -90,20 +100,35 @@ void SyncShellWindows(AppState& s) {
     SyncExplorerTakeover(s);
     std::vector<app::ShellWindowEntry> wanted;
     if (ShellWindowsEnabled(s)) {
-        ForEachPane(s, [&](app::Pane& pane) {
-            const app::Tab* tab = pane.ActiveTab();
-            if (!tab) return;
-            // The fs layer's \\?\ paths mean nothing to the shell.
-            std::wstring folder = path::StripExtendedPathPrefix(tab->current_path);
-            if (app::IsShellWindowPath(folder)) wanted.push_back({PaneKey(pane), std::move(folder)});
+        // Every window's panes (M4b), each registered with its own window.
+        app::ForEachWindowSharingCore(s, [&](AppState& window) {
+            ForEachPane(window, [&](app::Pane& pane) {
+                const app::Tab* tab = pane.ActiveTab();
+                if (!tab) return;
+                // The fs layer's \\?\ paths mean nothing to the shell.
+                std::wstring folder = path::StripExtendedPathPrefix(tab->current_path);
+                if (app::IsShellWindowPath(folder))
+                    wanted.push_back({PaneKey(pane, window.hwnd), std::move(folder), window.hwnd});
+            });
+        });
+        // Windows are visited most recent first; a stable order keeps
+        // switching windows from republishing an unchanged set.
+        std::stable_sort(wanted.begin(), wanted.end(), [](const auto& a, const auto& b) {
+            return reinterpret_cast<uintptr_t>(a.window) < reinterpret_cast<uintptr_t>(b.window);
         });
     }
-    if (wanted == s.shell_windows_published) return;
+    if (wanted == s.shell_windows_published) {
+        // Published is delivery deduplication, not acknowledgement. The STA
+        // retries COM failures; this only recovers a failed thread start.
+        if (s.shell_windows) s.shell_windows->EnsureRunning();
+        return;
+    }
     app::TraceShellWindows(L"sync enabled=%d wanted=%zu first=%s", ShellWindowsEnabled(s) ? 1 : 0,
                            wanted.size(), wanted.empty() ? L"" : wanted.front().path.c_str());
     if (!s.shell_windows) {
         if (wanted.empty()) return;
-        s.shell_windows = std::make_unique<app::ShellWindowRegistry>(s.hwnd, WM_SHELL_SELECT);
+        // Entries name their own windows; the host outlives every one of them.
+        s.shell_windows = std::make_unique<app::ShellWindowRegistry>(ServiceWindow(s), WM_SHELL_SELECT);
     }
     s.shell_windows->Publish(wanted);
     s.shell_windows_published = std::move(wanted);
@@ -115,7 +140,7 @@ void StopShellWindows(AppState& s) {
     // Stop synchronizes with posting; release requests which the destroyed
     // target window will no longer dispatch.
     MSG pending{};
-    while (PeekMessageW(&pending, s.hwnd, WM_EXPLORER_TAKEOVER, WM_EXPLORER_TAKEOVER, PM_REMOVE)) {
+    while (PeekMessageW(&pending, ServiceWindow(s), WM_EXPLORER_TAKEOVER, WM_EXPLORER_TAKEOVER, PM_REMOVE)) {
         std::unique_ptr<app::ExplorerTakeoverRequest> request(
             reinterpret_cast<app::ExplorerTakeoverRequest*>(pending.lParam));
         if (request && request->handoff) request->handoff->Cancel();
@@ -131,7 +156,7 @@ void HandleShellSelect(AppState& s, const app::ShellSelectRequest& request) {
     for (size_t i = 0; i < s.window_tabs.items.size() && !target; ++i) {
         if (!s.window_tabs.items[i]) continue;
         for (auto& pane : s.window_tabs.items[i]->panes) {
-            if (pane && PaneKey(*pane) == request.key) {
+            if (pane && PaneKey(*pane, s.hwnd) == request.key) {
                 layout_index = i;
                 target = pane.get();
                 break;
@@ -143,7 +168,7 @@ void HandleShellSelect(AppState& s, const app::ShellSelectRequest& request) {
                            target ? 1 : 0);
     if (!target) return;   // pane closed after the shell looked it up
 
-    s.tray_controller.RestoreWindow();
+    RevealWindow(s);
     if (layout_index != s.window_tabs.active) SwitchTab(s, layout_index);
     FocusPane(s, target);
     app::Tab* tab = ActiveTab(s);
@@ -168,18 +193,46 @@ void HandleShellSelect(AppState& s, const app::ShellSelectRequest& request) {
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
-void HandleExplorerTakeover(AppState& s, const app::ExplorerTakeoverRequest& request) {
+// A /select that applied in the hidden source after its folder was handed
+// over: select those names in the tab opened for it, if it still shows it.
+static void SelectTakenOverNames(AppState& mru, const app::ExplorerTakeoverRequest& request) {
+    if (!ExplorerTakeoverEnabled(mru) || request.names.empty()) return;
+    // The folder may have opened in any window (M7a): the most recent one
+    // whose active tab shows it.
+    AppState& s = app::FindWindowSharingCore(mru, [&request](AppState& w) {
+        const app::Tab* active = ActiveTab(w);
+        return active && SameFolder(active->current_path, request.folder);
+    });
+    app::Tab* tab = ActiveTab(s);
+    if (!tab || !SameFolder(tab->current_path, request.folder)) return;
+    app::TraceShellWindows(L"takeover late selection folder=[%s] names=%zu", request.folder.c_str(),
+                           request.names.size());
+    SelectNameInTab(s, *tab, request.names.front());
+    for (size_t i = 1; i < request.names.size(); ++i) AddNameToSelection(s, *tab, request.names[i]);
+    InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
+void HandleExplorerTakeover(AppState& mru, const app::ExplorerTakeoverRequest& request) {
+    if (request.select_only) {
+        SelectTakenOverNames(mru, request);
+        return;
+    }
     if (!request.handoff) return;
-    if (!ExplorerTakeoverEnabled(s) || GetTickCount64() >= request.handoff->deadline_tick) {
+    if (!ExplorerTakeoverEnabled(mru) || GetTickCount64() >= request.handoff->deadline_tick) {
         request.handoff->Cancel();
         return;
     }
     if (request.handoff->state != app::HandoffState::Pending) return;
     if (!request.handoff->Receive(GetTickCount64())) return;
     app::TraceShellWindows(L"takeover request folder=[%s] names=%zu", request.folder.c_str(), request.names.size());
-    // This PC travels as its parsing name, which OpenFolderInNewTab knows.
-    OpenFolderInNewTab(s, request.folder.empty() ? std::wstring(L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}")
-                                                 : request.folder);
+    // Explorer's window is about to close, so the folder must open where it
+    // can be seen: plan §6 picks the window (M7a); a window minimized or in
+    // the tray is restored (a fresh start from the tray included) when the
+    // folder goes there. This PC travels as its parsing name, which
+    // OpenExternalFolder knows.
+    AppState& s = OpenExternalFolder(mru, request.folder.empty()
+                                              ? std::wstring(L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}")
+                                              : request.folder);
     BringToFront(s.hwnd);
     app::Tab* tab = ActiveTab(s);
     if (!tab || !SameFolder(tab->current_path, request.folder)) {
@@ -198,6 +251,7 @@ void HandleExplorerTakeover(AppState& s, const app::ExplorerTakeoverRequest& req
     if (!lease->generation) return;
     tab->explorer_handoff = std::move(lease);
     tab->pending_selected_names = request.names;
+    tab->pending_selection_revision = tab->selection_revision;
     tab->pending_selected_name = request.names.empty() ? L"" : request.names.front();
     tab->pending_ensure_selection_visible = !request.names.empty();
     InvalidateRect(s.hwnd, nullptr, FALSE);

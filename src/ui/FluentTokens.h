@@ -192,16 +192,16 @@ struct Theme {
 
 enum class ThemeMode { Auto, Light, Dark };
 
-// The immersive colour policy — and the undocumented export that reports it — is cached
-// per process: ShouldAppsUseDarkMode keeps answering with the value the process saw
-// first, so a theme switched while the app is running never reaches it (measured on this
-// machine: with AppsUseLightTheme flipped underneath, the export still returned the old
-// answer, and RefreshImmersiveColorPolicyState did not clear it either). The value
-// Settings itself writes is read fresh every time, so that one leads; the export stays as
-// the fallback for profiles that do not carry the value at all.
 inline bool ShouldUseDarkMode(ThemeMode overrideMode) noexcept {
     if (overrideMode == ThemeMode::Dark) return true;
     if (overrideMode == ThemeMode::Light) return false;
+    // The immersive colour policy — and the undocumented export that reports it — is cached
+    // per process: ShouldAppsUseDarkMode keeps answering with the value the process saw
+    // first, so a theme switched while the app is running never reaches it (measured on this
+    // machine: with AppsUseLightTheme flipped underneath, the export still returned the old
+    // answer, and RefreshImmersiveColorPolicyState did not clear it either). The value
+    // Settings itself writes is read fresh every time, so that one leads; the export stays as
+    // the fallback for profiles that do not carry the value at all.
     DWORD value = 1;
     DWORD size = sizeof(value);
     if (RegGetValueW(HKEY_CURRENT_USER,

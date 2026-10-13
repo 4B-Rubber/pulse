@@ -16,6 +16,9 @@
 //         text: the only child's text for leaf elements), t text, c comment,
 //         d CDATA, p processing instruction.
 //       children: direct children in the document (containers).
+//   Element N records append an "attributes-v1" field. Their A records carry
+//   A\t<attribute-name>\t<decoded-value> (also escaping CR as \r).
+//   These preserve copy values independently of clipped/flattened display text.
 //   X\t<source>            the decoded text for the source view.
 #pragma once
 

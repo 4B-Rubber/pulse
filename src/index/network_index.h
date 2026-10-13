@@ -51,6 +51,7 @@ public:
     bool TakeResult(uint32_t id, SearchResult& result);
 
     std::vector<NetworkRootInfo> Roots() const;
+    std::wstring ConfigError() const;
     bool AddRoot(const std::wstring& path, std::wstring* error = nullptr);
     bool RemoveRoot(const std::wstring& path, std::wstring* error = nullptr);
     void Rebuild(const std::wstring& path = {});
@@ -59,6 +60,8 @@ public:
     ChangeState ChangeCoverage(const std::wstring& path) const;
 
 private:
+    friend struct NetworkIndexTestAccess;
+    bool ReadConfig(const std::wstring& path, std::vector<std::wstring>& configured);
     ChangeTracker changes_;
     std::mutex change_seed_mutex_;
     std::unordered_set<std::wstring> change_seed_owners_;
@@ -98,6 +101,8 @@ private:
 
     void CrawlLoop();
     void WatchLoop();
+    void SetWatching(const std::wstring& path, bool watching);
+    bool ReloadConfigurationLocked(std::wstring* error);
     void SearchLoop();
     void BuildRoot(const std::wstring& path, uint64_t generation);
     void NotifyStatus() const;
@@ -112,6 +117,7 @@ private:
     std::condition_variable crawl_cv_;
     std::condition_variable search_cv_;
     std::vector<RootState> roots_;
+    std::wstring config_error_;
     std::unordered_set<std::wstring> dirty_roots_;
     uint64_t generation_ = 1;
     Query pending_query_;
@@ -126,7 +132,7 @@ private:
 };
 
 SearchResult MergeSearchResults(const Query& query, SearchResult local,
-                                SearchResult network);
+                                SearchResult network, bool deduplicate_paths = false);
 
 // #74: name search in a network folder that no ready network root covers. The
 // local index never holds SMB paths and the network index only answers for
@@ -134,10 +140,12 @@ SearchResult MergeSearchResults(const Query& query, SearchResult local,
 // Explorer walks the folder. These walk it live with the network index's
 // matching and ordering rules.
 struct LiveNetworkMatches {
-    std::vector<Hit> hits;  // walk order, at most kSearchPageCap
+    std::vector<Hit> hits;  // bounded top-k for order, or traversal order for Index
+    Query order;
     size_t total = 0;       // all matches, including past the cap
-    DWORD error = 0;        // the folder itself could not be listed
-    bool complete = false;  // the walk finished (was not cancelled)
+    DWORD error = 0;        // any directory or enumeration failed
+    bool finished = false;
+    bool complete = false;  // walk finished; nonzero error means partial results
 };
 // UNC paths and mapped network drives.
 bool IsNetworkFolderPath(const std::wstring& path);
@@ -145,15 +153,28 @@ bool IsNetworkFolderPath(const std::wstring& path);
 // whose index can answer a search right now count.
 bool NetworkRootsCover(const std::vector<NetworkRootInfo>& roots, const std::wstring& path,
                        bool require_ready);
-// Lists `folder` recursively and appends the matches to `out` under
-// `out_mutex`. `progress` runs about every 250 ms while new matches arrive;
-// the walk stops when `cancelled` returns true.
+// Replaces out with a bounded selection while recursively listing the scope.
+// The Query overload retains its ordered top-k; the string overload keeps
+// traversal order for compatibility. Progress runs about every 250 ms;
+// cancellation is checked between enumeration entries.
 void LiveNetworkWalk(const std::wstring& folder, const std::wstring& needle, bool folders_only,
                      LiveNetworkMatches& out, std::mutex& out_mutex,
                      const std::function<bool()>& cancelled,
                      const std::function<void()>& progress);
+void LiveNetworkWalk(const Query& query, LiveNetworkMatches& out, std::mutex& out_mutex,
+                     const std::function<bool()>& cancelled,
+                     const std::function<void()>& progress);
+// The complete capped prefix is retained, so pagination can reuse a walk;
+// changes to matching, ordering or session require a fresh walk.
+bool CanReuseLiveNetworkWalk(const Query& previous, const Query& next);
 // One provider answer (offset/limit applied) from the matches so far. The
 // caller holds the mutex guarding `matches`.
 SearchResult SelectLiveNetworkHits(const Query& query, const LiveNetworkMatches& matches);
 
 } // namespace pulse::index
+
+namespace pulse::index {
+void LiveNetworkWalk(const std::wstring& folder, const std::wstring& needle, bool folders_only,
+    LiveNetworkMatches& out, std::mutex& mutex, const std::function<bool()>& cancelled,
+    const std::function<void()>& progress, const Query* selection);
+}

@@ -20,7 +20,7 @@ struct IndexMigration {
 std::wstring ResolveIndexMigrationTarget(const std::wstring& target);
 bool SameIndexLocation(const std::wstring& source, const std::wstring& target);
 bool CopyIndexForMigration(const std::wstring& source, const std::wstring& target,
-                           IndexMigration& migration, std::wstring& error);
+                           IndexMigration& migration, std::wstring& error, bool private_target = false);
 bool RemoveMigratedIndexSource(const IndexMigration& migration, std::wstring& error);
 void DiscardIndexMigrationCopies(const IndexMigration& migration);
 }

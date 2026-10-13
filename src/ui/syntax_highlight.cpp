@@ -197,6 +197,7 @@ public:
     bool Full() const { return spans_.size() >= max_; }
 
     void Emit(size_t start, size_t end, SyntaxToken token) {
+        end = (std::min)(end, text_.size());
         if (end <= start || token == SyntaxToken::Plain || Full()) return;
         spans_.push_back({static_cast<uint32_t>(start), static_cast<uint32_t>(end - start), token});
     }

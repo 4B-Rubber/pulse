@@ -1,4 +1,5 @@
 #include "content_task_search.h"
+#include "content_directory_listing.h"
 #include "content_scope.h"
 #include "document_reader.h"
 #include "text_task_reader.h"
@@ -484,7 +485,7 @@ bool RunContentTaskSupplement(const ContentIndexConfig &config, const ContentSea
                     for (const auto& path : request.candidate_paths) {
                         if (visited.insert(ContentScopeKey(path)).second && !visit(path)) break;
                     }
-                } else if (config.shared_scope) {
+                } else if (config.shared_scope && request.root.empty() && request.roots.empty()) {
                     IndexFeedConnection feed(cancel_event);
                     uint64_t epoch = 0, cursor = 0;
                     while (!interrupted()) {
@@ -513,17 +514,70 @@ bool RunContentTaskSupplement(const ContentIndexConfig &config, const ContentSea
                         cursor = page.next;
                     }
                 } else {
-                    // Collapse overlapping roots before DFS instead of retaining a
-                    // corpus-sized set of every path visited during the task.
-                    std::vector<std::wstring> roots;
-                    for (const auto &root : config.roots) {
+                    const bool constrained = !request.root.empty() || !request.roots.empty();
+                    const bool walk_recursive = !constrained || request.recursive;
+                    std::vector<std::wstring> configured;
+                    for (const auto& root : config.roots) {
                         const auto key = ContentScopeKey(root.path);
-                        if (std::any_of(roots.begin(), roots.end(),
-                                        [&](const auto &old) { return InScope(key, old, true); }))
-                            continue;
-                        std::erase_if(roots, [&](const auto &old) { return InScope(old, key, true); });
-                        roots.push_back(key);
+                        if (std::any_of(configured.begin(), configured.end(),
+                            [&](const auto& old) { return ContentPathUnder(key, old); })) continue;
+                        std::erase_if(configured, [&](const auto& old) { return ContentPathUnder(old, key); });
+                        configured.push_back(key);
                     }
+                    std::vector<std::wstring> scopes;
+                    const auto primary = ContentScopeKey(request.root);
+                    if (request.roots.empty()) {
+                        if (!primary.empty()) scopes.push_back(primary);
+                    } else {
+                        for (const auto& scope : request.roots) {
+                            const auto key = ContentScopeKey(scope);
+                            if (primary.empty() || key == primary ||
+                                (walk_recursive && ContentPathUnder(key, primary))) scopes.push_back(key);
+                            else if (walk_recursive && ContentPathUnder(primary, key)) scopes.push_back(primary);
+                        }
+                    }
+                    struct WalkRoot { std::wstring path, anchor; };
+                    std::vector<WalkRoot> roots;
+                    auto add_root = [&](const std::wstring& path, const std::wstring& anchor) {
+                        auto covers = [&](const std::wstring& a, const std::wstring& b) {
+                            return a == b || (walk_recursive && ContentPathUnder(b, a));
+                        };
+                        if (std::any_of(roots.begin(), roots.end(),
+                            [&](const auto& old) { return covers(old.path, path); })) return;
+                        std::erase_if(roots, [&](const auto& old) { return covers(path, old.path); });
+                        roots.push_back({path, anchor});
+                    };
+                    for (const auto& configured_root : configured) {
+                        if (!constrained) add_root(configured_root, configured_root);
+                        for (const auto& scope : scopes) {
+                            if (ContentPathUnder(scope, configured_root)) add_root(scope, configured_root);
+                            else if (walk_recursive && ContentPathUnder(configured_root, scope))
+                                add_root(configured_root, configured_root);
+                        }
+                    }
+                    // Starting below a configured root must not bypass the DFS
+                    // exclusions for junctions, offline directories or excluded ancestors.
+                    auto reachable = [&](const WalkRoot& root) {
+                        if (root.path == root.anchor) return true;
+                        size_t component = root.anchor.size() + (root.anchor.ends_with(L'\\') ? 0 : 1);
+                        for (;;) {
+                            const auto separator = root.path.find(L'\\', component);
+                            const auto ancestor = root.path.substr(0, separator);
+                            if (interrupted() || cache.excluded(ancestor) ||
+                                (request.skip_system_locations && SystemPath(ancestor))) return false;
+                            const DWORD attributes = GetFileAttributesW(NativePath(ancestor).c_str());
+                            if (attributes == INVALID_FILE_ATTRIBUTES) {
+                                const DWORD enumeration_error = GetLastError();
+                                complete = false;
+                                std::lock_guard lock(mutex);
+                                if (!error) error = enumeration_error ? enumeration_error : ERROR_GEN_FAILURE;
+                                return false;
+                            }
+                            if (attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)) return false;
+                            if (separator == std::wstring::npos) return true;
+                            component = separator + 1;
+                        }
+                    };
                     struct Frame {
                         std::wstring path;
                         HANDLE find = INVALID_HANDLE_VALUE;
@@ -535,7 +589,7 @@ bool RunContentTaskSupplement(const ContentIndexConfig &config, const ContentSea
                         ~CloseFinds() {
                             for (auto &frame : stack)
                                 if (frame.find != INVALID_HANDLE_VALUE)
-                                    FindClose(frame.find);
+                                    content_listing::Close(frame.find);
                         }
                     } close_finds{stack};
                     auto open = [&](const std::wstring &path) {
@@ -543,30 +597,40 @@ bool RunContentTaskSupplement(const ContentIndexConfig &config, const ContentSea
                             return;
                         Frame frame;
                         frame.path = path;
-                        frame.find = FindFirstFileExW((NativePath(path) + L"\\*").c_str(), FindExInfoBasic, &frame.data,
-                                                      FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+                        frame.find = content_listing::First(NativePath(path) + L"\\*", frame.data,
+                                                            FIND_FIRST_EX_LARGE_FETCH);
                         if (frame.find != INVALID_HANDLE_VALUE)
                             stack.push_back(std::move(frame));
                         else {
+                            const DWORD enumeration_error = GetLastError();
+                            if (content_listing::EmptyDirectoryResult(NativePath(path), enumeration_error)) return;
                             complete = false;
                             std::lock_guard lock(mutex);
-                            error = GetLastError();
+                            if (!error) error = enumeration_error ? enumeration_error : ERROR_GEN_FAILURE;
                         }
                     };
                     for (const auto &root : roots) {
-                        open(root);
+                        if (interrupted()) break;
+                        if (!reachable(root)) continue;
+                        open(root.path);
                         while (!stack.empty() && !interrupted()) {
                             auto &frame = stack.back();
                             const auto data = frame.data;
                             const auto child = frame.path + L"\\" + data.cFileName;
-                            if (!FindNextFileW(frame.find, &frame.data)) {
-                                FindClose(frame.find);
+                            if (!content_listing::Next(frame.find, frame.data)) {
+                                const DWORD enumeration_error = GetLastError();
+                                if (enumeration_error != ERROR_NO_MORE_FILES) {
+                                    complete = false;
+                                    std::lock_guard lock(mutex);
+                                    if (!error) error = enumeration_error ? enumeration_error : ERROR_GEN_FAILURE;
+                                }
+                                content_listing::Close(frame.find);
                                 stack.pop_back();
                             }
                             if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L".."))
                                 continue;
                             if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                                if (!(data.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)))
+                                if (walk_recursive && !(data.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)))
                                     open(child);
                             } else if (!visit(child))
                                 break;

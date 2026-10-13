@@ -191,7 +191,7 @@ private:
 } // namespace
 
 bool ApplyMathInline(IDWriteFactory2* factory, IDWriteTextLayout* layout, DWRITE_TEXT_RANGE range,
-                     std::wstring_view source, float font_size, bool display, float max_width) {
+                     std::wstring_view source, float font_size, bool display, float max_width, float window_scale) {
     if (!factory || !layout || !range.length || source.empty() || source.size() > 4096 || !std::isfinite(font_size) ||
         font_size < 4 || font_size > 256 || !std::isfinite(max_width) || max_width <= 0)
         return false;
@@ -215,7 +215,7 @@ bool ApplyMathInline(IDWriteFactory2* factory, IDWriteTextLayout* layout, DWRITE
             return false;
         const auto metrics = math::ReadFontMathMetrics(face.Get());
         Box box;
-        if (!math::BuildMathLayout(factory, face.Get(), metrics, parsed.root, font_size, display, box))
+        if (!math::BuildMathLayout(factory, face.Get(), metrics, parsed.root, font_size, display, box, window_scale))
             return false;
         const float scale = box.width > 0 ? std::min(1.0f, max_width / box.width) : 1.0f;
         if (scale < 0.55f)

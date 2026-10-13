@@ -102,6 +102,8 @@ public:
     void EnsureDefaults();
     bool Load();
     bool Save() const;
+    bool FlushTagSave() const;
+    DWORD TagSaveError() const;
 
     int FindWorkspace(const std::wstring& root) const;
     int PinWorkspace(const std::wstring& root, const std::wstring& name, int layout,
@@ -182,6 +184,10 @@ public:
     void TagsReordered();
 
 private:
+    friend struct PlacesPersistenceAudit;
+#ifdef PULSE_PLACES_SAVE_TEST
+    friend struct PlacesSaveTestAccess;
+#endif
     struct SaveSnapshot {
         std::vector<Workspace> workspaces;
         std::vector<ColorTag> tags;
@@ -191,6 +197,7 @@ private:
         std::vector<QuickAccessBadge> quick_access_badges;
         std::vector<RecentItem> recent_items;
         int active_workspace = -1;
+        uint64_t tags_generation = 0;
         bool persist = true;
     };
 
@@ -199,7 +206,7 @@ private:
     void CommitTagChanges(const std::vector<std::wstring>& paths,
                           std::vector<TagAdsUpdate>* deferred_ads);
     void QueueTagSave() const;
-    static bool SaveTagFile(const std::vector<ColorTag>& tags);
+    static bool SaveTagFile(const std::vector<ColorTag>& tags, uint64_t generation);
     void StopTagWriter();
     SaveSnapshot CaptureSaveSnapshot() const;
     static bool SaveSnapshotFile(const SaveSnapshot& snapshot);
@@ -209,11 +216,14 @@ private:
 
     std::unordered_map<std::wstring, std::vector<int>> tag_index_;
     std::unordered_set<std::wstring> starred_index_;
-    mutable std::atomic<ULONGLONG> places_save_due_{0};
+    mutable ULONGLONG places_save_due_ = 0;
     uint64_t tag_revision_ = 1;
     mutable std::mutex tag_save_mutex_;
     mutable std::condition_variable tag_save_cv_;
-    mutable std::optional<std::vector<ColorTag>> pending_tag_save_;
+    mutable std::optional<std::pair<std::vector<ColorTag>, uint64_t>> pending_tag_save_;
+    mutable uint64_t tags_generation_ = 0;
+    mutable DWORD tag_save_error_ = ERROR_SUCCESS;
+    mutable std::mutex tag_save_io_mutex_;
     mutable std::thread tag_save_thread_;
     mutable bool tag_save_stop_ = false;
     mutable std::mutex places_save_mutex_;
@@ -222,7 +232,7 @@ private:
     mutable std::thread places_save_thread_;
     mutable bool places_save_stop_ = false;
     mutable std::mutex places_save_io_mutex_;
-    mutable std::atomic<uint64_t> places_save_revision_{0};
+    mutable uint64_t places_save_revision_ = 0;
 };
 
 inline std::wstring MakeStarredPath() { return L"pulse:starred"; }

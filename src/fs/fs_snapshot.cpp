@@ -8,6 +8,7 @@ bool QueryDirectoryIdentity(const std::wstring& path, DirectoryIdentity& out) {
     out = {};
     if (path.empty() || IsVirtualPath(path)) return false;
     const std::wstring normalized = NormalizePath(path);
+    if (normalized.empty()) return false;
     HANDLE handle = CreateFileW(
         normalized.c_str(),
         FILE_READ_ATTRIBUTES,
@@ -71,6 +72,7 @@ SnapshotPtr SnapshotStore::GetOrStart(const std::wstring& path, uint64_t& out_ge
                                       DirectoryIdentity* out_identity) {
     std::wstring key = NormalizePath(path);
     if (out_identity) *out_identity = {};
+    if (!path.empty() && key.empty()) { out_generation = 0; return nullptr; }
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = map_.find(key);
     if (it != map_.end()) {
@@ -108,6 +110,7 @@ SnapshotPtr SnapshotStore::GetOrStart(const std::wstring& path, uint64_t& out_ge
 
 SnapshotPtr SnapshotStore::Peek(const std::wstring& path) const {
     std::wstring key = NormalizePath(path);
+    if (!path.empty() && key.empty()) return nullptr;
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = map_.find(key);
     if (it == map_.end()) return nullptr;
@@ -116,6 +119,7 @@ SnapshotPtr SnapshotStore::Peek(const std::wstring& path) const {
 
 DirectoryIdentity SnapshotStore::Identity(const std::wstring& path) const {
     const std::wstring key = NormalizePath(path);
+    if (!path.empty() && key.empty()) return {};
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = map_.find(key);
     return it == map_.end() ? DirectoryIdentity{} : it->second.identity;
@@ -123,6 +127,7 @@ DirectoryIdentity SnapshotStore::Identity(const std::wstring& path) const {
 
 bool SnapshotStore::IsDirty(const std::wstring& path) const {
     const std::wstring key = NormalizePath(path);
+    if (!path.empty() && key.empty()) return false;
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = map_.find(key);
     return it != map_.end() && it->second.dirty;
@@ -131,6 +136,7 @@ bool SnapshotStore::IsDirty(const std::wstring& path) const {
 void SnapshotStore::Update(const std::wstring& path, uint64_t generation,
                            SnapshotPtr snapshot, DirectoryIdentity identity) {
     std::wstring key = NormalizePath(path);
+    if (!path.empty() && key.empty()) return;
     // Snapshots are immutable; count large directories before taking the UI-facing lock.
     const size_t bytes = SnapshotBytes(snapshot);
     std::lock_guard<std::mutex> lock(mutex_);
@@ -170,6 +176,7 @@ void SnapshotStore::Update(const std::wstring& path, uint64_t generation,
 
 uint64_t SnapshotStore::Put(const std::wstring& path, SnapshotPtr snapshot) {
     std::wstring key = NormalizePath(path);
+    if (!path.empty() && key.empty()) return 0;
     // Snapshots are immutable; count large directories before taking the UI-facing lock.
     const size_t bytes = SnapshotBytes(snapshot);
     std::lock_guard<std::mutex> lock(mutex_);
@@ -206,9 +213,18 @@ uint64_t SnapshotStore::Put(const std::wstring& path, SnapshotPtr snapshot) {
 
 void SnapshotStore::MarkDirty(const std::wstring& path) {
     std::wstring key = NormalizePath(path);
+    if (!path.empty() && key.empty()) return;
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = map_.find(key);
     if (it != map_.end()) it->second.dirty = true;
+}
+
+void SnapshotStore::BeginRefresh(const std::wstring& path) {
+    std::wstring key = NormalizePath(path);
+    if (!path.empty() && key.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = map_.find(key);
+    if (it != map_.end()) it->second.dirty = false;
 }
 
 size_t SnapshotStore::EntryCount() const {

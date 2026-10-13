@@ -14,16 +14,27 @@ using Id = l10n::StringId;
 struct HelpRow { Id label; std::wstring keys; };
 struct HelpGroup { Id title; std::vector<HelpRow> rows; };
 
+// What the key below Esc types on this keyboard layout; the same label the
+// window switcher hint shows (app/window_switcher_ui.cpp SwitcherKeyLabel).
+std::wstring SwitcherKey() {
+    const UINT vk = MapVirtualKeyW(0x29, MAPVK_VSC_TO_VK);
+    const UINT ch = vk ? (MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) & 0x7FFFFFFFu) : 0;  // high bit: dead key
+    if (ch >= 0x20) return std::wstring(1, static_cast<wchar_t>(ch));
+    wchar_t name[32]{};
+    if (GetKeyNameTextW(0x29 << 16, name, 32) > 0) return name;
+    return L"`";
+}
+
 // Every shortcut HandleKeyDown (app_input.cpp) and WM_SYSKEYDOWN (app_main.cpp)
 // handle, grouped. In the two-column layout the first kLeftGroups groups fill
-// the left column.
-constexpr size_t kLeftGroups = 2;
+// the left column; tabs and windows stay side by side on the right.
+constexpr size_t kLeftGroups = 3;
 std::vector<HelpGroup> HelpGroups() {
     return {
         {Id::HelpGroupNav, {
             {Id::HelpOpen, l10n::Pick(L"Enter / 双击", L"Enter / Double-click")},
-            {Id::HelpBackForward, L"Alt ← / →"},
-            {Id::Up, L"Backspace / Alt ↑"},
+            {Id::HelpBackForward, L"Backspace / Alt ← / →"},
+            {Id::Up, L"Alt ↑"},
             {Id::HelpGoToPath, L"Ctrl L / Alt D / F4"},
             {Id::Refresh, L"F5"},
             {Id::HelpMoveFocus, L"↑ ↓ PgUp PgDn Home End"},
@@ -35,18 +46,12 @@ std::vector<HelpGroup> HelpGroups() {
             {Id::Undo, L"Ctrl Z"},
             {Id::Rename, L"F2"},
             {Id::BatchRename, L"Ctrl Shift R"},
-            {Id::NewFolder, L"F7"},
-            {Id::Delete, L"Delete"},
+            {Id::NewFolder, L"Ctrl Shift N / F7"},
+            {Id::Delete, L"Delete / Ctrl D"},
             {Id::PermanentDelete, L"Shift Delete"},
             {Id::Properties, L"Alt Enter"},
-            {Id::HelpToggleTag, L"Ctrl Shift 1–7"},
-        }},
-        {Id::HelpGroupSearch, {
-            {Id::Search, L"Ctrl K"},
-            {Id::HelpCommandBar, L"Ctrl Shift K"},
-            {Id::HelpProject, L"Ctrl P"},
-            {Id::HelpFilter, L"Ctrl F"},
-            {Id::AdvancedSearch, L"Ctrl Shift F"},
+            {Id::HelpContextMenu, L"Shift F10"},
+            {Id::HelpToggleTag, L"Ctrl Alt Shift 1–7"},
         }},
         {Id::HelpGroupSelect, {
             {Id::SelectAll, L"Ctrl A"},
@@ -54,15 +59,32 @@ std::vector<HelpGroup> HelpGroups() {
             {Id::HelpSelectPattern, L"Ctrl Shift A"},
             {Id::SelectionHint, l10n::Get(Id::SelectionKeys)},
         }},
+        {Id::HelpGroupSearch, {
+            {Id::Search, L"Ctrl K"},
+            {Id::HelpCommandBar, L"Ctrl Shift K"},
+            {Id::HelpProject, L"Ctrl P"},
+            {Id::HelpFilter, L"Ctrl F / Ctrl E / F3"},
+            {Id::AdvancedSearch, L"Ctrl Shift F"},
+        }},
         {Id::HelpGroupTabs, {
             {Id::TooltipNewTab, L"Ctrl T"},
             {Id::TabClose, L"Ctrl W"},
-            {Id::HelpSwitchTab, L"Ctrl Tab / Ctrl Shift Tab"},
-            {Id::SplitLayout, L"Ctrl 1 / 2 / 3 / 4"},
+            {Id::HelpSwitchTab, L"Ctrl Tab / Ctrl 1–9"},
+            {Id::SplitLayout, L"Ctrl Alt 1 / 2 / 3 / 4"},
+            {Id::HelpViewMode, L"Ctrl Shift 1–8"},
             {Id::HelpNextPane, L"F6"},
-            {Id::HelpMarkTarget, L"Ctrl D"},
+            {Id::HelpMarkTarget, L"Ctrl Alt D"},
             {Id::HelpTransferTarget, L"Ctrl Alt C / X"},
             {Id::HelpSidebar, L"Ctrl B"},
+            {Id::Maximize, L"F11"},
+        }},
+        {Id::HelpGroupWindows, {
+            {Id::HelpNewWindow, L"Ctrl N"},
+            {Id::HelpCloseWindow, L"Ctrl Shift W / Alt F4"},
+            {Id::HelpTabToWindow, L"Ctrl Shift M"},
+            {Id::HelpReopenClosed, L"Ctrl Shift T"},
+            {Id::HelpSwitchWindow, L"Ctrl " + SwitcherKey()},
+            {Id::HelpWindowOverview, L"Ctrl Shift O"},
         }},
     };
 }
@@ -304,4 +326,3 @@ void ShowShortcutHelp(HWND owner,bool dark,D2D1_COLOR_F accent) {
     if (status==0) PostQuitMessage(static_cast<int>(msg.wParam));
 }
 }
-

@@ -450,11 +450,11 @@ void BloomAccentPicker::Draw(ID2D1DeviceContext* dc, const Theme& theme) const {
     float inner_r = radius * solid_sc;
     if (inner_r > outer_r - 1.5f) inner_r = outer_r - 1.5f;
 
-    ID2D1Factory* factory = nullptr;
-    dc->GetFactory(&factory);
+    ComPtr<ID2D1Factory> factory;
+    dc->GetFactory(&factory.p);
     ComPtr<ID2D1SolidColorBrush> ring_br;
     dc->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 1), &ring_br.p);
-    if (factory && ring_br.get()) {
+    if (factory.get() && ring_br.get()) {
         ComPtr<ID2D1StrokeStyle> round_cap;
         D2D1_STROKE_STYLE_PROPERTIES caps{};
         caps.startCap = D2D1_CAP_STYLE_ROUND;

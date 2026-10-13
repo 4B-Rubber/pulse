@@ -2,15 +2,19 @@
 #include "session.h"
 #include "../common/utf8_file.h"
 #include "../fs/fs_enum.h"
+#include "../common/localization.h"
 #include <map>
 #include <mutex>
 #include <cwctype>
+#include <set>
+#include <memory>
 namespace pulse::app {
 namespace {
 std::mutex mutex;
 std::wstring loaded_dir;
 std::map<std::wstring, TagAdsUpdate> pending;
 bool readable = false;
+DWORD load_error = ERROR_SUCCESS;
 std::wstring Key(const std::wstring& path) {
     auto key = fs::NormalizePath(path);
     for (auto& ch : key) ch = static_cast<wchar_t>(towlower(ch));
@@ -32,7 +36,7 @@ bool Field(std::wstring_view text, size_t& position, std::wstring& value) {
 void Load() {
     const auto dir = GetPulseDataDir();
     if (loaded_dir == dir && !loaded_dir.empty()) return;
-    loaded_dir = dir; pending.clear(); readable = false;
+    loaded_dir = dir; pending.clear(); readable = false; load_error = ERROR_INVALID_DATA;
     if (dir.empty()) return;
     const auto file = dir + L"\\tag_ads_pending.dat";
     if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -41,7 +45,9 @@ void Load() {
     }
     std::wstring text;
     constexpr std::wstring_view prefix = L"PULSE_ADS_PENDING_1\n";
-    if (!ReadUtf8File(file,text) || !text.starts_with(prefix)) return;
+    SetLastError(ERROR_SUCCESS);
+    if (!ReadUtf8File(file,text)) { load_error = GetLastError(); return; }
+    if (!text.starts_with(prefix)) return;
     size_t pos = prefix.size();
     while (pos < text.size()) {
         TagAdsUpdate update; size_t count = 0;
@@ -71,12 +77,57 @@ bool HasPendingTagAds(const std::wstring& path) {
     std::lock_guard lock(mutex); Load();
     return !readable || pending.contains(Key(path));
 }
-std::vector<std::wstring> SyncTagAdsUpdates(const std::vector<TagAdsUpdate>& updates) {
+std::wstring TagAdsFailureMessage(const TagAdsFailure& failure) {
+    if (failure.unsupported) {
+        auto message = l10n::Get(l10n::StringId::TagMetadataUnsupported);
+        const auto marker = message.find(L"{path}");
+        if (marker != std::wstring::npos) message.replace(marker, 6, failure.path);
+        return message;
+    }
+    const wchar_t* stage = failure.stage == TagAdsFailureStage::JournalRead ? L"journal-read" :
+        failure.stage == TagAdsFailureStage::JournalWrite ? L"journal-write" :
+        failure.stage == TagAdsFailureStage::Pending ? L"pending" : L"stream-write";
+    return std::wstring(l10n::Pick(L"文件标签元数据同步尚未完成；待重试。", L"File tag metadata sync is pending retry.")) +
+        L" " + failure.path + L" (" + stage + L", " + std::to_wstring(failure.error) + L")";
+}
+void ApplyTagAdsNotice(TagAdsNoticeState& owned, const std::vector<TagAdsFailure>& failures,
+                       std::wstring& title, std::wstring& message, bool show_new) {
+    const bool owns_banner = !owned.message.empty() && title == owned.title && message == owned.message;
+    owned = {};
+    if (failures.empty()) {
+        if (owns_banner) { title.clear(); message.clear(); }
+        return;
+    }
+    // A later unrelated notification owns its banner; a sync retry cannot erase it.
+    if (!owns_banner && (!show_new || !title.empty() || !message.empty())) return;
+    owned.title = l10n::Pick(L"文件标签同步", L"File tag sync");
+    const TagAdsFailure* shown = &failures.back();
+    for (const auto& failure : failures)
+        if (failure.stage != TagAdsFailureStage::Pending) shown = &failure;
+    owned.message = TagAdsFailureMessage(*shown);
+    title = owned.title; message = owned.message;
+}
+static std::vector<std::wstring> SyncBatch(const std::vector<TagAdsUpdate>& updates,
+    std::vector<TagAdsFailure>* diagnostics, std::map<std::wstring, TagAdsFailure>* attempted) {
     std::unique_lock lock(mutex); Load();
     std::vector<std::wstring> failed;
+    if (diagnostics) diagnostics->clear();
+    auto report = [&](const std::wstring& path, TagAdsFailureStage stage, DWORD error) {
+        failed.push_back(path);
+        if (!diagnostics) return;
+        TagAdsFailure failure{path, stage, error ? error : ERROR_GEN_FAILURE};
+        if (stage == TagAdsFailureStage::StreamWrite) {
+            wchar_t root[32768]{};
+            DWORD flags = 0;
+            if (GetVolumePathNameW(path.c_str(), root, ARRAYSIZE(root)) &&
+                GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, &flags, nullptr, 0))
+                failure.unsupported = (flags & FILE_NAMED_STREAMS) == 0;
+        }
+        diagnostics->push_back(std::move(failure));
+    };
     if (!readable) {
-        for (const auto& update : updates) failed.push_back(update.path);
-        if (failed.empty()) failed.push_back(loaded_dir);
+        for (const auto& update : updates) report(update.path, TagAdsFailureStage::JournalRead, load_error);
+        if (failed.empty()) report(loaded_dir, TagAdsFailureStage::JournalRead, load_error);
         return failed;
     }
     auto staged = pending;
@@ -88,18 +139,73 @@ std::vector<std::wstring> SyncTagAdsUpdates(const std::vector<TagAdsUpdate>& upd
     // Also persist retries: an earlier journal write may have failed while the
     // intended values were retained only in memory.
     if (!Save(staged)) {
-        for (const auto& [key,update] : staged) failed.push_back(update.path);
+        const DWORD error = GetLastError();
+        for (const auto& [key,update] : staged) report(update.path, TagAdsFailureStage::JournalWrite, error);
         return failed;
     }
-    size_t attempted = 0;
-    for (auto it = staged.begin(); it != staged.end() && attempted < 64; ++attempted) {
+    size_t attempted_count = 0;
+    for (auto it = staged.begin(); it != staged.end() && attempted_count < 64;) {
+        if (attempted && attempted->contains(it->first)) { ++it; continue; }
+        ++attempted_count;
         if (WriteTagAdsV2(it->second.path,it->second.tags)) it = staged.erase(it);
-        else ++it;
+        else {
+            const DWORD error = GetLastError();
+            report(it->second.path, TagAdsFailureStage::StreamWrite, error);
+            if (attempted && diagnostics) (*attempted)[it->first] = diagnostics->back();
+            ++it;
+        }
     }
     const bool saved = Save(staged);
+    const DWORD save_error = GetLastError();
     lock.lock();
     if (saved) pending = std::move(staged);
-    for (const auto& [key,update] : pending) failed.push_back(update.path);
+    if (saved) {
+        // The result is the complete pending snapshot, including work deferred
+        // by the per-batch limit. An empty result is permission to clear the UI.
+        const std::set<std::wstring> reported(failed.begin(), failed.end());
+        for (const auto& [key, update] : pending) {
+            if (!reported.contains(update.path)) {
+                if (attempted && attempted->contains(key)) {
+                    failed.push_back(update.path);
+                    if (diagnostics) diagnostics->push_back(attempted->at(key));
+                } else report(update.path, TagAdsFailureStage::Pending, ERROR_IO_PENDING);
+            }
+        }
+    }
+    if (!saved) {
+        failed.clear();
+        if (diagnostics) diagnostics->clear();
+        for (const auto& [key,update] : pending) report(update.path, TagAdsFailureStage::JournalWrite, save_error);
+    }
     return failed;
+}
+std::vector<std::wstring> SyncTagAdsUpdates(const std::vector<TagAdsUpdate>& updates,
+                                         std::vector<TagAdsFailure>* diagnostics) {
+    return SyncBatch(updates, diagnostics, nullptr);
+}
+namespace {
+struct DrainState {
+    std::map<std::wstring, TagAdsFailure> attempted;
+    std::function<void(std::function<void()>)> enqueue;
+    std::function<void(std::vector<TagAdsFailure>)> publish;
+};
+void ScheduleDrain(const std::shared_ptr<DrainState>& state, std::vector<TagAdsUpdate> updates) {
+    state->enqueue([state, updates = std::move(updates)] {
+        std::vector<TagAdsFailure> failures;
+        SyncBatch(updates, &failures, &state->attempted);
+        bool more = false;
+        for (const auto& failure : failures)
+            more |= failure.stage == TagAdsFailureStage::Pending;
+        state->publish(std::move(failures));
+        if (more) ScheduleDrain(state, {});
+    });
+}
+}
+void QueueTagAdsDrain(std::vector<TagAdsUpdate> updates,
+    std::function<void(std::function<void()>)> enqueue,
+    std::function<void(std::vector<TagAdsFailure>)> publish) {
+    auto state = std::make_shared<DrainState>();
+    state->enqueue = std::move(enqueue); state->publish = std::move(publish);
+    ScheduleDrain(state, std::move(updates));
 }
 }

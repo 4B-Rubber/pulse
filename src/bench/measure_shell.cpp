@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <cmath>
+#include <optional>
 
 namespace fs = std::filesystem;
 
@@ -90,23 +91,48 @@ static void time_sysiconindex(const std::wstring& path, double& ms) {
     ms = millis(t1 - t0);
 }
 
-static void time_thumbnail(const std::wstring& path, double& ms, bool& ok) {
-    ok = false;
+enum class ThumbnailStatus { BindFailed, ImageFailed, Success };
+
+struct ThumbnailSample {
+    ThumbnailStatus status = ThumbnailStatus::BindFailed;
+    std::optional<double> image_ms;
+};
+
+static ThumbnailSample time_thumbnail(const std::wstring& path) {
+    ThumbnailSample sample;
     IShellItemImageFactory* factory = nullptr;
     HRESULT hr = SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&factory));
-    if (SUCCEEDED(hr)) {
-        HBITMAP hbmp = nullptr;
-        auto t0 = std::chrono::steady_clock::now();
-        hr = factory->GetImage({256, 256}, SIIGBF_THUMBNAILONLY, &hbmp);
-        auto t1 = std::chrono::steady_clock::now();
-        ms = millis(t1 - t0);
-        if (SUCCEEDED(hr) && hbmp) {
-            ok = true;
-            DeleteObject(hbmp);
-        }
-        factory->Release();
+    if (FAILED(hr) || !factory) {
+        if (factory) factory->Release();
+        return sample;
     }
+    HBITMAP bitmap = nullptr;
+    const auto start = std::chrono::steady_clock::now();
+    hr = factory->GetImage({256, 256}, SIIGBF_THUMBNAILONLY, &bitmap);
+    sample.image_ms = millis(std::chrono::steady_clock::now() - start);
+    sample.status = SUCCEEDED(hr) && bitmap ? ThumbnailStatus::Success : ThumbnailStatus::ImageFailed;
+    if (bitmap) DeleteObject(bitmap);
+    factory->Release();
+    return sample;
 }
+
+struct ThumbnailSamples {
+    std::vector<double> calls;
+    std::vector<double> hits;
+    size_t bind_failures = 0;
+    size_t image_failures = 0;
+
+    void Add(const ThumbnailSample& sample) {
+        if (sample.status == ThumbnailStatus::BindFailed) {
+            ++bind_failures;
+            return;
+        }
+        if (sample.image_ms) calls.push_back(*sample.image_ms);
+        if (sample.status == ThumbnailStatus::Success) {
+            if (sample.image_ms) hits.push_back(*sample.image_ms);
+        } else ++image_failures;
+    }
+};
 
 static void run_for_directory(const std::wstring& dir, int64_t n) {
     std::wcout << L"\n=== " << dir << L" (first " << n << L" items) ===\n";
@@ -117,24 +143,17 @@ static void run_for_directory(const std::wstring& dir, int64_t n) {
     }
     std::wcout << L"sampled " << files.size() << L" items\n";
 
-    std::vector<double> t1, t2, t3;
-    std::vector<double> t3_success;
-    int thumbs_hit = 0;
+    std::vector<double> t1, t2;
+    ThumbnailSamples thumbnails;
 
     for (size_t i = 0; i < files.size(); ++i) {
         const auto& p = files[i];
-        double a, b, c;
-        bool ok;
+        double a = 0, b = 0;
         time_smallicon(p, a);
         time_sysiconindex(p, b);
-        time_thumbnail(p, c, ok);
+        thumbnails.Add(time_thumbnail(p));
         t1.push_back(a);
         t2.push_back(b);
-        t3.push_back(c);
-        if (ok) {
-            t3_success.push_back(c);
-            ++thumbs_hit;
-        }
         if ((i + 1) % 50 == 0) {
             std::wcout << L"  processed " << (i + 1) << L" / " << files.size() << L"\n";
         }
@@ -142,13 +161,15 @@ static void run_for_directory(const std::wstring& dir, int64_t n) {
 
     report_times("SHGFI_ICON|SMALLICON", t1, 100000);
     report_times("SHGFI_SYSICONINDEX", t2, 100000);
-    report_times("IShellItemImageFactory thumb", t3, 100000);
-    if (!t3_success.empty()) {
-        report_times("thumbnail (hits only)", t3_success, 100000);
+    report_times("thumbnail GetImage calls", thumbnails.calls, 100000);
+    if (!thumbnails.hits.empty()) {
+        report_times("thumbnail (hits only)", thumbnails.hits, 100000);
     }
-    std::cout << "  thumbnail hit rate: " << thumbs_hit << " / " << files.size()
+    std::cout << "  thumbnail failures: bind=" << thumbnails.bind_failures
+              << " image=" << thumbnails.image_failures << "\n";
+    std::cout << "  thumbnail hit rate: " << thumbnails.hits.size() << " / " << files.size()
               << " (" << std::fixed << std::setprecision(1)
-              << (100.0 * thumbs_hit / files.size()) << "%)\n";
+              << (100.0 * thumbnails.hits.size() / files.size()) << "%)\n";
 }
 
 static int usage(const char* argv0) {
@@ -168,6 +189,16 @@ int main() {
 
 int wmain(int argc, wchar_t* argv[]) {
     std::ios::sync_with_stdio(false);
+
+    if (argc == 2 && std::wstring(argv[1]) == L"--audit-bind-failure") {
+        const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (FAILED(initialized)) return 2;
+        const auto sample = time_thumbnail(L"?:\\Pulse-invalid-shell-benchmark-fixture");
+        const bool passed = !sample.milliseconds && !sample.hit;
+        CoUninitialize();
+        std::cout << (passed ? "[PASS]" : "[FAIL]") << " factory binding failure has no timing sample and cannot enter statistics\n";
+        return passed ? 0 : 1;
+    }
 
     int64_t n = 200;
 

@@ -1,19 +1,17 @@
-// Visual contract for Pulse's own dialogs (confirm + folder / picture picker).
+// Visual contract for Pulse's own confirm dialogs. The open dialog hosts the
+// main window's renderer and is exercised with pulse.exe --picker-live.
 //
 //   pulse_dialog_gallery.exe [--lang zh-CN|en-US] [out_dir]
 //       Renders every scene offscreen in light, dark and high contrast at 100%
 //       and 150% scale into out_dir (default build-dialog-verify).
-//   pulse_dialog_gallery.exe --live <kind> [--dark] [--init <path>] [--out <file>]
+//   pulse_dialog_gallery.exe --live <kind> [--dark] [--out <file>]
 //       Opens the real window. kind: confirm-warning, confirm-danger,
-//       confirm-three, confirm-items, picker-folder, picker-image. The choice
-//       or picked path is written to --out (UTF-8).
+//       confirm-three, confirm-items. The choice is written to --out (UTF-8).
 
 #include "../common/windows_compat.h"
 #include "../common/localization.h"
 #include "../ui/confirm_dialog.h"
 #include "../ui/confirm_dialog_view.h"
-#include "../ui/folder_picker_dialog.h"
-#include "../ui/folder_picker_view.h"
 #include "../ui/fluent_components.h"
 
 #include <shellapi.h>
@@ -96,10 +94,10 @@ std::vector<ConfirmScene> ConfirmScenes() {
         s.spec.message = L"这些项目不会进入回收站，删除后无法恢复。";
         s.spec.confirm_text = L"永久删除";
         s.spec.danger = true;
-        s.spec.items = {L"C:\\Users\\SS\\Desktop\\报告 2026.docx", L"C:\\Users\\SS\\Desktop\\预算.xlsx",
-                        L"C:\\Users\\SS\\Desktop\\照片", L"C:\\Users\\SS\\Desktop\\notes.md",
-                        L"C:\\Users\\SS\\Desktop\\demo.mp4", L"C:\\Users\\SS\\Desktop\\a.txt",
-                        L"C:\\Users\\SS\\Desktop\\b.txt"};
+        s.spec.items = {L"C:\\Users\\Example\\Desktop\\报告 2026.docx", L"C:\\Users\\Example\\Desktop\\预算.xlsx",
+                        L"C:\\Users\\Example\\Desktop\\照片", L"C:\\Users\\Example\\Desktop\\notes.md",
+                        L"C:\\Users\\Example\\Desktop\\demo.mp4", L"C:\\Users\\Example\\Desktop\\a.txt",
+                        L"C:\\Users\\Example\\Desktop\\b.txt"};
         s.spec.default_choice = ConfirmChoice::Cancel;
         s.visual.focus = kConfirmCancel;
         s.visual.hover = kConfirmPrimary;
@@ -127,151 +125,6 @@ std::vector<ConfirmScene> ConfirmScenes() {
         s.spec.note = L"关闭程序前请先保存它里面的改动。";
         s.spec.tone = ConfirmTone::Warning;
         scenes.push_back(std::move(s));
-    }
-    return scenes;
-}
-
-// ---- picker scenes ---------------------------------------------------------
-
-FILETIME Day(int year, int month, int day, int hour, int minute) {
-    SYSTEMTIME st{};
-    st.wYear = static_cast<WORD>(year);
-    st.wMonth = static_cast<WORD>(month);
-    st.wDay = static_cast<WORD>(day);
-    st.wHour = static_cast<WORD>(hour);
-    st.wMinute = static_cast<WORD>(minute);
-    FILETIME ft{};
-    SystemTimeToFileTime(&st, &ft);
-    return ft;
-}
-
-PickerEntry Folder(const std::wstring& parent, const wchar_t* name, int day) {
-    PickerEntry e;
-    e.name = name;
-    e.path = parent + L"\\" + name;
-    e.kind = PickerEntryKind::Folder;
-    e.modified = Day(2026, 9, day, 9 + day % 8, 12);
-    return e;
-}
-
-PickerEntry Image(const std::wstring& parent, const wchar_t* name, uint64_t size, int day) {
-    PickerEntry e = Folder(parent, name, day);
-    e.kind = PickerEntryKind::Image;
-    e.size = size;
-    return e;
-}
-
-PickerEntry Drive(const wchar_t* name, const wchar_t* root, uint64_t total_gb,
-                  uint64_t free_gb) {
-    PickerEntry e;
-    e.name = name;
-    e.path = root;
-    e.kind = PickerEntryKind::Drive;
-    e.size = total_gb << 30;
-    e.free = free_gb << 30;
-    return e;
-}
-
-std::vector<PickerPlace> GalleryPlaces() {
-    const std::wstring home = L"C:\\Users\\SS";
-    return {
-        {pulse::l10n::Get(StringId::Desktop), home + L"\\Desktop", L"\xE7F4", HexColor(0x38BDF8), false},
-        {pulse::l10n::Get(StringId::PickerDocuments), home + L"\\Documents", L"\xE8A5", HexColor(0x60A5FA), false},
-        {pulse::l10n::Get(StringId::Downloads), home + L"\\Downloads", L"\xE896", HexColor(0xC084FC), false},
-        {pulse::l10n::Get(StringId::PickerPictures), home + L"\\Pictures", L"\xEB9F", HexColor(0xF472B6), false},
-        {pulse::l10n::Get(StringId::PickerHome), home, L"\xE80F", HexColor(0x34D399), false},
-        {pulse::l10n::Get(StringId::ThisPc), L"", L"\xE977", {}, true},
-    };
-}
-
-struct PickerScene {
-    const wchar_t* name;
-    FolderPickerVisual visual;
-};
-
-FolderPickerVisual BaseVisual(PickerMode mode, const std::wstring& current) {
-    FolderPickerVisual v;
-    v.mode = mode;
-    v.title = pulse::l10n::Get(mode == PickerMode::Image ? StringId::TooltipChooseBackground
-                                                          : StringId::PickerTitleFolder);
-    v.primary_text = pulse::l10n::Get(mode == PickerMode::Image ? StringId::PickerSelect
-                                                                 : StringId::PickerSelectFolder);
-    v.cancel_text = pulse::l10n::Get(StringId::Cancel);
-    v.current = current;
-    v.path_text = current.empty() ? pulse::l10n::Get(StringId::ThisPc) : current;
-    v.places = GalleryPlaces();
-    v.can_back = true;
-    v.can_up = !current.empty();
-    v.focus = kPickList;
-    return v;
-}
-
-std::vector<PickerScene> PickerScenes() {
-    std::vector<PickerScene> scenes;
-    {
-        const std::wstring cur = L"C:\\Users\\SS\\Documents";
-        FolderPickerVisual v = BaseVisual(PickerMode::Folder, cur);
-        const wchar_t* names[] = {L"2024 报税", L"2025 报税", L"Adobe", L"Pulse 设计稿",
-                                  L"WeChat Files", L"会议纪要", L"合同", L"学习资料",
-                                  L"工作项目", L"截图", L"旅行计划", L"照片备份",
-                                  L"项目 10", L"项目 2"};
-        int day = 1;
-        for (const wchar_t* n : names) v.entries.push_back(Folder(cur, n, day++));
-        v.selected = 3;
-        v.hover = kPickRow + 5;
-        v.show_focus = true;
-        v.chosen = PickerChosenPath(v.mode, v.current, &v.entries[3]);
-        scenes.push_back({L"picker_folder", std::move(v)});
-    }
-    {
-        const std::wstring cur = L"C:\\Users\\SS\\Pictures";
-        FolderPickerVisual v = BaseVisual(PickerMode::Image, cur);
-        v.entries.push_back(Folder(cur, L"Camera Roll", 3));
-        v.entries.push_back(Folder(cur, L"Screenshots", 28));
-        v.entries.push_back(Folder(cur, L"壁纸", 12));
-        v.entries.push_back(Image(cur, L"aurora.jpg", 4'812'332, 14));
-        v.entries.push_back(Image(cur, L"desk-setup.png", 2'301'004, 20));
-        v.entries.push_back(Image(cur, L"mountain 4k.webp", 9'420'110, 21));
-        v.entries.push_back(Image(cur, L"小猫.jpeg", 812'003, 22));
-        v.entries.push_back(Image(cur, L"海边日落.png", 3'003'100, 25));
-        // Long enough to need the trailing ellipsis in the name column.
-        v.entries.push_back(Image(cur, L"【壁纸】2026 秋季合集-山脉-日落-湖面倒影-超清原图-第 12 张.png",
-                                  6'610'200, 26));
-        v.selected = 5;
-        v.chosen = PickerChosenPath(v.mode, v.current, &v.entries[5]);
-        scenes.push_back({L"picker_image", std::move(v)});
-    }
-    {
-        FolderPickerVisual v = BaseVisual(PickerMode::Folder, L"");
-        v.entries.push_back(Drive(L"系统 (C:)", L"C:\\", 476, 120));
-        v.entries.push_back(Drive(L"资料 (D:)", L"D:\\", 931, 40));
-        v.entries.push_back(Drive(L"U 盘 (E:)", L"E:\\", 0, 0));
-        v.hover = kPickRow + 1;
-        v.chosen.clear();
-        scenes.push_back({L"picker_drives", std::move(v)});
-    }
-    {
-        const std::wstring cur = L"D:\\Empty";
-        FolderPickerVisual v = BaseVisual(PickerMode::Folder, cur);
-        v.chosen = cur;
-        v.focus = kPickPrimary;
-        v.show_focus = true;
-        scenes.push_back({L"picker_empty", std::move(v)});
-    }
-    {
-        const std::wstring cur = L"\\\\nas\\share";
-        FolderPickerVisual v = BaseVisual(PickerMode::Image, cur);
-        v.error = L"找不到「\\\\nas\\share」";
-        scenes.push_back({L"picker_error", std::move(v)});
-    }
-    {
-        const std::wstring cur = L"\\\\nas\\photos";
-        FolderPickerVisual v = BaseVisual(PickerMode::Folder, cur);
-        v.waiting = true;
-        v.loading = true;
-        v.spinner = 0.3f;
-        v.chosen = cur;
-        scenes.push_back({L"picker_loading", std::move(v)});
     }
     return scenes;
 }
@@ -319,24 +172,6 @@ int RunGallery(const std::wstring& out_dir) {
                     });
                 ok ? ++written : ++failures;
             }
-            for (const PickerScene& scene : PickerScenes()) {
-                const int width = static_cast<int>(780.0f * scale);
-                const int height = static_cast<int>(540.0f * scale);
-                const FolderPickerLayout layout = LayoutFolderPicker(
-                    static_cast<float>(width), static_cast<float>(height), scene.visual.places,
-                    painter, scene.visual.primary_text, scene.visual.cancel_text, scale);
-                FolderPickerVisual visual = scene.visual;
-                visual.scroll = ClampPickerScroll(layout, visual.entries.size(), visual.scroll);
-                const std::wstring out = out_dir + L"\\" + scene.name + L"_" + variant.name +
-                                         suffix + L".png";
-                const bool ok = RenderScene(
-                    compositor, painter, theme, variant.high_contrast, scale, width, height, out,
-                    [&] {
-                        DrawFolderPicker(compositor, painter, theme, visual, layout,
-                                         variant.dark, variant.high_contrast);
-                    });
-                ok ? ++written : ++failures;
-            }
         }
     }
     compositor.Shutdown();
@@ -364,8 +199,7 @@ void WriteResult(const std::wstring& file, const std::wstring& text) {
     }
 }
 
-int RunLive(const std::wstring& kind, bool dark, const std::wstring& init,
-            const std::wstring& out) {
+int RunLive(const std::wstring& kind, bool dark, const std::wstring& out) {
     const D2D1_COLOR_F accent = HexColor(0x0078D4);
     if (kind.rfind(L"confirm-", 0) == 0) {
         const std::wstring name = L"confirm_" + kind.substr(8);
@@ -377,15 +211,6 @@ int RunLive(const std::wstring& kind, bool dark, const std::wstring& init,
             return 0;
         }
         return 5;
-    }
-    if (kind == L"picker-folder" || kind == L"picker-image") {
-        FolderPickerSpec spec;
-        spec.mode = kind == L"picker-image" ? PickerMode::Image : PickerMode::Folder;
-        spec.initial_path = init;
-        std::wstring path;
-        const bool picked = ShowFolderPicker(nullptr, spec, dark, accent, path);
-        WriteResult(out, picked ? L"picked:" + path : L"cancel");
-        return 0;
     }
     return 5;
 }
@@ -409,13 +234,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     int result = 0;
     if (!args.empty() && args[0] == L"--live" && args.size() >= 2) {
         bool dark = false;
-        std::wstring init, out;
+        std::wstring out;
         for (size_t i = 2; i < args.size(); ++i) {
             if (args[i] == L"--dark") dark = true;
-            else if (args[i] == L"--init" && i + 1 < args.size()) init = args[++i];
             else if (args[i] == L"--out" && i + 1 < args.size()) out = args[++i];
         }
-        result = RunLive(args[1], dark, init, out);
+        result = RunLive(args[1], dark, out);
     } else {
         result = RunGallery(args.empty() ? L"build-dialog-verify" : args[0]);
     }

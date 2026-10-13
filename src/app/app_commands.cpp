@@ -1,10 +1,13 @@
+#include "tag_color_commands.h"
 #include "tag_ads_sync.h"
+#include <atomic>
 #include "../ui/shortcut_help.h"
 // app_commands.cpp — extracted from app_main.cpp.
 #include "quick_access.h"
 #include "app_column_view.h"
 #include "../ui/toolbar_layout.h"
 #include "app_internal.h"
+#include "app_sidebar_refresh.h"
 #include "tray_reveal.h"
 #include "group_wheel_ui.h"
 #include "text_diff.h"
@@ -26,13 +29,11 @@
 #include "snapshot_patch.h"
 #include "entry_sort.h"
 #include "session.h"
-#include "jump_list.h"
-#include "instance_launcher.h"
-#include "single_instance_coordinator.h"
 #include "context_menu.h"
 #include "app_change_tracking.h"
 #include "batch_rename.h"
 #include "search_query.h"
+#include <limits>
 #include "link_resolve.h"
 #include "resource.h"
 #include "../ops/clipboard.h"
@@ -118,28 +119,22 @@ void CreateNewItem(AppState& s, bool folder) {
     ops::OpRequest req;
     req.type = folder ? ops::OpType::CreateFolder : ops::OpType::CreateTextFile;
     req.sources.push_back(full);
-    s.pendingRenameName = name;
-    s.ops.Submit(std::move(req));
+    const auto task_id = s.ops.Submit(std::move(req));
+    app::QueueCreateRenameIntent(tab->create_rename_intents, task_id,
+        tab->current_path, tab->view_generation);
 }
 
 void QueueTagAds(AppState& s, std::vector<app::TagAdsUpdate> updates) {
-    const HWND notify = s.hwnd;
-    const auto network_location = l10n::Get(l10n::StringId::TagNetworkLocation);
-    const auto this_location = l10n::Get(l10n::StringId::TagThisLocation);
-    s.worker.EnqueueSerialIo([updates = std::move(updates), notify, network_location, this_location] {
-        auto failed = std::make_unique<std::vector<std::wstring>>();
-        for (const auto& failed_path : app::SyncTagAdsUpdates(updates)) {
-            wchar_t volume[MAX_PATH]{};
-            if (GetVolumePathNameW(failed_path.c_str(), volume, ARRAYSIZE(volume)))
-                failed->push_back(ClipboardPath(volume));
-            else if (fs::IsUncPath(failed_path))
-                failed->push_back(network_location);
-            else
-                failed->push_back(this_location);
-        }
-        if (!failed->empty() && notify)
-            PostMessageW(notify, WM_TAG_ADS_WARNING, 0,
-                         reinterpret_cast<LPARAM>(failed.release()));
+    const HWND notify = ServiceWindow(s);
+    app::QueueTagAdsDrain(std::move(updates), [&worker = s.worker](std::function<void()> task) {
+        worker.EnqueueSerialIo(std::move(task));
+    }, [notify](std::vector<app::TagAdsFailure> failures) {
+        static std::atomic<uint64_t> revision{0};
+        auto result = std::make_unique<app::TagAdsResult>();
+        result->failures = std::move(failures);
+        result->revision = ++revision;
+        if (notify && PostMessageW(notify, WM_TAG_ADS_WARNING, 0,
+                reinterpret_cast<LPARAM>(result.get()))) result.release();
     });
 }
 
@@ -224,7 +219,7 @@ void ShowTagPicker(AppState& s, POINT screen_pt, const std::vector<std::wstring>
     const std::vector<std::wstring> paths = paths_override ? *paths_override
         : ActiveTab(s) ? SelectedFullPaths(*ActiveTab(s)) : std::vector<std::wstring>{};
     constexpr int kTagPickerBase = 20000;
-    constexpr int kCreateTag = 29999;
+    constexpr int kCreateTag = app::kCreateTagCommand;
     auto rebuild = [&s, &paths](const std::wstring& query) {
         std::vector<ui::FluentMenuItem> items;
         std::wstring needle = query;
@@ -482,8 +477,9 @@ void ShowTrayBatchMenu(AppState& s, POINT screen_pt) {
             spec.cancel_text = l10n::Get(l10n::StringId::Cancel);
             if (!ui::ShowConfirmDialog(s.hwnd, spec, s.darkMode, s.accentColor)) break;
         }
-        for (const auto& p : paths)
-            ShellExecuteW(s.hwnd, nullptr, p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        // The same open service as the list: long-path prefixes, the item's
+        // folder as working directory, and off the UI thread.
+        for (const auto& p : paths) s.ops.OpenWith(p);
         break;
     }
     case kReveal: {
@@ -499,6 +495,7 @@ void ShowTrayBatchMenu(AppState& s, POINT screen_pt) {
         NavigateTo(s, parent);
         if (app::Tab* tab = ActiveTab(s)) {
             tab->pending_selected_names = leaves;
+            tab->pending_selection_revision = tab->selection_revision;
             if (!leaves.empty()) tab->pending_selected_name = leaves.front();
             tab->pending_ensure_selection_visible = true;
         }
@@ -521,12 +518,18 @@ void ShowTrayBatchMenu(AppState& s, POINT screen_pt) {
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
+#ifdef PULSE_WITH_SELFTEST
+static thread_local CreateTagPickerTestIo* create_tag_test_io = nullptr;
+CreateTagPickerTestIo* SetCreateTagPickerTestIo(CreateTagPickerTestIo* io) {
+    auto* previous = create_tag_test_io; create_tag_test_io = io; return previous;
+}
+#endif
 void ShowCreateTagPicker(AppState& s, POINT screen_pt) {
     if (!EnsureMenu(s)) return;
-    constexpr int kCreateTag = 29999;
-    constexpr int kColorStrip = 30050;
-    constexpr int kColorBase = 30060;
-    constexpr int kCustomColor = 30070;
+    constexpr int kCreateTag = app::kCreateTagCommand;
+    constexpr int kColorStrip = app::kTagColorStripCommand;
+    constexpr int kColorBase = app::kTagColorBaseCommand;
+    constexpr int kCustomColor = app::kCustomTagColorCommand;
     uint32_t selected_rgb = TagColorPalette(s)[0];
     auto rebuild = [&](const std::wstring& query) {
         const std::vector<uint32_t>& palette = TagColorPalette(s);
@@ -534,9 +537,9 @@ void ShowCreateTagPicker(AppState& s, POINT screen_pt) {
         colors.command = kColorStrip;
         colors.separator_after = true;
         colors.quick_swatches.reserve(palette.size());
-        for (int i = 0; i < static_cast<int>(palette.size()); ++i) {
+        for (size_t i = 0; i < std::min(palette.size(), app::kMaxTagColorCommands); ++i) {
             ui::FluentMenuSwatch swatch;
-            swatch.command = kColorBase + i;
+            swatch.command = kColorBase + static_cast<int>(i);
             swatch.color = ui::HexColor(palette[static_cast<size_t>(i)]);
             swatch.checked = selected_rgb == palette[static_cast<size_t>(i)];
             colors.quick_swatches.push_back(std::move(swatch));
@@ -564,17 +567,32 @@ void ShowCreateTagPicker(AppState& s, POINT screen_pt) {
         s.menu->SetFilterPlaceholder(l10n::Get(l10n::StringId::TagNewHint));
         s.menu->SetFilterMinWidth(300.0f);
         s.menu->SetInitialFilterText(name);
-        const int command = s.menu->TrackPopup(screen_pt, rebuild(name), rebuild);
-        name = s.menu->LastFilterQuery();
-        if (command >= kColorBase && command < kColorBase +
-            static_cast<int>(TagColorPalette(s).size())) {
+        int command;
+        bool committed;
+#ifdef PULSE_WITH_SELFTEST
+        if (create_tag_test_io) {
+            const auto choice = create_tag_test_io->menu(rebuild(name), rebuild);
+            command = choice.command; name = choice.name; committed = choice.committed;
+        } else
+#endif
+        {
+            command = s.menu->TrackPopup(screen_pt, rebuild(name), rebuild);
+            name = s.menu->LastFilterQuery(); committed = s.menu->LastFilterCommitted();
+        }
+        if (app::IsTagColorCommand(command, TagColorPalette(s).size())) {
             selected_rgb = TagColorPalette(s)[static_cast<size_t>(command - kColorBase)];
             continue;
         }
         if (command == kCustomColor) {
             uint32_t picked = selected_rgb;
-            if (ui::ColorPickerPopup::Pick(s.hwnd, &s.compositor, s.menu.get(), s.scale,
-                                           screen_pt, picked, s.darkMode, picked)) {
+            bool accepted;
+#ifdef PULSE_WITH_SELFTEST
+            if (create_tag_test_io) accepted = create_tag_test_io->color(picked);
+            else
+#endif
+                accepted = ui::ColorPickerPopup::Pick(s.hwnd, &s.compositor, s.menu.get(), s.scale,
+                                           screen_pt, picked, s.darkMode, picked);
+            if (accepted) {
                 selected_rgb = picked;
                 // Accepted custom colors join the swatch strip (last dot).
                 AppendCustomTagColor(s, picked);
@@ -582,7 +600,7 @@ void ShowCreateTagPicker(AppState& s, POINT screen_pt) {
             continue;
         }
         if ((command == kCreateTag ||
-             (command == app::CmdNone && s.menu->LastFilterCommitted())) && !name.empty()) {
+             (command == app::CmdNone && committed)) && !name.empty()) {
             s.places.CreateTag(name, selected_rgb);
         }
         break;
@@ -672,12 +690,31 @@ void ShowTagSidebarMenu(AppState& s, const app::TagId& tag_id, POINT screen_pt) 
             ? TagLabel(l10n::StringId::TagDeleteConfirmFormat, tag->name)
             : TagLabel(l10n::StringId::TagDeleteUsedFormat, tag->name, count);
         if (ui::ShowConfirmDialog(s.hwnd, confirm, s.darkMode, s.accentColor)) {
-            std::vector<app::TagAdsUpdate> updates;
-            s.places.DeleteTag(tag_id, &updates);
-            QueueTagAds(s, std::move(updates));
+            DeleteTagAndRefreshViews(s, tag_id);
         }
     }
     InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
+bool DeleteTagAndRefreshViews(AppState& s, const app::TagId& tag_id) {
+    if (!s.places.FindTag(tag_id)) return false;
+    const auto path = app::MakeTagPath(tag_id);
+    std::vector<app::Tab*> affected;
+    ForEachPane(s, [&](app::Pane& pane) {
+        auto* tab = pane.ActiveTab();
+        if (!tab) return;
+        std::wstring kind, reference;
+        app::ParsePulsePath(tab->current_path, &kind, &reference);
+        if (kind == L"tag" && s.places.ResolveTagRef(reference) == tag_id)
+            affected.push_back(tab);
+    });
+    std::vector<app::TagAdsUpdate> updates;
+    s.places.DeleteTag(tag_id, &updates);
+    QueueTagAds(s, std::move(updates));
+    // Resolve legacy references before deletion changes the catalog indices.
+    for (auto* tab : affected) LoadVirtualView(s, *tab, path);
+    InvalidateRect(s.hwnd, nullptr, FALSE);
+    return true;
 }
 
 // Reveal a path in the folder that holds it: the parent becomes the location and the
@@ -694,6 +731,7 @@ void RevealInParent(AppState& s, const std::wstring& full) {
     NavigateTo(s, parent);
     tab->pending_selected_name = leaf;
     tab->pending_selected_names = { leaf };
+    tab->pending_selection_revision = tab->selection_revision;
     tab->pending_ensure_selection_visible = true;
 }
 
@@ -712,6 +750,8 @@ void DispatchMenuCommand(AppState& s, int cmd) {
         if (const app::Tab* tab = ActiveTab(s)) ApplyGroupToAllFolders(s, tab->group_by);
         break;
     case app::CmdRefresh:
+        RequestSidebarRefresh(s);
+        s.renderer.RefreshFolderThumbnails();
         if (const auto* tab = ActiveTab(s)) {
             s.store.MarkDirty(tab->current_path);
             RefreshActiveTab(s);
@@ -893,7 +933,7 @@ void DispatchMenuCommand(AppState& s, int cmd) {
             if (s.places.FindWorkspace(root) >= 0) {
                 s.places.UnpinWorkspace(root);
             } else {
-                s.places.PinWorkspace(root, L"", static_cast<int>(LayoutOf(s)), CollectPanePaths(s),
+                s.places.PinWorkspace(root, L"", static_cast<int>(WorkspaceLayoutOf(s)), CollectPanePaths(s),
                                       CollectPaneViews(s));
             }
         }
@@ -1088,7 +1128,7 @@ std::wstring StaticVerbKey(const app::Tab& tab, const std::vector<int>& indices)
 // the reader posts WM_SHELL_VERBS back when done.
 void PrefetchStaticVerbs(AppState& s, const std::wstring& ext) {
     if (!s.context_menu.RequestStaticPrefetch(ext)) return;
-    HWND hwnd = s.hwnd;
+    HWND hwnd = ServiceWindow(s);
     const uint32_t cache_generation = s.context_menu.cache_generation();
     std::thread([hwnd, ext, cache_generation] {
         auto* result = new ShellVerbsResult{ ext, app::EnumerateStaticVerbs(ext), cache_generation };
@@ -1172,7 +1212,7 @@ void StopShellRegistryWatch() {
 }
 
 void SeedShellVerbCache(AppState& s) {
-    HWND hwnd = s.hwnd;
+    HWND hwnd = ServiceWindow(s);
     // A newer seed supersedes this one; stop instead of piling up readers.
     const uint32_t generation = ++g_shell_seed_generation;
     const uint32_t cache_generation = s.context_menu.cache_generation();
@@ -1248,8 +1288,10 @@ void MaybePrefetchHoverCtxMenu(AppState& s) {
 // then swap in this session's live ids when RSP_CTX_ITEMS lands.
 void PumpShellMenuMessages(AppState& s) {
     MSG msg{};
+    // Static verb reads report to the host window (host_routing.h).
+    const HWND verbs_window = ServiceWindow(s);
     while (PeekMessageW(&msg, s.hwnd, WM_SHELLCTX_ITEMS, WM_SHELLCTX_ITEMS, PM_REMOVE) ||
-           PeekMessageW(&msg, s.hwnd, WM_SHELL_VERBS, WM_SHELL_VERBS, PM_REMOVE)) {
+           PeekMessageW(&msg, verbs_window, WM_SHELL_VERBS, WM_SHELL_VERBS, PM_REMOVE)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -1308,7 +1350,14 @@ void ShowItemContextMenu(AppState& s, POINT screen_pt) {
     std::wstring undoLabel = s.ops.UndoLabel();
     const auto quick_paths = QuickAccessTargets(tab, false);
     auto base_items = BuildFinderItemMenu(s, s.ops.CanUndo(), undoLabel);
-    app::ApplyBuiltinMenuPrefs(base_items, s.ctxMenuPrefs);
+    std::vector<std::wstring> window_folders;
+    if (!IsRecycleTab(tab)) {
+        app::ApplyBuiltinMenuPrefs(base_items, s.ctxMenuPrefs, app::BuiltinMenuSurface::Item);
+        if (!paths.empty()) window_folders = WindowTransferFolders(s);
+        app::AppendWindowTransferCommands(base_items, window_folders, tab && !tab->net_readonly);
+    } else {
+        app::ApplyBuiltinMenuPrefs(base_items, s.ctxMenuPrefs);
+    }
     s.context_menu.OpenMenu(base_items);
     auto display = IsRecycleTab(tab) ? std::move(base_items)
                                      : ExplorerMenu(s, s.context_menu.base_items());
@@ -1318,7 +1367,14 @@ void ShowItemContextMenu(AppState& s, POINT screen_pt) {
     s.context_menu.CloseMenu();
     if (HandleShellMenuCommand(s, cmd)) return;
     if (HandleQuickAccessCommand(s, cmd, quick_paths)) return;
-    if (cmd == app::CmdTags) ShowTagPicker(s, screen_pt);
+    const auto window_folder = [&](int base) {
+        const int index = cmd - base;
+        return index >= 0 && index < static_cast<int>(window_folders.size()) ? &window_folders[static_cast<size_t>(index)]
+                                                                              : nullptr;
+    };
+    if (const std::wstring* folder = window_folder(app::CmdCopyToWindowBase)) TransferSelectionToFolder(s, *folder, false);
+    else if (const std::wstring* moved_to = window_folder(app::CmdMoveToWindowBase)) TransferSelectionToFolder(s, *moved_to, true);
+    else if (cmd == app::CmdTags) ShowTagPicker(s, screen_pt);
     else if (cmd >= app::CmdTagBase && cmd < app::CmdTagBase + quick_count)
         ToggleTagForSelection(s, s.places.tags[static_cast<size_t>(cmd - app::CmdTagBase)].id, paths);
     else if (cmd != app::CmdNone) DispatchMenuCommand(s, cmd);
@@ -1369,7 +1425,7 @@ void ShowBackgroundContextMenu(AppState& s, POINT screen_pt) {
     ApplyWorkspacePinLabel(base_items, s);
     const auto quick_paths = QuickAccessTargets(tab, true);
     AppendQuickAccessCommand(s, base_items, quick_paths);
-    app::ApplyBuiltinMenuPrefs(base_items, s.ctxMenuPrefs);
+    app::ApplyBuiltinMenuPrefs(base_items, s.ctxMenuPrefs, app::BuiltinMenuSurface::Background);
     s.context_menu.OpenMenu(std::move(base_items));
     auto display = ExplorerMenu(s, s.context_menu.base_items());
 
@@ -1421,8 +1477,8 @@ void ShowSplitDropdown(AppState& s) {
 // Browser-style tab groups: named + colored; strip chips open the group popup.
 // ---------------------------------------------------------------------------
 void RefreshSidebarModel(AppState& s) {
-    s.sidebar = app::BuildSidebarModel(&s.recycle_info);
-    SyncSavedSearchSidebar(s);
+    RequestSidebarRefresh(s, true);
+    if (s.networkLocations) RequestNetworkLocations(s);
 }
 
 app::SidebarEntry* QuickAccessEntryForPath(AppState& s,
@@ -1590,6 +1646,8 @@ void ShowCuratedItemMenu(AppState& s, const std::wstring& path,
             s.ops.OpenWith(path);
             RecordRecentOpen(s, path, app::PlaceItemKind::File);
         }
+    } else if (cmd == app::CmdOpenPath) {
+        RevealInParent(s, path);
     } else if (cmd == app::CmdEditStarBadge) {
         ShowStarredBadgeEditor(s, path, screen_pt);
     } else if (cmd >= app::CmdTabColorBase &&
@@ -1624,8 +1682,6 @@ void ShowCuratedItemMenu(AppState& s, const std::wstring& path,
         if (s.places.IsStarred(path)) ToggleStarred(s, path);
     } else if (cmd == app::CmdRemoveRecent) {
         if (s.places.RemoveRecent(path)) RefreshRecentViews(s);
-    } else if (cmd == app::CmdOpenPath) {
-        RevealInParent(s, path);
     }
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
@@ -1859,12 +1915,16 @@ void ShowAdvancedSearch(AppState& s, bool require_scope) {
     if (s.addressSearching && IsWindow(s.hwndAddressEdit)) {
         std::wstring draft(static_cast<size_t>(GetWindowTextLengthW(s.hwndAddressEdit)) + 1, L'\0');
         draft.resize(GetWindowTextW(s.hwndAddressEdit, draft.data(), static_cast<int>(draft.size())));
-        if (s.addressSearchContent) spec.content = draft;
-        else { spec.name = draft; spec.content.clear(); spec.content_exclude.clear(); }
-        spec.current_folder = s.addressSearchRoot;
-        spec.custom_folder.clear();
-        spec.location = s.addressSearchCurrent && !spec.current_folder.empty()
-            ? app::LocationScope::CurrentFolder : app::LocationScope::Indexed;
+        if (s.addressSearchContent) {
+            spec.content = draft;
+            spec.current_folder = s.addressSearchRoot;
+            spec.custom_folder.clear();
+            spec.location = s.addressSearchCurrent && !spec.current_folder.empty()
+                ? app::LocationScope::CurrentFolder : app::LocationScope::Indexed;
+        } else {
+            spec = app::ParseSearchQuery(app::CompileNameQueryInput(draft,
+                s.addressSearchCurrent ? s.addressSearchRoot : L""), current);
+        }
     }
     if (spec.location == app::LocationScope::Indexed && !current.empty() &&
         (require_scope || (rest.empty() && !s.addressSearching)))
@@ -1881,7 +1941,7 @@ void ShowAdvancedSearch(AppState& s, bool require_scope) {
         q.session_id = s.advancedCountId;
         DispatchIndexSearch(s, q, s.advancedCountId);
     };
-    const auto result = ui::ShowAdvancedSearchDialog(s.hwnd, spec, s.darkMode, s.accentColor, count);
+    const auto result = ui::ShowAdvancedSearchDialog(s.hwnd, spec, s.darkMode, s.accentColor, count, s.appPrefs.list_selection_outline);
     s.advancedCountId = 0;
     s.advancedCountHwnd = nullptr;
     if (result.accepted)
@@ -2125,14 +2185,30 @@ void ApplyAppWindowChrome(AppState& s) {
     s.backdropActive = ui::ApplyWindowEffect(s.hwnd, effect, s.darkMode);
 }
 
-bool PickImageFile(AppState& s, std::wstring& path) {
+// The picker draws its list with the main window's renderer; hand it the
+// same list style so rows look identical.
+static ui::FolderPickerSpec MakePickerSpec(const AppState& s, ui::PickerMode mode) {
     ui::FolderPickerSpec spec;
-    spec.mode = ui::PickerMode::Image;
+    spec.mode = mode;
+    spec.selection_outline = s.appPrefs.list_selection_outline;
+    spec.row_height_dip = static_cast<float>(
+        app::EffectiveRowHeightDip(s.appPrefs.row_height, s.appPrefs.ui_font_scale));
+    spec.list_smart_date = s.appPrefs.list_smart_date;
+    spec.list_zebra_rows = s.appPrefs.list_zebra_rows;
+    spec.list_size_bar = s.appPrefs.list_size_bar;
+    spec.thumbnail_badges = s.appPrefs.list_thumbnail_badges;
+    spec.details_columns = s.appPrefs.details_columns;
+    spec.show_hidden = s.appPrefs.show_hidden_files;
+    return spec;
+}
+
+bool PickImageFile(AppState& s, std::wstring& path) {
+    ui::FolderPickerSpec spec = MakePickerSpec(s, ui::PickerMode::Image);
     return ui::ShowFolderPicker(s.hwnd, spec, s.darkMode, s.accentColor, path);
 }
 
 bool PickFolder(AppState& s, std::wstring& path, const wchar_t* title) {
-    ui::FolderPickerSpec spec;
+    ui::FolderPickerSpec spec = MakePickerSpec(s, ui::PickerMode::Folder);
     spec.title = title ? title : L"";
     return ui::ShowFolderPicker(s.hwnd, spec, s.darkMode, s.accentColor, path);
 }
@@ -2235,7 +2311,10 @@ void ToggleQuickPreview(AppState& s) {
                 }
             }
         }
+        s.quickPreview.Initialize(s.hwnd, WM_QUICK_PREVIEW_NAVIGATE,
+                                  WM_QUICK_PREVIEW_OPEN, WM_QUICK_PREVIEW_COMMAND);
         s.quickPreview.Show(item, s.darkMode, effect, s.safeMode, zoom_from);
+        s.quickPreviewSelection.Reset(item.path);
     }
 }
 
@@ -2255,51 +2334,6 @@ void NavigateQuickPreview(AppState& s, int direction) {
         if(v.quickPreview.visible() && SelectedQuickPreviewItem(v,item)) v.quickPreview.Update(item);
     };
     if(!DeferContentSelection(s,update,true)) update(s);
-    InvalidateRect(s.hwnd, nullptr, FALSE);
-}
-
-void HandleQuickPreviewCommand(AppState& s, ui::QuickPreviewAction action, bool shift) {
-    if (!s.quickPreview.visible()) return;
-    app::Tab* tab = ActiveTab(s);
-    if (!tab || !tab->snapshot) return;
-    // Verbs act on the previewed entry only: re-focus it in case the list
-    // selection drifted while the preview window owned the keyboard.
-    const ui::QuickPreviewItem shown = s.quickPreview.item();
-    const int index = QuickPreviewEntryIndex(*tab, shown);
-    if (index < 0) return;
-    if (index != tab->selected_index || tab->SelectedCount() != 1) {
-        tab->SelectOnly(index);
-        EnsureRowVisible(s, *tab, index);
-    }
-    switch (action) {
-    case ui::QuickPreviewAction::Open: OpenSelected(s); break;
-    case ui::QuickPreviewAction::Cut: CollectToTray(s, true); break;
-    case ui::QuickPreviewAction::Copy: CollectToTray(s, false); break;
-    case ui::QuickPreviewAction::CopyPath: CopySelectedPath(s); break;
-    case ui::QuickPreviewAction::ToggleStar: {
-        const fs::DirEntry& entry = tab->EntryAt(static_cast<size_t>(index));
-        ToggleStarred(s, shown.path, entry.is_dir ? app::PlaceItemKind::Folder
-                                                  : app::PlaceItemKind::File);
-        s.quickPreview.SetStarred(s.places.IsStarred(shown.path));
-        break;
-    }
-    case ui::QuickPreviewAction::Rename:
-        // The rename editor is hosted by the main window; hand focus back first.
-        s.quickPreview.Close();
-        ShowRenameOverlay(s);
-        break;
-    case ui::QuickPreviewAction::Delete: {
-        const ui::WindowViewModel vm = BuildVm(s);
-        s.quickPreviewAnchorView = vm.pane.ViewIndex(index);
-        DeleteSelected(s, shift);
-        break;
-    }
-    case ui::QuickPreviewAction::Properties:
-        DispatchMenuCommand(s, app::CmdProperties);
-        break;
-    default:
-        break;
-    }
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -2376,7 +2410,6 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
             }
         });
         s.scrollTargetY = 0.0f;
-        s.tagAdsLastSnapshot = nullptr;
     }
     if (app::HasEffect(effects, app::SettingsEffect::Accent))
         ApplyAccentFromPrefs(s, false);
@@ -2392,17 +2425,6 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
         s.renderer.InvalidateTypography();
         RefreshEditFonts(s);
     }
-    // The jump list is built from the mode, so a change has to rebuild it, and
-    // turning the mode off collects the extra windows back into this one - it
-    // keeps the session, the tray icon and the hotkey. Only the primary window
-    // owns the taskbar identity, so a second window applies neither.
-    if (app::HasEffect(effects, app::SettingsEffect::MultiInstance) && !s.secondaryInstance) {
-        app::RefreshJumpList(s.places.quick_access_paths, s.appPrefs.multi_instance_mode);
-        if (!s.appPrefs.multi_instance_mode) {
-            for (HWND other : app::OtherPulseWindows(s.hwnd))
-                app::SingleInstanceCoordinator::SendDrainRequest(other, s.hwnd);
-        }
-    }
     if (app::HasEffect(effects, app::SettingsEffect::RowHeight) ||
         app::HasEffect(effects, app::SettingsEffect::UiFontSize)) {
         const int row_height = app::EffectiveRowHeightDip(s.appPrefs.row_height, s.appPrefs.ui_font_scale);
@@ -2415,7 +2437,9 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
                                 s.appPrefs.list_size_bar, s.appPrefs.list_tag_name_color,
                                 s.appPrefs.list_selection_outline);
         s.renderer.SetDetailsColumns(s.appPrefs.details_columns);
-        s.renderer.SetRowActions(app::RowActionMask(s.ctxMenuPrefs.builtin_hidden));
+        s.renderer.SetRowActions(app::RowActionMask(s.ctxMenuPrefs.builtin_hidden,
+            s.ctxMenuPrefs.BuiltinOrder(app::BuiltinMenuSurface::RowButtons)));
+        s.renderer.SetThumbnailBadges(s.appPrefs.list_thumbnail_badges);
     }
     if (app::HasEffect(effects, app::SettingsEffect::FolderSort)) {
         app::SetFolderSortMode(app::FolderSortModeFromInt(s.appPrefs.folder_sort_mode));
@@ -2437,8 +2461,7 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
     if (app::HasEffect(effects, app::SettingsEffect::TrayDeckIcon))
         s.renderer.SetTrayIconDip(static_cast<float>(s.appPrefs.tray_icon_size));
     if (app::HasEffect(effects, app::SettingsEffect::TrayVisibility))
-        // A second window owns no tray icon: the primary keeps the only one.
-        s.tray_controller.SetVisible(!s.secondaryInstance && WantsTrayIcon(s, s.hidden_to_tray));
+        s.tray_controller.SetVisible(WantsTrayIcon(s, s.hidden_to_tray));
     if (app::HasEffect(effects, app::SettingsEffect::GlobalSearch))
         ApplyGlobalSearchSettings(s);
     if (app::HasEffect(effects, app::SettingsEffect::StatusBarPerformance))

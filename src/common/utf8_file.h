@@ -3,11 +3,16 @@
 // sets failbit on any wchar_t outside 0x00-0x7F, so Chinese tag names, UNC
 // folders, and starred paths never reached disk.
 #include <algorithm>
+#include <climits>
 #include <string>
 #include <vector>
 #include <windows.h>
 
 namespace pulse {
+
+// One byte-based contract for both directions, including multibyte UTF-8.
+// Larger tag catalogs written by earlier versions remain readable.
+inline constexpr uint64_t kMaxUtf8FileBytes = 64ull * 1024 * 1024;
 
 inline bool DecodeUtf8Bytes(const std::vector<uint8_t>& bytes, std::wstring& text) {
     size_t offset = 0;
@@ -17,6 +22,7 @@ inline bool DecodeUtf8Bytes(const std::vector<uint8_t>& bytes, std::wstring& tex
         text.clear();
         return true;
     }
+    if (bytes.size() - offset > static_cast<size_t>(INT_MAX)) return false;
     const int byte_count = static_cast<int>(bytes.size() - offset);
     const int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                                            reinterpret_cast<const char*>(bytes.data() + offset),
@@ -33,6 +39,7 @@ inline bool EncodeUtf8Bytes(const std::wstring& text, std::vector<uint8_t>& byte
         bytes.clear();
         return true;
     }
+    if (text.size() > static_cast<size_t>(INT_MAX)) return false;
     const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
                                          static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
     if (size <= 0) return false;
@@ -50,9 +57,8 @@ inline bool ReadUtf8File(const std::wstring& path, std::wstring& text) {
                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
-    constexpr uint64_t kMaxBytes = 16ull * 1024 * 1024;
     if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 ||
-        static_cast<uint64_t>(size.QuadPart) > kMaxBytes) {
+        static_cast<uint64_t>(size.QuadPart) > kMaxUtf8FileBytes) {
         CloseHandle(file);
         return false;
     }
@@ -74,11 +80,17 @@ inline bool ReadUtf8File(const std::wstring& path, std::wstring& text) {
 
 inline bool WriteUtf8FileAtomic(const std::wstring& path, const std::wstring& text) {
     std::vector<uint8_t> bytes;
+    if (text.size() > kMaxUtf8FileBytes) {
+        SetLastError(ERROR_FILE_TOO_LARGE);
+        return false;
+    }
     if (!EncodeUtf8Bytes(text, bytes)) return false;
-    // One temp name per process: two Pulse windows saving the same file at once used
-    // to collide on a single "<path>.tmp", and the loser's CreateFileW failed, which
-    // silently dropped that save.
-    const std::wstring temp = path + L".tmp." + std::to_wstring(GetCurrentProcessId());
+    // Never replace a readable configuration with bytes our reader rejects.
+    if (bytes.size() > kMaxUtf8FileBytes) {
+        SetLastError(ERROR_FILE_TOO_LARGE);
+        return false;
+    }
+    const std::wstring temp = path + L".tmp";
     HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
@@ -106,24 +118,6 @@ inline bool WriteUtf8FileAtomic(const std::wstring& path, const std::wstring& te
         return false;
     }
     return true;
-}
-
-// Save() policy shared by the two JSON settings files, one copy so they cannot drift.
-// Sets the unreadable file aside as <path>.bad instead of overwriting the only copy of
-// it; false means the rename failed (another process holds the file) and the caller
-// must leave the file alone.
-inline bool QuarantineUnreadableFile(const std::wstring& path) {
-    const std::wstring quarantine = path + L".bad";
-    DeleteFileW(quarantine.c_str());
-    if (!MoveFileExW(path.c_str(), quarantine.c_str(), MOVEFILE_REPLACE_EXISTING))
-        return false;
-    return true;
-}
-
-// Keeps the previous file one step back as <path>.bak for the next Load() to fall back
-// to. Best effort: a failed copy only costs the fallback.
-inline void KeepPreviousFileCopy(const std::wstring& path) {
-    CopyFileW(path.c_str(), (path + L".bak").c_str(), FALSE);
 }
 
 } // namespace pulse

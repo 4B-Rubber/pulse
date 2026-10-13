@@ -1,6 +1,7 @@
 #include "global_search_controller.h"
 #include "global_search_handoff.h"
 #include "app_internal.h"
+#include "tray_reveal.h"
 #include "../common/localization.h"
 
 namespace pulse {
@@ -20,18 +21,14 @@ bool HotkeyAllowed(const AppState& s) {
 
 void ApplyGlobalSearchSettings(AppState& s) {
     if (!HotkeyAllowed(s)) return;
-    // Only the primary window owns the global hotkey and the tray icon; a second
-    // window started with --new-window must not fight it for either.
-    if (s.secondaryInstance) return;
     const bool enabled = s.appPrefs.global_search_enabled;
-    const bool ok = s.globalSearchHotkey.Update(s.hwnd, enabled,
+    const bool ok = s.globalSearchHotkey.Update(ServiceWindow(s), enabled,
         s.appPrefs.global_search_modifiers, s.appPrefs.global_search_key);
     s.settings.SetGlobalSearchError(ok ? std::wstring{} : l10n::Get(
         s.globalSearchHotkey.Error() == ERROR_HOTKEY_ALREADY_REGISTERED
             ? l10n::StringId::GlobalSearchConflict : l10n::StringId::GlobalSearchRegisterFailed));
     if (!enabled || !ok) s.globalSearchWindow.Hide();
-    s.tray_controller.SetVisible(app::TrayIconWanted(s.appPrefs.keep_running_on_close || enabled,
-                                                     s.appPrefs.notify_icon_mode, s.hidden_to_tray));
+    s.tray_controller.SetVisible(WantsTrayIcon(s, s.hidden_to_tray));
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -61,11 +58,13 @@ void ToggleGlobalSearch(AppState& s) {
     s.globalSearchWindow.SetAppearance(s.darkMode, ui::WindowEffectFromId(s.appPrefs.window_effect),
         s.appPrefs.background_image, s.accentColor);
     if (const auto* tab = ActiveTab(s); tab && !fs::IsVirtualPath(tab->current_path)) folder = tab->current_path;
-    s.globalSearchWindow.SetHandoffHandler([&s](const GlobalSearchHandoff& request) {
-        ContinueGlobalSearchInMain(s, request);
+    // The search window is process-wide and outlives the window that opened
+    // it (M4b): continue in the most recent window when the handoff happens.
+    s.globalSearchWindow.SetHandoffHandler([core = &s.core](const GlobalSearchHandoff& request) {
+        if (AppState* window = core->windows.MostRecent()) ContinueGlobalSearchInMain(*window, request);
     });
     if (!s.globalSearchWindow.Show(s.hwnd, s.darkMode, s.scale, folder, s.appPrefs.search_pinyin)) {
-        s.tray_controller.RestoreWindow();
+        RevealWindow(s);
         s.notification_toast.ShowError(s.hwnd, l10n::Get(l10n::StringId::GlobalSearch),
             l10n::Get(l10n::StringId::GlobalSearchOpenFailed));
     }

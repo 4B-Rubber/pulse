@@ -91,8 +91,8 @@ struct Context {
 
 class Layout {
   public:
-    Layout(IDWriteFactory2 *factory, IDWriteFontFace *face, const FontMathMetrics &metrics, float size)
-        : factory_(factory), face_(face), metrics_(metrics), base_size_(size) {}
+    Layout(IDWriteFactory2 *factory, IDWriteFontFace *face, const FontMathMetrics &metrics, float size, float window_scale)
+        : factory_(factory), face_(face), metrics_(metrics), base_size_(size), window_scale_(window_scale) {}
     bool Run(const MathNode &root, bool display, Box &result) {
         result = Build(root, {display ? Style::Display : Style::Text});
         if (!ok_ || (result.glyphs.empty() && result.rules.empty() && !result.intentional_space) || !ContainInk(result))
@@ -105,6 +105,7 @@ class Layout {
     IDWriteFontFace *face_;
     const FontMathMetrics &metrics_;
     float base_size_;
+    float window_scale_;
     bool ok_ = true;
     size_t visited_ = 0;
     size_t depth_ = 0;
@@ -127,7 +128,7 @@ class Layout {
             return 0;
         }
         if (length.unit == MathLengthUnit::Pt)
-            return length.value * (96.0f / 72.27f);
+            return length.value * (96.0f / 72.27f) * window_scale_;
         if (length.unit == MathLengthUnit::Ex) {
             DWRITE_FONT_METRICS font{};
             face_->GetMetrics(&font);
@@ -911,9 +912,10 @@ class Layout {
 } // namespace
 
 bool BuildMathLayout(IDWriteFactory2 *factory, IDWriteFontFace *face, const FontMathMetrics &metrics,
-                     const MathNode &root, float font_size, bool display, FormulaLayout &result) {
-    if (!factory || !face || !std::isfinite(font_size) || font_size < 4 || font_size > 256)
+                     const MathNode &root, float font_size, bool display, FormulaLayout &result, float window_scale) {
+    if (!factory || !face || !std::isfinite(font_size) || font_size < 4 || font_size > 256 ||
+        !std::isfinite(window_scale) || window_scale <= 0 || window_scale > 8)
         return false;
-    return Layout(factory, face, metrics, font_size).Run(root, display, result);
+    return Layout(factory, face, metrics, font_size, window_scale).Run(root, display, result);
 }
 } // namespace pulse::ui::math

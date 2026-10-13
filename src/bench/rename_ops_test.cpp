@@ -7,6 +7,10 @@
 #include <cstdio>
 #include <atomic>
 #include <climits>
+#include <chrono>
+#include <condition_variable>
+#include <map>
+#include <mutex>
 using namespace pulse::ops;
 namespace {
 int failures = 0;
@@ -19,6 +23,9 @@ bool Wait(OpsManager& ops, uint64_t before) {
     }
     return false;
 }
+bool Has(const std::wstring& text, const wchar_t* part) { return text.find(part) != std::wstring::npos; }
+// Failure text is for people: a reason, never a bare error number.
+bool Friendly(const std::wstring& text) { return !text.empty() && !Has(text, L"错误 ") && !Has(text, L"error "); }
 bool Exact(const std::filesystem::path& path) {
     WIN32_FIND_DATAW data{};
     HANDLE find = FindFirstFileW(path.c_str(), &data);
@@ -34,26 +41,29 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(root / L"child");
     auto make = [&](const wchar_t* name) { std::ofstream(root / name) << "fixture"; };
     if (argc > 1 && std::string_view(argv[1]) == "--shell-roundtrip") {
-        OpsManager roundtrip;
-        roundtrip.Start([] {});
-        OpRequest create; create.type = OpType::CreateTextFile;
-        create.sources = {(root / L"shell-created.txt").wstring()};
-        roundtrip.Submit(create);
-        const bool received = Wait(roundtrip, 0);
-        const auto create_status = roundtrip.Status();
-        std::printf("[INFO] create received=%d phase=%d exists=%d error=", received,
-            static_cast<int>(create_status.phase), Exact(root / L"shell-created.txt"));
-        for (const auto c : create_status.last_error) std::printf("%04x ", static_cast<unsigned>(c));
-        std::printf("\n");
-        Check(received && create_status.phase == OpPhase::Completed &&
+        // New items are created in process now, so drive the Shell host's
+        // request/Done stream directly.
+        auto& client = pulse::ipc::ShellClient::Instance();
+        std::mutex done_mutex;
+        std::condition_variable done_cv;
+        std::map<uint32_t, uint32_t> done;
+        pulse::ipc::ShellClient::Callbacks callbacks;
+        callbacks.done = [&](uint32_t id, uint32_t hr, bool, std::wstring) {
+            std::lock_guard lock(done_mutex); done[id] = hr; done_cv.notify_all();
+        };
+        client.Start(std::move(callbacks));
+        auto succeeded = [&](uint32_t id) {
+            std::unique_lock lock(done_mutex);
+            const bool received = id && done_cv.wait_for(lock, std::chrono::seconds(15), [&] { return done.contains(id); });
+            std::printf("[INFO] shell request=%u received=%d hr=%08x\n", id, received, received ? done[id] : 0u);
+            return received && SUCCEEDED(static_cast<HRESULT>(done[id]));
+        };
+        Check(succeeded(client.CreateNewFile((root / L"shell-created.txt").wstring())) &&
             Exact(root / L"shell-created.txt"), "normal shell CreateNewFile receives Done");
-        Check(pulse::ipc::ShellClient::Instance().Ping(), "normal shell ping submitted on proven connection");
-        const auto after_ping = roundtrip.Status().completed_ops;
-        create.sources = {(root / L"shell-after-ping.txt").wstring()};
-        roundtrip.Submit(create);
-        Check(Wait(roundtrip, after_ping) && roundtrip.Status().phase == OpPhase::Completed &&
+        Check(client.Ping(), "normal shell ping submitted on proven connection");
+        Check(succeeded(client.CreateNewFile((root / L"shell-after-ping.txt").wstring())) &&
             Exact(root / L"shell-after-ping.txt"), "shell response stream continues after Ping");
-        roundtrip.Stop();
+        client.Stop();
         std::filesystem::remove_all(root);
         return failures ? 1 : 0;
     }
@@ -146,6 +156,15 @@ int main(int argc, char** argv) {
         rename(L"stay.txt", name);
         Check(Exact(root / L"stay.txt") && ops.Status().phase == OpPhase::Failed, "invalid filename rejected");
     }
+    const struct { const wchar_t* name; const wchar_t* reason; } reasons[] = {
+        {L"bad:name", L"不能包含以下字符"}, {L"bad?name", L"不能包含以下字符"}, {L"trailing.", L"空格或句点结尾"},
+        {L"trailing ", L"空格或句点结尾"}, {L"CON.txt", L"Windows 保留的名称"}, {L"LPT1", L"Windows 保留的名称"},
+        {L"", L"不能为空"}};
+    for (const auto& item : reasons) {
+        rename(L"stay.txt", item.name);
+        Check(Exact(root / L"stay.txt") && Has(ops.Status().last_error, item.reason) &&
+            Friendly(ops.Status().last_error), "invalid filename says why");
+    }
     make(L"first.txt"); make(L"second.txt"); make(L"third.txt");
     OpRequest batch; batch.type = OpType::BatchRename;
     batch.sources = {(root / L"first.txt").wstring(), (root / L"second.txt").wstring(), (root / L"third.txt").wstring()};
@@ -171,6 +190,27 @@ int main(int argc, char** argv) {
     Check(Exact(root / L"conflict-source.txt") && Exact(root / L"conflict-target.txt") &&
         ops.Status().phase == OpPhase::Failed && ops.Status().last_error != L"操作层未启动",
         "existing target rejected without replacing either file");
+    Check(ops.Status().last_error == L"目标名称已存在", "existing target keeps the message the UI localizes");
+    auto create = [&](OpType type, const std::filesystem::path& path) {
+        const auto before = ops.Status().completed_ops;
+        OpRequest request; request.type = type; request.sources = {path.wstring()};
+        ops.Submit(std::move(request)); Check(Wait(ops, before), "create completes within deadline");
+        return ops.Status();
+    };
+    {
+        auto status = create(OpType::CreateFolder, root / L"新建文件夹");
+        Check(status.phase == OpPhase::Completed && std::filesystem::is_directory(root / L"新建文件夹"),
+            "new folder is created in process");
+        status = create(OpType::CreateTextFile, root / L"新建文本文档.txt");
+        Check(status.phase == OpPhase::Completed && std::filesystem::is_regular_file(root / L"新建文本文档.txt"),
+            "new text file is created in process");
+        status = create(OpType::CreateFolder, root / L"新建文件夹");
+        Check(status.phase == OpPhase::Failed && status.last_error == L"已存在同名项目",
+            "existing new-folder name fails with a reason");
+        status = create(OpType::CreateFolder, root / L"missing-parent" / L"新建文件夹");
+        Check(status.phase == OpPhase::Failed && Has(status.last_error, L"当前文件夹已不存在") &&
+            Friendly(status.last_error), "new folder in a vanished folder says why");
+    }
     make(L"locked.txt");
     HANDLE locked = CreateFileW((root / L"locked.txt").c_str(), GENERIC_READ, FILE_SHARE_READ,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -179,6 +219,17 @@ int main(int argc, char** argv) {
     Check(Exact(root / L"locked.txt") && !std::filesystem::exists(root / L"locked-renamed.txt") &&
         ops.Status().phase == OpPhase::Failed && ops.Status().last_error != L"操作层未启动",
         "sharing violation reports failure without changing file");
+    {
+        const auto status = ops.Status();
+        Check(Has(status.last_error, L"正被其他程序使用") && Friendly(status.last_error),
+            "sharing violation says another program is using the file");
+        bool self = false;
+        for (const auto& owner : status.lock_owners) self = self || owner.pid == GetCurrentProcessId();
+        std::printf("[INFO] locked rename owners=%zu path_matches=%d\n", status.lock_owners.size(),
+            status.locked_path == (root / L"locked.txt").wstring());
+        Check(self && status.locked_path == (root / L"locked.txt").wstring(),
+            "locked rename names the program holding the file");
+    }
     if (locked != INVALID_HANDLE_VALUE) CloseHandle(locked);
     ops.Stop();
     // This absolute directory was created by this process under bench_data.

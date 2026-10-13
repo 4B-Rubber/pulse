@@ -5,15 +5,29 @@
 
 #include <windows.h>
 
+#include "../fs/fs_snapshot.h"
+
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace pulse::ui {
 
-enum class PickerMode { Folder, Image };
-enum class PickerEntryKind { Folder, Image, Drive };
+enum class PickerMode { Folder, Image, File };
+enum class PickerEntryKind { Folder, Image, Drive, File };
+
+struct PickerFilter { std::wstring label; std::wstring pattern; };
+enum class PickerSort { Name, Modified, Size, Type };
+struct PickerOptions {
+    std::vector<PickerFilter> filters;
+    size_t filter_index = 0;
+    bool show_hidden = false;
+    std::wstring search;
+    PickerSort sort = PickerSort::Name;
+    bool descending = false;
+};
 
 struct PickerEntry {
     std::wstring name;   // display name ("Local Disk (C:)" for drives)
@@ -22,6 +36,7 @@ struct PickerEntry {
     FILETIME modified{};
     uint64_t size = 0;   // file size; total bytes for drives
     uint64_t free = 0;   // drives only
+    size_t source = 0;   // index in the enumeration, used while building the listing
 };
 
 // One folder's contents as read by the loader. path "" is This PC (drives).
@@ -29,15 +44,26 @@ struct PickerListing {
     uint64_t generation = 0;
     std::wstring path;
     std::vector<PickerEntry> entries;
+    // The same rows in the same order as the main window's directory snapshot,
+    // so the picker's list is drawn by the shared pane renderer.
+    fs::SnapshotPtr snapshot;
     DWORD error = ERROR_SUCCESS;
 };
 
 bool IsPickerImageName(std::wstring_view name);
 // Hidden and system items, "." and "..", and (in picture mode) other files
 // stay out of the list.
-bool PickerShowsEntry(DWORD attributes, std::wstring_view name, PickerMode mode);
+bool PickerMatchesFilter(std::wstring_view name, PickerMode mode, const PickerOptions& options = {});
+// read_next sets followed only when it replaces path with a shortcut target.
+// Kept independent of COM so cycle, cancellation and hop bounds are testable.
+DWORD FollowPickerShortcutChain(std::wstring& path,
+    const std::function<DWORD(std::wstring&, bool& followed)>& read_next,
+    const std::function<bool()>& cancelled = {});
+bool ParsePickerNames(std::wstring_view text, std::vector<std::wstring>& names);
+bool PickerShowsEntry(DWORD attributes, std::wstring_view name, PickerMode mode,
+                      const PickerOptions& options = {});
 // Folders first, then names in Explorer's numeric-aware order.
-void SortPickerEntries(std::vector<PickerEntry>& entries);
+void SortPickerEntries(std::vector<PickerEntry>& entries, const PickerOptions& options = {});
 
 // "C:\a\b" -> "C:\a"; a drive or share root -> "" (This PC).
 std::wstring PickerParent(std::wstring_view path);
@@ -60,9 +86,13 @@ public:
     void Navigate(std::wstring from);
     bool CanGoBack() const { return !back_.empty(); }
     std::wstring Back();
+    bool CanGoForward() const { return !forward_.empty(); }
+    std::wstring Back(std::wstring current);
+    std::wstring Forward(std::wstring current);
 
 private:
     std::vector<std::wstring> back_;
+    std::vector<std::wstring> forward_;
 };
 
 } // namespace pulse::ui

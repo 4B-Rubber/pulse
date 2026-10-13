@@ -1,6 +1,8 @@
 // index_client.cpp — Connect to Pulse.Index (service or spawned helper).
 #include "../common/command_line.h"
 #include "index_client.h"
+#include "index_config.h"
+#include "index_executable.h"
 #include "search_trace.h"
 #include <chrono>
 #include <algorithm>
@@ -9,12 +11,34 @@
 
 namespace pulse::index {
 
+namespace {
+
+bool IsFile(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Index location changes (Pulse.Index.exe --set-index-path, elevated) stop the
+// service while they copy the index and start it again themselves. The mutex
+// exists exactly while one runs; an elevated owner may deny us SYNCHRONIZE.
+bool IndexConfigurationRunning() {
+    HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE, L"Global\\PulseIndexConfiguration");
+    if (mutex) {
+        CloseHandle(mutex);
+        return true;
+    }
+    return GetLastError() == ERROR_ACCESS_DENIED;
+}
+
+} // namespace
+
 std::wstring IndexClient::ExePath() {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
     wchar_t* slash = wcsrchr(exe, L'\\');
-    if (!slash) return L"Pulse.Index.exe";
-    return std::wstring(exe, slash + 1) + L"Pulse.Index.exe";
+    const std::wstring sibling = slash ? std::wstring(exe, slash + 1) + L"Pulse.Index.exe" : L"Pulse.Index.exe";
+    if (IsFile(sibling)) return sibling;  // common case: no service query
+    return ResolveIndexExecutable(sibling, InstalledServiceCommand(kServiceName), IsFile);
 }
 
 void IndexClient::Start(HWND notify, UINT status_msg, UINT search_msg, std::wstring pipe_name) {
@@ -61,9 +85,34 @@ void IndexClient::Stop() {
     connected_ = false;
 }
 
+// The service is installed but its host is gone: it crashed, setup ended it,
+// or it quit with an error. SCM restarts crashed hosts only after a minute and
+// never restarts one that stopped "cleanly", so start it from here, at most
+// every 30 s. Interactive users have SERVICE_START (InstallService); with an
+// older service DACL this is denied and Pulse keeps waiting as before.
+void IndexClient::StartStoppedService() {
+    const ULONGLONG now = GetTickCount64();
+    if (service_start_tick_ && now - service_start_tick_ < 30000) return;
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) return;
+    if (SC_HANDLE svc = OpenServiceW(scm, kServiceName, SERVICE_QUERY_STATUS | SERVICE_START)) {
+        SERVICE_STATUS status{};
+        if (QueryServiceStatus(svc, &status) && status.dwCurrentState == SERVICE_STOPPED &&
+            !IndexConfigurationRunning()) {
+            service_start_tick_ = now;
+            StartServiceW(svc, 0, nullptr);   // the pipe shows up once it runs
+        }
+        CloseServiceHandle(svc);
+    } else {
+        service_start_tick_ = now;   // denied (older DACL) or gone: do not ask every second
+    }
+    CloseServiceHandle(scm);
+}
+
 bool IndexClient::SpawnHelper() {
     if (pipe_name_ != kPipeName) return false;
     if (ServiceInstalled()) {
+        StartStoppedService();
         {
             std::lock_guard<std::mutex> lock(mu_);
             status_ = L"正在等待索引服务…";
@@ -250,12 +299,31 @@ void IndexClient::HandleVolumes(const uint8_t* p, size_t n) {
             excluded_paths.push_back(std::move(path_value));
         }
     }
+    uint32_t system_flags = 0, group_count = 0, system_count = 0;
+    std::vector<std::wstring> groups, system_paths;
+    bool system_known = r.GetU32(system_flags) && r.GetU32(group_count);
+    for (uint32_t i = 0; system_known && i < group_count; ++i) {
+        std::wstring group;
+        system_known = r.GetString(group);
+        if (system_known) groups.push_back(std::move(group));
+    }
+    system_known = system_known && r.GetU32(system_count);
+    for (uint32_t i = 0; system_known && i < system_count; ++i) {
+        std::wstring path_value;
+        system_known = r.GetString(path_value);
+        if (system_known) system_paths.push_back(std::move(path_value));
+    }
+    if (!system_known) { groups.clear(); system_paths.clear(); }
     {
         std::lock_guard<std::mutex> lock(mu_);
         service_mode_ = service != 0;
         index_path_ = std::move(path);
         volumes_ = std::move(volumes);
         excluded_paths_ = std::move(excluded_paths);
+        system_known_ = system_known;
+        exclude_system_ = system_known && (system_flags & 1u) != 0;
+        system_groups_ = std::move(groups);
+        system_paths_ = std::move(system_paths);
         scope_ready_ = true;
     }
     if (notify_ && status_msg_) PostMessageW(notify_, status_msg_, 0, 0);
@@ -296,8 +364,12 @@ void IndexClient::Writer() {
         {
             std::unique_lock<std::mutex> lock(mu_);
             pending_cv_.wait_for(lock, std::chrono::milliseconds(100),
-                [this] { return !running_ || have_pending_ || !cancelled_sessions_.empty() || volume_refresh_requested_; });
+                [this] { return !running_ || (connected_ &&
+                    (have_pending_ || !cancelled_sessions_.empty() || volume_refresh_requested_)); });
             if (!running_) return;
+            // Queued work must survive an outage without keeping this thread
+            // runnable. Worker notifies us after reconnecting.
+            if (!connected_) continue;
             if (!have_pending_ && cancelled_sessions_.empty() && !volume_refresh_requested_) continue;
         }
         if (connected_) {
@@ -404,6 +476,15 @@ bool IndexClient::GetScope(std::vector<VolumeInfo>& volumes, std::vector<std::ws
     std::lock_guard<std::mutex> lock(mu_);
     if (!connected_ || !scope_ready_) return false;
     volumes = volumes_; excluded = excluded_paths_;
+    excluded.insert(excluded.end(), system_paths_.begin(), system_paths_.end());
+    return true;
+}
+
+bool IndexClient::SystemExclusion(bool& enabled, std::vector<std::wstring>& groups) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!system_known_) return false;
+    enabled = exclude_system_;
+    groups = system_groups_;
     return true;
 }
 
@@ -454,8 +535,13 @@ std::wstring QuoteCommandArg(const std::wstring& value) {
 
 bool RunElevatedIndexCommand(const std::wstring& exe, const std::wstring& parameters,
                             DWORD* result = nullptr) {
+    // Never let the shell show its own "cannot find the file" box; callers report it.
+    if (!IsFile(exe)) {
+        if (result) *result = ERROR_FILE_NOT_FOUND;
+        return false;
+    }
     SHELLEXECUTEINFOW sei{ sizeof(sei) };
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
     sei.lpVerb = L"runas";
     sei.lpFile = exe.c_str();
     sei.lpParameters = parameters.c_str();
@@ -515,6 +601,8 @@ bool IndexClient::ConfigureIndexPathElevated(const std::wstring& path, std::wstr
             *error = L"请选择独立的索引文件夹，不能与原位置互相包含，也不能使用链接目录。选择磁盘根目录时会自动使用其中的 Index 文件夹。"; break;
         case ERROR_PARTIAL_COPY:
             *error = L"索引已切换到新位置，但部分旧文件被占用，未能清理。新索引可以正常使用。"; break;
+        case kIndexDirectoryNotPrivate:
+            *error = L"索引位置里有不属于 Pulse 的文件或链接，为保护隐私，索引服务不会使用它。请改选一个空文件夹。"; break;
         case ERROR_SERVICE_NOT_ACTIVE: case ERROR_SERVICE_REQUEST_TIMEOUT:
             *error = L"索引服务未能恢复。原索引文件已保留，请重新启动索引服务后重试。"; break;
         default:
@@ -530,9 +618,14 @@ bool IndexClient::ConfigureExcludePathElevated(const std::wstring& path, bool en
     return RunElevatedIndexCommand(ExePath(), parameters);
 }
 
-bool IndexClient::ExportDiagnosticsElevated(const std::wstring& empty_directory) {
+bool IndexClient::ConfigureSystemExclusionElevated(const std::wstring& group, bool enabled) {
+    return RunElevatedIndexCommand(ExePath(), L"--configure-system-exclusion " + QuoteCommandArg(group) +
+                                   (enabled ? L" --enable" : L" --disable"));
+}
+
+bool IndexClient::ExportDiagnosticsElevated(const std::wstring& empty_directory, bool include_dumps) {
     return RunElevatedIndexCommand(ExePath(),
-        L"--export-diagnostics " + QuoteCommandArg(empty_directory));
+        L"--export-diagnostics " + QuoteCommandArg(empty_directory) + (include_dumps ? L" --include-dumps" : L""));
 }
 
 } // namespace pulse::index

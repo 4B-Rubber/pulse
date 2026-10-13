@@ -1,7 +1,6 @@
 #include "quick_access.h"
 #include "app_commands.h"
 #include "app_navigation.h"
-#include "jump_list.h"
 #include "../common/localization.h"
 #include <algorithm>
 
@@ -50,7 +49,6 @@ bool HandleQuickAccessCommand(AppState& s, int command,
                               const std::vector<std::wstring>& paths) {
     if (command != app::CmdPinQuickAccess && command != app::CmdUnpinQuickAccess) return false;
     s.places.SetQuickAccessPinned(paths, command == app::CmdPinQuickAccess);
-    app::RefreshJumpList(s.places.quick_access_paths, s.appPrefs.multi_instance_mode);
     InvalidateRect(s.hwnd, nullptr, FALSE);
     return true;
 }
@@ -142,7 +140,7 @@ void ShowWorkspaceMenu(AppState& s, int index, POINT point) {
     } else if (command == kUpdate) {
         // The snapshot was only taken when pinning; this is the one way to
         // refresh it without unpinning (which would drop frequent folders).
-        s.places.UpdateWorkspaceSnapshot(index, static_cast<int>(LayoutOf(s)),
+        s.places.UpdateWorkspaceSnapshot(index, static_cast<int>(WorkspaceLayoutOf(s)),
                                          CollectPanePaths(s), CollectPaneViews(s));
         s.places.active_workspace = index;
         s.places.Save();

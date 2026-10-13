@@ -1,9 +1,12 @@
 // app_input.h — Pointer, keyboard, marquee, and drag/drop input.
 #pragma once
 #include "app_runtime.h"
+#include "app_hover.h"
 
 namespace pulse {
 bool HandleBrowserNavigation(AppState& s, LPARAM command);
+bool HandleListCharacter(AppState& s, wchar_t ch);
+void TickQuickPreviewSelection(AppState& s, ULONGLONG now);
 bool HandleDetailsPreviewPointer(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT HandleMouseLeave(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -20,15 +23,6 @@ void ClearDropFeedback(AppState& s);
 std::wstring BaseName(const std::wstring& path);
 bool PointOnPaneHeader(const AppState& s, const ui::WindowViewModel& vm,
                               int pane_index, float x, float y);
-// Column widths live in two arrays and a pane renders with exactly one of them: the
-// search-style set (the one carrying the path column) covers search results, saved
-// searches, the Recycle Bin and the changes view, and the pane view model's is_search
-// flag says which. Both the drag and the double-click refit go through these, so a
-// gesture always writes the widths the pane actually reads.
-void ResizePaneColumnDivider(AppState& s, app::Tab& tab, const ui::WindowViewModel& vm,
-                             int pane_index, int divider, float cursor_x);
-void AutoFitPaneColumnDivider(AppState& s, app::Tab& tab, const ui::WindowViewModel& vm,
-                              int pane_index, int divider);
 std::wstring HeaderDropHint(const std::vector<std::wstring>& sources);
 std::wstring ResolveHeaderDropFolder(const std::vector<std::wstring>& sources);
 DWORD ResolveDropTarget(AppState& s, const std::vector<std::wstring>& sources,
@@ -44,6 +38,18 @@ void EnsureRowVisible(AppState& s, app::Tab& tab, int index);
 bool PointInList(const AppState& s, int mx, int my);
 void ResetMarquee(AppState& s);
 void ApplyMarqueeSelection(AppState& s);
+// Marquee start in current pane pixels (it moves with the scrolled content).
+POINT MarqueeStartOnScreen(const AppState& s);
+// The marquee rectangle to draw, in current pane pixels.
+D2D1_RECT_F MarqueeDisplayRect(const AppState& s);
+// Starts/stops edge auto-scroll for the marquee. Scrolling happens in
+// UpdateMarqueeFrame on display frames; Tick (kTimerMarqueeScroll) only asks
+// for the next frame while the pointer rests.
+void UpdateMarqueeAutoScroll(AppState& s);
+void TickMarqueeAutoScroll(AppState& s);
+// Render, once per frame: advances edge auto-scroll by elapsed time and
+// applies a band the pointer or scrolling changed since the last frame.
+void UpdateMarqueeFrame(AppState& s);
 void HandleListRowClick(AppState& s, int index, bool ctrl, bool shift);
 void FinishListRowClick(AppState& s);
 void CancelRenameClick(AppState& s);
@@ -54,6 +60,6 @@ float TagEaseOutCubic(float x);
 float TagEaseInOutQuad(float t);
 void TickTagTransitions(AppState& s);
 void TickTabTransitions(AppState& s);
-void StartSmoothScroll(AppState& s, float delta);
-void UpdateSmoothScroll(AppState& s);
+void StartSmoothScroll(AppState& s, float delta, bool horizontal = false);
+void UpdateSmoothScroll(AppState& s, const HoverPointerApi& api = {});
 } // namespace pulse

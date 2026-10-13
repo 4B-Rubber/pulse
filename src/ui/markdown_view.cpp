@@ -8,6 +8,7 @@
 #include "../ipc/preview_protocol.h"
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cwctype>
 #include <initializer_list>
 
@@ -104,7 +105,14 @@ static bool NotebookOutput(const std::wstring& marker) { return !marker.empty() 
 
 // ---------------------------------------------------------------- model
 
+MarkdownView::~MarkdownView() {
+    if (image_session_) image_session_->active = false;
+}
+
 void MarkdownView::Clear() {
+    image_metadata_.Reset();
+    if (image_session_) image_session_->active = false;
+    image_session_.reset();
     parsed_ = false;
     payload_.clear();
     path_.clear();
@@ -134,6 +142,7 @@ void MarkdownView::Clear() {
     toc_scroll_ = 0.0f;
     toc_follow_ = true;
     scroll_ = 0.0f;
+    scroll_x_ = 0.0f;
     relayout_ = true;
     doc_height_ = 0.0f;
 }
@@ -142,6 +151,7 @@ bool MarkdownView::SetPayload(const std::wstring& payload, const std::wstring& f
     if (parsed_ && payload == payload_ && file_path == path_) return true;
     Clear();
     if (payload.rfind(L"PULSEMD\t1\n", 0) != 0) return false;
+    image_session_ = std::make_shared<DocumentImageSession>();
     payload_ = payload;
     path_ = file_path;
     const size_t slash = file_path.find_last_of(L"\\/");
@@ -237,7 +247,7 @@ bool MarkdownView::SetPayload(const std::wstring& payload, const std::wstring& f
             }
             b.image = b.kind == L'p' && b.runs.size() == 1 && (b.runs[0].flags & kImage) &&
                       b.runs[0].start == 0 && b.runs[0].length == b.text.size();
-            if (b.image) ResolveImage(b);
+
             blocks_.push_back(std::move(b));
         }
     }
@@ -294,6 +304,7 @@ bool MarkdownView::ShowSection(int index, int block, bool at_end) {
     }
     section_ = index;
     scroll_ = 0.0f;
+    scroll_x_ = 0.0f;
     overscroll_ = 0.0f;
     doc_height_ = 0.0f;
     relayout_ = true;
@@ -302,40 +313,6 @@ bool MarkdownView::ShowSection(int index, int block, bool at_end) {
     pending_reveal_ = false;
     toc_follow_ = true;
     return true;
-}
-
-// Local pictures only: remote, file: and UNC targets stay placeholders so a
-// document cannot make Quick Look reach out to a server.
-void MarkdownView::ResolveImage(Block& block) {
-    std::wstring target = block.runs[0].target;
-    std::wstring lower = target;
-    for (auto& c : lower) c = static_cast<wchar_t>(std::towlower(c));
-    const size_t colon = lower.find(L':');
-    const bool drive = colon == 1 && lower.size() > 2 && (lower[2] == L'\\' || lower[2] == L'/');
-    if (target.empty() || (colon != std::wstring::npos && !drive) ||
-        lower.rfind(L"//", 0) == 0 || lower.rfind(L"\\\\", 0) == 0)
-        return;
-    const size_t cut = target.find_first_of(L"?#");
-    if (cut != std::wstring::npos) target.resize(cut);
-    for (auto& c : target) if (c == L'/') c = L'\\';
-    std::wstring joined;
-    if (drive) joined = target;
-    else if (!target.empty() && target[0] == L'\\') joined = base_dir_.substr(0, (std::min<size_t>)(2, base_dir_.size())) + target;
-    else joined = base_dir_ + L'\\' + target;
-    wchar_t full[MAX_PATH * 2]{};
-    const DWORD n = GetFullPathNameW(joined.c_str(), static_cast<DWORD>(std::size(full)), full, nullptr);
-    if (!n || n >= std::size(full)) return;
-    const std::wstring resolved(full);
-    if (resolved.rfind(L"\\\\", 0) == 0 && base_dir_.rfind(L"\\\\", 0) != 0) return;
-    WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExW(resolved.c_str(), GetFileExInfoStandard, &data) ||
-        (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-        return;
-    block.image_path = resolved;
-    block.image_attrs = data.dwFileAttributes;
-    block.image_size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-    block.image_modified = (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
-                           data.ftLastWriteTime.dwLowDateTime;
 }
 
 // ---------------------------------------------------------------- layout
@@ -489,7 +466,7 @@ WrlPtr<IDWriteTextLayout> MarkdownView::MakeLayout(IDWriteFactory2* factory, con
         layout->GetFontSize(run.start, &size);
         const bool applied = ApplyMathInline(factory, layout.Get(), {run.start, run.length},
             text.substr(delimiter, text.size() - delimiter * 2),
-            display ? (std::max)(size, 18.0f * scale_) : size, display, width);
+            display ? (std::max)(size, 18.0f * scale_) : size, display, width, scale_);
         display_rendered = display_rendered || (display && applied);
     }
     if (b.kind == L'm' && display_rendered)
@@ -636,6 +613,8 @@ void MarkdownView::Layout(IDWriteFactory2* factory, float width, float scale) {
         footer_y_ = y + 8.0f * s;
         y += 64.0f * s;
     }
+    doc_width_ = W;
+    for (const auto& table : tables_) doc_width_ = (std::max)(doc_width_, table.x + table.w);
     doc_height_ = y + 24.0f * s;
     relayout_ = false;
     ClampScroll();
@@ -644,6 +623,10 @@ void MarkdownView::Layout(IDWriteFactory2* factory, float width, float scale) {
 void MarkdownView::ClampScroll() {
     const float view = view_.bottom - view_.top;
     scroll_ = std::clamp(scroll_, 0.0f, (std::max)(0.0f, doc_height_ - view));
+    const float width = view_.right - view_.left;
+    const float margin = (std::max)(28.0f * scale_, (width - ContentWidth(width)) * 0.5f);
+    scroll_x_ = std::clamp(scroll_x_, 0.0f, (std::max)(0.0f, doc_width_ + margin * 2 - width));
+    origin_x_ = view_.left + margin - scroll_x_;
 }
 
 // ---------------------------------------------------------------- drawing
@@ -716,7 +699,7 @@ bool MarkdownView::DrawDocument(ID2D1DeviceContext* dc, IDWriteFactory2* factory
     ClampScroll();
     const float s = scale;
     const float W = ContentWidth(width);
-    origin_x_ = rect.left + (std::max)(28.0f * s, (width - W) * 0.5f);
+    origin_x_ = rect.left + (std::max)(28.0f * s, (width - W) * 0.5f) - scroll_x_;
     const float oy = rect.top - scroll_;
     const float top_doc = scroll_ - 40.0f * s, bottom_doc = scroll_ + (rect.bottom - rect.top) + 40.0f * s;
     bool repaint = false;
@@ -801,6 +784,17 @@ bool MarkdownView::DrawDocument(ID2D1DeviceContext* dc, IDWriteFactory2* factory
             dc->FillRectangle(R(bx, by, bx + b.w, by + b.h), brush_.Get());
             continue;
         } else if (b.image) {
+            if (!b.image_metadata_ready && !b.runs.empty()) {
+                const auto info = image_metadata_.Lookup(b.runs[0].target, base_dir_, notify_);
+                if (info.ready) {
+                    b.image_metadata_ready = true;
+                    b.image_path = info.path;
+                    b.image_attrs = info.attrs;
+                    b.image_size = info.size;
+                    b.image_modified = info.modified;
+                    if (!info.path.empty()) { relayout_ = true; repaint = true; }
+                }
+            }
             const D2D1_RECT_F box = R(bx, by, bx + b.w, by + b.h);
             bool drawn = false;
             if (!b.image_path.empty() && images) {
@@ -811,7 +805,8 @@ bool MarkdownView::DrawDocument(ID2D1DeviceContext* dc, IDWriteFactory2* factory
                 const PreviewDrawResult r = images->Draw(dc, dest, b.image_path, b.image_attrs, pixels,
                     generation, b.image_modified, b.image_size, b.image_aspect > 0.0f ? 1.0f : 0.0f,
                     nullptr, nullptr, nullptr, false, nullptr, nullptr, nullptr, nullptr, nullptr, 0,
-                    nullptr, nullptr, nullptr, &dec_w, &dec_h, &src_w, &src_h);
+                    nullptr, nullptr, nullptr, &dec_w, &dec_h, &src_w, &src_h,
+                    nullptr, nullptr, false, nullptr, nullptr, nullptr, image_session_);
                 if (!src_w || !src_h) { src_w = dec_w; src_h = dec_h; }
                 if (r == PreviewDrawResult::Bitmap && src_w && src_h) {
                     if (b.image_aspect <= 0.0f) {
@@ -826,7 +821,7 @@ bool MarkdownView::DrawDocument(ID2D1DeviceContext* dc, IDWriteFactory2* factory
                 brush_->SetColor(subtle);
                 dc->FillRoundedRectangle(D2D1::RoundedRect(box, 6.0f * s, 6.0f * s), brush_.Get());
                 std::wstring label = L"\xD83D\xDDBC  " + b.text;
-                if (b.image_path.empty())
+                if (b.image_metadata_ready && b.image_path.empty())
                     label += pulse::l10n::Pick(L"\x3000\xFF08\x672A\x52A0\x8F7D\x8FDC\x7A0B\x6216\x7F3A\x5931\x7684\x56FE\x7247\xFF09", L"   (remote or missing image not loaded)");
                 WrlPtr<IDWriteTextLayout> tl;
                 factory->CreateTextLayout(label.data(), static_cast<UINT32>(label.size()), body_.Get(),
@@ -940,6 +935,16 @@ bool MarkdownView::DrawDocument(ID2D1DeviceContext* dc, IDWriteFactory2* factory
         dc->FillRoundedRectangle(D2D1::RoundedRect(R(rect.right - 6.0f * s, ty, rect.right - 3.0f * s, ty + thumb),
                                                    1.5f * s, 1.5f * s), brush_.Get());
     }
+    const float margin = (std::max)(28.0f * s, (width - W) * 0.5f);
+    const float horizontal_extent = doc_width_ + 2 * margin;
+    if (horizontal_extent > width + 1.0f) {
+        const float track = (std::max)(1.0f, width - 8.0f * s);
+        const float thumb = (std::min)(track, (std::max)(24.0f * s, track * width / horizontal_extent));
+        const float tx = rect.left + 4.0f * s + (track - thumb) * scroll_x_ / (horizontal_extent - width);
+        brush_->SetColor(WithAlpha(theme.text, 0.25f));
+        dc->FillRoundedRectangle(D2D1::RoundedRect(R(tx, rect.bottom - 6.0f * s,
+            tx + thumb, rect.bottom - 3.0f * s), 1.5f * s, 1.5f * s), brush_.Get());
+    }
     dc->PopAxisAlignedClip();
     return repaint;
 }
@@ -953,7 +958,15 @@ bool MarkdownView::Scroll(float wheel_steps) {
     return scroll_ != before;
 }
 
+bool MarkdownView::ScrollHorizontal(float wheel_steps) {
+    const float before = scroll_x_;
+    scroll_x_ -= wheel_steps * 56.0f * scale_;
+    ClampScroll();
+    return before != scroll_x_;
+}
+
 bool MarkdownView::Key(UINT vk) {
+    if (vk == VK_LEFT || vk == VK_RIGHT) return ScrollHorizontal(vk == VK_LEFT ? 1.0f : -1.0f);
     const float view = view_.bottom - view_.top;
     const float before = scroll_;
     if (!sections_.empty() && !relayout_) {
@@ -1007,7 +1020,7 @@ bool MarkdownView::HitTest(float x, float y, uint32_t& offset) const {
     BOOL trailing = FALSE, inside = FALSE;
     DWRITE_HIT_TEST_METRICS m{};
     if (FAILED(b.layout->HitTestPoint(x - (origin_x_ + b.x), doc_y - b.y, &trailing, &inside, &m))) return true;
-    const uint32_t trailing_length = m.isText ? 1u : m.length;
+    const uint32_t trailing_length = m.length;
     offset += (std::min)(m.textPosition + (trailing ? trailing_length : 0u), static_cast<uint32_t>(b.text.size()));
     return true;
 }
@@ -1053,12 +1066,22 @@ void MarkdownView::Reveal(uint32_t offset) {
     for (size_t i = 0; i < blocks_.size(); ++i) if (blocks_[i].plain_start <= offset) index = i;
     const Block& b = blocks_[index];
     float y = b.y, h = (std::max)(b.h, 20.0f * scale_);
+    float x = b.x, hit_width = 1.0f;
     if (b.layout) {
         FLOAT px = 0, py = 0;
         DWRITE_HIT_TEST_METRICS m{};
         const uint32_t local = (std::min)(offset - b.plain_start, static_cast<uint32_t>(b.text.size()));
-        if (SUCCEEDED(b.layout->HitTestTextPosition(local, FALSE, &px, &py, &m))) { y = b.y + py; h = m.height; }
+        if (SUCCEEDED(b.layout->HitTestTextPosition(local, FALSE, &px, &py, &m))) { y = b.y + py; h = m.height; x += px; hit_width = m.width; }
     }
+    // A table lookup must expose the cell, not merely the first matched glyph.
+    // Oversized cells still use the caret range so their text remains traversable.
+    if (b.table >= 0 && b.w <= view_.right - view_.left - 40.0f * scale_) {
+        x = b.x;
+        hit_width = b.w;
+    }
+    const float left = origin_x_ + x, right = left + hit_width;
+    if (left < view_.left + 20.0f * scale_) scroll_x_ -= view_.left + 20.0f * scale_ - left;
+    else if (right > view_.right - 20.0f * scale_) scroll_x_ += right - view_.right + 20.0f * scale_;
     const float view = view_.bottom - view_.top;
     if (y < scroll_ + 20.0f * scale_) scroll_ = y - 40.0f * scale_;
     else if (y + h > scroll_ + view - 20.0f * scale_) scroll_ = y + h - view + 60.0f * scale_;

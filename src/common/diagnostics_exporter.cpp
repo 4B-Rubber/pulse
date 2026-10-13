@@ -1,4 +1,7 @@
 #include "diagnostics_exporter.h"
+#include "diagnostics_cleanup_io.h"
+#include "diagnostics_report.h"
+#include "runtime_log.h"
 #include "pulse_version.h"
 #include "localization.h"
 
@@ -56,6 +59,7 @@ struct FileRecord {
     uint64_t bytes = 0;
     DWORD error = ERROR_SUCCESS;
     bool missing = false;
+    uint64_t rejected_lines = 0;
 };
 
 struct ExportState {
@@ -78,6 +82,7 @@ bool IsRuntimeArtifact(std::wstring_view name) {
     if (name.ends_with(L".1")) name.remove_suffix(2);
     if (!name.ends_with(L".jsonl")) return false;
     name.remove_suffix(6);
+    if (name.ends_with(L".critical")) name.remove_suffix(9);
     static constexpr std::array<std::wstring_view, 10> prefixes = {
         L"app-", L"index-", L"index-service-", L"index-helper-", L"network-agent-",
         L"content-agent-", L"preview-", L"shell-", L"test-", L"unknown-"
@@ -147,7 +152,7 @@ void RecordError(ExportState& state, std::wstring name, DWORD error, bool option
 }
 
 void CopyArtifact(const std::wstring& source, const std::wstring& destination,
-                  std::wstring name, ExportState& state, bool optional = false) {
+                  std::wstring name, ExportState& state, bool optional = false, bool sanitize = false) {
     FileRecord record{std::move(name)};
     HANDLE input = CreateFileW(source.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
@@ -172,20 +177,31 @@ void CopyArtifact(const std::wstring& source, const std::wstring& destination,
         if (output == INVALID_HANDLE_VALUE) record.error = GetLastError();
     }
     std::array<char, 64 * 1024> buffer{};
+    std::string runtime_text;
+    uint64_t consumed = 0;
     // Snapshot the initial length, so an active writer cannot grow the export forever.
-    while (!record.error && record.bytes < static_cast<uint64_t>(size.QuadPart)) {
+    while (!record.error && consumed < static_cast<uint64_t>(size.QuadPart)) {
         const DWORD wanted = static_cast<DWORD>((std::min)(
-            static_cast<uint64_t>(buffer.size()), static_cast<uint64_t>(size.QuadPart) - record.bytes));
+            static_cast<uint64_t>(buffer.size()), static_cast<uint64_t>(size.QuadPart) - consumed));
         DWORD read = 0;
         if (!ReadFile(input, buffer.data(), wanted, &read, nullptr)) {
             record.error = GetLastError();
             break;
         }
         if (!read) { record.error = ERROR_HANDLE_EOF; break; }
+        consumed += read;
+        if (sanitize) { runtime_text.append(reinterpret_cast<const char*>(buffer.data()), read); continue; }
         DWORD written = 0;
         const BOOL wrote = WriteFile(output, buffer.data(), read, &written, nullptr);
         record.bytes += written;
         if (!wrote || written != read) record.error = wrote ? ERROR_WRITE_FAULT : GetLastError();
+    }
+    if (sanitize && !record.error) {
+        const auto safe = SanitizeRuntime(runtime_text, record.rejected_lines);
+        DWORD written = 0;
+        if (!WriteFile(output, safe.data(), static_cast<DWORD>(safe.size()), &written, nullptr) || written != safe.size())
+            record.error = GetLastError() ? GetLastError() : ERROR_WRITE_FAULT;
+        record.bytes = written;
     }
     if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
     CloseHandle(input);
@@ -229,7 +245,7 @@ void CopyDirectoryArtifacts(const ExportOptions& options, std::wstring_view fold
             break;
         }
         CopyArtifact(JoinPath(source, name), JoinPath(destination, name),
-            std::wstring(folder) + L"/" + std::wstring(name), state);
+            std::wstring(folder) + L"/" + std::wstring(name), state, false, runtime && options.support_report);
     } while (FindNextFileW(find, &data));
     const DWORD enumeration_error = GetLastError();
     FindClose(find);
@@ -278,6 +294,7 @@ bool WriteManifest(const ExportOptions& options, const ExportState& state) {
         text += "\n    {\"name\":" + JsonString(record.name) +
             ",\"bytes\":" + std::to_string(record.bytes) +
             ",\"error_code\":" + std::to_string(record.error) +
+            ",\"rejected_lines\":" + std::to_string(record.rejected_lines) +
             ",\"status\":\"" + (record.missing ? "missing" : record.error ? "error" : "copied") + "\"}";
     }
     text += "\n  ]\n}\n";
@@ -291,6 +308,8 @@ bool WriteManifest(const ExportOptions& options, const ExportState& state) {
 
 bool Export(const ExportOptions& options, std::wstring* error) {
     if (error) error->clear();
+    const bool flushed = options.support_report && runtime::Flush(2000);
+    const auto logger_health = runtime::GetHealth();
     DirectoryLocks locks;
     if (locks.Lock(options.source_root) || locks.Lock(options.destination)) {
         SetError(error, l10n::Pick(L"诊断源目录或目标目录不可用，或包含重解析点。",
@@ -305,16 +324,18 @@ bool Export(const ExportOptions& options, std::wstring* error) {
     static constexpr std::array<std::wstring_view, 5> logs = {
         L"pulse_crash.log", L"pulse_shell_host.log", L"material.log", L"index-service.log", L"pulse_graphics.log"
     };
-    for (const auto name : logs) {
+    if (!options.support_report) for (const auto name : logs) {
         CopyArtifact(JoinPath(options.source_root, name), JoinPath(options.destination, name),
             std::wstring(name), state, true);
     }
     CopyDirectoryArtifacts(options, L"Runtime", true, state, locks);
-    CopyDirectoryArtifacts(options, L"Crashes", false, state, locks);
+    if (!options.support_report || options.include_dumps)
+        CopyDirectoryArtifacts(options, L"Crashes", false, state, locks);
     if (!WriteManifest(options, state)) {
         SetError(error, l10n::Pick(L"无法写入诊断清单。", L"Could not write the diagnostics manifest."));
         return false;
     }
+    if (options.support_report && !WriteSupportReport(options, state.ok, flushed, logger_health, error)) return false;
     if (!state.ok) {
         SetError(error, l10n::Pick(L"部分诊断文件未能导出；详情见目标目录中的 diagnostics-manifest.json。",
             L"Some diagnostics files could not be exported; see diagnostics-manifest.json in the destination."));
@@ -322,21 +343,46 @@ bool Export(const ExportOptions& options, std::wstring* error) {
     return state.ok;
 }
 bool ClearCrashReports(const std::wstring& source_root, std::wstring* error) {
+    return ClearCrashReportsWithIo(source_root, error, CleanupIo{});
+}
+bool ClearCrashReportsWithIo(const std::wstring& source_root, std::wstring* error, const CleanupIo& io) {
+    if (error) error->clear();
+    const auto fail = [error](DWORD code) {
+        SetError(error, l10n::Pick(L"部分诊断文件无法删除。", L"Some diagnostics files could not be deleted."));
+        if (error) *error += L" (" + std::to_wstring(code) + L")";
+        return false;
+    };
     const std::wstring source = JoinPath(source_root, L"Diagnostics\\Crashes");
-    if (!IsPlainDirectory(source)) return true;
+    const DWORD attributes = io.attributes(source.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const DWORD code = GetLastError();
+        return IsMissing(code) ? true : fail(code);
+    }
+    if (!(attributes & FILE_ATTRIBUTE_DIRECTORY) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        return fail(ERROR_ACCESS_DENIED);
+    DirectoryLocks locks;
+    const DWORD lock_error = locks.Lock(source);
+    if (lock_error != ERROR_SUCCESS) return IsMissing(lock_error) ? true : fail(lock_error);
     WIN32_FIND_DATAW data{};
-    HANDLE find = FindFirstFileW(JoinPath(source, L"*").c_str(), &data);
-    if (find == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
-    bool ok = true;
+    HANDLE find = io.first(JoinPath(source, L"*").c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        return code == ERROR_FILE_NOT_FOUND || code == ERROR_NO_MORE_FILES ? true : fail(code);
+    }
+    DWORD failure = ERROR_SUCCESS;
     do {
         if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         const std::wstring_view name(data.cFileName);
         if (!IsCrashArtifact(name, true)) continue;
-        if (!DeleteFileW(JoinPath(source, name).c_str())) ok = false;
-    } while (FindNextFileW(find, &data));
+        if (!DeleteFileW(JoinPath(source, name).c_str())) {
+            const DWORD code = GetLastError();
+            if (!IsMissing(code) && failure == ERROR_SUCCESS) failure = code;
+        }
+    } while (io.next(find, &data));
+    const DWORD enumeration_error = GetLastError();
     FindClose(find);
-    if (!ok) SetError(error, l10n::Pick(L"部分诊断文件无法删除。", L"Some diagnostics files could not be deleted."));
-    return ok;
+    if (enumeration_error != ERROR_NO_MORE_FILES) failure = enumeration_error;
+    return failure == ERROR_SUCCESS ? true : fail(failure);
 }
 
 } // namespace pulse::diagnostics

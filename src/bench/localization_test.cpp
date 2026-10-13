@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <atomic>
 #include <thread>
+#include <utility>
+#include <string_view>
 
 namespace {
 
@@ -11,12 +13,41 @@ bool Report(const char* name, bool passed) {
     return passed;
 }
 
+bool CheckSystemLanguage() {
+    using namespace pulse::l10n;
+    struct Case { LANGID id; Language expected; const char* name; };
+    const Case cases[] = {
+        {0x0404, Language::ZhTW, "Taiwan maps to Traditional Chinese"},
+        {0x0c04, Language::ZhTW, "Hong Kong maps to Traditional Chinese"},
+        {0x1404, Language::ZhTW, "Macau maps to Traditional Chinese"},
+        {0x7c04, Language::ZhTW, "Hant maps to Traditional Chinese"},
+        {0x0804, Language::ZhCN, "PRC maps to Simplified Chinese"},
+        {0x1004, Language::ZhCN, "Singapore maps to Simplified Chinese"},
+        {0x0004, Language::ZhCN, "neutral Chinese maps to Simplified Chinese"},
+        {0x0409, Language::EnUS, "US English maps to English"},
+        {0x0809, Language::EnUS, "UK English maps to shipped English"},
+        {0x0411, Language::EnUS, "unshipped locale falls back to English"},
+    };
+    bool passed = true;
+    for (const auto& test : cases)
+        passed &= Report(test.name, LanguageFromLangId(test.id) == test.expected);
+    SetLanguage(L"system");
+    passed &= Report("system preference follows actual Windows UI language",
+        effective_language() == LanguageFromLangId(GetUserDefaultUILanguage()));
+    return passed;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace pulse::l10n;
     bool passed = true;
     Initialize(GetModuleHandleW(nullptr), L"zh-CN");
+    if (argc > 1) {
+        if (argc == 2 && std::string_view(argv[1]) == "--system-language")
+            return CheckSystemLanguage() ? 0 : 1;
+        return 2;
+    }
     const auto& held_chinese = Get(StringId::TabRename);
     SetLanguage(L"en-US");
     passed &= Report("language switch preserves strings held by worker tasks",
@@ -31,6 +62,30 @@ int main() {
     for (int i = 0; i < 100; ++i) SetLanguage(i % 2 ? L"en-US" : L"zh-CN");
     reader.join();
     passed &= Report("worker localization remains valid during language switches", worker_ok.load());
+    // The cache only covers ids up to kLastString; the newest ids must still load.
+    bool latest_ids = true;
+    for (const auto language : {L"zh-CN", L"zh-TW", L"en-US"}) {
+        SetLanguage(language);
+        for (UINT id = IDS_SETTINGS_CLOSE_TAB_DOUBLE_CLICK_DESC; id <= IDS_HELP_WINDOW_OVERVIEW; ++id)
+            latest_ids &= !Get(static_cast<StringId>(id)).empty();
+    }
+    SetLanguage(L"zh-CN");
+    latest_ids &= Get(StringId::HelpGroupWindows) == L"\u7A97\u53E3";  // 窗口
+    SetLanguage(L"en-US");
+    latest_ids &= Get(StringId::HelpWindowOverview) == L"Window overview";
+    passed &= Report("newest strings (Recycle Bin, BitLocker, closed window, drop hints, snackbar, window shortcuts) load in every language",
+                     latest_ids);
+    // Drop hints are filled in by hand (M7h): every language keeps its slots.
+    bool drop_slots = true;
+    for (const auto language : {L"zh-CN", L"zh-TW", L"en-US"}) {
+        SetLanguage(language);
+        const auto has = [](StringId id, std::wstring_view slot) { return Get(id).find(slot) != std::wstring::npos; };
+        drop_slots &= has(StringId::DropHintStrip, L"%1") && has(StringId::DropHintStrip, L"%2") &&
+                      has(StringId::DropHintSplit, L"%1") && has(StringId::DropHintSplit, L"%2") &&
+                      has(StringId::DropHintTab, L"%1") && has(StringId::DropHintRest, L"%1") &&
+                      has(StringId::DropPaneCount, L"%d") && has(StringId::WindowsMergedTitle, L"%d");
+    }
+    passed &= Report("drop hints keep their %1/%2 slots in every language", drop_slots);
     for (const auto language : {L"zh-CN", L"en-US"}) {
         SetLanguage(language);
         bool complete = true;
@@ -108,11 +163,17 @@ int main() {
             SetLanguage(language);
             for (const auto id : {StringId::LanguageZhTW, StringId::SettingsAutoUpdate,
                                   StringId::SettingsAutoUpdateDesc, StringId::UpdateDescManual,
-                                  StringId::SettingsUiFontSize, StringId::UiFontLarger})
+                                  StringId::SettingsUiFontSize, StringId::UiFontLarger,
+                                  StringId::ListThumbnailBadges, StringId::ListThumbnailBadgesDesc,
+                                  StringId::ContextOrderHintRow, StringId::SystemGroupNodeModules,
+                                  StringId::HelpViewMode, StringId::HelpContextMenu})
                 newest &= !Get(id).empty();
         }
         SetLanguage(L"zh-TW");
         newest &= Get(StringId::SettingsAutoUpdate) == L"\u81EA\u52D5\u6AA2\u67E5\u66F4\u65B0";  // 自動檢查更新
+        SetLanguage(L"en-US");
+        newest &= Get(StringId::SystemGroupNodeModules) == L"Development dependencies";
+        newest &= Get(StringId::HelpContextMenu) == L"Open the context menu";
         passed &= Report("newest string ids load in every language", newest);
     }
     SetLanguage(L"zh-CN");
@@ -223,10 +284,7 @@ int main() {
     passed &= Report("zh-CN service text is unchanged",
         ServiceText(L"已索引 1,234 项 · 实时更新") == L"已索引 1,234 项 · 实时更新");
 
-    SetLanguage(L"system");
-    passed &= Report("system language resolves to a shipped locale",
-                     effective_language() == Language::ZhCN ||
-                     effective_language() == Language::EnUS);
+    passed &= CheckSystemLanguage();
     std::printf("\n== localization tests: %s ==\n", passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }

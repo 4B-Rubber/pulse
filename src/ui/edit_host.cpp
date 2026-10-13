@@ -1,23 +1,76 @@
 #include "edit_host.h"
+#include "typography.h"
 #include <commctrl.h>
+#include <algorithm>
 namespace pulse::ui {
 constexpr UINT_PTR kEditCaretTimer = 71;
 namespace {
 constexpr wchar_t kNativeEdit[] = L"Pulse.NativeEditFallback";
+constexpr wchar_t kPolicyNative[] = L"Pulse.NativeEditPolicy";
+constexpr wchar_t kRestoreUploaded[] = L"Pulse.EditRestoreUploaded";
+constexpr wchar_t kMigrating[] = L"Pulse.EditMigrating";
+void RestoreNativeCaret(HWND hwnd) {
+    if (GetFocus() != hwnd) return;
+    GUITHREADINFO info{sizeof(info)};
+    if (GetGUIThreadInfo(GetCurrentThreadId(), &info) && info.hwndCaret == hwnd) {
+        // Custom mouse/paint paths can hide the system caret more than once.
+        // Recreate it at the EDIT's current position to reset that hide count.
+        const int width = (std::max)(1L, info.rcCaret.right - info.rcCaret.left);
+        const int height = (std::max)(1L, info.rcCaret.bottom - info.rcCaret.top);
+        if (CreateCaret(hwnd, nullptr, width, height)) SetCaretPos(info.rcCaret.left, info.rcCaret.top);
+    }
+    ShowCaret(hwnd);
+}
 bool CustomEdit(Compositor& compositor, HWND hwnd) {
-    return compositor.LumaTextEnabled() && !GetPropW(hwnd, kNativeEdit);
+    const bool custom = compositor.CustomEditEnabled() && !GetPropW(hwnd, kNativeEdit);
+    if (GetPropW(hwnd, kMigrating)) return custom;
+    const bool policy_native = GetPropW(hwnd, kPolicyNative) != nullptr;
+    if (!custom && !policy_native) {
+        SetPropW(hwnd, kMigrating, reinterpret_cast<HANDLE>(1));
+        DWORD flags = 0;
+        if (!GetLayeredWindowAttributes(hwnd, nullptr, nullptr, &flags) || !(flags & LWA_ALPHA))
+            SetPropW(hwnd, kRestoreUploaded, reinterpret_cast<HANDLE>(1));
+        SetPropW(hwnd, kPolicyNative, reinterpret_cast<HANDLE>(1));
+        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        KillTimer(hwnd, kEditCaretTimer);
+        RestoreNativeCaret(hwnd);
+        InvalidateRect(hwnd, nullptr, TRUE);
+        RemovePropW(hwnd, kMigrating);
+    } else if (custom && policy_native) {
+        SetPropW(hwnd, kMigrating, reinterpret_cast<HANDLE>(1));
+        if (RemovePropW(hwnd, kRestoreUploaded)) {
+            const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & ~WS_EX_LAYERED);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED);
+        }
+        RemovePropW(hwnd, kPolicyNative);
+        if (GetFocus() == hwnd) {
+            HideCaret(hwnd);
+            SetTimer(hwnd, kEditCaretTimer, GetCaretBlinkTime(), nullptr);
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        RemovePropW(hwnd, kMigrating);
+    }
+    return custom;
 }
 bool PresentEdit(Compositor& compositor, HWND hwnd, IDWriteTextFormat* format,
     D2D1_COLOR_F foreground, D2D1_COLOR_F background) {
-    if (compositor.PresentLumaEdit(hwnd, format, foreground, background)) return true;
+    bool force_failure = false;
+#ifdef PULSE_WITH_SELFTEST
+    force_failure = GetPropW(hwnd, L"Pulse.Test.LumaPresentFailure") != nullptr;
+#endif
+    if (!force_failure && compositor.PresentLumaEdit(hwnd, format, foreground, background)) return true;
     // Keep native EDIT input, selection and IME together if presentation fails.
     SetPropW(hwnd, kNativeEdit, reinterpret_cast<HANDLE>(1));
     SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
     KillTimer(hwnd, kEditCaretTimer);
-    if (GetFocus() == hwnd) ShowCaret(hwnd);
+    RestoreNativeCaret(hwnd);
     InvalidateRect(hwnd, nullptr, TRUE);
     return false;
 }
+}
+bool SynchronizeChildEditBackend(Compositor& compositor, HWND hwnd) {
+    return hwnd && CustomEdit(compositor, hwnd);
 }
 bool PresentChildEdit(Compositor& compositor, IDWriteTextFormat* format,
     D2D1_COLOR_F foreground, D2D1_COLOR_F background, HWND hwnd) {
@@ -29,7 +82,20 @@ bool HandleChildEditMessage(Compositor& compositor, IDWriteTextFormat* format,
     D2D1_COLOR_F foreground, D2D1_COLOR_F background, HBRUSH background_brush,
     HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT& result) {
     (void)background_brush;
-    if (msg == WM_NCDESTROY) RemovePropW(hwnd, kNativeEdit);
+    if (msg == WM_NCDESTROY) {
+        compositor.SynchronizeEditSelection(hwnd, msg, wParam, lParam);
+        RemovePropW(hwnd, kNativeEdit);
+        RemovePropW(hwnd, kPolicyNative);
+        RemovePropW(hwnd, kRestoreUploaded);
+        RemovePropW(hwnd, kMigrating);
+        return false;
+    }
+    if (msg == typography::TextBackendChangedMessage()) {
+        if (CustomEdit(compositor, hwnd) && IsWindowVisible(hwnd))
+            PresentEdit(compositor, hwnd, format, foreground, background);
+        result = 0;
+        return true;
+    }
     if (CustomEdit(compositor, hwnd) &&
         (msg == WM_PRINT || msg == WM_PRINTCLIENT || msg == WM_NCPAINT)) {
         result = 0;
@@ -74,6 +140,7 @@ bool HandleChildEditMessage(Compositor& compositor, IDWriteTextFormat* format,
         return true;
     }
     case WM_KILLFOCUS:
+        compositor.SynchronizeEditSelection(hwnd, msg, wParam, lParam);
         KillTimer(hwnd, kEditCaretTimer);
         return false;
     case WM_TIMER:
@@ -102,6 +169,7 @@ LRESULT DefPresentedChildEditProc(Compositor& compositor, IDWriteTextFormat* for
     const bool custom_paint = changes_visual && CustomEdit(compositor, hwnd) && IsWindowVisible(hwnd);
     if (custom_paint) SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
     const LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
+    if (changes_visual) compositor.SynchronizeEditSelection(hwnd, msg, wParam, lParam);
     if (custom_paint) {
         SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
         HideCaret(hwnd);

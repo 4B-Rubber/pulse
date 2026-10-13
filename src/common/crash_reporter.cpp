@@ -12,6 +12,7 @@
 #include <exception>
 #include <intrin.h>
 #include <map>
+#include <memory>
 #include <string_view>
 #include <vector>
 
@@ -31,9 +32,19 @@ struct Breadcrumb {
     int32_t result = 0;
 };
 
+struct ScopedHandle {
+    HANDLE value;
+    ~ScopedHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+};
+
+struct ScopedFind {
+    HANDLE value;
+    ~ScopedFind() { FindClose(value); }
+};
+
 struct DiagnosticEvent {
     std::wstring stem;
-    std::vector<std::wstring> paths;
+    std::vector<std::pair<std::wstring, uint64_t>> paths;
     uint64_t bytes = 0;
     uint64_t modified = 0;
 };
@@ -51,6 +62,22 @@ DWORD g_os_build = 0;
 bool g_initialized = false;
 bool g_safe_mode = false;
 LPTOP_LEVEL_EXCEPTION_FILTER g_previous_filter = nullptr;
+struct Maintenance {
+    std::wstring root;
+    HANDLE wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE thread = nullptr;
+    ~Maintenance() { if (wake) CloseHandle(wake); if (stop) CloseHandle(stop); if (thread) CloseHandle(thread); }
+};
+SRWLOCK g_maintenance_lock = SRWLOCK_INIT;
+std::shared_ptr<Maintenance> g_maintenance;
+// Keep the exception path allocation-free and nonblocking for maintenance.
+void RequestMaintenance() noexcept {
+    if (!TryAcquireSRWLockShared(&g_maintenance_lock)) return;
+    if (g_maintenance) SetEvent(g_maintenance->wake);
+    ReleaseSRWLockShared(&g_maintenance_lock);
+}
+
 
 uint64_t FileTimeValue(const FILETIME& value) noexcept {
     ULARGE_INTEGER result{};
@@ -122,26 +149,31 @@ std::wstring EventStemFromFile(std::wstring name) {
     return name;
 }
 
-void RotateDiagnostics() {
-    if (g_diagnostics_root.empty()) return;
+void RotateDiagnostics(const std::wstring& root, HANDLE stop = nullptr) {
+    if (root.empty()) return;
+    ScopedHandle retention_lock{CreateFileW(JoinPath(root, L"retention.lock").c_str(),
+        GENERIC_WRITE | DELETE, 0, nullptr, OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr)};
+    if (retention_lock.value == INVALID_HANDLE_VALUE) return;
     std::map<std::wstring, DiagnosticEvent> grouped;
     WIN32_FIND_DATAW data{};
-    HANDLE find = FindFirstFileW(JoinPath(g_diagnostics_root, L"*").c_str(), &data);
+    HANDLE find = FindFirstFileW(JoinPath(root, L"*").c_str(), &data);
     if (find == INVALID_HANDLE_VALUE) return;
+    ScopedFind find_guard{find};
     do {
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return;
+        if (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
         const std::wstring name = data.cFileName;
         if (!name.ends_with(L".json") && !name.ends_with(L".dmp") &&
             !name.ends_with(L".log")) continue;
         const std::wstring stem = EventStemFromFile(name);
         auto& event = grouped[stem];
         event.stem = stem;
-        event.paths.push_back(JoinPath(g_diagnostics_root, name));
         ULARGE_INTEGER size{data.nFileSizeLow, data.nFileSizeHigh};
         event.bytes += size.QuadPart;
         event.modified = (std::max)(event.modified, FileTimeValue(data.ftLastWriteTime));
     } while (FindNextFileW(find, &data));
-    FindClose(find);
+    if (GetLastError() != ERROR_NO_MORE_FILES) return;
 
     std::vector<DiagnosticEvent> events;
     events.reserve(grouped.size());
@@ -155,11 +187,69 @@ void RotateDiagnostics() {
     });
     size_t remaining = events.size();
     for (const auto& event : events) {
+        if (stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return;
+        // Keep the newest report even when it alone exceeds the byte budget.
+        if (&event == &events.back()) break;
         if (remaining <= kMaxEvents && total <= kMaxDiagnosticBytes) break;
-        for (const auto& path : event.paths) DeleteFileW(path.c_str());
-        total = total > event.bytes ? total - event.bytes : 0;
-        --remaining;
+        const std::wstring lock_path = JoinPath(root, event.stem + L".writing");
+        HANDLE lock = CreateFileW(lock_path.c_str(), GENERIC_WRITE | DELETE, 0, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (lock == INVALID_HANDLE_VALUE) continue;
+        ScopedHandle event_guard{lock};
+        // Refresh the group after taking its lease: enumeration may have overlapped
+        // a writer that closed its dump before creating the metadata.
+        std::vector<std::wstring> paths;
+        WIN32_FIND_DATAW current{};
+        HANDLE scan = FindFirstFileW(JoinPath(root, event.stem + L".*").c_str(), &current);
+        if (scan == INVALID_HANDLE_VALUE) continue;
+        ScopedFind scan_guard{scan};
+        do {
+        if (stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return;
+            const std::wstring_view name(current.cFileName);
+            if (!(current.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+                (name.ends_with(L".json") || name.ends_with(L".dmp") || name.ends_with(L".log")))
+                paths.push_back(JoinPath(root, name));
+        } while (FindNextFileW(scan, &current));
+        const DWORD scan_error = GetLastError();
+        if (scan_error != ERROR_NO_MORE_FILES) continue;
+        bool removed = true;
+        for (const auto& path : paths) {
+            WIN32_FILE_ATTRIBUTE_DATA attributes{};
+            const bool measured = GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes) != FALSE;
+            if (DeleteFileW(path.c_str())) {
+                if (measured) {
+                    const uint64_t bytes = (static_cast<uint64_t>(attributes.nFileSizeHigh) << 32) |
+                        attributes.nFileSizeLow;
+                    total -= (std::min)(total, bytes);
+                }
+            } else if (GetLastError() != ERROR_FILE_NOT_FOUND) removed = false;
+        }
+        if (removed) --remaining;
     }
+}
+
+DWORD WINAPI MaintenanceMain(void* argument) {
+    std::unique_ptr<std::shared_ptr<Maintenance>> holder(static_cast<std::shared_ptr<Maintenance>*>(argument));
+    auto state = *holder; holder.reset();
+    const HANDLE events[]{state->stop, state->wake};
+    for (;;) {
+        const DWORD wait = WaitForMultipleObjects(2, events, FALSE, 1000);
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
+        // Retry sharing violations even when no new report requests a sweep.
+        try { RotateDiagnostics(state->root, state->stop); } catch (...) {}
+    }
+    return 0;
+}
+void StartMaintenance() noexcept {
+    try {
+        auto state = std::make_shared<Maintenance>(); state->root = g_diagnostics_root;
+        if (!state->wake || !state->stop) return;
+        auto* argument = new std::shared_ptr<Maintenance>(state);
+        state->thread = CreateThread(nullptr, 0, MaintenanceMain, argument, 0, nullptr);
+        if (!state->thread) { delete argument; return; }
+        AcquireSRWLockExclusive(&g_maintenance_lock); g_maintenance = std::move(state);
+        ReleaseSRWLockExclusive(&g_maintenance_lock);
+    } catch (...) {}
 }
 
 bool DetectCrashLoop() {
@@ -293,10 +383,20 @@ LONG WriteReport(EXCEPTION_POINTERS* exception, const char* context,
     void* address = exception && exception->ExceptionRecord
         ? exception->ExceptionRecord->ExceptionAddress : nullptr;
     const std::wstring stem = EventStem();
+    HANDLE lease = CreateFileW(JoinPath(g_diagnostics_root, stem + L".writing").c_str(), GENERIC_WRITE, 0,
+        nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (lease == INVALID_HANDLE_VALUE) {
+        if (recoverable) g_report_active.store(0, std::memory_order_release);
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
     const bool dump_written = WriteDump(stem, exception);
     WriteJson(stem, exception, context, recoverable, dump_written);
     if (!dump_written) WriteFallback(stem, code, address, context);
-    if (recoverable) g_report_active.store(0, std::memory_order_release);
+    if (lease != INVALID_HANDLE_VALUE) CloseHandle(lease);
+    if (recoverable) {
+        g_report_active.store(0, std::memory_order_release);
+        RequestMaintenance();
+    }
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -329,7 +429,8 @@ bool Initialize(const Config& config) noexcept {
     (void)diagnostics::runtime::Initialize(root, component.c_str());
     g_started_tick = GetTickCount64();
     QueryOsVersion();
-    RotateDiagnostics();
+    RotateDiagnostics(g_diagnostics_root);
+    StartMaintenance();
     g_safe_mode = DetectCrashLoop();
     g_previous_filter = SetUnhandledExceptionFilter(TopLevelFilter);
     std::set_terminate([] { ReportTerminate(); });
@@ -338,6 +439,10 @@ bool Initialize(const Config& config) noexcept {
 }
 
 void Shutdown() noexcept {
+    AcquireSRWLockExclusive(&g_maintenance_lock);
+    if (g_maintenance) SetEvent(g_maintenance->stop);
+    g_maintenance.reset(); // Worker owns its state; never join filesystem I/O here.
+    ReleaseSRWLockExclusive(&g_maintenance_lock);
     diagnostics::runtime::Shutdown();
     if (!g_initialized) return;
     SetUnhandledExceptionFilter(g_previous_filter);

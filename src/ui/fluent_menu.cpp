@@ -8,15 +8,19 @@
 
 #include <windowsx.h>
 #include <commctrl.h>
+#include <imm.h>
 #include <uxtheme.h>
 #include <wincodec.h>
 #include <d2d1effects.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cwctype>
+#include <string_view>
 
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "imm32.lib")
 
 namespace pulse::ui {
 
@@ -95,12 +99,19 @@ bool DisplayEqualItem(const FluentMenuItem& a, const FluentMenuItem& b) {
 void PatchItemCommands(FluentMenuItem& dest, const FluentMenuItem& src) {
     dest.command = src.command;
     dest.trailing_command = src.trailing_command;
+    dest.mnemonic = src.mnemonic;
     const size_t n = (std::min)(dest.children.size(), src.children.size());
     for (size_t i = 0; i < n; ++i)
         PatchItemCommands(dest.children[i], src.children[i]);
     const size_t ns = (std::min)(dest.quick_swatches.size(), src.quick_swatches.size());
-    for (size_t i = 0; i < ns; ++i)
+    for (size_t i = 0; i < ns; ++i) {
         dest.quick_swatches[i].command = src.quick_swatches[i].command;
+        dest.quick_swatches[i].mnemonic = src.quick_swatches[i].mnemonic;
+    }
+}
+
+wchar_t UpperKey(wchar_t key) {
+    return key ? static_cast<wchar_t>(std::towupper(key)) : 0;
 }
 
 } // namespace
@@ -211,6 +222,51 @@ int FluentMenuModel::HitTestRow(float y_px) const {
     return -1;
 }
 
+wchar_t MenuItemMnemonic(const FluentMenuItem& item) {
+    if (item.mnemonic) return UpperKey(item.mnemonic);
+    // "编辑(E)" / "打开方式(H)...": shell32's CJK "(&X)" after CleanMenuText.
+    std::wstring_view text = item.text;
+    while (!text.empty() && (text.back() == L'.' || text.back() == L'\x2026' || text.back() == L' '))
+        text.remove_suffix(1);
+    if (text.size() < 3) return 0;
+    const wchar_t open = text[text.size() - 3];
+    const wchar_t key = text[text.size() - 2];
+    const wchar_t close = text.back();
+    if (!((open == L'(' && close == L')') || (open == L'\xFF08' && close == L'\xFF09'))) return 0;
+    const bool ascii_key = (key >= L'A' && key <= L'Z') || (key >= L'a' && key <= L'z') ||
+                           (key >= L'0' && key <= L'9');
+    return ascii_key ? UpperKey(key) : 0;
+}
+
+std::vector<MenuMnemonicTarget> FindMenuMnemonic(const std::vector<FluentMenuItem>& items,
+                                                 wchar_t key_a, wchar_t key_b) {
+    const wchar_t a = UpperKey(key_a);
+    const wchar_t b = UpperKey(key_b);
+    auto matches = [&](wchar_t key) { return key != 0 && (key == a || key == b); };
+    std::vector<MenuMnemonicTarget> out;
+    for (size_t i = 0; i < items.size(); ++i) {
+        const FluentMenuItem& item = items[i];
+        if (!item.enabled) continue;
+        if ((item.command != 0 || !item.children.empty()) && matches(MenuItemMnemonic(item)))
+            out.push_back({ static_cast<int>(i), -1 });
+        for (size_t s = 0; s < item.quick_swatches.size(); ++s) {
+            const FluentMenuSwatch& swatch = item.quick_swatches[s];
+            if (swatch.command != 0 && matches(UpperKey(swatch.mnemonic)))
+                out.push_back({ static_cast<int>(i), static_cast<int>(s) });
+        }
+    }
+    return out;
+}
+
+size_t NextMenuMnemonicTarget(const std::vector<MenuMnemonicTarget>& targets, int row,
+                              int swatch) {
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i].row > row || (targets[i].row == row && targets[i].swatch > swatch))
+            return i;
+    }
+    return 0;
+}
+
 int FluentMenuModel::NextEnabled(int from, int dir) const {
     if (items_.empty()) return -1;
     int n = (int)items_.size();
@@ -264,6 +320,34 @@ void FluentMenu::SetRowHeightDip(float dip) {
     model_.SetRowHeightDip(dip);
     sub_model_.SetRowHeightDip(dip);
 }
+
+namespace {
+
+// Native menus take letters as access keys even while a Chinese or Japanese
+// IME is on: the IME never sees them, so no candidate window pops up behind
+// the menu. A command menu has nothing to type into, so for its lifetime the
+// input context is detached from the window keeping keyboard focus and from
+// the menu itself (a click focuses it), then handed back unchanged.
+class ImeSuspension {
+public:
+    ImeSuspension(HWND focus, HWND menu) : focus_(focus), menu_(menu) {
+        if (focus_ && focus_ != menu_) saved_ = ImmAssociateContext(focus_, nullptr);
+        if (menu_) ImmAssociateContextEx(menu_, nullptr, 0);
+    }
+    ~ImeSuspension() {
+        if (menu_ && IsWindow(menu_)) ImmAssociateContextEx(menu_, nullptr, IACE_DEFAULT);
+        if (focus_ && focus_ != menu_ && IsWindow(focus_)) ImmAssociateContext(focus_, saved_);
+    }
+    ImeSuspension(const ImeSuspension&) = delete;
+    ImeSuspension& operator=(const ImeSuspension&) = delete;
+
+private:
+    HWND focus_ = nullptr;
+    HWND menu_ = nullptr;
+    HIMC saved_ = nullptr;
+};
+
+} // namespace
 
 bool FluentMenu::EnsureWindow() {
     if (hwnd_) return true;
@@ -1140,6 +1224,62 @@ int FluentMenu::InvokeAt(const FluentMenuModel& model, int row, float client_x) 
     return item->command;
 }
 
+bool FluentMenu::HandleMnemonicKey(const MSG& msg) {
+    if (filter_fn_ || animating_out_ || !open_) return false;
+    if (msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN) return false;
+    if (GetKeyState(VK_CONTROL) & 0x8000) return false; // Ctrl+C etc. stay app shortcuts
+    UINT vk = static_cast<UINT>(msg.wParam);
+    // An active IME (Chinese/Japanese input in the window behind) reports
+    // VK_PROCESSKEY; menus take the physical key, as native menus do.
+    if (vk == VK_PROCESSKEY) vk = ImmGetVirtualKey(msg.hwnd);
+    wchar_t latin = 0;
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
+        latin = static_cast<wchar_t>(vk);
+    else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+        latin = static_cast<wchar_t>(L'0' + (vk - VK_NUMPAD0));
+    // The keyboard layout's own character covers non-Latin access keys.
+    const UINT mapped = MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR);
+    wchar_t layout = (mapped & 0x80000000u) ? 0 : static_cast<wchar_t>(mapped & 0xFFFF);
+    if (layout <= L' ') layout = 0;
+    if (!latin && !layout) return false; // navigation / function keys
+
+    // Keys go to the flyout only once it has a highlighted row, like native
+    // menus: a flyout merely opened by hovering leaves the parent current.
+    const bool in_sub = sub_parent_row_ >= 0 && sub_hover_ >= 0;
+    const FluentMenuModel& model = in_sub ? sub_model_ : model_;
+    const auto targets = FindMenuMnemonic(model.Items(), latin, layout);
+    if (targets.empty()) return true;
+    if (targets.size() == 1) {
+        const MenuMnemonicTarget target = targets.front();
+        const FluentMenuItem* item = model.At(target.row);
+        if (!item) return true;
+        if (target.swatch >= 0) {
+            result_ = item->quick_swatches[static_cast<size_t>(target.swatch)].command;
+            Dismiss();
+        } else if (!in_sub && !item->children.empty()) {
+            UpdateHover(target.row);
+            OpenSubmenu(target.row);
+            sub_hover_ = sub_model_.FirstEnabled();
+            if (RenderSub()) PresentSub(255);
+        } else if (item->command != 0) {
+            result_ = item->command;
+            Dismiss();
+        }
+        return true;
+    }
+    const size_t next = NextMenuMnemonicTarget(targets, in_sub ? sub_hover_ : hover_row_,
+                                               in_sub ? sub_hover_swatch_ : hover_swatch_);
+    if (in_sub) {
+        sub_hover_ = targets[next].row;
+        sub_hover_swatch_ = targets[next].swatch;
+        if (RenderSub()) PresentSub(255);
+    } else {
+        CloseSubmenu();
+        UpdateHover(targets[next].row, targets[next].swatch);
+    }
+    return true;
+}
+
 float FluentMenu::FilterHeaderPx() const {
     if (!filter_fn_ || external_edit_) return 0.0f;
     if (anchor_to_rect_) {
@@ -1155,15 +1295,15 @@ bool FluentMenu::IsPaletteHwnd(HWND hwnd) const {
 
 bool FluentMenu::EnsureFilterEdit() {
     if (!filter_fn_ || !hwnd_ || external_edit_) return false;
-    if (!edit_font_) {
-        const int height = -std::max(14, static_cast<int>(std::lround(14.0f * scale_)));
-        edit_font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE, typography::PreferredTextFamily());
-        if (!edit_font_) {
-            edit_font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    // The menu outlives settings changes: follow the interface font size.
+    if (!edit_font_ || edit_font_generation_ != typography::Generation() ||
+        std::abs(edit_font_scale_ - scale_) > 0.001f) {
+        if (HFONT font = typography::CreateEditFont(scale_)) {
+            if (edit_font_) DeleteObject(edit_font_);
+            edit_font_ = font;
+            edit_font_generation_ = typography::Generation();
+            edit_font_scale_ = scale_;
+            if (edit_) SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(edit_font_), FALSE);
         }
     }
     if (edit_brush_) { DeleteObject(edit_brush_); edit_brush_ = nullptr; }
@@ -1173,8 +1313,6 @@ bool FluentMenu::EnsureFilterEdit() {
     edit_ = CreateChildEdit(hwnd_);
     if (!edit_) return false;
     SetWindowTheme(edit_, L"", L"");
-    if (!compositor_ || !compositor_->LumaTextEnabled())
-        SetLayeredWindowAttributes(edit_, 0, 255, LWA_ALPHA);
     SendMessageW(edit_, WM_SETFONT, (WPARAM)edit_font_, TRUE);
     SendMessageW(edit_, EM_SETCUEBANNER, TRUE,
         reinterpret_cast<LPARAM>(l10n::Get(l10n::StringId::TabMenuSearch).c_str()));
@@ -1207,17 +1345,7 @@ void FluentMenu::PlaceFilterEdit(int y_offset_px) {
         w = std::max(40, static_cast<int>(std::lround(text_r - text_l)));
         cell_h = std::max(18, static_cast<int>(std::lround(field_b - field_t)));
     }
-    int line_h = cell_h;
-    if (edit_font_) {
-        HDC hdc = GetDC(edit_);
-        HFONT old = static_cast<HFONT>(SelectObject(hdc, edit_font_));
-        TEXTMETRICW tm{};
-        GetTextMetricsW(hdc, &tm);
-        SelectObject(hdc, old);
-        ReleaseDC(edit_, hdc);
-        line_h = std::max(1, static_cast<int>(tm.tmHeight));
-    }
-    line_h = std::min(line_h, cell_h);
+    const int line_h = EditLineHeight(edit_, edit_font_, cell_h);
     y += std::max(0, (cell_h - line_h) / 2);
     POINT client{x, y};
     ScreenToClient(hwnd_, &client);
@@ -1259,113 +1387,37 @@ LRESULT CALLBACK FluentMenu::FilterEditProc(HWND hwnd, UINT msg, WPARAM wParam, 
                                             UINT_PTR, DWORD_PTR dwRefData) {
     auto* self = reinterpret_cast<FluentMenu*>(dwRefData);
     if (!self) return DefSubclassProc(hwnd, msg, wParam, lParam);
+    // Menu-specific: IME state, navigation keys and live filtering.
     if (msg == WM_IME_STARTCOMPOSITION) self->filter_composing_ = true;
     if (msg == WM_IME_ENDCOMPOSITION) self->filter_composing_ = false;
-    switch (msg) {
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONDBLCLK:
-    case WM_LBUTTONUP:
-    case WM_MOUSEMOVE:
-    case WM_CAPTURECHANGED:
-        if (self->compositor_ && self->compositor_->LumaTextEnabled()) {
-            const LRESULT result = self->compositor_->CallLumaEditMouse(
-                hwnd, msg, wParam, lParam, self->compositor_->TextFormat());
-            if (msg != WM_MOUSEMOVE || GetCapture() == hwnd) {
-                const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
-                const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
-                self->compositor_->PresentLumaEdit(hwnd, self->compositor_->TextFormat(),
-                                                   fg, bg);
-            }
-            return result;
-        }
-        break;
-    case WM_KEYDOWN:
-    case WM_SYSKEYDOWN:
-        if (!self->filter_composing_ && (wParam == VK_ESCAPE || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_RETURN)) {
-            self->HandleFilterKey(msg, wParam);
-            return 0;
-        }
-        break;
-    case WM_CHAR:
-        if (wParam == VK_RETURN || wParam == VK_ESCAPE) return 0;
-        {
-            LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
-            self->SyncFilterFromEdit();
-            return lr;
-        }
-    case WM_PASTE:
-    case WM_CUT:
-        {
-            LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
-            self->SyncFilterFromEdit();
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return lr;
-        }
-    case WM_PAINT: {
-        if (!self->compositor_ || !self->compositor_->LumaTextEnabled()) break;
-        HideCaret(hwnd);
-        const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
-        const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
-        if (!self->compositor_->PresentLumaEdit(hwnd, self->compositor_->TextFormat(),
-                                                fg, bg)) {
-            PAINTSTRUCT ps{};
-            HDC hdc = BeginPaint(hwnd, &ps);
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-            if (!self->edit_brush_) {
-                self->edit_brush_ = CreateSolidBrush(
-                    self->dark_ ? RGB(30, 30, 30) : RGB(255, 255, 255));
-            }
-            FillRect(hdc, &rc, EditBackBrush(self->edit_brush_));
-            EndPaint(hwnd, &ps);
-        }
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && !self->filter_composing_ &&
+        (wParam == VK_ESCAPE || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_RETURN)) {
+        self->HandleFilterKey(msg, wParam);
         return 0;
     }
-    case WM_SETFOCUS: {
-        LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
-        if (self->compositor_ && self->compositor_->LumaTextEnabled()) {
-            HideCaret(hwnd);
-            SetTimer(hwnd, 71, GetCaretBlinkTime(), nullptr);
-            const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
-            const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
-            self->compositor_->PresentLumaEdit(hwnd, self->compositor_->TextFormat(),
-                                               fg, bg);
-        } else {
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        return lr;
-    }
-    case WM_KILLFOCUS:
-        KillTimer(hwnd, 71);
-        break;
-    case WM_TIMER:
-        if (wParam == 71) {
-            if (GetCapture() != hwnd && self->compositor_ &&
-                self->compositor_->LumaTextEnabled()) {
-                const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
-                const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
-                self->compositor_->PresentLumaEdit(hwnd, self->compositor_->TextFormat(),
-                                                   fg, bg);
-            } else if (GetCapture() != hwnd) {
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-            return 0;
-        }
-        break;
-    case WM_ERASEBKGND:
-        if (self->compositor_ && self->compositor_->LumaTextEnabled()) return 1;
-        {
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-            if (!self->edit_brush_) {
-                self->edit_brush_ = CreateSolidBrush(
-                    self->dark_ ? RGB(30, 30, 30) : RGB(255, 255, 255));
-            }
-            FillRect(reinterpret_cast<HDC>(wParam), &rc, EditBackBrush(self->edit_brush_));
-            return 1;
+    if (msg == WM_CHAR && (wParam == VK_RETURN || wParam == VK_ESCAPE)) return 0;
+    // Everything visual is the shared hosted-edit handling: LumaText
+    // presentation, the caret timer, and the switch back to the native EDIT
+    // when a layered present fails (so the filter never turns invisible).
+    LRESULT result = 0;
+    if (!self->compositor_) {
+        result = DefSubclassProc(hwnd, msg, wParam, lParam);
+    } else {
+        const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
+        const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
+        IDWriteTextFormat* format = self->compositor_->TextFormat();
+        if (!HandleChildEditMessage(*self->compositor_, format, fg, bg, EditBackBrush(self->edit_brush_),
+                                    hwnd, msg, wParam, lParam, result)) {
+            result = DefPresentedChildEditProc(*self->compositor_, format, fg, bg, hwnd, msg, wParam, lParam);
         }
     }
-    return DefSubclassProc(hwnd, msg, wParam, lParam);
+    // Delete has no WM_CHAR; every message that can change the text resyncs
+    // (SyncFilterFromEdit returns early when nothing changed).
+    if (!self->filter_composing_ &&
+        (msg == WM_CHAR || msg == WM_KEYDOWN || msg == WM_PASTE || msg == WM_CUT || msg == WM_CLEAR ||
+         msg == WM_UNDO || msg == WM_SETTEXT || msg == WM_IME_ENDCOMPOSITION))
+        self->SyncFilterFromEdit();
+    return result;
 }
 
 bool FluentMenu::AppendFilterChar(wchar_t ch) {
@@ -1424,14 +1476,23 @@ bool FluentMenu::HandleFilterKey(UINT msg, WPARAM wParam) {
         return true;
     }
     if (wParam == VK_RETURN) {
+        int cmd = 0;
         if (hover_row_ >= 0) {
-            int cmd = InvokeRow(hover_row_);
-            if (cmd != 0) { result_ = cmd; Dismiss(); }
+            const FluentMenuItem* it = model_.At(hover_row_);
+            cmd = it && it->enabled && hover_swatch_ >= 0 &&
+                          static_cast<size_t>(hover_swatch_) < it->quick_swatches.size()
+                      ? it->quick_swatches[static_cast<size_t>(hover_swatch_)].command
+                      : InvokeRow(hover_row_);
+        }
+        // A highlighted row without a command of its own (a swatch strip
+        // under the resting pointer) must not swallow Enter: commit the text.
+        if (cmd != 0) {
+            result_ = cmd;
         } else {
             filter_committed_ = true;
             result_ = 0;
-            Dismiss();
         }
+        Dismiss();
         return true;
     }
     if (wParam == VK_BACK) {
@@ -1578,6 +1639,8 @@ int FluentMenu::RunModalLoop() {
                             }
                         }
                         swallow = true;
+                    } else if (HandleMnemonicKey(msg)) {
+                        swallow = true;
                     } else if (filter_fn_ && !edit_ && !external_edit_) {
                         msg.hwnd = hwnd_;
                         TranslateMessage(&msg);
@@ -1711,7 +1774,12 @@ int FluentMenu::TrackPopup(POINT screen_pt, std::vector<FluentMenuItem> items,
     } else {
         HideFilterEdit();
     }
-    const int popup_result = RunModalLoop();
+    int popup_result = 0;
+    {
+        const bool command_menu = !filter_fn_ && !external_edit_;
+        ImeSuspension ime(command_menu ? GetFocus() : nullptr, command_menu ? hwnd_ : nullptr);
+        popup_result = RunModalLoop();
+    }
     if (external_edit_) RemoveWindowSubclass(external_edit_, ExternalFilterEditProc, 2);
     external_edit_ = nullptr;
     UpdateTooltip(-1);
@@ -1759,6 +1827,9 @@ void FluentMenu::RequestFilterRefresh() {
 
 bool FluentMenu::ReplaceItems(std::vector<FluentMenuItem> items) {
     if (!open_ || animating_out_ || filter_fn_ || !compositor_ || items.empty()) return false;
+    // A flyout owns a copy of the displayed command IDs. Keep both that copy
+    // and the controller's display snapshot until it closes; IDs are session-local.
+    if (sub_parent_row_ >= 0) return false;
     if (model_.PatchCommands(items)) return true;
     // The rows changed shape: a context menu opened before the shell host
     // answered (no cached layout for this type yet) only had Pulse's own rows,

@@ -8,6 +8,7 @@
 #include "../ipc/ctx_menu_util.h"
 #include <windows.h>
 #include <algorithm>
+#include <cwchar>
 #include <cwctype>
 #include <string_view>
 #include <unordered_set>
@@ -38,6 +39,9 @@ constexpr const wchar_t* kGlyphRecycle = L"\xE75C";
 constexpr const wchar_t* kGlyphSelectAll = L"\xE8B3";
 constexpr const wchar_t* kGlyphInvert = L"\xE7A1";
 constexpr const wchar_t* kGlyphWildcard = L"\xE71C";
+constexpr const wchar_t* kGlyphViewMenu = L"\xE8A9";
+constexpr const wchar_t* kGlyphSortMenu = L"\xE8CB";
+constexpr const wchar_t* kGlyphGroupMenu = L"\xF168";
 
 ui::FluentMenuItem Item(int cmd, const wchar_t* text, const wchar_t* glyph,
                         const wchar_t* shortcut = nullptr, bool enabled = true) {
@@ -47,6 +51,13 @@ ui::FluentMenuItem Item(int cmd, const wchar_t* text, const wchar_t* glyph,
     it.glyph = glyph;
     if (shortcut) it.shortcut = shortcut;
     it.enabled = enabled;
+    it.mnemonic = BuiltinMenuMnemonic(cmd);
+    // Command-less flyout headers: 查看(V) / 排序方式(O) / 分组依据(P).
+    if (cmd == CmdNone && glyph) {
+        if (std::wcscmp(glyph, kGlyphViewMenu) == 0) it.mnemonic = L'V';
+        else if (std::wcscmp(glyph, kGlyphSortMenu) == 0) it.mnemonic = L'O';
+        else if (std::wcscmp(glyph, kGlyphGroupMenu) == 0) it.mnemonic = L'P';
+    }
     return it;
 }
 
@@ -73,10 +84,10 @@ std::vector<ui::FluentMenuItem> BuildItemMenu(bool can_undo, const std::wstring&
     strip.command = CmdNone; // row itself does nothing; buttons carry commands
     strip.enabled = true;
     strip.quick_swatches = {
-        { CmdCut,    {}, false, false, kGlyphCut },
-        { CmdCopy,   {}, false, false, kGlyphCopy },
-        { CmdDelete, {}, false, false, kGlyphDelete },
-        { CmdRename, {}, false, false, kGlyphRename },
+        { CmdCut,    {}, false, false, kGlyphCut,    BuiltinMenuMnemonic(CmdCut) },
+        { CmdCopy,   {}, false, false, kGlyphCopy,   BuiltinMenuMnemonic(CmdCopy) },
+        { CmdDelete, {}, false, false, kGlyphDelete, BuiltinMenuMnemonic(CmdDelete) },
+        { CmdRename, {}, false, false, kGlyphRename, BuiltinMenuMnemonic(CmdRename) },
     };
     strip.separator_after = true;
     items.push_back(std::move(strip));
@@ -111,15 +122,83 @@ BuiltinMenuItem BuiltinItemForCommand(int command) {
     case CmdInvertSelection:
     case CmdSelectWildcard: return BuiltinMenuItem::SelectCommands;
     case CmdUndo: return BuiltinMenuItem::Undo;
+    case CmdRefresh: return BuiltinMenuItem::Refresh;
+    case CmdNewFolder: return BuiltinMenuItem::NewFolder;
+    case CmdNewTextFile: return BuiltinMenuItem::NewTextFile;
+    case CmdPaste: return BuiltinMenuItem::Paste;
+    case CmdProperties: return BuiltinMenuItem::Properties;
+    case CmdFolderProperties: return BuiltinMenuItem::FolderProperties;
     default: return BuiltinMenuItem::Count;
     }
 }
 
+namespace {
+// 查看 / 排序方式 / 分组 are command-less flyout headers built by
+// AppendBackgroundViewCommands; their glyph is what identifies them.
+BuiltinMenuItem BuiltinItemForRow(const ui::FluentMenuItem& item) {
+    if (item.command != CmdNone) return BuiltinItemForCommand(item.command);
+    if (item.children.empty()) return BuiltinMenuItem::Count;
+    if (item.glyph == kGlyphViewMenu) return BuiltinMenuItem::View;
+    if (item.glyph == kGlyphSortMenu) return BuiltinMenuItem::Sort;
+    if (item.glyph == kGlyphGroupMenu) return BuiltinMenuItem::Group;
+    return BuiltinMenuItem::Count;
+}
+} // namespace
+
+namespace {
+// Consecutive rows owned by one movable item (the tag swatches and 标签...,
+// the three selection commands) move as one block.
+void ReorderBuiltinRows(std::vector<ui::FluentMenuItem>& items, const BuiltinMenuOrder& order) {
+    struct Block { size_t first, count, rank; };
+    auto rank_of = [&](BuiltinMenuItem item) {
+        const auto it = std::find(order.begin(), order.end(), item);
+        return it == order.end() ? order.size() : static_cast<size_t>(it - order.begin());
+    };
+    std::vector<Block> blocks;
+    for (size_t i = 0; i < items.size();) {
+        const BuiltinMenuItem owner = BuiltinItemForRow(items[i]);
+        const size_t rank = owner == BuiltinMenuItem::Count ? order.size() : rank_of(owner);
+        size_t end = i + 1;
+        if (rank < order.size()) {
+            while (end < items.size() && BuiltinItemForRow(items[end]) == owner) ++end;
+            blocks.push_back({ i, end - i, rank });
+        }
+        i = end;
+    }
+    auto sorted = blocks;
+    std::stable_sort(sorted.begin(), sorted.end(), [](const Block& a, const Block& b) { return a.rank < b.rank; });
+    bool moved = false;
+    for (size_t b = 0; b < blocks.size(); ++b) moved |= sorted[b].first != blocks[b].first;
+    if (!moved) return;
+    std::vector<bool> slot_separator(blocks.size());
+    for (size_t b = 0; b < blocks.size(); ++b)
+        slot_separator[b] = items[blocks[b].first + blocks[b].count - 1].separator_after;
+    std::vector<ui::FluentMenuItem> out;
+    out.reserve(items.size());
+    size_t next = 0;
+    for (size_t i = 0; i < items.size();) {
+        if (next < blocks.size() && i == blocks[next].first) {
+            const Block& source = sorted[next];
+            for (size_t k = 0; k < source.count; ++k) out.push_back(std::move(items[source.first + k]));
+            out.back().separator_after = slot_separator[next];
+            i += blocks[next].count;
+            ++next;
+        } else {
+            out.push_back(std::move(items[i++]));
+        }
+    }
+    items = std::move(out);
+}
+} // namespace
+
 void ApplyBuiltinMenuPrefs(std::vector<ui::FluentMenuItem>& items,
-                           const ContextMenuPrefs& prefs) {
+                           const ContextMenuPrefs& prefs,
+                           BuiltinMenuSurface surface) {
+    if (surface < BuiltinMenuSurface::Count && prefs.BuiltinOrderCustom(surface))
+        ReorderBuiltinRows(items, prefs.BuiltinOrder(surface));
     if (prefs.builtin_hidden == 0 || items.empty()) return;
     auto hidden = [&](const ui::FluentMenuItem& item) {
-        const BuiltinMenuItem owner = BuiltinItemForCommand(item.command);
+        const BuiltinMenuItem owner = BuiltinItemForRow(item);
         return owner != BuiltinMenuItem::Count && !prefs.BuiltinVisible(owner);
     };
     const bool last_dropped = hidden(items.back());
@@ -135,6 +214,38 @@ void ApplyBuiltinMenuPrefs(std::vector<ui::FluentMenuItem>& items,
     // The old last row never ended in a separator; keep it that way.
     if (last_dropped && !kept.empty()) kept.back().separator_after = false;
     items = std::move(kept);
+}
+
+void AppendWindowTransferCommands(std::vector<ui::FluentMenuItem>& items,
+                                  const std::vector<std::wstring>& folders, bool can_move) {
+    if (folders.empty()) return;
+    const auto flyout = [&](int base, l10n::StringId label, const wchar_t* glyph) {
+        ui::FluentMenuItem header = Item(CmdNone, l10n::Get(label).c_str(), glyph);
+        for (size_t i = 0; i < folders.size() && i < kMaxWindowTransferTargets; ++i) {
+            const std::wstring shown = path::FriendlyPathText(folders[i]);
+            const size_t slash = shown.find_last_of(L'\\');
+            const std::wstring name = slash == std::wstring::npos || slash + 1 >= shown.size()
+                ? shown : shown.substr(slash + 1);
+            auto row = Item(base + static_cast<int>(i), name.c_str(), kGlyphFolder);
+            row.shortcut = shown;
+            row.shortcut_inline = true;
+            row.tooltip = shown;  // the inline path is elided when long
+            header.children.push_back(std::move(row));
+        }
+        return header;
+    };
+    auto copy = flyout(CmdCopyToWindowBase, l10n::StringId::CopyToWindow, kGlyphCopy);
+    auto move = flyout(CmdMoveToWindowBase, l10n::StringId::MoveToWindow, kGlyphCut);
+    move.enabled = can_move;
+    auto at = std::find_if(items.begin(), items.end(), [](const ui::FluentMenuItem& row) {
+        return row.command == CmdCopyPath;
+    });
+    if (at == items.end())
+        at = std::find_if(items.begin(), items.end(), [](const ui::FluentMenuItem& row) {
+            return row.command == CmdProperties || row.command == CmdUndo;
+        });
+    at = items.insert(at, std::move(copy));
+    items.insert(at + 1, std::move(move));
 }
 
 std::wstring RecentChangesMenuPath(const Tab& tab, bool background) {
@@ -160,7 +271,17 @@ void AppendRecentChangesCommand(std::vector<ui::FluentMenuItem>& items,
                                 const std::wstring& path) {
     if (path.empty() || fs::IsVirtualPath(path)) return;
     auto item = Item(CmdViewRecentChanges, l10n::Get(l10n::StringId::ChangeView).c_str(), L"\xE81C");
-    items.insert(items.begin() + (items.empty() ? 0 : 1), std::move(item));
+    // Where the settings preview shows it (builtin_menu_items.cpp): right
+    // after the cut / copy / delete / rename strip on an item, right above
+    // 撤销 on the blank area, so moved rows land where the preview says.
+    const auto strip = std::find_if(items.begin(), items.end(), [](const ui::FluentMenuItem& row) {
+        return row.command == CmdNone && row.children.empty() && !row.quick_swatches.empty();
+    });
+    if (strip != items.end()) { items.insert(strip + 1, std::move(item)); return; }
+    const auto undo = std::find_if(items.begin(), items.end(), [](const ui::FluentMenuItem& row) {
+        return row.command == CmdUndo;
+    });
+    items.insert(undo, std::move(item));
 }
 
 std::vector<ui::FluentMenuItem> BuildRecycleItemMenu(bool can_undo,
@@ -200,7 +321,7 @@ std::vector<ui::FluentMenuItem> BuildRecyclePlaceMenu(bool can_empty) {
 std::vector<ui::FluentMenuItem> BuildBackgroundMenu(bool can_paste, bool can_undo,
                                                     const std::wstring& undo_label) {
     std::vector<ui::FluentMenuItem> items;
-    items.push_back(Item(CmdNewFolder, l10n::Get(l10n::StringId::NewFolder).c_str(), kGlyphNewFolder, L"F7"));
+    items.push_back(Item(CmdNewFolder, l10n::Get(l10n::StringId::NewFolder).c_str(), kGlyphNewFolder, L"Ctrl+Shift+N"));
     items.push_back(Item(CmdNewTextFile, l10n::Get(l10n::StringId::NewTextDocument).c_str(), kGlyphNewFile));
     items.back().separator_after = true;
     items.push_back(Item(CmdPaste, l10n::Get(l10n::StringId::Paste).c_str(), kGlyphPaste, L"Ctrl+V", can_paste));
@@ -291,7 +412,7 @@ ui::FluentMenuItem BuildShortcutHints() {
 }
 
 ui::FluentMenuItem BuildGroupMenu(const BackgroundViewOptions& options) {
-    auto group = Item(CmdNone, l10n::Get(l10n::StringId::GroupBy).c_str(), L"\xF168",
+    auto group = Item(CmdNone, l10n::Get(l10n::StringId::GroupBy).c_str(), kGlyphGroupMenu,
                       nullptr, options.can_group);
     struct GroupRow { int command; int value; l10n::StringId label; };
     constexpr GroupRow rows[] = {
@@ -324,9 +445,9 @@ ui::FluentMenuItem BuildGroupMenu(const BackgroundViewOptions& options) {
 
 void AppendBackgroundViewCommands(std::vector<ui::FluentMenuItem>& items,
                                   const BackgroundViewOptions& options) {
-    auto view = Item(CmdNone, l10n::Get(l10n::StringId::View).c_str(), L"\xE8A9");
+    auto view = Item(CmdNone, l10n::Get(l10n::StringId::View).c_str(), kGlyphViewMenu);
     view.children = BuildViewMenu(options.view_mode, options.details_panel, options.filesystem);
-    auto sort = Item(CmdNone, l10n::Get(l10n::StringId::SortBy).c_str(), L"\xE8CB", nullptr, options.can_sort);
+    auto sort = Item(CmdNone, l10n::Get(l10n::StringId::SortBy).c_str(), kGlyphSortMenu, nullptr, options.can_sort);
     sort.children = BuildSortMenu(options);
     auto refresh = Item(CmdRefresh, l10n::Get(l10n::StringId::Refresh).c_str(), L"\xE72C", L"F5");
     refresh.separator_after = true;
@@ -344,7 +465,7 @@ void AppendBackgroundViewCommands(std::vector<ui::FluentMenuItem>& items,
 
 std::vector<ui::FluentMenuItem> BuildNewMenu() {
     std::vector<ui::FluentMenuItem> items;
-    items.push_back(Item(CmdNewFolder, l10n::Get(l10n::StringId::Folder).c_str(), kGlyphNewFolder, L"F7"));
+    items.push_back(Item(CmdNewFolder, l10n::Get(l10n::StringId::Folder).c_str(), kGlyphNewFolder, L"Ctrl+Shift+N"));
     items.push_back(Item(CmdNewTextFile, l10n::Get(l10n::StringId::TextDocument).c_str(), kGlyphNewFile));
     return items;
 }
@@ -357,11 +478,11 @@ std::vector<ui::FluentMenuItem> BuildSplitMenu(int current_preset) {
         ui::fluent::MenuPictogram pictogram;
     };
     static constexpr Row kRows[] = {
-        { CmdLayoutSingle,        L"Ctrl+1", l10n::StringId::LayoutSingle,     ui::fluent::MenuPictogram::LayoutSingle },
-        { CmdLayoutTwoVertical,   L"Ctrl+2", l10n::StringId::LayoutVertical,   ui::fluent::MenuPictogram::LayoutSideBySide },
+        { CmdLayoutSingle,        L"Ctrl+Alt+1", l10n::StringId::LayoutSingle,     ui::fluent::MenuPictogram::LayoutSingle },
+        { CmdLayoutTwoVertical,   L"Ctrl+Alt+2", l10n::StringId::LayoutVertical,   ui::fluent::MenuPictogram::LayoutSideBySide },
         { CmdLayoutTwoHorizontal, nullptr,   l10n::StringId::LayoutHorizontal, ui::fluent::MenuPictogram::LayoutStacked },
-        { CmdLayoutThree,         L"Ctrl+3", l10n::StringId::LayoutThree,      ui::fluent::MenuPictogram::LayoutThree },
-        { CmdLayoutFourGrid,      L"Ctrl+4", l10n::StringId::LayoutFour,       ui::fluent::MenuPictogram::LayoutFour },
+        { CmdLayoutThree,         L"Ctrl+Alt+3", l10n::StringId::LayoutThree,      ui::fluent::MenuPictogram::LayoutThree },
+        { CmdLayoutFourGrid,      L"Ctrl+Alt+4", l10n::StringId::LayoutFour,       ui::fluent::MenuPictogram::LayoutFour },
     };
     std::vector<ui::FluentMenuItem> items;
     for (const auto& row : kRows) {
@@ -391,8 +512,13 @@ std::vector<ui::FluentMenuItem> BuildViewMenu(ui::ViewMode current_mode, bool de
     };
     std::vector<ui::FluentMenuItem> items;
     items.reserve(9);
+    // File Explorer's Ctrl+Shift+1..8 (explorer_shortcuts.h).
+    static constexpr const wchar_t* keys[] = {
+        L"Ctrl+Shift+1", L"Ctrl+Shift+2", L"Ctrl+Shift+3", L"Ctrl+Shift+4",
+        L"Ctrl+Shift+5", L"Ctrl+Shift+6", L"Ctrl+Shift+7", L"Ctrl+Shift+8"
+    };
     for (int i = 0; i < 8; ++i) {
-        auto row = Item(CmdViewBase + i, l10n::Get(labels[i]).c_str(), glyphs[i]);
+        auto row = Item(CmdViewBase + i, l10n::Get(labels[i]).c_str(), glyphs[i], keys[i]);
         if (i == 0) row.glyph_scale = 1.16f;
         else if (i == 1) row.glyph_scale = 1.0f;
         else if (i == 2) row.glyph_scale = 0.82f;
@@ -502,12 +628,12 @@ std::vector<ui::FluentMenuItem> BuildCommandPalette(const std::wstring& query,
         items.back().pictogram = pictogram;
     };
     if (!project_only && !search_mode && !path_like) {
-        add_cmd(CmdLayoutTwoVertical, l10n::Get(l10n::StringId::LayoutVertical).c_str(), L"", L"Ctrl+2",
+        add_cmd(CmdLayoutTwoVertical, l10n::Get(l10n::StringId::LayoutVertical).c_str(), L"", L"Ctrl+Alt+2",
                 ui::fluent::MenuPictogram::LayoutSideBySide);
-        add_cmd(CmdLayoutFourGrid, l10n::Get(l10n::StringId::LayoutFour).c_str(), L"", L"Ctrl+4",
+        add_cmd(CmdLayoutFourGrid, l10n::Get(l10n::StringId::LayoutFour).c_str(), L"", L"Ctrl+Alt+4",
                 ui::fluent::MenuPictogram::LayoutFour);
         add_cmd(CmdCopyToTarget, l10n::Get(l10n::StringId::CopyToTarget).c_str(), kGlyphCopy, L"Ctrl+Alt+C");
-        add_cmd(CmdNewFolder, l10n::Get(l10n::StringId::NewFolder).c_str(), kGlyphNewFolder, L"F7");
+        add_cmd(CmdNewFolder, l10n::Get(l10n::StringId::NewFolder).c_str(), kGlyphNewFolder, L"Ctrl+Shift+N");
         add_cmd(CmdPinWorkspace, l10n::Get(l10n::StringId::PinWorkspace).c_str(), kGlyphFolder, nullptr);
         add_cmd(CmdCopyPath, l10n::Get(l10n::StringId::CopyPath).c_str(), kGlyphLink, L"Ctrl+Shift+C");
         add_cmd(CmdInstallFullIndex, l10n::Get(l10n::StringId::EnableFullIndex).c_str(), kGlyphSearch, nullptr);

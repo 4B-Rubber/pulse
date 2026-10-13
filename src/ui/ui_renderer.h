@@ -6,11 +6,14 @@
 #include "fluent_components.h"
 #include "release_note_view.h"
 #include "shell_icons.h"
+#include "open_with_icons.h"
 #include "view_layout.h"
 #include "column_strip_layout.h"
 #include "panel_metrics.h"
 #include "toolbar_layout.h"
 #include "thumbnail_cache.h"
+#include "folder_thumbnail_cache.h"
+#include "render_caches.h"
 #include "archive_preview.h"
 #include "name_highlight.h"
 #include "preview_handler_host.h"
@@ -18,6 +21,9 @@
 #include "link_pill.h"
 #include "ui_view_morph.h"
 #include "group_wheel.h"
+#include "window_overview_view.h"
+#include "window_switcher_view.h"
+#include "../app/builtin_menu_items.h"
 #include "details_column_set.h"
 #include "../fs/fs_enum.h"
 #include "../fs/fs_snapshot.h"
@@ -34,10 +40,19 @@
 namespace pulse::app { class PlacesCatalog; }
 
 namespace pulse::ui {
+
+// SettingsToggle indexes of the Pulse menu preview (右键菜单 page): rows
+// are kSettingsMenuRowHit + BuiltinMenuItem, the fixed rows
+// kSettingsMenuFixedHit + BuiltinFixedRow; 68 restores the tab's order.
+inline constexpr int kSettingsMenuFixedHit = 99990;
+inline constexpr int kSettingsMenuRowHit = 100000;
+inline constexpr int kSettingsMenuOrderReset = 68;
 enum class PaneHeaderIcon;
 
 inline constexpr unsigned kSettingsContextExpandedMask = 0x1f00u;
-inline constexpr unsigned kSettingsDefaultExpandedMask = kSettingsContextExpandedMask | 0x3u;
+// Third-party context-menu groups (kSettingsContextExpandedMask) start
+// collapsed under 其他软件添加的项; the Pulse menu card is always open.
+inline constexpr unsigned kSettingsDefaultExpandedMask = 0x7u;
 
 class BloomAccentPicker;
 
@@ -66,33 +81,7 @@ struct TabGroupView {
     std::wstring name;
     uint32_t color_rgb = 0;
     bool collapsed = false;
-    bool has_active = false; // owns the active tab; the chip marks it
     float x_offset = 0.0f;  // px: chip slide during collapsed-group reorder
-};
-
-// One row of the Edge-style group hover card. Member rows switch to that tab;
-// the two trailing rows are the actions.
-struct TabGroupCardRow {
-    std::wstring text;
-    std::wstring glyph;      // Segoe Fluent Icons codepoint (action rows)
-    int tab_index = -1;      // >= 0: display index of a member tab
-    bool active = false;     // member row of the tab currently being viewed
-    bool new_tab = false;    // "New tab in group"
-    bool edit = false;       // "Edit group"
-    bool separator_after = false;
-    // Member row of the tab last used inside this group while it does not own
-    // the active tab: drawn with a faint check, never together with `active`.
-    bool was_active = false;
-};
-
-// Hover card for a group chip: member tabs of a collapsed group (nothing when
-// the group is expanded) followed by the action rows.
-struct TabGroupCardView {
-    bool visible = false;
-    int group_id = 0;
-    int chip_index = -1;     // index into WindowViewModel::tab_groups
-    int hover_row = -1;
-    std::vector<TabGroupCardRow> rows;
 };
 
 struct ListEntryView {
@@ -160,6 +149,9 @@ struct ColumnStripColumnView {
     bool auto_scroll = true;      // keep highlight_row centered until the user scrolls
     bool loading = false;
     bool error = false;
+    // Source indices of folders probed empty under the current hidden-file
+    // settings; drawn with the empty-folder icon and no chevron.
+    std::unordered_set<int> empty_sources;
 };
 
 // Column view of a folder pane: ancestors on the left, the regular list in
@@ -192,6 +184,17 @@ struct PaneViewModel {
     std::unordered_map<int, ChangeBadge> change_badges;
     std::unordered_map<int, std::wstring> folder_size_labels;
     std::unordered_set<int> folder_size_actions;
+    std::unordered_set<int> folder_size_muted;
+    std::unordered_set<int> folder_size_running;
+    // No value yet: pending rows (an answer is on its way) draw a skeleton bar;
+    // idle rows (deferred, failed, never automatic) draw a dash that reads
+    // as the calculate action while the row is hovered.
+    std::unordered_set<int> folder_size_pending;
+    std::unordered_set<int> folder_size_idle;
+    // Visible folders (source indices) probed empty under the current
+    // hidden-file settings. Kept out of ListEntryView: that is cached per
+    // snapshot, while emptiness changes without a new listing.
+    std::unordered_set<int> empty_folders;
     ChangeBadge title_change_badge;
     bool is_changes = false;
     std::wstring change_empty_text, change_status_text;
@@ -253,6 +256,7 @@ struct PaneViewModel {
     int drop_target_index = -1;   // folder row under an OLE drag (accent 2px stroke)
     bool header_drop = false;     // pane title bar is a navigate-to-folder target
     int rename_index = -1;        // name column is in edit mode; do not draw the label
+    bool focus_first_hint = false; // first view row has keyboard focus but no selection
     float scroll_y = 0.0f;
     float scroll_x = 0.0f;
     ViewMode view_mode = ViewMode::Details;
@@ -367,9 +371,9 @@ struct SidebarGroup {
     bool collapsed = false;
     bool hidden = false;           // Section menu: the group is not laid out at all.
     SidebarAddAction add_action = SidebarAddAction::None;
-    // The header title (icon + name) opens the section's own view (#80): only
-    // This PC has one. The rest of the header, and every other header, folds.
+    // The header title opens the section's own view; its chevron still folds.
     bool navigable = false;
+    std::wstring navigation_path; // Empty is This PC.
     bool tabs_section = false;     // vertical tabs block: set apart by a divider
 };
 
@@ -445,6 +449,7 @@ struct TrayDeckView {
     float open = 0.0f;               // 0..1 drag-over highlight
     float spread = 0.0f;             // 0..1 peeking layers fan out (stack hovered)
     float thumb_dip = 48.0f;         // thumbnail edge (settings: staging tray icon size)
+    bool hidden = false;             // host has no staging tray (file picker)
     int hovered = -1;                // live display index under the cursor (0 = top)
     std::vector<TrayDestView> dests; // recent drop folders, newest first (max 3)
     int stale_count = 0;             // staged items moved/deleted outside Pulse
@@ -534,13 +539,19 @@ struct SplitterView {
     D2D1_RECT_F hit_rect{};
     D2D1_RECT_F parent_bounds{};
     bool vertical = true; // vertical divider between left/right panes
+    // Two-pane layouts: round swap button shown while the divider is hovered.
+    // Empty otherwise.
+    D2D1_RECT_F swap_rect{};
 };
+// Splitter hit index of the swap button on splitter i: kSplitterSwapIndex + i.
+inline constexpr int kSplitterSwapIndex = 1000;
 
 struct SettingsRowView {
     std::wstring key;
     std::wstring text;
     int group = 0; // 0 software, 1 open-with, 2 share, 3 system, 4 print
     bool on = false;
+    bool slow_disabled = false; // auto-disabled after response timeouts (#77)
 };
 
 struct IndexVolumeRowView {
@@ -581,8 +592,44 @@ struct DuplicateDriveView {
     bool selected = false;
 };
 
+// HitTestResult::SettingsPackAction indices (Settings > 预览增强包).
+enum class PackAction : int {
+    Install = 0,        // FFmpeg pack: download and install
+    Remove,             // FFmpeg pack: uninstall
+    Enable,             // FFmpeg pack: on / off
+    UseCustom,          // use an FFmpeg already on this PC
+    Browse,             // choose that ffmpeg.exe
+    UseDetected,        // take the ffmpeg.exe found on PATH
+    OpenFolder,         // %LOCALAPPDATA%\Pulse\packs
+    RemoveOnUninstall,  // delete the packs with Pulse
+    ImagesInstall,      // image pack: download and install (or cancel)
+    ImagesRemove,       // image pack: uninstall
+    ImagesEnable,       // image pack: on / off
+    RawInstall, RawRemove, RawEnable,
+    ArchiveInstall, ArchiveRemove, ArchiveEnable,
+};
+
+// A tab dragged out of another window, over this one (multi-window M7h): the
+// dragged window hides and this window draws the tab as a pill at the cursor,
+// with what letting go does beside it.
+struct DragGhostView {
+    bool on = false;
+    float x = 0.0f, y = 0.0f;  // the cursor, client px
+    std::wstring title;        // the tab's title
+    int panes = 1;             // its visible panes ("2 panes" on the pill)
+    std::wstring hint;         // what letting go does
+    size_t em_start = 0;       // the part of `hint` in the accent color (M7i)
+    size_t em_length = 0;
+    std::wstring detail;       // a smaller note after it (may be empty)
+};
+
 struct WindowViewModel {
     std::wstring window_title;
+    // Multi-window M7c: with two or more windows the title bar shows this
+    // window's color dot and name in place of the product name.
+    bool window_identity = false;
+    std::wstring window_identity_name;
+    uint32_t window_identity_rgb = 0;
     std::vector<TabView> tabs;
     std::vector<TabGroupView> tab_groups;
     int active_tab = 0;
@@ -608,6 +655,13 @@ struct WindowViewModel {
     int breadcrumb_hover = -1;    // placed segment under the mouse
     int breadcrumb_drop = -1;     // placed segment under a drag
     int sidebar_drop_index = -1;  // sidebar item under a drag
+    int tab_drop_index = -1;      // a tab dragged from another window lands before this tab (M6b)
+    int tab_file_drop = -1;       // a file drag rests on this tab; it opens when the progress is full (M6e)
+    float tab_file_drop_progress = 0.0f;
+    bool content_drop = false;    // a tab dragged over the content area lands in content_drop_rects (M6d)
+    bool content_drop_as_tab = false;
+    std::vector<D2D1_RECT_F> content_drop_rects;  // one per pane it brings (M7h)
+    DragGhostView drag_ghost;     // the dragged tab itself (M7h)
     // Tag drag-reorder gesture (group/item = dragged tag, tag_drag_y = cursor).
     int tag_drag_group = -1;
     int tag_drag_item = -1;
@@ -641,7 +695,6 @@ struct WindowViewModel {
         std::wstring title, body, primary, never;
     } teach;
     ChangePopover change_popover;
-    TabGroupCardView tab_group_card;
     float tooltip_x = 0.0f;
     float tooltip_y = 0.0f;
 
@@ -682,6 +735,36 @@ struct WindowViewModel {
     bool settings_content_instant = false;
     unsigned settings_expanded = kSettingsDefaultExpandedMask;
     unsigned settings_preview_codecs = 0;  // DetectPreviewCodecs() mask, General page only
+    // Settings > 预览增强包 (page 5), from SettingsController's cached pack state.
+    uint32_t settings_pack_ffmpeg = 0;          // 0 none, 1 pack installed, 2 own FFmpeg in use
+    bool settings_pack_ffmpeg_enabled = true;
+    bool settings_pack_use_custom = false;
+    bool settings_pack_remove_on_uninstall = true;
+    uint32_t settings_pack_installed = 0;       // installed pack count
+    bool settings_pack_media_available = false, settings_pack_images_available = false;
+    bool settings_pack_media_installed = false; // the FFmpeg pack itself is on disk
+    uint64_t settings_pack_bytes = 0;           // disk use of the packs folder
+    std::wstring settings_pack_version;         // installed FFmpeg pack version
+    std::wstring settings_pack_custom_path;     // chosen ffmpeg.exe
+    std::wstring settings_pack_detected_path;   // ffmpeg.exe found on PATH
+    std::wstring settings_pack_root;            // %LOCALAPPDATA%\Pulse\packs
+    std::wstring settings_pack_notice;          // last action's message, empty when none
+    bool settings_pack_installing = false;      // the FFmpeg pack is downloading
+    float settings_pack_progress = 0.0f;        // 0..1 while downloading
+    bool settings_pack_images_installed = false; // the image pack (现代图像格式) is on disk
+    bool settings_pack_images_enabled = true;
+    bool settings_pack_images_installing = false;
+    float settings_pack_images_progress = 0.0f;
+    std::wstring settings_pack_images_version;
+    std::wstring settings_pack_images_notice;
+    bool settings_pack_raw_installed = false, settings_pack_raw_enabled = true, settings_pack_raw_installing = false;
+    bool settings_pack_raw_available = false;
+    float settings_pack_raw_progress = 0.0f;
+    std::wstring settings_pack_raw_version, settings_pack_raw_notice;
+    bool settings_pack_archive_installed = false, settings_pack_archive_enabled = true, settings_pack_archive_installing = false;
+    bool settings_pack_archive_available = false;
+    float settings_pack_archive_progress = 0.0f;
+    std::wstring settings_pack_archive_version, settings_pack_archive_notice;
     int settings_theme = 0; // system, light, dark
     bool settings_open = false;
     int settings_page = 0; // 0 general, 1 search/index, 2 context menu, 3 about, 4 duplicates
@@ -692,12 +775,12 @@ struct WindowViewModel {
     bool settings_show_hidden_files = false;
     bool settings_show_protected_os_files = false;
     bool show_pinned_tab_names = true;
-    bool settings_multi_instance_mode = false;
     bool settings_list_smart_date = true;
     bool settings_list_zebra_rows = true;
     bool settings_list_size_bar = false;
     bool settings_list_tag_names = false;
     bool settings_list_selection_outline = false;
+    bool settings_list_thumbnail_badges = true;
     bool settings_vertical_tabs = false;
     bool settings_show_hints = true;
     bool settings_tips_seen = false;   // any teaching bubble already shown
@@ -705,7 +788,9 @@ struct WindowViewModel {
     int settings_startup_open = 0; // 0 last tabs, 1 default location
     int settings_notify_icon = 0;  // 0 always, 1 in the background, 2 never (#57)
     int settings_new_tab_open = 0; // 0 current folder, 1 default location
+    int settings_external_open = 0; // 0 smart, 1 tab, 2 new window (multi-window M7b)
     bool settings_close_last_tab = false;
+    bool settings_close_tab_double_click = false;
     bool settings_confirm_delete = false;
     std::wstring settings_home_folder; // default location; empty = This PC
     int settings_text_render = 0; // 0 auto, 1 sharp, 2 smooth
@@ -713,6 +798,7 @@ struct WindowViewModel {
     bool settings_open_folders = false;
     bool settings_win_e = false;
     bool settings_this_pc = false;
+    bool settings_recycle_bin = false;
     bool settings_explorer_windows = false;   // experimental Explorer window takeover
     // 设为默认文件管理器: 0 off, 1 partial, 2 full; the text lists what is missing.
     int settings_default_manager = 0;
@@ -721,6 +807,7 @@ struct WindowViewModel {
     bool settings_integration_folders = false;
     bool settings_integration_win_e = false;
     bool settings_integration_this_pc = false;
+    bool settings_integration_recycle_bin = false;
     bool settings_integration_experimental = false;
     int settings_integration_state = 0; // 0 off, 1 on, 2 partial, 3 failed
     std::wstring settings_integration_summary;
@@ -735,6 +822,19 @@ struct WindowViewModel {
     int settings_language = 0;    // 0 system, 1 zh-CN, 2 zh-TW, 3 en-US
     BloomAccentPicker* settings_bloom = nullptr;
     bool settings_group_on[5] = { true, true, false, false, true };
+    // 本地右键菜单 › Pulse 菜单 card: selected tab (0 on a file, 1 blank area,
+    // 2 row buttons), the hidden-item mask, and where BuiltinMenuItem 0 sits
+    // in settings_items.
+    int settings_context_tab = 0;
+    uint32_t settings_builtin_hidden = 0;
+    size_t settings_builtin_first = 0;
+    // Pulse menu order per BuiltinMenuSurface (normalized), and the preview
+    // row being dragged: BuiltinMenuItem or -1, pointer position in px (y,
+    // or x on the row-buttons tab) and where inside the row it was grabbed.
+    app::BuiltinMenuOrder settings_builtin_order[static_cast<size_t>(app::BuiltinMenuSurface::Count)];
+    int settings_menu_drag = -1;
+    float settings_menu_drag_pos = 0.0f;
+    float settings_menu_drag_grab = 0.0f;
     std::vector<SettingsRowView> settings_items;
     bool settings_index_service = false;
     bool settings_index_installed = false;
@@ -744,6 +844,10 @@ struct WindowViewModel {
     std::wstring settings_index_error;
     std::vector<IndexVolumeRowView> settings_index_volumes;
     std::vector<std::wstring> settings_index_excluded_paths;
+    bool settings_index_system_known = false;   // service reports the system folder switch
+    bool settings_index_exclude_system = false;
+    uint32_t settings_index_system_groups = 0;  // bit i = index::kSystemExclusionGroups[i]
+    bool settings_index_system_expanded = false;
     std::vector<NetworkRootRowView> settings_network_roots;
     std::wstring settings_version;
     std::wstring settings_build_id;
@@ -890,6 +994,7 @@ struct HitTestResult {
         SettingsStartupOpen,
         SettingsNotifyIcon,
         SettingsNewTabOpen,
+        SettingsExternalOpen,
         SettingsBlankClick,
         SettingsHomeFolder,
         SettingsTextRender,
@@ -927,6 +1032,7 @@ struct HitTestResult {
         SettingsWallpaperLook,
         SettingsWallpaperBlur,
         SidebarToggle,       // title-bar sidebar collapse button
+        WindowIdentity,      // title-bar window color dot and name (M7c)
         StatusHintAction,    // clickable action at the end of the status-bar hint
         SearchEmptyAction,   // suggestion button on an empty search result page; path = new query
         TeachPrimary,        // teaching bubble: Got it / Try it
@@ -942,8 +1048,8 @@ struct HitTestResult {
         ToolbarGroup,        // toolbar "Group" button / active chip: open the group menu
         ToolbarGroupClear,   // "x" on the active group chip: stop grouping
         SettingsPreviewStore,  // Settings > Quick Look formats: get a missing system extension (index = row)
-        TabGroupCard,             // group hover card surface (padding/gaps)
-        TabGroupCardRow           // one row inside the hover card
+        SettingsPackAction,    // Settings > 预览增强包: index = PackAction
+        TabScroll,             // overflowing tab strip arrows: index -1 = left, 1 = right
     } region = None;
     SidebarAddAction sidebar_action = SidebarAddAction::None;
     int index = -1;          // tab/row/sidebar item/tray batch/tray item.
@@ -966,8 +1072,14 @@ class MainRenderer {
     friend struct PaneHeaderIconTest;
     friend struct FolderSizesUiTest;
     friend struct ColumnResizeUiTest;
+    friend struct UiModuleAuditTest;
 public:
     MainRenderer();
+    // Draws from caches shared with other windows (AppCore::render_caches).
+    explicit MainRenderer(RenderCaches& caches);
+    MainRenderer(const MainRenderer&) = delete;
+    MainRenderer& operator=(const MainRenderer&) = delete;
+    RenderCaches& Caches() noexcept { return caches_; }
 
     void SetScale(float scale);
     void SetCompositor(Compositor* comp);
@@ -987,9 +1099,15 @@ public:
     // Vertical tabs: the address row lives in the title bar, so the toolbar
     // keeps only its command row.
     void SetVerticalTabs(bool on) {
-        vertical_tabs_ = on;
-        toolbar_height_ = (on ? 44.0f : 88.0f) * scale_;
+        vertical_tabs_ = on && !embedded_;
+        toolbar_height_ = (vertical_tabs_ || embedded_ ? 44.0f : 88.0f) * scale_;
     }
+    // Hosted inside another window (the file picker): no title bar, tabs,
+    // command row, status bar or details panel; only the address row, the
+    // sidebar and the pane. `top_dip` is the host's own strip above the
+    // address row and `bottom_dip` its footer below the panes.
+    void SetEmbedded(float top_dip, float bottom_dip);
+    bool Embedded() const { return embedded_; }
     bool VerticalTabs() const { return vertical_tabs_; }
     // Collapse/expand; `animate` eases the width (skipped when the system
     // turns animations off). Re-setting the current state is a no-op.
@@ -1015,9 +1133,25 @@ public:
     int ToolbarGroup() const { return toolbar_group_; }
     // Drum "Group by" picker drawn over everything (app/group_wheel_ui.cpp).
     GroupWheel& GroupWheelPicker() { return group_wheel_; }
+    // Ctrl+` window switcher drawn over everything (app/window_switcher_ui.cpp, M7d).
+    WindowSwitcherView& WindowSwitcher() { return window_switcher_; }
+    // Ctrl+Shift+O window overview, under the switcher (app/window_overview_ui.cpp, M7e).
+    WindowOverviewView& WindowOverview() { return window_overview_; }
     float ToolbarGroupWidth(float w) const;
+    std::wstring ToolbarGroupLabel() const;   // "Group: Date" text of the active chip
     float SearchBarMinWidth() const { return search_min_dip_; }
     D2D1_RECT_F SidebarToggleRect(float w) const;
+    // The window's dot and name in the title bar (M7c). Without room for the
+    // name (the icon rail) only a dot on the corner of the mark or of the
+    // sidebar toggle shows; `hit` is then the mark, or the dot itself.
+    struct WindowIdentityGeometry {
+        D2D1_RECT_F hit{};  // empty: not shown
+        D2D1_POINT_2F dot{};
+        float dot_radius = 0.0f;
+        bool compact = false;
+    };
+    WindowIdentityGeometry WindowIdentityLayout(const WindowViewModel& vm, float w) const;
+    D2D1_RECT_F WindowIdentityRect(const WindowViewModel& vm, float w) const { return WindowIdentityLayout(vm, w).hit; }
     float PaneHeaderHeight() const { return pane_header_height_; }
     float ColumnHeaderHeight() const { return column_header_height_; }
     float RowHeight() const { return row_height_; }
@@ -1116,13 +1250,22 @@ public:
         // Loading placeholders shimmer (and must appear on time) while any
         // pane is still enumerating.
         active = active || list_loading_active_;
+        // Folder size skeleton shimmer and the scanning label's breathing.
+        active = active || folder_size_anim_active_;
         // Operation pill: indeterminate ring spin and the completion check fade.
         active = active || task_pill_spinning_ ||
                  (task_pill_done_at_ != 0 && now - task_pill_done_at_ < kTaskPillDoneMs + 400);
         if (copy_feedback_.Tick(now)) active = true;
         if (group_wheel_.Tick(motion_now)) active = true;
+        if (folder_thumbnail_cache_.Tick(now)) active = true;
         return active;
     }
+    void RefreshFolderThumbnails() { folder_thumbnail_cache_.Refresh(); }
+    // A preview pack was installed, removed or switched: files that had no
+    // thumbnail may have one now, so cached results are dropped.
+    void EvictThumbnails() { thumbnail_cache_.Evict(); }
+    auto FolderThumbnailDebugStats() { return folder_thumbnail_cache_.ReadDebugStats(); }
+    void SetFolderThumbnailsEnabled(bool enabled) { folder_thumbnails_enabled_ = enabled; }
     // region = HitTestResult region of the button that copied, index its index.
     void NotifyCopied(int region, int index) {
         copy_feedback_.Trigger(region, index, GetTickCount64());
@@ -1191,8 +1334,13 @@ public:
         auto_widths_scale_ = -1.0f;
     }
     bool ListSmartDate() const { return list_smart_date_; }
+    // Grid thumbnails: default-program badge and video playing time.
+    void SetThumbnailBadges(bool on) { thumbnail_badges_ = on; }
+    // Default programs changed (SHCNE_ASSOCCHANGED).
+    void InvalidateOpenWithIcons() { open_with_icons_.InvalidateAssociations(); }
     // List-row hover buttons the user keeps: bit 0 star, bit 1 new tab, bit 2 more.
-    void SetRowActions(unsigned mask) { row_actions_ = mask & 7u; }
+    // Bits 0-2 visible buttons, bits 3-8 their order (app::RowActionMask).
+    void SetRowActions(unsigned mask) { row_actions_ = mask & 0x1FFu; }
     // Optional details columns (details_column_set.h bits).
     void SetDetailsColumns(uint32_t mask) { details_columns_ = NormalizeDetailsColumns(mask); }
     uint32_t DetailsColumnsMask() const { return details_columns_; }
@@ -1278,6 +1426,11 @@ public:
                           float x, float y) const;
     // Settings slider value under x (0 transparency, 1 blur), clamped to the
     // track so a drag may leave the control.
+    // Pulse menu preview drag: where row `item` starts along the drag axis
+    // (NaN when it is not in the preview), and the order a drop at (x, y)
+    // gives (empty when the pointer is too far outside the preview).
+    float SettingsMenuRowStart(const WindowViewModel& vm, const D2D1_RECT_F& rect, int item);
+    app::BuiltinMenuOrder SettingsMenuDropOrder(const WindowViewModel& vm, const D2D1_RECT_F& rect, float x, float y);
     int SettingsSliderValueAt(const WindowViewModel& vm, const D2D1_RECT_F& rect,
                               int which, float x) const;
 
@@ -1292,6 +1445,9 @@ public:
     int PageDelta(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds) const;
     std::pair<int, int> VisibleRangeInPane(const PaneViewModel& vm,
                                            const D2D1_RECT_F& pane_bounds) const;
+    // Source indices of items meeting rect (pane pixels), on or off screen.
+    void ItemsInRectInPane(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds,
+                           const D2D1_RECT_F& rect, std::vector<int>& sources) const;
     int RowFromYInPane(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds, float y) const;
     int ItemFromPointInPane(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds,
                             float x, float y) const;
@@ -1313,6 +1469,15 @@ public:
                           D2D1_RECT_F* out) const;
     // Uniform tab pitch (excludes group-chip offsets); used by drag math.
     float TabPitchPx(const WindowViewModel& vm, float window_w) const;
+    // Overflowing tab strip: wheel over the strip (`steps` = wheel notches,
+    // positive = toward the first tab) and arrow pages. False when the strip
+    // fits or the point is outside it.
+    bool ScrollTabStrip(const WindowViewModel& vm, float window_w, float x, float y, float steps);
+    void ScrollTabStripPage(const WindowViewModel& vm, float window_w, int direction);
+    // Closing tabs keeps the current widths until the pointer leaves the strip,
+    // so repeated clicks land on the next close button (as in Chrome).
+    void FreezeTabWidths(const WindowViewModel& vm, float window_w);
+    bool ReleaseTabWidths();
     float SettingsMaxScroll(const WindowViewModel& vm, float window_w, float window_h) const;
     D2D1_RECT_F SettingsDropdownBounds(const WindowViewModel& vm, int index, float window_w, float window_h) const;
     float SettingsDestinationOffset(const WindowViewModel& vm, int setting_id, float window_w, float window_h) const;
@@ -1338,6 +1503,22 @@ private:
             int group = -1; // index into WindowViewModel::tab_groups
         };
         std::vector<Chip> chips;  // one chip at the start of each same-group run
+        // Too many tabs for the strip: inactive tabs shrink to their icon
+        // (`compact`) while the active one keeps its title (`active_w`); past
+        // that the strip scrolls between the two arrows (`overflow`).
+        int active = -1;          // visible, unpinned active tab, or -1
+        float active_w = 0.0f;
+        float pinned_w = 0.0f;
+        bool compact = false;
+        bool overflow = false;
+        float view_left = 0.0f, view_right = 0.0f; // tab clip span when overflowing
+        float arrow_w = 0.0f;
+        float scroll = 0.0f, max_scroll = 0.0f;
+        float new_x = 0.0f;       // "+" button left edge
+        float Width(const WindowViewModel& vm, size_t i) const {
+            if (vm.tabs[i].pinned) return pinned_w;
+            return static_cast<int>(i) == active ? active_w : w;
+        }
     };
     TabStripMetrics ComputeTabStrip(const WindowViewModel& vm, float window_w) const;
     void DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
@@ -1365,7 +1546,9 @@ private:
     void DrawTaskPill(const WindowViewModel& vm, const D2D1_RECT_F& area, const Theme& theme);
     void DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettingsContext(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
+    void DrawSettingsPulseMenu(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
+    void DrawSettingsPacks(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
 
     void DrawList(const PaneViewModel& vm, float x, float y, float w, float h, const Theme& theme,
                   int hover_region = 0, int hover_control_index = -1, bool pane_focused = true,
@@ -1395,13 +1578,32 @@ private:
                       ID2D1SolidColorBrush* brush, std::wstring_view text,
                       float x, float y, float width, float height,
                       D2D1_DRAW_TEXT_OPTIONS options = D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    void DrawFolderIcon(float x, float y, float size, const Theme& theme);
+    // The extension inside a type chip, centered in its box in every text
+    // rendering mode (Auto draws with LumaText, Sharp / Smooth with DirectWrite).
+    void DrawTypeChipLabel(ID2D1DeviceContext* dc, const std::wstring& chip, const D2D1_RECT_F& box,
+                           const D2D1_COLOR_F& ink, const D2D1_COLOR_F& background);
+    void DrawFolderIcon(float x, float y, float size, const Theme& theme,
+                        float opacity = 1.0f);
+    // Slate-gray folder for a folder with nothing to show (same silhouette as
+    // the shell folder, no paper). Fills [x, x+size] like DrawFolderIcon.
+    void DrawEmptyFolderIcon(float x, float y, float size, const Theme& theme,
+                             float opacity = 1.0f);
+    PreviewDrawResult DrawEntryThumbnail(ID2D1DeviceContext* dc, const D2D1_RECT_F& dest,
+        const ListEntryView& entry, ViewMode mode, uint64_t generation, uint32_t pixels,
+        float opacity, bool align_bottom, D2D1_RECT_F* artwork, uint32_t* duration = nullptr);
     void DrawSidebarPeek(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
-    void DrawFileIcon(float x, float y, float size, const Theme& theme);
-    void DrawEntryIcon(const ListEntryView& entry, float x, float y, float size, const Theme& theme);
+    void DrawFileIcon(float x, float y, float size, const Theme& theme,
+                      float opacity = 1.0f);
+    void DrawEntryIcon(const ListEntryView& entry, float x, float y, float size,
+                       const Theme& theme, float opacity = 1.0f);
     void DrawLinkOverlay(float x, float y, float size, const Theme& theme, float opacity = 1.0f,
                          const std::wstring& label = {}, float expansion = 0.0f,
                          float right_limit = 0.0f, const D2D1_RECT_F* artwork = nullptr);
+    // Grid thumbnail corners: the default program's icon bottom-right, and a
+    // playing-time chip (videos) or "GIF" chip bottom-left. `artwork` is the
+    // drawn image, `icon_size` the item's icon square, both in pixels.
+    void DrawThumbnailBadges(const ListEntryView& entry, const D2D1_RECT_F& artwork, float icon_size,
+                             uint32_t duration_ms, const Theme& theme);
     // One item's icon mid view-switch (ui_view_morph.h): thumbnail and shell
     // icon cross-fade while the rect travels. dx/dy: the row transform.
     void DrawMorphIcon(const ListEntryView& entry, const PaneViewModel& vm,
@@ -1437,15 +1639,22 @@ private:
     WindowMaterial material_;
     Compositor* compositor_ = nullptr;
     fluent::Painter painter_;
-    ShellIconCache icon_cache_;
+    // Icon and thumbnail caches (render_caches.h): shared through AppCore, or
+    // owned when the renderer stands alone. The member names alias into them.
+    std::unique_ptr<RenderCaches> owned_caches_;
+    RenderCaches& caches_;
+    ShellIconCache& icon_cache_ = caches_.icons;
+    OpenWithIconCache& open_with_icons_ = caches_.open_with_icons;
     std::unordered_map<ID2D1Bitmap*, ComPtr<ID2D1Effect>> tray_shadows_;
-    // Grid/list thumbnails and the details-pane preview decode through
-    // separate hosts and budgets: a 2048 px selection preview (up to 16 MB)
-    // must neither evict the visible grid nor queue ahead of it.
-    ThumbnailCache thumbnail_cache_{96ull * 1024ull * 1024ull, 1024};
-    ThumbnailCache details_cache_{48ull * 1024ull * 1024ull, 24};
+    ThumbnailCache& thumbnail_cache_ = caches_.thumbnails;
+    FolderThumbnailCache& folder_thumbnail_cache_ = caches_.folder_thumbnails;
+    bool folder_thumbnails_enabled_ = true;
+    ThumbnailCache& details_cache_ = caches_.details;
     PreviewHandlerHost preview_handler_;
     HWND notify_hwnd_ = nullptr;
+    bool embedded_ = false;
+    float embedded_top_dip_ = 0.0f;
+    float embedded_bottom_dip_ = 0.0f;
     float scale_ = 1.0f;
     float title_bar_height_ = kTitleBarHeight;
     float toolbar_height_ = 88.0f;
@@ -1459,6 +1668,8 @@ private:
     bool sidebar_peek_ = false;
     bool collapse_anim_ = false;
     GroupWheel group_wheel_;
+    WindowOverviewView window_overview_;
+    WindowSwitcherView window_switcher_;
     float collapse_value_ = 0.0f;  // 0 expanded .. 1 rail (frame-stable)
     float collapse_from_ = 0.0f;
     uint64_t collapse_start_ = 0;  // motion::NowMs()
@@ -1470,6 +1681,7 @@ private:
     bool list_smart_date_ = true, list_zebra_ = true, list_size_bar_ = false;
     bool list_tag_names_ = false;
     bool list_selection_outline_ = false;
+    bool thumbnail_badges_ = true;
     unsigned row_actions_ = 7u;
     uint32_t details_columns_ = kDetailsColumnsDefault;
     // Motion state: highlight plates glide between items (ui_motion.h).
@@ -1485,6 +1697,15 @@ private:
     std::array<uint64_t, 8> list_loading_since_{};
     bool list_loading_animate_ = true;
     bool list_loading_active_ = false;
+    // Tab strip overflow state: ComputeTabStrip clamps the scroll and reveals
+    // a newly active tab, so hit testing and drawing always agree.
+    mutable float tab_scroll_ = 0.0f;
+    mutable int tab_scroll_active_ = -1;
+    float tab_freeze_w_ = 0.0f, tab_freeze_active_w_ = 0.0f;
+    size_t tab_freeze_count_ = 0;
+    bool tab_freeze_compact_ = false;
+    std::array<uint64_t, 8> folder_size_pending_since_{};
+    bool folder_size_anim_active_ = false;
     motion::CopyFeedback copy_feedback_;
     static constexpr ULONGLONG kTaskPillDoneMs = 1600;
     static constexpr ULONGLONG kTaskPillFadeMs = 300;
@@ -1545,6 +1766,11 @@ private:
     mutable ComPtr<ID2D1StrokeStyle> dashStroke_;
     ComPtr<ID2D1StrokeStyle> paneHeaderStroke_;
     ComPtr<ID2D1PathGeometry> link_arrow_geometry_;
+    ComPtr<ID2D1PathGeometry> play_triangle_geometry_;
+    // Empty-folder icon: back/front in a 24-unit box, and a 96-unit large form.
+    ComPtr<ID2D1PathGeometry> empty_folder_geometry_[4];
+    mutable ComPtr<ID2D1SolidColorBrush> brEmptyFolder_;
+    ID2D1DeviceContext* empty_folder_dc_ = nullptr; // owner of the two above
     mutable ComPtr<ID2D1SolidColorBrush> brFpsBg_;
     mutable ComPtr<ID2D1SolidColorBrush> brFpsText_;
 

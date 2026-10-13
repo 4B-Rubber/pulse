@@ -1,4 +1,5 @@
 #include "pdfium_text.h"
+#include "pdf_unicode.h"
 #include "document_protocol.h"
 #include "document_literal_match.h"
 #include "../../third_party/pdfium/include/fpdfview.h"
@@ -16,7 +17,7 @@ struct Api {
     PDF_FUNCTION(FPDF_GetLastError); PDF_FUNCTION(FPDF_GetPageCount);
     PDF_FUNCTION(FPDF_LoadPage); PDF_FUNCTION(FPDF_ClosePage);
     PDF_FUNCTION(FPDFText_LoadPage); PDF_FUNCTION(FPDFText_ClosePage);
-    PDF_FUNCTION(FPDFText_CountChars); PDF_FUNCTION(FPDFText_GetText);
+    PDF_FUNCTION(FPDFText_CountChars); PDF_FUNCTION(FPDFText_GetUnicode);
 #undef PDF_FUNCTION
     bool ready = false;
     Api() {
@@ -33,7 +34,7 @@ struct Api {
         LOAD_PDF(FPDF_GetLastError); LOAD_PDF(FPDF_GetPageCount);
         LOAD_PDF(FPDF_LoadPage); LOAD_PDF(FPDF_ClosePage);
         LOAD_PDF(FPDFText_LoadPage); LOAD_PDF(FPDFText_ClosePage);
-        LOAD_PDF(FPDFText_CountChars); LOAD_PDF(FPDFText_GetText);
+        LOAD_PDF(FPDFText_CountChars); LOAD_PDF(FPDFText_GetUnicode);
 #undef LOAD_PDF
         FPDF_LIBRARY_CONFIG config{}; config.version = 2;
         FPDF_InitLibraryWithConfig_fn(&config); ready = true;
@@ -136,12 +137,27 @@ HRESULT ExtractPdfiumText(HANDLE file, uint64_t bytes, std::wstring& output,
         struct Text { Api& api; FPDF_TEXTPAGE value; ~Text() { api.FPDFText_ClosePage_fn(value); } } text_owner{api, text};
         const int chars = api.FPDFText_CountChars_fn(text);
         if (chars < 0) return HRESULT_FROM_WIN32(ERROR_BAD_FORMAT);
-        if (static_cast<size_t>(chars) + 1 > document::kMaximumTextChars - output.size()) return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
-        std::vector<unsigned short> buffer(static_cast<size_t>(chars) + 1);
-        const int length = api.FPDFText_GetText_fn(text, 0, chars, buffer.data());
-        if (length < 0 || static_cast<size_t>(length) > buffer.size()) return HRESULT_FROM_WIN32(ERROR_BAD_FORMAT);
-        if (!output.empty() && output.back() != L'\n') output += L'\n';
-        if (length > 1) AppendPage(output, {reinterpret_cast<const wchar_t*>(buffer.data()), static_cast<size_t>(length) - 1});
+        const size_t separator = !output.empty() && output.back() != L'\n' ? 1 : 0;
+        if (separator > document::kMaximumTextChars - output.size())
+            return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
+        const size_t capacity = document::kMaximumTextChars - output.size() - separator;
+        std::wstring page_text;
+        page_text.reserve((std::min)(static_cast<size_t>(chars), capacity));
+        for (int i = 0; i < chars; ++i) {
+            uint32_t value = api.FPDFText_GetUnicode_fn(text, i);
+            // The bundled PDFium exposes ToUnicode surrogate pairs as two
+            // character indices; other mappings can return a full scalar.
+            if (value >= 0xd800 && value <= 0xdbff) {
+                if (i + 1 >= chars) return HRESULT_FROM_WIN32(ERROR_BAD_FORMAT);
+                const uint32_t low = api.FPDFText_GetUnicode_fn(text, ++i);
+                if (low < 0xdc00 || low > 0xdfff) return HRESULT_FROM_WIN32(ERROR_BAD_FORMAT);
+                value = 0x10000 + ((value - 0xd800) << 10) + low - 0xdc00;
+            }
+            const HRESULT result = AppendPdfUnicode(page_text, value, capacity);
+            if (FAILED(result)) return result;
+        }
+        if (separator) output += L'\n';
+        AppendPage(output, page_text);
         if (match.Found(output)) return S_OK;
     }
     return output.find_first_not_of(L" \t\r\n\0", 0, 5) == std::wstring::npos ? HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) : S_OK;

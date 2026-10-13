@@ -63,7 +63,7 @@ enum MenuCmd : int {
     CmdSettings,            // palette / title-bar gear → settings tab
     CmdSettingsContextMenu, // 管理右键项… → 右键菜单 page
     CmdTags,
-    CmdTagBase = 70,        // +0..6  Ctrl+Shift+1..7
+    CmdTagBase = 70,        // +0..6  Ctrl+Alt+Shift+1..7
     CmdViewBase = 80,       // + ViewModeIndex (8 stable view choices)
     CmdTabColorBase = 90,   // +0..7  tab-group color swatches
     CmdTabGroupNewTab = 98,
@@ -74,7 +74,6 @@ enum MenuCmd : int {
     CmdDetailsShellMenu,    // details "更多": open the Explorer context menu
     CmdTabNewRight,         // tab menu: new tab to the right
     CmdTabDuplicate,        // tab menu: duplicate this tab
-    CmdTabOpenInNewWindow,  // tab menu: open this folder in its own window
     CmdTabPin,              // tab menu: pin/unpin toggle
     CmdTabClose,            // tab menu: close this tab
     CmdTabAddToNewGroup,    // tab menu: create a group with this tab
@@ -118,6 +117,9 @@ enum MenuCmd : int {
     // Explorer integration (优化.md §7): registry static verbs bound to the
     // current selection (+index into the StaticVerb list) and pulse_shell
     // IContextMenu session items (+host menu id, up to 0x7FFF).
+    // Item menu "复制到窗口 / 移动到窗口" (M6e): + index into the other windows listed.
+    CmdCopyToWindowBase = 5000,
+    CmdMoveToWindowBase = 5032,
     CmdShellStaticBase = 6000,
     CmdShellComBase = 8000,
 };
@@ -134,7 +136,30 @@ struct ShellMenuEntry {
     bool from_com = false;  // pulse_shell IContextMenu row (vs registry static)
     std::wstring clsid;     // handler CLSID when known ("{guid}")
     std::wstring handler;   // handler display name for the settings catalog
+    wchar_t mnemonic = 0;   // access key from the Explorer label ("&X"), 0 = none
 };
+
+// Explorer's access keys for the built-in rows that mirror its own verbs
+// (shell32 labels: 打开(O) 剪切(T) 复制(C) 粘贴(P) 删除(D) 重命名(M) 属性(R)
+// 撤消(U) 复制为路径(A) 刷新(E) 还原(E) 清空回收站(B)). 0 = no access key.
+inline wchar_t BuiltinMenuMnemonic(int command) {
+    switch (command) {
+    case CmdOpen: return L'O';
+    case CmdCut: return L'T';
+    case CmdCopy: return L'C';
+    case CmdPaste: return L'P';
+    case CmdDelete: return L'D';
+    case CmdRename: return L'M';
+    case CmdProperties:
+    case CmdFolderProperties: return L'R';
+    case CmdUndo: return L'U';
+    case CmdCopyPath: return L'A';
+    case CmdRefresh:
+    case CmdRestoreRecycle: return L'E';
+    case CmdEmptyRecycle: return L'B';
+    default: return 0;
+    }
+}
 
 // Context menu for a selected entry: 打开 + icon strip (cut/copy/delete/
 // rename) + built-in verbs + undo. Explorer rows are appended afterwards via
@@ -148,8 +173,11 @@ BuiltinMenuItem BuiltinItemForCommand(int command);
 // Drops the built-in rows the user hid on the 右键菜单 page from an item or
 // background menu, before the Explorer section is appended. A dropped row's
 // separator moves to the row above it, so groups stay apart without doubling.
+// With a surface, the movable rows first take the user's order for it: they
+// trade places among the slots they occupy and each slot keeps its separator.
 void ApplyBuiltinMenuPrefs(std::vector<ui::FluentMenuItem>& items,
-                           const ContextMenuPrefs& prefs);
+                           const ContextMenuPrefs& prefs,
+                           BuiltinMenuSurface surface = BuiltinMenuSurface::Count);
 
 struct Tab;
 // Uses snapshot metadata only; never probes the filesystem on the UI thread.
@@ -169,6 +197,16 @@ void AppendShellSection(std::vector<ui::FluentMenuItem>& items,
 // Host still returns the full list; call this in the UI process.
 std::vector<ShellMenuEntry> ApplyExplorerPrefs(const ContextMenuPrefs& prefs,
                                                const std::vector<ShellMenuEntry>& entries);
+
+// Other windows' shown folders, most recently used window first (M6e).
+inline constexpr size_t kMaxWindowTransferTargets = 32;
+static_assert(CmdCopyToWindowBase + kMaxWindowTransferTargets <= CmdMoveToWindowBase &&
+              CmdMoveToWindowBase + kMaxWindowTransferTargets <= CmdShellStaticBase);
+// Two flyouts, "复制到窗口" and "移动到窗口", one row per folder (its name, then
+// the full path, also its tooltip), right before 复制路径. Nothing without targets; 移动到窗口
+// stays visible but disabled when the selection cannot move.
+void AppendWindowTransferCommands(std::vector<ui::FluentMenuItem>& items,
+                                  const std::vector<std::wstring>& folders, bool can_move);
 
 // Context menu for empty list space (creation / paste / terminal / undo).
 std::vector<ui::FluentMenuItem> BuildBackgroundMenu(bool can_paste, bool can_undo,

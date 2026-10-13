@@ -16,6 +16,9 @@
 #include <atomic>
 #include <sstream>
 #include <cstdint>
+#include <cstring>
+#include <memory>
+#include "../fs/nt_directory_record.h"
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -49,19 +52,7 @@ struct NtIoStatusBlock {
 
 using NtPioApcRoutine = VOID (NTAPI*)(PVOID ApcContext, NtIoStatusBlock* IoStatusBlock, ULONG Reserved);
 
-struct NtFileFullDirInformation {
-    ULONG NextEntryOffset;
-    ULONG FileIndex;
-    LARGE_INTEGER CreationTime;
-    LARGE_INTEGER LastAccessTime;
-    LARGE_INTEGER LastWriteTime;
-    LARGE_INTEGER ChangeTime;
-    LARGE_INTEGER EndOfFile;
-    LARGE_INTEGER AllocationSize;
-    ULONG FileAttributes;
-    ULONG FileNameLength;
-    WCHAR FileName[1];
-};
+using pulse::fs::NtFileFullDirInformation;
 
 enum NtFileInformationClass : int {
     NtFileFullDirectoryInformation = 2,
@@ -140,7 +131,46 @@ struct EntryInfo {
     FILETIME mtime;
     DWORD attrs;
     bool is_dir;
+    DWORD reparse_tag = 0;
 };
+
+static void parse_nt_records(const BYTE* data, size_t bytes, std::vector<EntryInfo>& out) {
+    constexpr size_t header = offsetof(NtFileFullDirInformation, FileName);
+    for (;;) {
+        if (bytes < header) throw std::runtime_error("truncated NT directory record");
+        NtFileFullDirInformation info{};
+        std::memcpy(&info, data, header);
+        if (info.FileNameLength % sizeof(WCHAR) || info.FileNameLength > bytes - header)
+            throw std::runtime_error("invalid NT filename length");
+        EntryInfo e{};
+        e.name.resize(info.FileNameLength / sizeof(WCHAR));
+        std::memcpy(e.name.data(), data + header, info.FileNameLength);
+        e.size = info.EndOfFile.QuadPart;
+        e.mtime = {info.LastWriteTime.LowPart, static_cast<DWORD>(info.LastWriteTime.HighPart)};
+        e.attrs = info.FileAttributes;
+        e.reparse_tag = (e.attrs & FILE_ATTRIBUTE_REPARSE_POINT) ? info.EaSize : 0;
+        e.is_dir = (e.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        out.push_back(std::move(e));
+        if (!info.NextEntryOffset) break;
+        if (info.NextEntryOffset < header + info.FileNameLength ||
+            info.NextEntryOffset > bytes || info.NextEntryOffset % 8)
+            throw std::runtime_error("invalid NT record offset");
+        data += info.NextEntryOffset;
+        bytes -= info.NextEntryOffset;
+    }
+}
+
+static void normalize_entries(std::vector<EntryInfo>& entries) {
+    std::erase_if(entries, [](const EntryInfo& e) { return e.name == L"." || e.name == L".."; });
+    std::sort(entries.begin(), entries.end(), [](const EntryInfo& a, const EntryInfo& b) { return a.name < b.name; });
+}
+
+static bool same_entries(const std::vector<EntryInfo>& a, const std::vector<EntryInfo>& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const EntryInfo& x, const EntryInfo& y) {
+        return x.name == y.name && x.size == y.size && x.attrs == y.attrs && x.is_dir == y.is_dir && x.reparse_tag == y.reparse_tag &&
+            x.mtime.dwLowDateTime == y.mtime.dwLowDateTime && x.mtime.dwHighDateTime == y.mtime.dwHighDateTime;
+    });
+}
 
 static void collect_findfirstfile(const std::wstring& path, std::vector<EntryInfo>& out) {
     std::wstring pattern = add_long_path_prefix(path);
@@ -166,10 +196,13 @@ static void collect_findfirstfile(const std::wstring& path, std::vector<EntryInf
         e.size = static_cast<LONGLONG>(fd.nFileSizeHigh) << 32 | fd.nFileSizeLow;
         e.mtime = fd.ftLastWriteTime;
         e.attrs = fd.dwFileAttributes;
+        e.reparse_tag = (e.attrs & FILE_ATTRIBUTE_REPARSE_POINT) ? fd.dwReserved0 : 0;
         e.is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         out.push_back(e);
     } while (FindNextFileW(h, &fd));
+    const DWORD error = GetLastError();
     FindClose(h);
+    if (error != ERROR_NO_MORE_FILES) throw std::runtime_error("FindNextFileW failed: " + std::to_string(error));
 }
 
 static void collect_findfirstfileex_largefetch(const std::wstring& path, std::vector<EntryInfo>& out) {
@@ -196,10 +229,13 @@ static void collect_findfirstfileex_largefetch(const std::wstring& path, std::ve
         e.size = static_cast<LONGLONG>(fd.nFileSizeHigh) << 32 | fd.nFileSizeLow;
         e.mtime = fd.ftLastWriteTime;
         e.attrs = fd.dwFileAttributes;
+        e.reparse_tag = (e.attrs & FILE_ATTRIBUTE_REPARSE_POINT) ? fd.dwReserved0 : 0;
         e.is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         out.push_back(e);
     } while (FindNextFileW(h, &fd));
+    const DWORD error = GetLastError();
     FindClose(h);
+    if (error != ERROR_NO_MORE_FILES) throw std::runtime_error("FindNextFileW failed: " + std::to_string(error));
 }
 
 static NtCreateFile_t g_NtCreateFile = nullptr;
@@ -256,14 +292,17 @@ static void collect_ntquerydirectoryfile(const std::wstring& path, std::vector<E
         throw std::runtime_error(oss.str());
     }
 
+    auto close_handle = [](void* handle) { if (handle && handle != INVALID_HANDLE_VALUE) CloseHandle(handle); };
+    const std::unique_ptr<void, decltype(close_handle)> directory_owner(h, close_handle);
     constexpr SIZE_T buf_size = 64 * 1024;
     std::vector<BYTE> buffer(buf_size);
     bool restart = true;
     HANDLE hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!hEvent) {
-        CloseHandle(h);
         throw std::runtime_error("CreateEvent failed");
     }
+
+    const std::unique_ptr<void, decltype(close_handle)> event_owner(hEvent, close_handle);
 
     for (;;) {
         iosb = {};
@@ -289,32 +328,15 @@ static void collect_ntquerydirectoryfile(const std::wstring& path, std::vector<E
 
         if (status == STATUS_NO_MORE_FILES) break;
         if (status != STATUS_SUCCESS) {
-            CloseHandle(hEvent);
-            CloseHandle(h);
             std::ostringstream oss;
             oss << "NtQueryDirectoryFile failed, status=0x" << std::hex << status;
             throw std::runtime_error(oss.str());
         }
 
-        auto* info = reinterpret_cast<NtFileFullDirInformation*>(buffer.data());
-        for (;;) {
-            EntryInfo e;
-            e.name.assign(info->FileName, info->FileNameLength / sizeof(WCHAR));
-            e.size = info->EndOfFile.QuadPart;
-            e.mtime.dwLowDateTime = info->LastWriteTime.LowPart;
-            e.mtime.dwHighDateTime = info->LastWriteTime.HighPart;
-            e.attrs = info->FileAttributes;
-            e.is_dir = (info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            out.push_back(e);
-
-            if (info->NextEntryOffset == 0) break;
-            info = reinterpret_cast<NtFileFullDirInformation*>(
-                reinterpret_cast<BYTE*>(info) + info->NextEntryOffset);
-        }
+        if (iosb.Information > buffer.size()) throw std::runtime_error("invalid NT result size");
+        parse_nt_records(buffer.data(), iosb.Information, out);
     }
 
-    CloseHandle(hEvent);
-    CloseHandle(h);
 }
 
 // ---- generation ----
@@ -380,6 +402,7 @@ struct BenchResult {
     std::string method;
     std::vector<double> times_ms;
     int64_t count = 0;
+    std::vector<EntryInfo> entries;
     bool ok = false;
     std::string error;
 };
@@ -396,10 +419,13 @@ static BenchResult run_bench(const std::string& method_name, Collector fn, const
             fn(path, entries);
             auto t1 = std::chrono::steady_clock::now();
             r.times_ms.push_back(millis(t1 - t0));
-            if (i == 0) r.count = static_cast<int64_t>(entries.size());
-            else if (r.count != static_cast<int64_t>(entries.size())) {
+            normalize_entries(entries);
+            if (i == 0) {
+                r.count = static_cast<int64_t>(entries.size());
+                r.entries = std::move(entries);
+            } else if (!same_entries(r.entries, entries)) {
                 r.ok = false;
-                r.error = "inconsistent entry count across iterations";
+                r.error = "inconsistent names or metadata across iterations";
                 return r;
             }
             r.ok = true;
@@ -412,8 +438,8 @@ static BenchResult run_bench(const std::string& method_name, Collector fn, const
     return r;
 }
 
-static bool compare_counts(const BenchResult& a, const BenchResult& b) {
-    return a.ok && b.ok && a.count == b.count;
+static bool compare_results(const BenchResult& a, const BenchResult& b) {
+    return a.ok && b.ok && same_entries(a.entries, b.entries);
 }
 
 static void print_results(const std::wstring& path, const std::vector<BenchResult>& results) {
@@ -434,13 +460,12 @@ static void print_results(const std::wstring& path, const std::vector<BenchResul
                    << L" | " << std::setw(11) << best
                    << L" | " << r.count << L"\n";
     }
-    if (results.size() >= 3 && compare_counts(results[0], results[1]) && compare_counts(results[1], results[2])) {
-        std::wcout << L"  counts match across methods.\n";
+    if (results.size() >= 3 && compare_results(results[0], results[1]) && compare_results(results[1], results[2])) {
+        std::wcout << L"  names and metadata match across methods.\n";
     } else {
-        std::wcout << L"  WARNING: counts differ across methods.\n";
+        std::wcout << L"  INVALID benchmark: results differ or enumeration failed.\n";
     }
-    std::wcout << L"  Note: FindFirstFileW/ExW return . and ..; NtQueryDirectoryFile(FileFullDirectoryInformation) does not.\n";
-    std::wcout << L"  When comparing, only non-. .. entries are considered via the stored count.\n";
+
 }
 
 static int usage(const char* argv0) {
@@ -486,13 +511,15 @@ int wmain(int argc, wchar_t* argv[]) {
         return 0;
     }
 
+    bool valid = true;
     for (const auto& p : measure_paths) {
         std::vector<BenchResult> results;
         results.push_back(run_bench("FindFirstFileW", collect_findfirstfile, p, 5));
         results.push_back(run_bench("FindFirstFileExW+LARGE", collect_findfirstfileex_largefetch, p, 5));
         results.push_back(run_bench("NtQueryDirectoryFile", collect_ntquerydirectoryfile, p, 5));
         print_results(p, results);
+        valid = valid && compare_results(results[0], results[1]) && compare_results(results[1], results[2]);
     }
 
-    return 0;
+    return valid ? 0 : 2;
 }

@@ -8,7 +8,9 @@ struct ContentInstantSessionHooks {
     using Enqueue = std::function<void(const std::wstring&, bool)>;
     using Fail = std::function<void(ContentSubscriptionFailure, DWORD)>;
     std::function<void(Enqueue, Fail)> arm;
+    std::function<DWORD(const std::wstring&)> attributes;
     std::function<bool(const ContentSearchRequest&, const std::atomic<bool>&, ContentBatchCallback)> search;
+    std::function<DWORD(const std::wstring&, std::vector<std::wstring>&)> list_directory;
 };
 // Owns only the active query and its change subscription; never runs a body writer.
 bool RunInstantContentSession(ContentIndex& index, ContentSearchRequest request,

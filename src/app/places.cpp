@@ -7,18 +7,37 @@
 #include "../common/json_utils.h"
 #include "../common/localization.h"
 #include "../common/utf8_file.h"
+#include "../common/runtime_log.h"
 #include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <string_view>
 #include <unordered_set>
 #include <objbase.h>
 #include <cwctype>
+#include <chrono>
 
 namespace pulse::app {
+#ifdef PULSE_PLACES_SAVE_TEST
+void PlacesSaveTestStage(unsigned stage);
+#endif
 
 namespace {
 
 constexpr const wchar_t* kAdsSuffix = L":Pulse.Tag";
+
+bool WriteCatalogDocument(const std::wstring& path, const std::wstring& document, bool tags) {
+    if (!pulse::json::ValidConfigObject(document, true)) {
+        SetLastError(ERROR_INVALID_DATA);
+    } else if (WriteUtf8FileAtomic(path, document)) {
+        return true;
+    }
+    const DWORD error = GetLastError();
+    diagnostics::runtime::Event("places_save_failed", {{"tags", tags ? 1u : 0u},
+        {"error", error}, {"characters", document.size()}});
+    SetLastError(error);
+    return false;
+}
 
 static std::wstring FolderTitle(std::wstring path) {
     if (path.starts_with(L"\\\\?\\UNC\\")) path = L"\\\\" + path.substr(8);
@@ -30,13 +49,8 @@ static std::wstring FolderTitle(std::wstring path) {
 }
 
 static uint32_t ExtractRgb(const std::wstring& json) {
-    std::wstring quoted = L"\"rgb\"";
-    size_t pos = json.find(quoted);
+    size_t pos = pulse::json::ValuePosition(json, L"rgb");
     if (pos == std::wstring::npos) return 0xEF4444;
-    pos = json.find(L':', pos);
-    if (pos == std::wstring::npos) return 0xEF4444;
-    ++pos;
-    while (pos < json.size() && json[pos] == L' ') ++pos;
     if (pos + 2 < json.size() && json[pos] == L'0' && (json[pos + 1] == L'x' || json[pos + 1] == L'X')) {
         pos += 2;
         uint32_t v = 0;
@@ -53,6 +67,18 @@ static uint32_t ExtractRgb(const std::wstring& json) {
         return v;
     }
     return static_cast<uint32_t>(pulse::json::ExtractInt(json, L"rgb"));
+}
+
+static bool ReadTagsGeneration(const std::wstring& json, uint64_t& generation) {
+    generation = 0;
+    if (pulse::json::ValuePosition(json, L"tags_generation") == std::wstring::npos) return true;
+    const auto value = pulse::json::ExtractString(json, L"tags_generation");
+    if (value.empty()) return false;
+    for (wchar_t digit : value) {
+        if (digit < L'0' || digit > L'9' || generation > (UINT64_MAX - (digit - L'0')) / 10) return false;
+        generation = generation * 10 + (digit - L'0');
+    }
+    return generation != UINT64_MAX;
 }
 
 static std::wstring Norm(const std::wstring& p) {
@@ -160,7 +186,7 @@ PlacesCatalog::~PlacesCatalog() {
     StopTagWriter();
 }
 
-bool PlacesCatalog::SaveTagFile(const std::vector<ColorTag>& snapshot) {
+bool PlacesCatalog::SaveTagFile(const std::vector<ColorTag>& snapshot, uint64_t generation) {
     const std::wstring dir = GetPulseDataDir();
     if (dir.empty()) return false;
     std::wostringstream file;
@@ -174,7 +200,7 @@ bool PlacesCatalog::SaveTagFile(const std::vector<ColorTag>& snapshot) {
         }
         file << L"]";
     };
-    file << L"{\n  \"version\":2,\n  \"tags\":[\n";
+    file << L"{\n  \"version\":2,\n  \"tags_generation\":\"" << generation << L"\",\n  \"tags\":[\n";
     for (size_t i = 0; i < snapshot.size(); ++i) {
         std::wstring id, name;
         pulse::json::Escape(snapshot[i].id, id);
@@ -187,39 +213,121 @@ bool PlacesCatalog::SaveTagFile(const std::vector<ColorTag>& snapshot) {
         file << L"}" << (i + 1 < snapshot.size() ? L"," : L"") << L"\n";
     }
     file << L"  ]\n}\n";
-    return WriteUtf8FileAtomic(dir + L"\\tags.json", file.str());
+    std::wstring document = file.str();
+    document.insert(document.find(L'{') + 1, L"\n\"save_generation\":\"" + std::to_wstring(generation) + L"\",");
+    if (WriteCatalogDocument(dir + L"\\tags.json", document, true)) {
+        DeleteFileW((dir + L"\\tags.pending.json").c_str());
+        return true;
+    }
+    // A failed final rename may still permit a recovery copy. Its generation
+    // lets startup distinguish it from an older journal that could not be removed.
+    WriteCatalogDocument(dir + L"\\tags.pending.json", document, true);
+    return false;
 }
 
 void PlacesCatalog::QueueTagSave() const {
     if (!persist || load_failed) return;
     {
-        std::lock_guard<std::mutex> lock(tag_save_mutex_);
-        pending_tag_save_ = tags;
+        std::lock_guard lock(tag_save_mutex_);
+        pending_tag_save_ = std::make_pair(tags, ++tags_generation_);
         if (!tag_save_thread_.joinable()) {
             tag_save_stop_ = false;
             tag_save_thread_ = std::thread([this] {
+                uint64_t attempted_generation = 0;
+                unsigned attempts = 0;
                 for (;;) {
-                    std::optional<std::vector<ColorTag>> snapshot;
+                    std::pair<std::vector<ColorTag>, uint64_t> snapshot;
+                    bool stopping;
                     {
-                        std::unique_lock<std::mutex> lock(tag_save_mutex_);
-                        tag_save_cv_.wait(lock, [this] {
-                            return tag_save_stop_ || pending_tag_save_.has_value();
+                        std::unique_lock lock(tag_save_mutex_);
+                        tag_save_cv_.wait(lock, [&] {
+                            return tag_save_stop_ || (pending_tag_save_ &&
+                                (pending_tag_save_->second != attempted_generation || attempts < 3));
                         });
-                        if (pending_tag_save_) {
-                            snapshot = std::move(pending_tag_save_);
-                            pending_tag_save_.reset();
-                        } else if (tag_save_stop_) {
-                            return;
+                        if (!pending_tag_save_) {
+                            if (tag_save_stop_) return;
+                            continue;
+                        }
+                        snapshot = *pending_tag_save_;
+                        stopping = tag_save_stop_;
+                        if (snapshot.second != attempted_generation) {
+                            attempted_generation = snapshot.second;
+                            attempts = 0;
                         }
                     }
-                    if (snapshot) SaveTagFile(*snapshot);
-                    std::lock_guard<std::mutex> lock(tag_save_mutex_);
-                    if (tag_save_stop_ && !pending_tag_save_) return;
+                    bool saved = false, current;
+                    DWORD error = ERROR_SUCCESS;
+                    {
+                        std::lock_guard io_lock(tag_save_io_mutex_);
+                        {
+                            std::lock_guard state_lock(tag_save_mutex_);
+                            current = snapshot.second == tags_generation_;
+                        }
+                        if (current) {
+                            saved = SaveTagFile(snapshot.first, snapshot.second);
+                            if (!saved) { error = GetLastError(); if (!error) error = ERROR_WRITE_FAULT; }
+                        }
+                        std::lock_guard state_lock(tag_save_mutex_);
+                        if (current && snapshot.second == tags_generation_) {
+                            tag_save_error_ = error;
+                            if (saved) pending_tag_save_.reset();
+                            else ++attempts;
+                        }
+                    }
+                    std::unique_lock lock(tag_save_mutex_);
+                    if (stopping) {
+                        if (pending_tag_save_) OutputDebugStringW(L"Pulse: final tag save failed; check the places.json recovery copy.\n");
+                        return;
+                    }
+                    if (current && !saved && attempts >= 3)
+                        OutputDebugStringW(L"Pulse: tag save retries exhausted; tag changes remain pending.\n");
+                    if (pending_tag_save_ && pending_tag_save_->second == snapshot.second && attempts < 3) {
+                        tag_save_cv_.wait_for(lock, std::chrono::milliseconds(250 * attempts), [&] {
+                            return tag_save_stop_ || !pending_tag_save_ || pending_tag_save_->second != snapshot.second;
+                        });
+                    }
                 }
             });
         }
     }
+    // The existing places file is the recovery copy if the dedicated tag file
+    // cannot be replaced. Every tag generation must reach that save channel too.
+    MarkPlacesDirty();
     tag_save_cv_.notify_one();
+}
+
+DWORD PlacesCatalog::TagSaveError() const {
+    std::lock_guard lock(tag_save_mutex_);
+    return tag_save_error_;
+}
+
+bool PlacesCatalog::FlushTagSave() const {
+    if (!persist) return true;
+    if (load_failed) return false;
+    uint64_t generation;
+    const auto snapshot = tags;
+    {
+        std::lock_guard lock(tag_save_mutex_);
+        generation = tags_generation_;
+    }
+    std::lock_guard io_lock(tag_save_io_mutex_);
+    const bool saved = SaveTagFile(snapshot, generation);
+    DWORD error = saved ? ERROR_SUCCESS : GetLastError();
+    if (!saved && !error) error = ERROR_WRITE_FAULT;
+    {
+        std::lock_guard lock(tag_save_mutex_);
+        if (generation == tags_generation_) {
+            tag_save_error_ = error;
+            if (saved) pending_tag_save_.reset();
+            else pending_tag_save_ = std::make_pair(snapshot, generation);
+        }
+    }
+    tag_save_cv_.notify_all();
+    if (!saved) {
+        MarkPlacesDirty();
+        OutputDebugStringW(L"Pulse: tag flush failed; changes remain pending for recovery.\n");
+    }
+    return saved;
 }
 
 void PlacesCatalog::StopTagWriter() {
@@ -256,6 +364,7 @@ void PlacesCatalog::EnsureDefaults() {
 bool PlacesCatalog::Load() {
     StopPlacesWriter();
     StopTagWriter();
+    pending_tag_save_.reset();
     const std::wstring dir = GetPulseDataDir();
     std::wstring json, tag_json;
     auto read = [&](const wchar_t* name, std::wstring& text) {
@@ -270,7 +379,21 @@ bool PlacesCatalog::Load() {
         load_failed = true;
         return false;
     }
+    uint64_t places_generation = 0, tag_generation = 0;
+    if (!ReadTagsGeneration(json, places_generation) || !ReadTagsGeneration(tag_json, tag_generation)) {
+        load_failed = true;
+        return false;
+    }
     load_failed = false;
+    const auto generation = [](const std::wstring& document) {
+        const auto text = pulse::json::ExtractString(document, L"save_generation");
+        return text.empty() ? uint64_t{0} : _wcstoui64(text.c_str(), nullptr, 10);
+    };
+    std::wstring recovery;
+    const bool recovery_valid = read(L"\\tags.pending.json", recovery) && !recovery.empty();
+    const bool recovered = recovery_valid && generation(recovery) > generation(tag_json);
+    if (recovered) tag_json = std::move(recovery);
+    if (!ReadTagsGeneration(tag_json, tag_generation)) { load_failed = true; return false; }
     workspaces.clear();
     tags.clear();
     networks.clear();
@@ -394,16 +517,28 @@ bool PlacesCatalog::Load() {
             tag.paths = pulse::json::ExtractStringArray(block, L"paths");
             if (!tag.id.empty() && !tag.name.empty()) loaded.push_back(std::move(tag));
         }
-        if (!loaded.empty()) {
+        const auto position = pulse::json::ValuePosition(tag_json, L"tags");
+        bool empty_array = false;
+        if (position != std::wstring::npos && tag_json[position] == L'[') {
+            const auto next = tag_json.find_first_not_of(L" \t\r\n", position + 1);
+            empty_array = next != std::wstring::npos && tag_json[next] == L']';
+        }
+        if ((!loaded.empty() || (tag_generation && empty_array)) && tag_generation >= places_generation) {
             tags = std::move(loaded);
             tags_loaded = true;
         }
     }
 
+    {
+        std::lock_guard lock(tag_save_mutex_);
+        tags_generation_ = (std::max)(places_generation, tag_generation);
+        pending_tag_save_.reset();
+        tag_save_error_ = ERROR_SUCCESS;
+    }
     EnsureDefaults();
     RebuildTagIndex();
     RebuildStarIndex();
-    if (places_loaded && !tags_loaded) QueueTagSave();
+    if (recovered || (places_loaded && !tags_loaded)) QueueTagSave();
     return places_loaded || tags_loaded;
 }
 
@@ -426,6 +561,10 @@ PlacesCatalog::SaveSnapshot PlacesCatalog::CaptureSaveSnapshot() const {
     SaveSnapshot snapshot;
     snapshot.workspaces = workspaces;
     snapshot.tags = tags;
+    {
+        std::lock_guard lock(tag_save_mutex_);
+        snapshot.tags_generation = tags_generation_;
+    }
     snapshot.networks = networks;
     snapshot.quick_access_paths = quick_access_paths;
     snapshot.starred_items = starred_items;
@@ -437,17 +576,20 @@ PlacesCatalog::SaveSnapshot PlacesCatalog::CaptureSaveSnapshot() const {
 }
 
 void PlacesCatalog::MarkPlacesDirty() const {
-    places_save_revision_.fetch_add(1, std::memory_order_relaxed);
-    places_save_due_.store(GetTickCount64() + 1000, std::memory_order_release);
+#ifdef PULSE_PLACES_SAVE_TEST
+    PlacesSaveTestStage(3);
+#endif
+    std::lock_guard lock(places_save_mutex_);
+    ++places_save_revision_;
+    places_save_due_ = GetTickCount64() + 1000;
 }
 
 void PlacesCatalog::QueuePlacesSave() const {
     if (!persist || load_failed) return;
     auto snapshot = CaptureSaveSnapshot();
-    const uint64_t revision = places_save_revision_.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lock(places_save_mutex_);
-        pending_places_save_ = std::make_pair(std::move(snapshot), revision);
+        pending_places_save_ = std::make_pair(std::move(snapshot), places_save_revision_);
         if (!places_save_thread_.joinable()) {
             places_save_stop_ = false;
             places_save_thread_ = std::thread([this] {
@@ -466,20 +608,25 @@ void PlacesCatalog::QueuePlacesSave() const {
                         }
                     }
                     if (pending) {
+#ifdef PULSE_PLACES_SAVE_TEST
+                        PlacesSaveTestStage(1);
+#endif
                         bool saved = false;
-                        if (places_save_revision_.load(std::memory_order_acquire)
-                                == pending->second) {
-                            std::lock_guard<std::mutex> lock(places_save_io_mutex_);
-                            // A synchronous Save() may have superseded this
-                            // snapshot while it was waiting for the IO lock.
-                            if (places_save_revision_.load(std::memory_order_acquire)
-                                    == pending->second) {
-                                saved = SaveSnapshotFile(pending->first);
+                        {
+                            std::lock_guard io_lock(places_save_io_mutex_);
+                            bool current = false;
+                            {
+                                std::lock_guard state_lock(places_save_mutex_);
+                                current = places_save_revision_ == pending->second;
                             }
+                            if (current) saved = SaveSnapshotFile(pending->first);
                         }
-                        if (saved && places_save_revision_.load(std::memory_order_acquire)
-                                == pending->second) {
-                            places_save_due_.store(0, std::memory_order_release);
+                        std::lock_guard state_lock(places_save_mutex_);
+                        if (saved && places_save_revision_ == pending->second) {
+#ifdef PULSE_PLACES_SAVE_TEST
+                            PlacesSaveTestStage(2);
+#endif
+                            places_save_due_ = 0;
                         }
                     }
                     std::lock_guard<std::mutex> lock(places_save_mutex_);
@@ -504,9 +651,19 @@ bool PlacesCatalog::Save() const {
     if (!persist) return true;
     if (load_failed) return false;
     const SaveSnapshot snapshot = CaptureSaveSnapshot();
-    std::lock_guard<std::mutex> lock(places_save_io_mutex_);
+    uint64_t revision;
+    {
+        std::lock_guard state_lock(places_save_mutex_);
+        revision = ++places_save_revision_;
+        places_save_due_ = GetTickCount64() + 1000;
+        pending_places_save_.reset();
+    }
+    std::lock_guard io_lock(places_save_io_mutex_);
     const bool saved = SaveSnapshotFile(snapshot);
-    if (saved) places_save_due_.store(0, std::memory_order_release);
+    {
+        std::lock_guard state_lock(places_save_mutex_);
+        if (saved && places_save_revision_ == revision) places_save_due_ = 0;
+    }
     return saved;
 }
 
@@ -524,7 +681,8 @@ bool PlacesCatalog::SaveSnapshotFile(const SaveSnapshot& snapshot) {
         }
         f << L"]";
     };
-    f << L"{\n  \"places_version\":2,\n  \"tag_version\":2,\n  \"active_workspace\":" << snapshot.active_workspace
+    f << L"{\n  \"places_version\":2,\n  \"tag_version\":2,\n  \"tags_generation\":\"" << snapshot.tags_generation
+      << L"\",\n  \"active_workspace\":" << snapshot.active_workspace
       << L",\n  \"workspaces\":[\n";
     for (size_t i = 0; i < snapshot.workspaces.size(); ++i) {
         const auto& w = snapshot.workspaces[i];
@@ -621,11 +779,16 @@ bool PlacesCatalog::SaveSnapshotFile(const SaveSnapshot& snapshot) {
     }
     f << L"  ]\n}\n";
     DeleteFileW((dir + L"\\places.tmp").c_str());
-    return WriteUtf8FileAtomic(dir + L"\\places.json", f.str());
+    const std::wstring document = f.str();
+    return WriteCatalogDocument(dir + L"\\places.json", document, false);
 }
 
 bool PlacesCatalog::FlushPendingSave(bool force) const {
-    const ULONGLONG due = places_save_due_.load(std::memory_order_acquire);
+    ULONGLONG due;
+    {
+        std::lock_guard lock(places_save_mutex_);
+        due = places_save_due_;
+    }
     if (!due) return true;
     if (!force && GetTickCount64() < due) return true;
     if (force) return Save();
@@ -1441,7 +1604,9 @@ bool WriteTagAdsV2(const std::wstring& path, const std::vector<TagAdsRecord>& ta
     DWORD written = 0;
     const BOOL ok = WriteFile(h, payload.data(),
         static_cast<DWORD>(payload.size() * sizeof(wchar_t)), &written, nullptr);
+    const DWORD write_error = ok ? ERROR_WRITE_FAULT : GetLastError();
     CloseHandle(h);
+    if (!ok || written != payload.size() * sizeof(wchar_t)) SetLastError(write_error);
     return ok != 0 && written == payload.size() * sizeof(wchar_t);
 }
 
@@ -1453,7 +1618,8 @@ static std::wstring ReadAdsPayload(const std::wstring& path) {
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return {};
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > 65536) {
+    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > 65536 ||
+        size.QuadPart % sizeof(wchar_t) != 0) {
         CloseHandle(h);
         return {};
     }

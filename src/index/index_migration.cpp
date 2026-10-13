@@ -1,4 +1,6 @@
 #include "index_migration.h"
+#include "index_config.h"
+#include "index_directory_security.h"
 #include <windows.h>
 #include <algorithm>
 #include <filesystem>
@@ -101,13 +103,15 @@ bool ValidPlan(const IndexMigration& migration) {
     return true;
 }
 
-DWORD CopyVerified(const fs::path& source, const fs::path& target, const MigratedIndexFile& expected) {
+DWORD CopyVerified(const fs::path& source, const fs::path& target, const MigratedIndexFile& expected, bool private_target) {
+    security::PrivateAttributes attributes;
+    if (private_target && !attributes) return ERROR_INVALID_SECURITY_DESCR;
     HANDLE input = CreateFileW(source.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (input == INVALID_HANDLE_VALUE) return GetLastError();
     const fs::path temporary = target.wstring() + L".pulse-copy-" +
         std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
-    HANDLE output = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
+    HANDLE output = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, private_target ? attributes.get() : nullptr,
         CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (output == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
@@ -163,7 +167,7 @@ bool SameIndexLocation(const std::wstring& source, const std::wstring& target) {
 }
 
 bool CopyIndexForMigration(const std::wstring& source, const std::wstring& target,
-                           IndexMigration& migration, std::wstring& error) {
+                           IndexMigration& migration, std::wstring& error, bool private_target) {
     migration = {};
     try {
         fs::path from = fs::path(source).lexically_normal().make_preferred();
@@ -178,7 +182,13 @@ bool CopyIndexForMigration(const std::wstring& source, const std::wstring& targe
         while (b.size() > 3 && b.back() == L'\\') b.pop_back();
         migration.source = from.wstring();
         migration.target = to.wstring();
-        if (a == b) { migration.failure = 0; return true; }
+        if (a == b) {
+            if (private_target && !ProtectIndexDirectory(to.wstring())) {
+                migration.failure = ERROR_ACCESS_DENIED;
+                throw std::runtime_error("existing root is not private");
+            }
+            migration.failure = 0; return true;
+        }
         if ((a + L"\\").starts_with(b + L"\\") || (b + L"\\").starts_with(a + L"\\"))
             throw std::runtime_error("overlapping directories");
         const auto files = Inventory(from);
@@ -192,6 +202,12 @@ bool CopyIndexForMigration(const std::wstring& source, const std::wstring& targe
             }
         }
         fs::create_directories(to);
+        PrivateIndexDirectoryLock target_lock;
+        if (private_target) {
+            migration.failure = ERROR_ACCESS_DENIED;
+            if (!target_lock.Acquire(to) || !ProtectIndexDirectory(to.wstring()))
+                throw std::runtime_error("target is not private");
+        }
         uint64_t required = 0;
         for (const auto& file : files)
             if (!fs::exists(to / file.relative)) required += file.size;
@@ -210,7 +226,7 @@ bool CopyIndexForMigration(const std::wstring& source, const std::wstring& targe
             }
             DWORD copy_error = ERROR_WRITE_FAULT;
             for (int attempt = 0; attempt < 3; ++attempt) {
-                copy_error = CopyVerified(old_file, new_file, file);
+                copy_error = CopyVerified(old_file, new_file, file, private_target);
                 if (!copy_error) break;
                 migration.failure = copy_error;
                 if (copy_error != ERROR_SHARING_VIOLATION && copy_error != ERROR_LOCK_VIOLATION) break;
@@ -220,6 +236,10 @@ bool CopyIndexForMigration(const std::wstring& source, const std::wstring& targe
             file.copied = true;
             migration.files.push_back(file);
             if (!Matches(new_file, file) || !Matches(old_file, file)) throw std::runtime_error("verification failed");
+        }
+        if (private_target && !security::PrivateTree(to.wstring())) {
+            migration.failure = ERROR_ACCESS_DENIED;
+            throw std::runtime_error("target permissions changed");
         }
         migration.failure = 0;
         return true;

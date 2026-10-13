@@ -1,7 +1,8 @@
 // tray_reveal.h — Closing to the tray and coming back.
 //
-// With "keep running after close" or global search on, the close button only
-// hides the window. When startup is set to open the default location, the
+// With "keep running after close", global search or Explorer window takeover
+// on (AppPrefs::KeepsRunningInBackground), the close button only hides the
+// window. When startup is set to open the default location, the
 // window starts over there when it is shown again, as a fresh launch would;
 // with "restore last tabs" it comes back unchanged. Pinned tabs stay.
 #pragma once
@@ -19,6 +20,10 @@ bool TakeFreshStart(AppState& s);
 void StartFreshAt(AppState& s, const std::wstring& path);
 // Lets TrayController::RestoreWindow start over before showing the window.
 void InstallTrayRevealHook(AppState& s);
+// Shows and activates `s` (multi-window M4b). The tray controller hides and
+// restores one window; when `s` is another one it is shown directly, so a
+// request for one window never brings up a different one.
+void RevealWindow(AppState& s);
 // Whether the notification-area icon should show (#57: always, only while
 // the window is closed to it, or never).
 bool WantsTrayIcon(const AppState& s, bool window_hidden);

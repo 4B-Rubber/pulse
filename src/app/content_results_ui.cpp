@@ -11,6 +11,9 @@ struct ContentSelectionAction {
     std::vector<int> indices;
     bool all=false;
     bool pattern=false;
+    bool waiting_for_view=false;
+    app::Tab* origin=nullptr;
+    index::ContentResultStore::Filter match_filter;
     bool focused_only=false;
     size_t count=0;
     int focus=-1;
@@ -84,11 +87,17 @@ bool RefreshContentResults(AppState& s) {
             tab->ClearSelection(); tab->scroll_y=0;
             store.SetFilter(app::ContentFilter(tab->filter_text,s.places));
         }
-        if(tab->content_revision!=store.Revision() || tab->search_total!=store.Count()) {
+        if(tab->content_revision!=store.Revision() || tab->search_total!=store.Count() ||
+           tab->content_order_revision!=store.OrderRevision()) {
             if (tab->content_order_revision != store.OrderRevision()) {
                 auto paths = std::move(tab->content_selected_paths);
                 const auto focus = tab->content_focus_path;
+                const auto pattern_job = s.contentSelectionAction;
+                const bool owns_transition = pattern_job && pattern_job->waiting_for_view &&
+                    pattern_job->origin == tab && pattern_job->store.lock() == tab->content_results &&
+                    pattern_job->selection == tab->selection_revision && tab->filter_text.empty();
                 tab->ClearSelection();
+                if (owns_transition) { pattern_job->selection = tab->selection_revision; paths.clear(); }
                 tab->content_order_revision=store.OrderRevision();
                 if (!paths.empty()) {
                     const auto focused = std::find(paths.begin(),paths.end(),focus);
@@ -186,21 +195,42 @@ bool DeferContentSelection(AppState& s,std::function<void(AppState&)> action,boo
 }
 void SelectContentPattern(AppState& s,const std::wstring& pattern) {
     auto* tab=ActiveTab(s);if(!tab || !tab->content_results) return;
-    auto job=std::make_shared<ContentSelectionAction>();job->pattern=true;job->store=tab->content_results;
+    s.contentSelectionAction.reset();
+    tab->content_selection_restore.reset();
+    tab->search_preserve_selection.clear();
+    tab->content_selected_paths.clear();
     tab->filter_text.clear();RefreshContentResults(s);
-    job->selection=tab->selection_revision; job->order=tab->content_results->OrderRevision(); s.contentSelectionAction=job; InvalidateRect(s.hwnd,nullptr,FALSE);
-    tab->content_results->Match(app::ContentFilter(pattern,s.places),[weak=std::weak_ptr<ContentSelectionAction>(job),hwnd=s.hwnd](auto result) {
-        if(auto current=weak.lock()) {
-            {std::lock_guard lock(current->mutex);current->result=std::move(result);}
-            PostMessageW(hwnd,WM_CONTENT_SELECTION,0,0);
-        }
-    });
+    auto job=std::make_shared<ContentSelectionAction>();job->pattern=true;job->store=tab->content_results;
+    job->origin=tab; job->waiting_for_view=true;
+    job->match_filter=app::ContentFilter(pattern,s.places);
+    job->selection=tab->selection_revision;
+    s.contentSelectionAction=job; InvalidateRect(s.hwnd,nullptr,FALSE);
+    CompleteContentSelection(s);
 }
 void CompleteContentSelection(AppState& s) {
     auto job=s.contentSelectionAction; if(!job) return;
     if(job->pattern) {
         auto store=job->store.lock();
-        if(store && store->Filtering()) return;
+        auto* tab=ActiveTab(s);
+        if(!tab || tab!=job->origin || !store || tab->content_results!=store ||
+           tab->selection_revision!=job->selection || !tab->filter_text.empty()) {
+            s.contentSelectionAction.reset(); return;
+        }
+        if(store->Filtering() || store->Sorting()) return;
+        if(job->waiting_for_view) {
+            // Refresh owns the clear-filter transition and must publish its
+            // final order/selection tokens before matching the new view.
+            if(tab->content_order_revision!=store->OrderRevision()) return;
+            job->waiting_for_view=false;
+            job->order=store->OrderRevision();
+            store->Match(std::move(job->match_filter),[weak=std::weak_ptr<ContentSelectionAction>(job),hwnd=s.hwnd](auto result) {
+                if(auto current=weak.lock()) {
+                    {std::lock_guard lock(current->mutex);current->result=std::move(result);}
+                    PostMessageW(hwnd,WM_CONTENT_SELECTION,0,0);
+                }
+            });
+            return;
+        }
     }
     std::optional<index::ContentResultStore::Selection> result;
     { std::lock_guard lock(job->mutex); result=std::move(job->result); }

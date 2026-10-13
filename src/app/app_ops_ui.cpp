@@ -18,6 +18,7 @@
 #include "batch_rename.h"
 #include "link_resolve.h"
 #include "locked_item_prompt.h"
+#include "paste_source.h"
 #include "resource.h"
 #include "../ops/clipboard.h"
 #include "../ipc/ctx_menu_util.h"
@@ -53,11 +54,12 @@ bool ErrorHas(const std::wstring& error, const wchar_t* simplified) {
 }
 } // namespace
 
-bool SubmitWithConflictResolution(AppState& s, ops::OpRequest request) {
+bool SubmitWithConflictResolution(AppState& s, ops::OpRequest request, uint64_t* task_id) {
     // Copy/move conflict discovery is part of the transfer worker's recursive
     // scan. The UI only consumes immutable conflict snapshots.
-    s.ops.Submit(std::move(request));
-    return true;
+    const auto id = s.ops.Submit(std::move(request));
+    if (task_id) *task_id = id;
+    return id != 0;
 }
 
 // Tell the user that staged items which vanished were left out.
@@ -70,6 +72,33 @@ static void NotifyTraySkipped(AppState& s, size_t n) {
 }
 
 // Release one tray batch into the current folder through the ops layer.
+// Every paste that moves a cut finishes it the same way: once all of the cut's
+// items have moved (app_main's completion handler), the system clipboard is
+// emptied - but only while it still holds exactly that cut (sequence number
+// and paths), so a newer copy is never touched.
+static void TrackCutClipboard(AppState& s, const ops::ClipboardData& cut) {
+    s.cutPaths.clear();
+    s.pendingCutClipboardSequence = cut.sequence;
+    s.pendingCutClipboardPaths = cut.paths;
+    s.completedCutClipboardPaths.clear();
+}
+
+// Ctrl+X mirrors a tray move batch onto the system clipboard (CollectToTray).
+// When the tray releases those items instead, the mirrored cut is finished as
+// well, as long as every clipboard path is among the items being moved.
+static void TrackTrayCutClipboard(AppState& s, const std::vector<std::wstring>& moved) {
+    ops::ClipboardData cut;
+    if (moved.empty() || !ops::ReadClipboard(cut) || !cut.cut) return;
+    for (const auto& path : cut.paths) {
+        const std::wstring normalized = fs::NormalizePath(path);
+        const bool staged = std::any_of(moved.begin(), moved.end(), [&](const std::wstring& item) {
+            return _wcsicmp(fs::NormalizePath(item).c_str(), normalized.c_str()) == 0;
+        });
+        if (!staged) return;
+    }
+    TrackCutClipboard(s, cut);
+}
+
 void ReleaseTrayBatch(AppState& s, size_t idx) {
     app::Tab* tab = ActiveTab(s);
     if (!tab || idx >= s.tray.batches().size()) return;
@@ -78,18 +107,27 @@ void ReleaseTrayBatch(AppState& s, size_t idx) {
     ops::OpRequest req;
     req.type = b.move_intent ? ops::OpType::Move : ops::OpType::Copy;
     req.dest_dir = tab->current_path;
+    std::vector<uint64_t> item_ids;
     size_t skipped = 0;
     for (const auto& it : b.items) {
-        if (it.exists) req.sources.push_back(it.path);
+        if (s.tray.IsInFlight(it.path)) continue;
+        if (it.exists) {
+            if (std::none_of(req.sources.begin(), req.sources.end(), [&](const auto& source) {
+                return _wcsicmp(source.c_str(), it.path.c_str()) == 0;
+            })) req.sources.push_back(it.path);
+            item_ids.push_back(it.id);
+        }
         else ++skipped;
     }
     NotifyTraySkipped(s, skipped);
     if (req.sources.empty()) return;
-    if (!SubmitWithConflictResolution(s, std::move(req))) return;
+    const bool move = b.move_intent;
+    const auto moved = move ? req.sources : std::vector<std::wstring>{};
+    const auto task = s.ops.Submit(std::move(req));
+    if (!task) return;
+    if (move) TrackTrayCutClipboard(s, moved);
+    s.tray.MarkInFlight(task, item_ids, move);
     RememberTrayDest(s, tab->current_path);
-    // Move batches are consumed by release; copy batches stay staged so the
-    // same set can be dropped into several folders (like a clipboard copy).
-    if (b.move_intent) s.tray.RemoveBatch(idx);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -129,43 +167,63 @@ void SendTrayToDest(AppState& s, const std::wstring& dir, bool move) {
     ops::OpRequest req;
     req.type = move ? ops::OpType::Move : ops::OpType::Copy;
     req.dest_dir = fs::NormalizePath(dir);
+    std::vector<uint64_t> item_ids;
     size_t skipped = 0;
     for (const auto& batch : s.tray.batches())
-        for (const auto& item : batch.items)
-            if (GetFileAttributesW(item.path.c_str()) != INVALID_FILE_ATTRIBUTES)
-                req.sources.push_back(item.path);
-            else
+        for (const auto& item : batch.items) {
+            if (s.tray.IsInFlight(item.path)) continue;
+            if (GetFileAttributesW(item.path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                if (std::none_of(req.sources.begin(), req.sources.end(), [&](const auto& source) {
+                    return _wcsicmp(source.c_str(), item.path.c_str()) == 0;
+                })) req.sources.push_back(item.path);
+                item_ids.push_back(item.id);
+            } else
                 ++skipped;
+        }
     NotifyTraySkipped(s, skipped);
     if (req.sources.empty()) return;
-    if (!SubmitWithConflictResolution(s, std::move(req))) return;
+    const auto moved = move ? req.sources : std::vector<std::wstring>{};
+    const auto task = s.ops.Submit(std::move(req));
+    if (!task) return;
+    if (move) TrackTrayCutClipboard(s, moved);
+    s.tray.MarkInFlight(task, item_ids, move);
     RememberTrayDest(s, dir);
-    if (move) s.tray.Clear(); // moved items leave their old paths behind
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
-// Ctrl+V: release newest tray batch, else paste from the system clipboard.
+// Ctrl+V: release the newest tray batch while it is still the latest copy,
+// else paste from the system clipboard (paste_source.h).
 void PasteIntoCurrent(AppState& s) {
     app::Tab* tab = ActiveTab(s);
     if (!tab || tab->current_path.empty() || fs::IsVirtualPath(tab->current_path) || tab->net_readonly) return;
-    if (!s.tray.batches().empty()) {
-        size_t idx = s.tray.batches().size() - 1;
-        if (s.tray.batches()[idx].move_intent) s.cutPaths.clear();
-        ReleaseTrayBatch(s, idx);
-        return;
-    }
     ops::ClipboardData cb;
-    if (ops::ReadClipboard(cb)) {
+    const bool clipboard_files = ops::ReadClipboard(cb);
+    if (!s.tray.batches().empty()) {
+        const size_t idx = s.tray.batches().size() - 1;
+        const app::TrayBatch& newest = s.tray.batches()[idx];
+        std::vector<std::wstring> batch_paths;
+        batch_paths.reserve(newest.items.size());
+        for (const auto& item : newest.items) batch_paths.push_back(item.path);
+        app::PasteChoiceInput choice;
+        choice.batch_paths = &batch_paths;
+        choice.batch_move = newest.move_intent;
+        choice.clipboard_has_files = clipboard_files;
+        choice.clipboard_paths = &cb.paths;
+        choice.clipboard_cut = cb.cut;
+        choice.clipboard_written_for_batch = clipboard_files && s.trayClipboardSequence != 0 &&
+            s.trayClipboardBatchId == newest.id && cb.sequence == s.trayClipboardSequence;
+        if (app::ChoosePasteSource(choice) == app::PasteSource::TrayBatch) {
+            if (newest.move_intent) s.cutPaths.clear();
+            ReleaseTrayBatch(s, idx);
+            return;
+        }
+    }
+    if (clipboard_files) {
         ops::OpRequest req;
         req.type = cb.cut ? ops::OpType::Move : ops::OpType::Copy;
         req.dest_dir = tab->current_path;
         for (auto& p : cb.paths) req.sources.push_back(fs::NormalizePath(p));
-        if (SubmitWithConflictResolution(s, std::move(req)) && cb.cut) {
-            s.cutPaths.clear();
-            s.pendingCutClipboardSequence = cb.sequence;
-            s.pendingCutClipboardPaths = cb.paths;
-            s.completedCutClipboardPaths.clear();
-        }
+        if (SubmitWithConflictResolution(s, std::move(req)) && cb.cut) TrackCutClipboard(s, cb);
     }
 }
 
@@ -220,6 +278,10 @@ void DeleteSelected(AppState& s, bool permanent) {
         return;
     }
     std::vector<std::wstring> paths = SelectedFullPaths(*tab);
+    DeletePaths(s, std::move(paths), permanent);
+}
+
+void DeletePaths(AppState& s, std::vector<std::wstring> paths, bool permanent) {
     if (paths.empty()) return;
     if (permanent) {
         ui::ConfirmDialogSpec confirm;
@@ -299,6 +361,10 @@ void CollectToTray(AppState& s, bool move_intent) {
     app::Tab* tab = ActiveTab(s);
     if (!tab || !tab->snapshot || IsRecycleTab(tab)) return;
     std::vector<std::wstring> paths = SelectedFullPaths(*tab);
+    CollectPathsToTray(s, paths, move_intent);
+}
+
+void CollectPathsToTray(AppState& s, const std::vector<std::wstring>& paths, bool move_intent) {
     if (!paths.empty()) {
         s.tray.Collect(paths, move_intent);
         // Mirror the cut state onto the list rows (ui.md §5.2 rule 6).
@@ -307,14 +373,85 @@ void CollectToTray(AppState& s, bool move_intent) {
         std::vector<std::wstring> cbPaths;
         cbPaths.reserve(paths.size());
         for (const auto& p : paths) cbPaths.push_back(ClipboardPath(p));
-        ops::WriteClipboard(cbPaths, move_intent);
+        // Remember which clipboard value belongs to the new batch so Ctrl+V can
+        // tell it from a later copy made elsewhere (paste_source.h).
+        s.trayClipboardBatchId = s.tray.batches().empty() ? 0 : s.tray.batches().back().id;
+        s.trayClipboardSequence =
+            ops::WriteClipboard(cbPaths, move_intent) ? GetClipboardSequenceNumber() : 0;
         InvalidateRect(s.hwnd, nullptr, FALSE);
     }
 }
+bool EnsureOperationWindow(AppState& s) {
+    if (s.operationWindow) return true;
+    const HWND hwnd = s.hwnd;
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    ui::FileOperationCallbacks operation_callbacks;
+    operation_callbacks.cancel = [hwnd] {
+        if (AppState* state = GetAppState(hwnd)) state->ops.CancelCurrent();
+    };
+    operation_callbacks.pause = [hwnd] {
+        if (AppState* state = GetAppState(hwnd)) state->ops.PauseCurrent();
+    };
+    operation_callbacks.resume = [hwnd] {
+        if (AppState* state = GetAppState(hwnd)) state->ops.ResumeCurrent();
+    };
+    operation_callbacks.retry_authorization = [hwnd](uint64_t task_id) {
+        if (AppState* state = GetAppState(hwnd)) state->ops.ResolveAuthorization(task_id, true);
+    };
+    operation_callbacks.skip_authorization = [hwnd](uint64_t task_id) {
+        if (AppState* state = GetAppState(hwnd)) state->ops.ResolveAuthorization(task_id, false);
+    };
+    operation_callbacks.dismiss = [hwnd] {
+        if (AppState* state = GetAppState(hwnd)) {
+            state->operationDismissedTaskId = state->ops.Status().task_id;
+            state->operationPinnedByUser = false;
+        }
+    };
+    s.operationWindow = std::make_unique<ui::FileOperationWindow>();
+    s.operationWindow->Create(hwnd, std::move(operation_callbacks));
+    s.operationWindow->SetTheme(s.darkMode, s.accentColor);
+    return true;
+}
+
+static bool OperationWindowVisible(const AppState& s) {
+    return s.operationWindow && s.operationWindow->IsVisible();
+}
+
+static void HideOperationWindow(AppState& s) {
+    if (OperationWindowVisible(s)) s.operationWindow->Hide();
+}
+
+static void ShowOperationWindow(AppState& s, const ops::OpStatus& status, bool activate) {
+    const bool created = !s.operationWindow;
+    if (!EnsureOperationWindow(s)) return;
+    if (created) s.operationWindow->Update(status);
+    s.operationWindow->Show(activate);
+}
+
+void MoveOperationUi(AppState& from, AppState& to) {
+    if (&from == &to || !to.hwnd) return;
+    to.operationUiTaskId = from.operationUiTaskId;
+    to.operationDismissedTaskId = from.operationDismissedTaskId;
+    to.conflictUiToken = from.conflictUiToken;
+    to.lockPromptTaskId = from.lockPromptTaskId;
+    to.operationAutoShown = from.operationAutoShown;
+    to.operationPinnedByUser = from.operationPinnedByUser;
+    to.operationStartedAt = from.operationStartedAt;
+    to.operationFinishedAt = from.operationFinishedAt;
+    const bool shown = OperationWindowVisible(from);
+    if (shown) from.operationWindow->Hide();
+    to.ops.SetUiWindow(to.hwnd);
+    if (shown && EnsureOperationWindow(to)) {
+        to.operationWindow->Update(to.ops.Status());
+        to.operationWindow->Show(false);
+    }
+}
+
 void PinAndShowOperationWindow(AppState& s) {
-    if (!s.operationWindow) return;
+    if (AppState* ui = GetAppState(s.ops.UiWindow()); ui && ui != &s) MoveOperationUi(*ui, s);
     const ops::OpStatus status = s.ops.Status();
     if (!status.active && status.summary.empty() && status.last_error.empty()) return;
+    if (!EnsureOperationWindow(s)) return;
     s.operationDismissedTaskId = 0;
     s.operationPinnedByUser = true;
     s.operationAutoShown = true;
@@ -322,11 +459,11 @@ void PinAndShowOperationWindow(AppState& s) {
     s.operationWindow->Show(true);
 }
 
-void ShowBatchRename(AppState& s) {
-    if(DeferContentSelection(s,[=](AppState& v){ShowBatchRename(v);})) return;
-    app::Tab* tab = ActiveTab(s);
-    if (!tab || IsRecycleTab(tab) || tab->net_readonly) return;
-    std::vector<std::wstring> paths = SelectedFullPaths(*tab);
+// Both batch-rename entries (the selection and the tray) submit through here.
+// Nothing else changes up front: places and the tray follow the renames that
+// actually succeeded once the operation completes (app_main's completion
+// handler), so a failed or cancelled item never leaves a stale new name behind.
+static void SubmitBatchRename(AppState& s, const std::vector<std::wstring>& paths, app::Tab* select_in) {
     if (paths.size() < 2) return;
     const auto result = ui::ShowBatchRenameDialog(s.hwnd, paths, s.darkMode, s.accentColor);
     if (!result.accepted) return;
@@ -338,34 +475,35 @@ void ShowBatchRename(AppState& s) {
         req.new_names.push_back(item.new_name);
     }
     if (req.sources.empty()) return;
-    tab->pending_selected_names = req.new_names;
-    if (!req.new_names.empty()) tab->pending_selected_name = req.new_names.front();
-    s.ops.Submit(std::move(req));
-}
-void ShowBatchRenamePaths(AppState& s, const std::vector<std::wstring>& paths) {
-    if (paths.size() < 2) return;
-    const auto result = ui::ShowBatchRenameDialog(s.hwnd, paths, s.darkMode, s.accentColor);
-    if (!result.accepted) return;
-    ops::OpRequest req;
-    req.type = ops::OpType::BatchRename;
-    for (const auto& item : result.items) {
-        if (item.status != app::BatchRenameStatus::Ok) continue;
-        req.sources.push_back(item.source_path);
-        req.new_names.push_back(item.new_name);
-        std::wstring parent = fs::ParentPath(item.source_path);
-        if (!parent.empty() && parent.back() != L'\\') parent += L'\\';
-        s.tray.ReplacePath(item.source_path, parent + item.new_name);
+    if (select_in) {
+        select_in->pending_selected_names = req.new_names;
+        select_in->pending_selected_name = req.new_names.front();
     }
-    if (req.sources.empty()) return;
     s.ops.Submit(std::move(req));
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
+void ShowBatchRename(AppState& s) {
+    if(DeferContentSelection(s,[=](AppState& v){ShowBatchRename(v);})) return;
+    app::Tab* tab = ActiveTab(s);
+    if (!tab || IsRecycleTab(tab) || tab->net_readonly) return;
+    SubmitBatchRename(s, SelectedFullPaths(*tab), tab);
+}
+void ShowBatchRenamePaths(AppState& s, const std::vector<std::wstring>& paths) {
+    SubmitBatchRename(s, paths, nullptr);
+}
+
 void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
-    if (!s.operationWindow) return;
+    // A notification queued for the previous operations window (M4c) goes on
+    // to the window that shows operations now.
+    if (AppState* ui = GetAppState(s.ops.UiWindow()); ui && ui != &s) {
+        UpdateOperationWindow(*ui, allow_conflict_dialog);
+        return;
+    }
+    // Built on first show (EnsureOperationWindow): most windows never need one.
     const auto now = std::chrono::steady_clock::now();
     const ops::OpStatus status = s.ops.Status();
-    s.operationWindow->Update(status);
+    if (s.operationWindow) s.operationWindow->Update(status);
 
     if (status.active && status.task_id != s.operationUiTaskId) {
         s.operationUiTaskId = status.task_id;
@@ -393,14 +531,20 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
         s.lockPromptTaskId = status.task_id;
         s.operationDismissedTaskId = status.task_id;
         s.operationPinnedByUser = false;
-        if (s.operationWindow->IsVisible()) s.operationWindow->Hide();
+        HideOperationWindow(s);
         PromptLockedItem(s, status);
         return;
     }
 
     if (status.task_id != 0 && status.task_id == s.operationDismissedTaskId &&
         !s.operationPinnedByUser) {
-        if (s.operationWindow->IsVisible()) s.operationWindow->Hide();
+        HideOperationWindow(s);
+        return;
+    }
+
+    if (status.active && status.authorization != ops::AuthorizationState::None) {
+        // Keep the existing operation window visible without stealing focus from UAC.
+        if (!OperationWindowVisible(s)) ShowOperationWindow(s, status, false);
         return;
     }
 
@@ -413,18 +557,18 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
     if (s.operationPinnedByUser) return;
 
     if (status.phase == ops::OpPhase::Completed) {
-        if (s.operationWindow->IsVisible()) {
+        if (OperationWindowVisible(s)) {
             if (s.operationFinishedAt.time_since_epoch().count() == 0)
                 s.operationFinishedAt = now;
             if (now - s.operationFinishedAt >= std::chrono::milliseconds(600))
-                s.operationWindow->Hide();
+                HideOperationWindow(s);
         }
     } else if (status.phase == ops::OpPhase::Failed) {
         // The ops notification shows the locked-item prompt; a timer tick
         // that sees the failure first must not open the failure window.
         if (locked_failure) return;
         if (ErrorIs(status.last_error, L"已取消", L"Canceled")) {
-            s.operationWindow->Hide();
+            HideOperationWindow(s);
             return;
         }
         const bool simple = status.type == ops::OpType::CreateFolder
@@ -432,13 +576,10 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
                          || status.type == ops::OpType::Rename
                          || status.type == ops::OpType::BatchRename;
         if (simple) {
-            if (s.operationWindow->IsVisible()) s.operationWindow->Hide();
+            HideOperationWindow(s);
             if (status.task_id == 0 || status.task_id == s.operationDismissedTaskId)
                 return;
             s.operationDismissedTaskId = status.task_id;
-            if (status.type == ops::OpType::CreateFolder ||
-                status.type == ops::OpType::CreateTextFile)
-                s.pendingRenameName.clear();
             const bool folder = status.type == ops::OpType::CreateFolder;
             const bool file = status.type == ops::OpType::CreateTextFile;
             const std::wstring title = l10n::Get(folder ? l10n::StringId::CannotCreateFolder
@@ -468,7 +609,7 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
             s.notification_toast.ShowError(s.hwnd, title, std::move(message));
             return;
         }
-        if (!s.operationWindow->IsVisible()) s.operationWindow->Show(true);
+        if (!OperationWindowVisible(s)) ShowOperationWindow(s, status, true);
     }
 }
 

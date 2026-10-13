@@ -10,8 +10,14 @@ namespace {
 
 constexpr UINT kFirstString = IDS_SETTINGS;
 // Must stay on the highest allocated string id, otherwise Get() returns empty.
-constexpr UINT kLastString = IDS_OP_ITEMS_PER_SECOND;
+constexpr UINT kLastString = IDS_OPEN_ITEM_LOCATION;
+static_assert(static_cast<UINT>(StringId::OpenItemLocation) <= kLastString);
+static_assert(static_cast<UINT>(StringId::SettingsRecycleBinDesc) <= kLastString);
+static_assert(static_cast<UINT>(StringId::HelpContextMenu) <= kLastString);
 static_assert(static_cast<UINT>(StringId::UiFontLarger) <= kLastString);
+static_assert(static_cast<UINT>(StringId::OpAuthorizationNotGranted) <= kLastString);
+static_assert(static_cast<UINT>(StringId::ListThumbnailBadgesDesc) <= kLastString);
+static_assert(static_cast<UINT>(StringId::SystemGroupNodeModules) <= kLastString);
 static_assert(static_cast<UINT>(StringId::UpdateWaitingOperations) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SidebarShowHidden) <= kLastString);
 static_assert(static_cast<UINT>(StringId::ApplyGroupNoneMessage) <= kLastString);
@@ -21,13 +27,6 @@ static_assert(static_cast<UINT>(StringId::NetworkLiveAddFailed) <= kLastString);
 static_assert(static_cast<UINT>(StringId::IntegrationReapply) <= kLastString);
 static_assert(static_cast<UINT>(StringId::UpdateDescManual) <= kLastString);
 static_assert(static_cast<UINT>(StringId::Downloads) <= kLastString);
-static_assert(static_cast<UINT>(StringId::TabOpenNewWindow) <= kLastString);
-static_assert(static_cast<UINT>(StringId::TrayNewWindow) <= kLastString);
-static_assert(static_cast<UINT>(StringId::JumpListPinned) <= kLastString);
-static_assert(static_cast<UINT>(StringId::TabGroupEdit) <= kLastString);
-static_assert(static_cast<UINT>(StringId::OpenItemLocation) <= kLastString);
-static_assert(static_cast<UINT>(StringId::SettingsMultiInstance) <= kLastString);
-static_assert(static_cast<UINT>(StringId::SettingsMultiInstanceDesc) <= kLastString);
 static_assert(static_cast<UINT>(StringId::OpItemsPerSecond) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SettingsChangeTracking) >= kFirstString &&
               static_cast<UINT>(StringId::ChangeDisabled) <= kLastString &&
@@ -45,6 +44,7 @@ static_assert(static_cast<UINT>(StringId::SettingsChangeTracking) >= kFirstStrin
               static_cast<UINT>(StringId::ContextRowMore) <= kLastString &&
               static_cast<UINT>(StringId::GlobalSearchTruncatedShort) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SettingsCloseLastTabDesc) <= kLastString);
+static_assert(static_cast<UINT>(StringId::SettingsCloseTabDoubleClickDesc) <= kLastString);
 static_assert(static_cast<UINT>(StringId::LockedItemTitle) <= kLastString &&
               static_cast<UINT>(StringId::LockedItemRetry) <= kLastString);
 static_assert(static_cast<UINT>(StringId::LanguageZhTW) <= kLastString &&

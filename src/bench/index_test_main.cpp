@@ -1,4 +1,5 @@
 #include "../index/index_config.h"
+#include "../index/index_executable.h"
 #include "../index/index_query.h"
 #include "../index/network_index.h"
 #include "../index/network_crawl_schedule.h"
@@ -8,8 +9,18 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <mutex>
+#include <vector>
+
+namespace pulse::index {
+struct NetworkIndexTestAccess {
+    static bool ReadConfig(NetworkIndex& index, const std::wstring& path, std::vector<std::wstring>& roots) {
+        return index.ReadConfig(path, roots);
+    }
+};
+}
 
 using namespace pulse::index;
 
@@ -258,8 +269,84 @@ void RunLiveNetworkTests() {
     std::filesystem::remove_all(dir, ec);
 }
 
+int RunNetworkConfigAudit() {
+    const auto root = std::filesystem::absolute(std::filesystem::path("bench_data") /
+        ("network-config-audit-" + std::to_string(GetCurrentProcessId())));
+    std::filesystem::create_directories(root);
+    const auto path = root / "network-index.json";
+    NetworkIndex index;
+    std::vector<std::wstring> roots;
+    Check(NetworkIndexTestAccess::ReadConfig(index, path.wstring(), roots) && roots.empty(), L"missing network configuration is empty");
+    for (const std::string json : {std::string("{\"roots\":[]}"), std::string("{\"roots\":["),
+            std::string("{\"roots\":42}"), std::string("{\"roots\":[1]}"),
+            std::string("{\"roots\":[]} trailing"), std::string("\xff")}) {
+        std::ofstream(path, std::ios::binary | std::ios::trunc) << json;
+        const bool valid = json == "{\"roots\":[]}";
+        Check(NetworkIndexTestAccess::ReadConfig(index, path.wstring(), roots) == valid,
+            L"production config loader distinguishes malformed input from empty roots");
+        if (!valid) {
+            std::wstring error;
+            Check(!index.ConfigError().empty(), L"startup retains explicit configuration error");
+            Check(!index.AddRoot(L"\\\\fixture-server\\share", &error) && !error.empty(),
+                L"failed load prevents adding a root");
+            Check(!index.RemoveRoot(L"\\\\fixture-server\\share", &error), L"failed load prevents root removal");
+            std::ifstream saved(path, std::ios::binary);
+            const std::string bytes((std::istreambuf_iterator<char>(saved)), std::istreambuf_iterator<char>());
+            Check(bytes == json, L"failed mutation preserves original configuration bytes");
+        }
+    }
+    std::ofstream(path, std::ios::binary | std::ios::trunc) << "{\"roots\":[]}";
+    HANDLE locked = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    Check(locked != INVALID_HANDLE_VALUE && !NetworkIndexTestAccess::ReadConfig(index, path.wstring(), roots),
+        L"sharing-denied configuration read remains an error");
+    if (locked != INVALID_HANDLE_VALUE) CloseHandle(locked);
+    Check(NetworkIndexTestAccess::ReadConfig(index, path.wstring(), roots) && index.ConfigError().empty(),
+        L"repaired config reload clears failure state");
+    std::filesystem::remove_all(root);
+    return failures ? 1 : 0;
+}
+
+// Pulse.Index.exe resolution for a pulse.exe started outside the install folder.
+void RunIndexExecutableTests() {
+    const std::wstring installed = L"C:\\Program Files\\Pulse\\Pulse.Index.exe";
+    Check(IndexExecutableFromServiceCommand(L"\"C:\\Program Files\\Pulse\\Pulse.Index.exe\" --service") == installed,
+          L"service command: quoted image path");
+    Check(IndexExecutableFromServiceCommand(L"C:\\Program Files\\Pulse\\pulse.index.exe --service") ==
+              L"C:\\Program Files\\Pulse\\pulse.index.exe",
+          L"service command: unquoted path with spaces");
+    Check(IndexExecutableFromServiceCommand(L"\"C:\\Tools\\Other.exe\" --run C:\\x\\Pulse.Index.exe").empty() &&
+              IndexExecutableFromServiceCommand(L"\"C:\\Pulse\\NotPulse.Index.exe\" --service").empty() &&
+              IndexExecutableFromServiceCommand(L"Pulse.Index.exe --service").empty() &&
+              IndexExecutableFromServiceCommand(L"").empty(),
+          L"service command: other images rejected");
+    const std::wstring downloads = L"D:\\Users\\qwer5\\Downloads\\Pulse.Index.exe";
+    const std::wstring service = L"\"" + installed + L"\" --service";
+    auto only = [](std::initializer_list<std::wstring> files) {
+        return [files = std::vector<std::wstring>(files)](const std::wstring& path) {
+            return std::find(files.begin(), files.end(), path) != files.end();
+        };
+    };
+    Check(ResolveIndexExecutable(downloads, service, only({installed})) == installed,
+          L"pulse.exe outside the install folder uses the service executable");
+    Check(ResolveIndexExecutable(downloads, service, only({downloads, installed})) == downloads,
+          L"sibling Pulse.Index.exe stays preferred");
+    Check(ResolveIndexExecutable(downloads, L"", only({})) == downloads &&
+              ResolveIndexExecutable(downloads, service, only({})) == downloads,
+          L"no service or missing service file keeps the sibling path for the error");
+    // Live: an installed PulseIndex service resolves to an existing executable
+    // without elevation (this process runs as the signed-in user).
+    const std::wstring live = InstalledServiceCommand(L"PulseIndex");
+    if (!live.empty()) {
+        const std::wstring image = IndexExecutableFromServiceCommand(live);
+        Check(!image.empty() && GetFileAttributesW(image.c_str()) != INVALID_FILE_ATTRIBUTES,
+              L"installed PulseIndex service resolves to its Pulse.Index.exe");
+    }
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--network-config-only") return RunNetworkConfigAudit();
     RunLiveNetworkTests();
+    RunIndexExecutableTests();
     Check(NormalizeVolumeId(L"  \\\\?\\Volume{abc}\\  ") == L"\\\\?\\VOLUME{ABC}\\",
           L"volume id normalization");
 

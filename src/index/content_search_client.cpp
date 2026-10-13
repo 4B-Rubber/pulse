@@ -208,7 +208,20 @@ void ContentSearchClient::SearchAsync(ContentSearchRequest request) {
     if (!running_) return;
     Resume();
     Cancel(request.session_id);
-    { std::lock_guard lock(state_mu_); generation_ = request.generation; current_sessions_[request.session_id] = request.generation; pending_requests_.push_back(std::move(request)); }
+    {
+        std::lock_guard lock(state_mu_);
+        // Instant agents always produce an unordered task stream, including
+        // saved searches whose caller did not explicitly request task_scan.
+        if (persistent_enabled_ && mode_ == ContentAgentMode::Instant &&
+            request.indexed && request.mode == ContentSearchMode::Content) {
+            request.task_scan = true;
+            request.after_revision = 0;
+            request.incremental = false;
+        }
+        generation_ = request.generation;
+        current_sessions_[request.session_id] = request.generation;
+        pending_requests_.push_back(std::move(request));
+    }
     wake_.notify_all();
 }
 void ContentSearchClient::Enqueue(Command command) {

@@ -22,7 +22,7 @@ inline bool GetSubscriptionStatus(ipc::PayloadReader& reader, ContentSearchProgr
     if (!reader.remaining()) return true;
     uint32_t failure = 0, error = 0;
     if (!reader.GetU32(error) || !reader.GetU32(failure) ||
-        failure > static_cast<uint32_t>(ContentSubscriptionFailure::Transport) ||
+        failure > static_cast<uint32_t>(ContentSubscriptionFailure::Reconcile) ||
         ((error == 0) != (failure == 0))) return false;
     progress.subscription_error = error;
     progress.subscription_failure = static_cast<ContentSubscriptionFailure>(failure);

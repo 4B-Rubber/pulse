@@ -16,6 +16,10 @@
 #include <string>
 
 namespace pulse::ui {
+#if defined(PULSE_TEST_BATCH_RENAME_PRESENT)
+void BatchRenameShownForTest(HWND hwnd);
+float BatchRenameScaleForTest();
+#endif
 namespace {
 
 constexpr wchar_t kClass[] = L"PulseBatchRenameWindow";
@@ -49,6 +53,9 @@ public:
         dark_ = dark;
         accent_ = accent;
         scale_ = static_cast<float>(pulse::compat::WindowDpi(owner ? owner : GetDesktopWindow())) / 96.0f;
+#if defined(PULSE_TEST_BATCH_RENAME_PRESENT)
+        scale_ = BatchRenameScaleForTest();
+#endif
         result_ = {};
 
         WNDCLASSEXW wc{ sizeof(wc) };
@@ -71,6 +78,9 @@ public:
         if (owner_) EnableWindow(owner_, FALSE);
         ShowWindow(hwnd_, SW_SHOW);
         LayoutEdits();
+#if defined(PULSE_TEST_BATCH_RENAME_PRESENT)
+        BatchRenameShownForTest(hwnd_);
+#endif
         SetForegroundWindow(hwnd_);
         if (edit_find_) SetFocus(edit_find_);
 
@@ -156,8 +166,6 @@ private:
         HWND edit = CreateChildEdit(hwnd_, text.c_str(), number ? ES_NUMBER : 0);
         if (!edit) return nullptr;
         SetWindowTheme(edit, L"", L"");
-        if (!compositor_.LumaTextEnabled())
-            SetLayeredWindowAttributes(edit, 0, 255, LWA_ALPHA);
         if (font_) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
         SetWindowSubclass(edit, EditProc, static_cast<UINT_PTR>(id),
                           reinterpret_cast<DWORD_PTR>(this));
@@ -177,21 +185,20 @@ private:
         const int w = std::max(40, static_cast<int>(std::lround(
             cell.right - cell.left - 20.0f * scale_)));
         const int cell_h = std::max(18, static_cast<int>(std::lround(cell.bottom - cell.top)));
-        int line_h = cell_h;
-        if (font_) {
-            HDC hdc = GetDC(hwnd);
-            HFONT old = static_cast<HFONT>(SelectObject(hdc, font_));
-            TEXTMETRICW tm{};
-            GetTextMetricsW(hdc, &tm);
-            SelectObject(hdc, old);
-            ReleaseDC(hwnd, hdc);
-            line_h = std::max(1, static_cast<int>(tm.tmHeight));
-        }
-        line_h = std::min(line_h, cell_h);
+        const int line_h = EditLineHeight(hwnd, font_, cell_h);
         pt.y += std::max(0, (cell_h - line_h) / 2);
+        RECT previous{};
+        GetWindowRect(hwnd, &previous);
+        MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&previous), 2);
+        const bool surface_changed = !IsWindowVisible(hwnd) || previous.left != pt.x ||
+            previous.top != pt.y || previous.right - previous.left != w ||
+            previous.bottom - previous.top != line_h;
         EnableWindow(hwnd, TRUE);
         SetWindowPos(hwnd, HWND_TOP, pt.x, pt.y, w, line_h,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (surface_changed)
+            PresentChildEdit(compositor_, compositor_.TextFormat(),
+                             EditForeground(), EditBackground(), hwnd);
     }
 
     void LayoutEdits() {
@@ -472,21 +479,15 @@ private:
         switch (message) {
         case WM_CREATE: {
             scale_ = static_cast<float>(pulse::compat::WindowDpi(hwnd_)) / 96.0f;
+#if defined(PULSE_TEST_BATCH_RENAME_PRESENT)
+            scale_ = BatchRenameScaleForTest();
+#endif
             backdrop_enabled_ = pulse::ui::ApplyBackdrop(hwnd_, dark_);
             if (!compositor_.Init(hwnd_)) return -1;
             compositor_.RecreateTextFormats(scale_);
             painter_.SetCompositor(&compositor_);
             painter_.SetScale(scale_);
-            const int height = -std::max(1, static_cast<int>(std::lround(14.0f * scale_)));
-            const wchar_t* family = typography::PreferredTextFamily();
-            font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE, family);
-            if (!font_) {
-                font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                    DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            }
+            font_ = typography::CreateEditFont(scale_);
             if (edit_brush_) { DeleteObject(edit_brush_); edit_brush_ = nullptr; }
             edit_brush_ = CreateSolidBrush(dark_ ? RGB(30, 30, 30) : RGB(255, 255, 255));
             edit_find_ = CreateField(1, {});

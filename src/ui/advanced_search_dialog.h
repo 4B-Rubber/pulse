@@ -23,6 +23,7 @@ AdvancedSearchDialogResult ShowAdvancedSearchDialog(HWND owner,
                                                     app::AdvancedSearchSpec spec,
                                                     bool dark,
                                                     D2D1_COLOR_F accent,
-                                                    AdvancedSearchCountRequest count = {});
+                                                    AdvancedSearchCountRequest count = {},
+                                                    bool selection_outline = false);
 
 } // namespace pulse::ui

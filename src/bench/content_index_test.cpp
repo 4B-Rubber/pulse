@@ -1624,8 +1624,118 @@ int RunEncodingCacheTest(const std::filesystem::path& base) {
     return failed ? 1:0;
 }
 
+int RunSessionBatchAudit() {
+    using namespace index;
+    for (const auto sort : {ContentResultSort::Index, ContentResultSort::Name, ContentResultSort::Size,
+                           ContentResultSort::Mtime, ContentResultSort::Path, ContentResultSort::Type}) {
+        for (const bool descending : {false, true}) {
+            ContentSearchRequest request; request.generation = 700; request.paged_results = request.task_scan = true;
+            request.sort = sort; request.sort_desc = descending;
+            ContentSearchSession session(request, nullptr, 0);
+            ContentHit z{L"C:\\fixture\\z.zzz", L"z.zzz"}, a{L"C:\\fixture\\a.aaa", L"a.aaa"};
+            z.size = z.modified = 9; a.size = a.modified = 1;
+            ContentSearchUpdate first; first.progress.generation = 700; first.hits = {z};
+            Check(session.Accept(std::move(first)).has_value() && session.Results()->RawCount() == 1,
+                  "task session exposes first cached/uncached hit immediately");
+            ContentSearchUpdate later; later.progress.generation = 700; later.progress.done = true; later.hits = {a};
+            session.Accept(std::move(later));
+            ContentResultStore::Row row;
+            const bool expect_z = sort == ContentResultSort::Index ? !descending : descending;
+            const auto deadline = GetTickCount64() + 2000;
+            while (!session.Results()->Get(0, row) && GetTickCount64() < deadline) Sleep(1);
+            Check(row.entry.name == (expect_z ? L"z.zzz" : L"a.aaa") && session.Results()->Count() == 2,
+                  "task session restores requested global ordering regardless of arrival order");
+        }
+    }
+    for (const size_t count : {1000u, 2000u, 4000u, 8000u}) {
+        ContentSearchRequest request; request.generation = count; request.paged_results = request.task_scan = true;
+        request.sort = ContentResultSort::Name;
+        ContentSearchSession session(request, nullptr, 0);
+        const auto started = GetTickCount64(); size_t publications = 0, rewritten_positions = 0; ULONGLONG first_ms = 0;
+        uint64_t revision = 0;
+        for (size_t i = 0; i < count; ++i) {
+            ContentSearchUpdate update; update.progress.generation = count;
+            ContentHit hit; hit.name = std::to_wstring(count - i) + L".txt"; hit.path = L"C:\\fixture\\" + hit.name; hit.file_id = i + 1;
+            update.hits.push_back(std::move(hit));
+            session.Accept(std::move(update));
+            const auto store = session.Results();
+            if (store->Revision() != revision) {
+                revision = store->Revision(); ++publications; rewritten_positions += store->Count();
+                if (publications == 1) first_ms = GetTickCount64() - started;
+            }
+        }
+        ContentSearchUpdate done; done.progress.generation = count; done.progress.done = true; session.Accept(std::move(done));
+        if (session.Results()->Revision() != revision) { ++publications; rewritten_positions += session.Results()->Count(); }
+        printf("BATCH rows=%zu publications=%zu rebuilt_positions=%zu per_hit_baseline=%zu first_ms=%llu last_ms=%llu cached=%zu\n",
+            count, publications, rewritten_positions, count * (count + 1) / 2, first_ms, GetTickCount64() - started, session.Results()->CachedRows());
+        Check(session.Results()->Count() == count && publications < count / 4 && rewritten_positions < count * (count + 1) / 8,
+              "single-hit production session avoids rebuilding the display order for each row");
+        Check(session.Results()->CachedRows() <= ContentResultStore::kPageSize * ContentResultStore::kCachePages,
+              "batched publication preserves bounded hot pages");
+    }
+    ContentSearchRequest request; request.generation = 900; request.task_scan = request.paged_results = true;
+    ContentSearchSession session(request, nullptr, 0);
+    for (int i = 0; i < 11; ++i) {
+        ContentSearchUpdate update; update.progress.generation = 900;
+        ContentHit hit; hit.path = L"C:\\fixture\\" + std::to_wstring(i) + L".txt"; hit.name = std::to_wstring(i);
+        update.hits.push_back(std::move(hit)); session.Accept(std::move(update));
+    }
+    const auto cancel_start = GetTickCount64(); const auto cancelled = session.Fail(ERROR_CANCELLED);
+    Check(cancelled && cancelled->progress.error == ERROR_CANCELLED && session.Results()->Count() == 11 &&
+          GetTickCount64() - cancel_start < 1000, "cancellation drains pending partial results without waiting for batch timer");
+    return failed ? 1 : 0;
+}
+
+int RunTaskScopeAudit(const std::filesystem::path& base) {
+    const auto root = base / L"scope", wanted = root / L"wanted", deep = wanted / L"deep";
+    std::filesystem::create_directories(deep);
+    Write(wanted / L"yes.txt", "scope_marker"); Write(deep / L"nested.txt", "scope_marker");
+    index::ContentIndexConfig config; config.roots = {{root.wstring()}, {(base / L"missing-outside").wstring()}};
+    index::ContentSearchRequest request; request.root = wanted.wstring(); request.needle = L"scope_marker";
+    request.recursive = false; request.generation = 123;
+    index::ContentTaskCache cache;
+    cache.version = [](const auto&) { return std::wstring(L"fixture"); };
+    cache.excluded = [](const auto&) { return false; };
+    cache.fresh = [](const auto&, auto, auto, const auto&) { return false; };
+    std::atomic<bool> cancelled = false;
+    auto run = [&](size_t expected) {
+        size_t hits = 0; index::ContentSearchProgress final;
+        const bool ok = index::RunContentTaskSupplement(config, request, cancelled, cache, {}, 0,
+            [&](const auto& state, auto batch) { final = state; hits += batch.size(); return true; });
+        Check(ok && !final.error && final.done && hits == expected,
+              "actual task enumeration remains complete within requested coverage");
+    };
+    // Deny directory listing only on this owned temporary child. Nonrecursive
+    // enumeration must never open it; restore its DACL before fixture cleanup.
+    PSECURITY_DESCRIPTOR denied = nullptr, allowed = nullptr;
+    const bool descriptors = ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(D;;0x1;;;WD)(A;;FA;;;OW)", SDDL_REVISION_1, &denied, nullptr) &&
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;FA;;;WD)", SDDL_REVISION_1, &allowed, nullptr);
+    const bool secured = descriptors && SetFileSecurityW(deep.c_str(), DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, denied);
+    Check(secured, "isolated deep directory denies list access");
+    if (secured) {
+        WIN32_FIND_DATAW find{}; HANDLE h = FindFirstFileW((deep.wstring() + L"\\*").c_str(), &find);
+        Check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED, "fixture verifies real directory access denial");
+        if (h != INVALID_HANDLE_VALUE) FindClose(h);
+    }
+    Check(index::ContentTaskRoots(config, request) == std::vector<std::wstring>{index::ContentScopeKey(wanted.wstring())},
+          "effective roots drop unrelated configured roots before directory opens");
+    run(1);
+    if (secured) Check(SetFileSecurityW(deep.c_str(), DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, allowed) != FALSE,
+                      "restore isolated directory permissions");
+    if (denied) LocalFree(denied); if (allowed) LocalFree(allowed);
+    request.recursive = true; run(2);
+    request.root = base.wstring(); config.roots = {{wanted.wstring()}, {deep.wstring()}};
+    Check(index::ContentTaskRoots(config, request).size() == 1, "ancestor query collapses overlapping configured coverage"); run(2);
+    request.root = (base / L"other").wstring(); run(0);
+    cancelled = true;
+    Check(!index::RunContentTaskSupplement(config, request, cancelled, cache, {}, 0, [](const auto&, auto) { return true; }),
+          "scope-restricted task respects cancellation");
+    return failed ? 1 : 0;
+}
+
 int RunInstantLifecycleTests(const std::filesystem::path& base);
 int RunInstantGapTests(const std::filesystem::path& base);
+int RunInstantReconcileAudit(const std::filesystem::path& base);
 int wmain() {
     wchar_t module[32768]{}; GetModuleFileNameW(nullptr, module, ARRAYSIZE(module));
     const auto base = std::filesystem::path(module).parent_path().parent_path() / L"bench_data" /
@@ -1634,9 +1744,12 @@ int wmain() {
         std::filesystem::path path;
         ~CleanupFixture() { std::error_code error; std::filesystem::remove_all(path, error); }
     } cleanup_fixture{base};
+    if (GetEnvironmentVariableW(L"PULSE_TEST_SESSION_BATCH_AUDIT", nullptr, 0)) return RunSessionBatchAudit();
+    if (GetEnvironmentVariableW(L"PULSE_TEST_TASK_SCOPE_AUDIT", nullptr, 0)) return RunTaskScopeAudit(base);
     if (GetEnvironmentVariableW(L"PULSE_TEST_ENCODING_CACHE", nullptr, 0)) return RunEncodingCacheTest(base);
     if (GetEnvironmentVariableW(L"PULSE_TEST_TASK_TEXT_BENCH_ROOT", nullptr, 0)) return RunTaskTextIoBenchmark(base);
     if (GetEnvironmentVariableW(L"PULSE_TEST_DELTA_CACHE", nullptr, 0)) return RunDeltaCacheTest(base);
+    if (GetEnvironmentVariableW(L"PULSE_TEST_INSTANT_RECONCILE_AUDIT", nullptr, 0)) return RunInstantReconcileAudit(base);
     if (GetEnvironmentVariableW(L"PULSE_TEST_INSTANT_GAPS", nullptr, 0)) return RunInstantGapTests(base);
     if (GetEnvironmentVariableW(L"PULSE_TEST_INSTANT_MODE", nullptr, 0)) return RunInstantLifecycleTests(base);
     if (GetEnvironmentVariableW(L"PULSE_TEST_ZERO_REVISION", nullptr, 0)) return RunZeroRevisionSubscriptionTest(base);

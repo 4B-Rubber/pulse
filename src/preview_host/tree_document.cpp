@@ -8,6 +8,7 @@
 #include <cwctype>
 #include <string_view>
 #include <vector>
+#include <utility>
 
 namespace pulse::preview {
 namespace {
@@ -23,6 +24,7 @@ struct Node {
     wchar_t type = L's';
     std::wstring key, value, text;
     size_t children = 0;
+    std::vector<std::pair<std::wstring, std::wstring>> attributes;
 };
 
 void AppendEscaped(std::wstring& out, std::wstring_view text) {
@@ -90,7 +92,7 @@ private:
         if (nodes_.size() >= kMaxNodes) { truncated_ = true; return static_cast<size_t>(-1); }
         Clip(key);
         Clip(value);
-        nodes_.push_back({depth, type, std::move(key), std::move(value), {}, 0});
+        nodes_.push_back({depth, type, std::move(key), std::move(value), {}, 0, {}});
         return nodes_.size() - 1;
     }
     bool String(std::wstring& out, Failure& failure) {
@@ -188,6 +190,22 @@ private:
 
 // ----------------------------------------------------------------- XML ----
 
+std::wstring XmlAttributeEscape(const std::wstring& value) {
+    std::wstring out;
+    for (wchar_t ch : value) {
+        switch (ch) {
+        case L'&': out += L"&amp;"; break;
+        case L'<': out += L"&lt;"; break;
+        case L'"': out += L"&quot;"; break;
+        case L'\t': out += L"&#9;"; break;
+        case L'\r': out += L"&#13;"; break;
+        case L'\n': out += L"&#10;"; break;
+        default: out += ch; break;
+        }
+    }
+    return out;
+}
+
 std::wstring XmlUnescape(std::wstring_view s) {
     std::wstring out;
     out.reserve(s.size());
@@ -219,6 +237,19 @@ std::wstring XmlUnescape(std::wstring_view s) {
     return out;
 }
 
+std::wstring XmlAttributeValue(std::wstring_view source) {
+    // Normalize literal whitespace before decoding references: &#10; is a LF,
+    // while a literal line break in an XML CDATA attribute becomes one space.
+    std::wstring normalized;
+    normalized.reserve(source.size());
+    for (size_t i = 0; i < source.size(); ++i) {
+        const wchar_t c = source[i];
+        if (c == L'\r' && i + 1 < source.size() && source[i + 1] == L'\n') ++i;
+        normalized += c == L'\r' || c == L'\n' || c == L'\t' ? L' ' : c;
+    }
+    return XmlUnescape(normalized);
+}
+
 std::wstring Collapse(std::wstring_view s) {
     // Text nodes: whitespace runs become one space, trimmed.
     std::wstring out;
@@ -247,7 +278,7 @@ bool ParseXml(std::wstring_view s, std::vector<Node>& nodes, Failure& failure, b
         if (!open.empty() && open.back() != static_cast<size_t>(-1)) ++nodes[open.back()].children;
         Clip(key);
         Clip(value);
-        nodes.push_back({static_cast<int>(open.size()), type, std::move(key), std::move(value), {}, 0});
+        nodes.push_back({static_cast<int>(open.size()), type, std::move(key), std::move(value), {}, 0, {}});
         return nodes.size() - 1;
     };
     while (pos < s.size()) {
@@ -329,6 +360,7 @@ bool ParseXml(std::wstring_view s, std::vector<Node>& nodes, Failure& failure, b
         if (i == name_start) return fail(L"tag", pos);
         std::wstring name(s.substr(name_start, i - name_start));
         std::wstring attrs;
+        std::vector<std::pair<std::wstring, std::wstring>> attributes;
         bool self_closing = false;
         while (i < s.size()) {
             while (i < s.size() && (s[i] == L' ' || s[i] == L'\t' || s[i] == L'\r' || s[i] == L'\n')) ++i;
@@ -350,13 +382,15 @@ bool ParseXml(std::wstring_view s, std::vector<Node>& nodes, Failure& failure, b
             while (i < s.size() && s[i] != q) ++i;
             if (i >= s.size()) return fail(L"attribute", value_start);
             if (!attrs.empty()) attrs += L' ';
-            attrs += std::wstring(key) + L"=\"" + Collapse(XmlUnescape(s.substr(value_start, i - value_start))) + L'"';
+            attrs += std::wstring(key) + L"=\"" + XmlAttributeEscape(XmlUnescape(s.substr(value_start, i - value_start))) + L'"';
+            attributes.emplace_back(key, XmlAttributeValue(s.substr(value_start, i - value_start)));
             ++i;
         }
         if (open.empty() && root_seen) return fail(L"root", pos);
         if (open.size() >= static_cast<size_t>(kMaxDepth)) return fail(L"depth", pos);
         root_seen = true;
         const size_t index = emit(L'e', name, std::move(attrs));
+        if (index != static_cast<size_t>(-1)) nodes[index].attributes = std::move(attributes);
         pos = i;
         if (!self_closing) {
             open.push_back(index);
@@ -436,7 +470,16 @@ bool MakeTreeDocument(const std::wstring& path, std::wstring_view extension, std
         AppendEscaped(body, n.value);
         body += L'\t' + std::to_wstring(n.children) + L'\t';
         AppendEscaped(body, n.text);
+        if (n.type == L'e') body += L"\tattributes-v1";
         body += L'\n';
+        for (const auto& [key, value] : n.attributes) {
+            body += L"A\t"; AppendEscaped(body, key); body += L'\t';
+            for (const wchar_t c : value) {
+                if (c == L'\r') body += L"\\r";
+                else AppendEscaped(body, std::wstring_view(&c, 1));
+            }
+            body += L'\n';
+        }
         if (body.size() > budget) { body.resize(mark); more = true; break; }
         ++written;
     }

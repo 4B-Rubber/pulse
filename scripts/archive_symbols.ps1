@@ -15,13 +15,14 @@ $buildId = (Get-Content -LiteralPath $buildIdPath -TotalCount 1).Trim()
 $destination = [System.IO.Path]::GetFullPath((Join-Path $repo (Join-Path $OutputRoot (Join-Path $version $buildId))))
 New-Item -ItemType Directory -Path $destination -Force | Out-Null
 
-$artifacts = @(
-    "pulse.exe", "pulse.pdb",
-    "Pulse.Index.exe", "Pulse.Index.pdb",
-    "Pulse.Document.exe", "Pulse.Document.pdb",
-    "Pulse.Preview.exe", "Pulse.Preview.pdb",
-    "pulse_shell.exe", "pulse_integration.exe", "pulse_shell.pdb", "pulse_integration.pdb"
-)
+. "$PSScriptRoot/release_payload.ps1"
+$artifacts = @()
+foreach ($executable in $PulseReleaseExecutables) {
+    $pdb = [IO.Path]::ChangeExtension($executable, '.pdb')
+    & python "$PSScriptRoot/verify_symbol_identity.py" (Join-Path $buildPath $executable) (Join-Path $buildPath $pdb)
+    if ($LASTEXITCODE -ne 0) { throw "Missing or mismatched symbols for $executable; build_release.bat /symbols is required" }
+    $artifacts += @($executable, $pdb)
+}
 $manifest = @()
 foreach ($name in $artifacts) {
     $source = Join-Path $buildPath $name

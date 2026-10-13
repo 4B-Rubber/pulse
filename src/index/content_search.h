@@ -63,7 +63,8 @@ struct ContentHit {
 };
 
 enum class ContentSubscriptionFailure : uint32_t {
-    None, QueueOverflow, FeedConnect, FeedNotReady, FeedGap, WatchOverflow, WatchNotReady, Transport
+    None, QueueOverflow, FeedConnect, FeedNotReady, FeedGap, WatchOverflow, WatchNotReady, Transport,
+    Metadata, DirectoryEnumeration, Reconcile
 };
 
 struct ContentSearchProgress {

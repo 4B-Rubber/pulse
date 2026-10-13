@@ -4,6 +4,7 @@
 #include "index_query.h"
 #include "../common/utf8_file.h"
 #include "../common/json_utils.h"
+#include "../common/config_json.h"
 #include <algorithm>
 #include <chrono>
 #include <cwctype>
@@ -195,44 +196,6 @@ std::wstring ShardPath(const std::wstring& root, int slot = -1) {
     return path + L".bin";
 }
 
-std::vector<std::wstring> ExtractStringArray(const std::wstring& json,
-                                             const std::wstring& key) {
-    std::vector<std::wstring> result;
-    const std::wstring marker = L"\"" + key + L"\"";
-    size_t at = json.find(marker);
-    if (at == std::wstring::npos || (at = json.find(L'[', at + marker.size())) == std::wstring::npos)
-        return result;
-    ++at;
-    while (at < json.size()) {
-        while (at < json.size() && iswspace(json[at])) ++at;
-        if (at == json.size() || json[at] == L']') break;
-        if (json[at++] != L'\"') return {};
-        std::wstring value;
-        while (at < json.size() && json[at] != L'\"') {
-            if (json[at] != L'\\') {
-                value.push_back(json[at++]);
-                continue;
-            }
-            if (++at >= json.size()) return {};
-            switch (json[at]) {
-            case L'\"': value.push_back(L'\"'); break;
-            case L'\\': value.push_back(L'\\'); break;
-            case L'n': value.push_back(L'\n'); break;
-            case L'r': value.push_back(L'\r'); break;
-            case L't': value.push_back(L'\t'); break;
-            default: value.push_back(json[at]); break;
-            }
-            ++at;
-        }
-        if (at >= json.size()) return {};
-        ++at;
-        result.push_back(std::move(value));
-        while (at < json.size() && iswspace(json[at])) ++at;
-        if (at < json.size() && json[at] == L',') ++at;
-    }
-    return result;
-}
-
 bool WriteAll(HANDLE file, const void* data, size_t bytes) {
     const auto* cursor = static_cast<const uint8_t*>(data);
     while (bytes) {
@@ -374,52 +337,10 @@ bool MatchNetworkRecord(const NetworkRecord& record, std::wstring_view path,
     const bool is_dir = (record.flags & kRecordDirectory) != 0;
     if (folders_only && !is_dir) return false;
     if (query.groups.empty()) return true;
-    auto match_term = [&](const Term& term) {
-        if (term.folder && !is_dir) return false;
-        if (term.file && is_dir) return false;
-        if (!term.exts.empty()) {
-            bool ok = MatchExt(name.data(), static_cast<uint32_t>(name.size()), term);
-            if (term.ext_not) ok = !ok;
-            if (!ok) return false;
-        }
-        if (term.size_how != SizeHow::Any) {
-            bool ok = MatchSize(record.size, term);
-            if (term.size_not) ok = !ok;
-            if (!ok) return false;
-        }
-        if (term.date_how != DateHow::Any) {
-            bool ok = record.mtime && MatchDate(record.mtime, term);
-            if (term.date_not) ok = !ok;
-            if (!ok) return false;
-        }
-        if (term.name_how != NameHow::Any) {
-            bool ok = false;
-            if (!term.name_in_path) {
-                ok = MatchName(name.data(), static_cast<uint32_t>(name.size()), term);
-            } else if (term.name_how == NameHow::Wildcard) {
-                ok = WildcardFolded(path.data(), static_cast<uint32_t>(path.size()), term.name);
-            } else {
-                size_t begin = 0;
-                while (begin < path.size()) {
-                    const size_t end = path.find(L'\\', begin);
-                    const size_t length = (end == std::wstring_view::npos ? path.size() : end) - begin;
-                    if (length && MatchName(path.data() + begin, static_cast<uint32_t>(length), term)) {
-                        ok = true;
-                        break;
-                    }
-                    if (end == std::wstring_view::npos) break;
-                    begin = end + 1;
-                }
-            }
-            if (term.name_not) ok = !ok;
-            if (!ok) return false;
-        }
-        return true;
-    };
     for (const auto& group : query.groups) {
         bool matched = true;
         for (const auto& term : group) {
-            if (!match_term(term)) {
+            if (!MatchTerm(path, name, is_dir, record.size, record.mtime, term)) {
                 matched = false;
                 break;
             }
@@ -535,9 +456,22 @@ struct NetworkIndex::Overlay {
     std::vector<std::wstring> pending_scans;
     // Last change dropped because the overlay was full.
     std::chrono::steady_clock::time_point last_skipped{};
+    std::chrono::steady_clock::time_point watch_started{};
     std::shared_ptr<const OverlayView> view;
 
     size_t Size() const { return entries.size() + removed.size(); }
+    bool CanApplyScan(std::wstring_view path, std::chrono::steady_clock::time_point started) const {
+        const auto newer = entries.find(path);
+        if (newer != entries.end() && newer->second.seen >= started) return false;
+        for (;;) {
+            const auto removed_at = removed.find(path);
+            if (removed_at != removed.end() && removed_at->second >= started) return false;
+            const auto slash = path.rfind(L'\\');
+            if (slash == std::wstring_view::npos || slash <= 2) break;
+            path = path.substr(0, slash);
+        }
+        return true;
+    }
 };
 
 struct NetworkIndex::OverlayView {
@@ -569,8 +503,9 @@ std::wstring NormalizeNetworkRoot(std::wstring path) {
 
     if (path.size() >= 2 && path[1] == L':') {
         DWORD bytes = 0;
-        WNetGetUniversalNameW(path.c_str(), UNIVERSAL_NAME_INFO_LEVEL, nullptr, &bytes);
-        if (GetLastError() == ERROR_MORE_DATA && bytes) {
+        const DWORD result = WNetGetUniversalNameW(path.c_str(), UNIVERSAL_NAME_INFO_LEVEL, nullptr, &bytes);
+        constexpr DWORD maximum_bytes = sizeof(UNIVERSAL_NAME_INFOW) + 32768 * sizeof(wchar_t);
+        if (result == ERROR_MORE_DATA && bytes >= sizeof(UNIVERSAL_NAME_INFOW) && bytes <= maximum_bytes) {
             std::vector<uint8_t> buffer(bytes);
             if (WNetGetUniversalNameW(path.c_str(), UNIVERSAL_NAME_INFO_LEVEL,
                                       buffer.data(), &bytes) == NO_ERROR) {
@@ -597,7 +532,6 @@ std::wstring NetworkConfigPath() {
 bool LoadNetworkRoots(std::vector<std::wstring>& roots, std::wstring* error) {
     const std::wstring path = NetworkConfigPath();
     if (path.empty()) {
-        roots.clear();
         SetError(error, L"无法定位当前用户配置目录");
         return false;
     }
@@ -606,9 +540,14 @@ bool LoadNetworkRoots(std::vector<std::wstring>& roots, std::wstring* error) {
 
 bool LoadNetworkRootsFile(const std::wstring& path, std::vector<std::wstring>& roots,
                           std::wstring* error) {
-    roots.clear();
-    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES &&
-        GetLastError() == ERROR_FILE_NOT_FOUND) return true;
+    SetError(error, {});
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+            roots.clear();
+            return true;
+        }
+    }
     std::vector<uint8_t> bytes;
     if (!ReadBytes(path, bytes, error)) return false;
     std::wstring json;
@@ -616,17 +555,23 @@ bool LoadNetworkRootsFile(const std::wstring& path, std::vector<std::wstring>& r
         SetError(error, L"网络索引配置不是有效的 UTF-8 文件");
         return false;
     }
-    if (json.find(L'{') == std::wstring::npos) {
+    std::vector<std::wstring> raw_roots;
+    if (!pulse::json::ConfigSyntax(json, false).StringArrayMember(L"roots", raw_roots)) {
         SetError(error, L"网络索引配置已损坏");
         return false;
     }
-    for (const auto& raw : ExtractStringArray(json, L"roots")) {
+    std::vector<std::wstring> parsed;
+    for (const auto& raw : raw_roots) {
         std::wstring root = NormalizeNetworkRoot(raw);
-        if (root.empty()) continue;
-        if (std::none_of(roots.begin(), roots.end(), [&](const auto& existing) {
+        if (root.empty() || std::any_of(raw.begin(), raw.end(), [](wchar_t c) { return c < 0x20; })) {
+            SetError(error, L"网络索引配置包含无效的服务器文件夹");
+            return false;
+        }
+        if (std::none_of(parsed.begin(), parsed.end(), [&](const auto& existing) {
                 return EqualPath(existing, root);
-            })) roots.push_back(std::move(root));
+            })) parsed.push_back(std::move(root));
     }
+    roots = std::move(parsed);
     return true;
 }
 
@@ -843,6 +788,8 @@ void NetworkIndex::ScanPendingSubtrees() {
     struct Job {
         std::wstring root;
         std::wstring directory;
+        std::shared_ptr<Overlay> overlay;
+        uint64_t generation = 0;
     };
     std::vector<Job> jobs;
     {
@@ -850,7 +797,7 @@ void NetworkIndex::ScanPendingSubtrees() {
         for (auto& root : roots_) {
             if (!root.overlay) continue;
             for (auto& directory : root.overlay->pending_scans)
-                jobs.push_back({root.info.path, std::move(directory)});
+                jobs.push_back({root.info.path, std::move(directory), root.overlay, generation_});
             root.overlay->pending_scans.clear();
         }
     }
@@ -859,8 +806,9 @@ void NetworkIndex::ScanPendingSubtrees() {
         const auto scan_start = std::chrono::steady_clock::now();
         std::vector<std::pair<std::wstring, Overlay::Entry>> found;
         bool truncated = false;
+        DWORD failure = ERROR_SUCCESS;
         std::vector<std::wstring> stack{job.directory};
-        while (!stack.empty() && running_ && !truncated) {
+        while (!stack.empty() && running_ && !truncated && failure == ERROR_SUCCESS) {
             const std::wstring directory = std::move(stack.back());
             stack.pop_back();
             const std::wstring pattern = LongPath(directory) + L"\\*";
@@ -872,8 +820,14 @@ void NetworkIndex::ScanPendingSubtrees() {
                 handle = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &find,
                                           FindExSearchNameMatch, nullptr, 0);
             }
-            if (handle == INVALID_HANDLE_VALUE) continue;
+            if (handle == INVALID_HANDLE_VALUE) {
+                const DWORD error = GetLastError();
+                if (error != ERROR_FILE_NOT_FOUND && error != ERROR_NO_MORE_FILES)
+                    failure = error ? error : ERROR_GEN_FAILURE;
+                continue;
+            }
             do {
+                if (!running_) { truncated = true; break; }
                 if (wcscmp(find.cFileName, L".") == 0 || wcscmp(find.cFileName, L"..") == 0)
                     continue;
                 if (found.size() >= kSubtreeScanLimit) {
@@ -890,17 +844,46 @@ void NetworkIndex::ScanPendingSubtrees() {
                     stack.push_back(full);
                 found.emplace_back(std::move(full), entry);
             } while (FindNextFileW(handle, &find));
+            const DWORD enumeration_error = GetLastError();
+            if (!truncated && enumeration_error != ERROR_NO_MORE_FILES)
+                failure = enumeration_error ? enumeration_error : ERROR_GEN_FAILURE;
             FindClose(handle);
         }
+        if (!running_) return;
+        if (failure != ERROR_SUCCESS) found.clear();
         // A subtree too large for the overlay is left to a crawl.
-        bool needs_crawl = truncated;
+        bool needs_crawl = truncated || failure != ERROR_SUCCESS;
         {
             std::lock_guard<std::mutex> lock(mu_);
             for (auto& root : roots_) {
                 if (!EqualPath(root.info.path, job.root)) continue;
-                if (!root.overlay) root.overlay = std::make_shared<Overlay>();
+                // Removing and re-adding the same path creates a different
+                // overlay; an old job must never populate the new root.
+                if (root.overlay != job.overlay) break;
+                if (generation_ != job.generation) {
+                    // An unrelated root edit invalidated the batch. Retry
+                    // this still-current root rather than losing its scan.
+                    root.overlay->pending_scans.push_back(job.directory);
+                    break;
+                }
                 Overlay& overlay = *root.overlay;
+                if (failure != ERROR_SUCCESS) {
+                    root.info.error = Win32Message(failure);
+                    root.info.state = L"子目录扫描未完成，等待重新扫描";
+                }
                 for (auto& [path, entry] : found) {
+                    const auto newer = overlay.entries.find(path);
+                    if (newer != overlay.entries.end() && newer->second.seen >= scan_start) continue;
+                    bool removed = false;
+                    for (size_t end = path.size(); end > 2 && end != std::wstring::npos;
+                         end = path.rfind(L'\\', end - 1)) {
+                        const auto tombstone = overlay.removed.find(std::wstring_view(path).substr(0, end));
+                        if (tombstone != overlay.removed.end() && tombstone->second >= scan_start) {
+                            removed = true;
+                            break;
+                        }
+                    }
+                    if (removed) continue;
                     if (overlay.Size() >= kOverlayLimit) {
                         overlay.last_skipped = scan_start;
                         needs_crawl = true;
@@ -909,10 +892,16 @@ void NetworkIndex::ScanPendingSubtrees() {
                     overlay.entries.insert_or_assign(std::move(path), entry);
                 }
                 overlay.view.reset();
+                if (needs_crawl) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!root.change_pending) root.change_first = now;
+                    root.change_pending = true;
+                    root.change_last = now;
+                }
                 break;
             }
         }
-        if (needs_crawl) NoteRootChanged(job.root);
+        if (needs_crawl) crawl_cv_.notify_one();
     }
 }
 
@@ -953,7 +942,7 @@ std::chrono::steady_clock::time_point NetworkIndex::CollectDueRootsLocked(
         }
         // Until the first crawl of this session the start-up rule applies;
         // the watch may simply not be armed yet.
-        if (!root.info.watching && root.last_crawl_end != unset) {
+        if ((!root.info.watching || root.last_crawl_failed) && root.last_crawl_end != unset) {
             when = (std::min)(when, crawl_schedule::UnwatchedDue(root.last_crawl_end, root.last_crawl,
                                                                   root.last_crawl_failed));
         }
@@ -976,6 +965,14 @@ std::chrono::steady_clock::time_point NetworkIndex::CollectDueRootsLocked(
     return next;
 }
 
+bool NetworkIndex::ReadConfig(const std::wstring& path, std::vector<std::wstring>& configured) {
+    std::wstring error;
+    const bool loaded = !path.empty() && LoadNetworkRootsFile(path, configured, &error);
+    std::lock_guard<std::mutex> lock(mu_);
+    config_error_ = loaded ? L"" : error.empty() ? L"无法读取网络索引配置" : error;
+    return loaded;
+}
+
 void NetworkIndex::Start(HWND notify, UINT status_msg, UINT search_msg) {
     changes_.Open(NetworkDataDir());
     Stop();
@@ -984,10 +981,11 @@ void NetworkIndex::Start(HWND notify, UINT status_msg, UINT search_msg) {
     search_msg_ = search_msg;
     std::vector<std::wstring> configured;
     std::wstring error;
-    LoadNetworkRoots(configured, &error);
+    const bool config_loaded = LoadNetworkRoots(configured, &error);
     {
         std::lock_guard<std::mutex> lock(mu_);
         roots_.clear();
+        config_error_ = config_loaded ? L"" : error.empty() ? L"无法读取网络索引配置" : error;
         dirty_roots_.clear();
         const auto started = std::chrono::steady_clock::now();
         FILETIME now_time{};
@@ -1058,6 +1056,50 @@ std::vector<NetworkRootInfo> NetworkIndex::Roots() const {
     return result;
 }
 
+std::wstring NetworkIndex::ConfigError() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return config_error_;
+}
+
+bool NetworkIndex::ReloadConfigurationLocked(std::wstring* error) {
+    std::vector<std::wstring> configured;
+    std::wstring load_error;
+    if (!LoadNetworkRoots(configured, &load_error)) {
+        config_error_ = load_error.empty() ? L"无法读取网络索引配置" : std::move(load_error);
+        SetError(error, config_error_);
+        NotifyStatus();
+        return false;
+    }
+    config_error_.clear();
+    SetError(error, {});
+    const bool unchanged = configured.size() == roots_.size() &&
+        std::equal(configured.begin(), configured.end(), roots_.begin(),
+            [](const std::wstring& path, const RootState& root) { return EqualPath(path, root.info.path); });
+    if (!unchanged) {
+        std::vector<RootState> refreshed;
+        refreshed.reserve(configured.size());
+        for (const auto& path : configured) {
+            auto existing = std::find_if(roots_.begin(), roots_.end(),
+                [&](const RootState& root) { return EqualPath(path, root.info.path); });
+            if (existing != roots_.end()) {
+                refreshed.push_back(std::move(*existing));
+            } else {
+                RootState root;
+                root.info.path = path;
+                root.info.state = L"等待扫描";
+                refreshed.push_back(std::move(root));
+                dirty_roots_.insert(path);
+            }
+        }
+        roots_ = std::move(refreshed);
+        ++generation_;
+        crawl_cv_.notify_one();
+        if (watch_wake_event_) SetEvent(watch_wake_event_);
+    }
+    NotifyStatus();
+    return true;
+}
+
 bool NetworkIndex::AddRoot(const std::wstring& raw, std::wstring* error) {
     const std::wstring path = NormalizeNetworkRoot(raw);
     if (path.empty()) {
@@ -1065,6 +1107,7 @@ bool NetworkIndex::AddRoot(const std::wstring& raw, std::wstring* error) {
         return false;
     }
     std::lock_guard<std::mutex> lock(mu_);
+    if (!ReloadConfigurationLocked(error)) return false;
     if (std::any_of(roots_.begin(), roots_.end(), [&](const RootState& root) {
             return EqualPath(root.info.path, path);
         })) return true;
@@ -1088,6 +1131,7 @@ bool NetworkIndex::AddRoot(const std::wstring& raw, std::wstring* error) {
 bool NetworkIndex::RemoveRoot(const std::wstring& raw, std::wstring* error) {
     const std::wstring path = NormalizeNetworkRoot(raw);
     std::lock_guard<std::mutex> lock(mu_);
+    if (!ReloadConfigurationLocked(error)) return false;
     auto found = std::find_if(roots_.begin(), roots_.end(), [&](const RootState& root) {
         return EqualPath(root.info.path, path);
     });
@@ -1136,6 +1180,8 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
         for (auto& root : roots_) {
             if (!EqualPath(root.info.path, path)) continue;
             root.info.building = false;
+            root.info.progress = 0;
+            root.info.indexed_items = root.shard ? root.shard->count : 0;
             root.info.state = L"等待重新扫描";
             dirty_roots_.insert(root.info.path);
             break;
@@ -1160,7 +1206,6 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
     std::vector<std::wstring> stack{path};
     DWORD failure = builder.Valid() ? ERROR_SUCCESS : ERROR_WRITE_FAULT;
     bool root_accessible = true;
-    bool storage_failure = !builder.Valid();
     uint64_t since_notify = 0;
     while (!stack.empty() && running_ && failure == ERROR_SUCCESS) {
         if (!RootStillCurrent(path, generation)) {
@@ -1179,19 +1224,20 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
                                       FindExSearchNameMatch, nullptr, 0);
         }
         if (handle == INVALID_HANDLE_VALUE) {
-            if (EqualPath(directory, path)) {
-                failure = GetLastError();
-                root_accessible = false;
+            const DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_NO_MORE_FILES) {
+                failure = error ? error : ERROR_GEN_FAILURE;
+                if (EqualPath(directory, path)) root_accessible = false;
             }
             continue;
         }
         do {
+            if (!running_) { failure = ERROR_OPERATION_ABORTED; break; }
             if (wcscmp(find.cFileName, L".") == 0 || wcscmp(find.cFileName, L"..") == 0)
                 continue;
             std::wstring full = directory + L"\\" + find.cFileName;
             if (!builder.Add(full, find)) {
                 failure = ERROR_WRITE_FAULT;
-                storage_failure = true;
                 break;
             }
             if ((find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
@@ -1208,6 +1254,9 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
                 NotifyStatus();
             }
         } while (FindNextFileW(handle, &find));
+        const DWORD enumeration_error = GetLastError();
+        if (failure == ERROR_SUCCESS && enumeration_error != ERROR_NO_MORE_FILES)
+            failure = enumeration_error ? enumeration_error : ERROR_GEN_FAILURE;
         FindClose(handle);
     }
     if (!running_) return;
@@ -1216,14 +1265,22 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
         return;
     }
 
-    const bool server_accessible = root_accessible && (failure == ERROR_SUCCESS || storage_failure);
+    const bool server_accessible = root_accessible;
     int next_slot = 0;
+    bool watch_gap = false;
     {
         std::lock_guard<std::mutex> lock(mu_);
         for (const auto& root : roots_) {
-            if (EqualPath(root.info.path, path) && root.shard && root.shard->slot == 0)
-                next_slot = 1;
+            if (!EqualPath(root.info.path, path)) continue;
+            if (root.shard && root.shard->slot == 0) next_slot = 1;
+            watch_gap = root.overlay && root.overlay->watch_started >= crawl_start;
+            break;
         }
+    }
+    if (failure == ERROR_SUCCESS && watch_gap) {
+        abandon();
+        NotifyStatus();
+        return;
     }
     const std::wstring publish_path = ShardPath(path, next_slot);
     std::shared_ptr<Shard> shard;
@@ -1231,7 +1288,6 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
         shard = Shard::Open(publish_path, next_slot);
     if (failure == ERROR_SUCCESS && !shard) {
         failure = ERROR_WRITE_FAULT;
-        storage_failure = true;
     }
 
     {
@@ -1249,6 +1305,18 @@ void NetworkIndex::BuildRoot(const std::wstring& path, uint64_t generation) {
         for (auto& root : roots_) {
             if (!EqualPath(root.info.path, path)) continue;
             root.info.building = false;
+            if (failure == ERROR_SUCCESS && root.overlay && root.overlay->watch_started >= crawl_start) {
+                // This crawl started before notification coverage. It may
+                // have missed changes in directories already enumerated.
+                // Keep the old snapshot until a watched crawl completes.
+                shard.reset();
+                DeleteFileW(publish_path.c_str());
+                root.info.progress = 0;
+                root.info.indexed_items = root.shard ? root.shard->count : 0;
+                root.info.state = L"等待重新扫描";
+                dirty_roots_.insert(root.info.path);
+                break;
+            }
             root.info.progress = failure == ERROR_SUCCESS ? 100 : 0;
             root.last_crawl_end = std::chrono::steady_clock::now();
             root.last_crawl_failed = failure != ERROR_SUCCESS;
@@ -1329,6 +1397,29 @@ void NetworkIndex::CrawlLoop() {
     }
 }
 
+void NetworkIndex::SetWatching(const std::wstring& path, bool watching) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto& root : roots_) {
+            if (!EqualPath(root.info.path, path)) continue;
+            if (watching && !root.info.watching) {
+                if (!root.overlay) root.overlay = std::make_shared<Overlay>();
+                root.overlay->watch_started = std::chrono::steady_clock::now();
+                // Also reconcile when the first baseline was published
+                // before the watch could be established.
+                dirty_roots_.insert(root.info.path);
+                if (!root.info.building) root.info.state = L"监视已启动 · 等待校验";
+            }
+            root.info.watching = watching;
+            if (watching) {
+                root.info.online = true;
+            }
+            break;
+        }
+    }
+    crawl_cv_.notify_one();
+}
+
 void NetworkIndex::WatchLoop() {
     constexpr DWORD kNotifyFilter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
                                     FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
@@ -1361,23 +1452,6 @@ void NetworkIndex::WatchLoop() {
                                          TRUE, kNotifyFilter, nullptr, &overlapped, nullptr) != FALSE;
         }
     };
-    auto set_watching = [this](const std::wstring& path, bool watching) {
-        std::lock_guard<std::mutex> lock(mu_);
-        for (auto& root : roots_) {
-            if (!EqualPath(root.info.path, path)) continue;
-            root.info.watching = watching;
-            if (watching) {
-                // An open change notification proves the server is reachable.
-                root.info.online = true;
-                if (!root.info.building) {
-                    root.info.state = L"实时监视 · " +
-                        std::to_wstring(root.info.indexed_items) + L" 项";
-                }
-            }
-            break;
-        }
-    };
-
     std::vector<std::unique_ptr<Watch>> watches;
     bool refresh = true;
     while (running_) {
@@ -1389,7 +1463,7 @@ void NetworkIndex::WatchLoop() {
             {
                 std::lock_guard<std::mutex> lock(mu_);
                 for (const auto& root : roots_) {
-                    if ((root.info.online || root.shard) && paths.size() + 1 < MAXIMUM_WAIT_OBJECTS)
+                    if (paths.size() + 1 < MAXIMUM_WAIT_OBJECTS)
                         paths.push_back(root.info.path);
                 }
             }
@@ -1410,7 +1484,7 @@ void NetworkIndex::WatchLoop() {
                 if (watch->directory == INVALID_HANDLE_VALUE) continue;
                 watch->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
                 if (!watch->event || !watch->Arm()) continue;
-                set_watching(path, true);
+                SetWatching(path, true);
                 watches.push_back(std::move(watch));
             }
             NotifyStatus();
@@ -1453,7 +1527,7 @@ void NetworkIndex::WatchLoop() {
         if ((!read && read_error != ERROR_NOTIFY_ENUM_DIR) || !watch.Arm()) {
             const std::wstring path = watch.path;
             watches.erase(watches.begin() + static_cast<std::ptrdiff_t>(index));
-            set_watching(path, false);
+            SetWatching(path, false);
             crawl_cv_.notify_one();
             NotifyStatus();
         }
@@ -1480,6 +1554,8 @@ void NetworkIndex::SearchLoop() {
         // Parallel to shards: overlay whose changes supersede the shard's
         // records (null for the overlay's own in-memory shard).
         std::vector<std::shared_ptr<const OverlayView>> overlays;
+        std::vector<std::wstring> owner_paths;
+        std::vector<size_t> shard_owners;
         {
             std::unique_lock<std::mutex> lock(mu_);
             search_cv_.wait(lock, [this] { return !running_ || have_pending_search_; });
@@ -1489,12 +1565,16 @@ void NetworkIndex::SearchLoop() {
             have_pending_search_ = false;
             for (auto& root : roots_) {
                 if (!root.info.online || !root.shard) continue;
+                const size_t owner = owner_paths.size();
+                owner_paths.push_back(root.info.path);
                 auto view = OverlayViewLocked(root);
                 shards.push_back(root.shard);
                 overlays.push_back(view);
+                shard_owners.push_back(owner);
                 if (view && view->added->count) {
                     shards.push_back(view->added);
                     overlays.push_back(nullptr);
+                    shard_owners.push_back(owner);
                 }
             }
         }
@@ -1546,6 +1626,22 @@ void NetworkIndex::SearchLoop() {
         if (!query.rank && query.sort == ResultSort::Index)
             in_order.reserve((std::min)(wanted, static_cast<size_t>(4096)));
         size_t total = 0;
+        // The most specific available root owns its descendants, including
+        // its overlay and deletions. Unavailable children leave the parent
+        // authoritative. Root directories themselves still belong to their
+        // parent because a root's own shard does not enumerate itself.
+        const auto owner_of = [&](std::wstring_view path) {
+            size_t owner = SIZE_MAX;
+            size_t longest = 0;
+            for (size_t i = 0; i < owner_paths.size(); ++i) {
+                const auto& scope = owner_paths[i];
+                if (scope.size() <= longest || path.size() <= scope.size()) continue;
+                if (!StartsWithPath(path, scope)) continue;
+                owner = i;
+                longest = scope.size();
+            }
+            return owner;
+        };
         for (size_t shard_index = 0; shard_index < shards.size(); ++shard_index) {
             const auto& shard = shards[shard_index];
             const OverlayView* overlay = overlays[shard_index].get();
@@ -1554,6 +1650,7 @@ void NetworkIndex::SearchLoop() {
                 const auto& record = shard->records[i];
                 const std::wstring_view path(shard->pool + record.path_off, record.path_len);
                 if (!StartsWithPath(path, query.path_prefix)) continue;
+                if (owner_of(path) != shard_owners[shard_index]) continue;
                 const std::wstring_view name(path.data() + record.name_off, record.name_len);
                 if (!MatchNetworkRecord(record, path, name, compiled, query.folders_only)) continue;
                 if (overlay && overlay->Hides(path)) continue;
@@ -1650,24 +1747,73 @@ void LiveNetworkWalk(const std::wstring& raw_folder, const std::wstring& needle,
                      LiveNetworkMatches& out, std::mutex& out_mutex,
                      const std::function<bool()>& cancelled,
                      const std::function<void()>& progress) {
-    std::wstring folder = raw_folder;
+    Query query;
+    query.path_prefix = raw_folder;
+    query.needle = needle;
+    query.folders_only = folders_only;
+    query.rank = false;
+    LiveNetworkWalk(query, out, out_mutex, cancelled, progress);
+}
+
+bool CanReuseLiveNetworkWalk(const Query& previous, const Query& next) {
+    return previous.session_id == next.session_id && previous.subscribe == next.subscribe &&
+        previous.needle == next.needle && previous.path_prefix == next.path_prefix &&
+        previous.folders_only == next.folders_only && previous.rank == next.rank &&
+        previous.sort == next.sort && previous.sort_desc == next.sort_desc;
+}
+
+void LiveNetworkWalk(const Query& query, LiveNetworkMatches& out, std::mutex& out_mutex,
+                     const std::function<bool()>& cancelled,
+                     const std::function<void()>& progress) {
+    std::wstring folder = query.path_prefix;
     std::replace(folder.begin(), folder.end(), L'/', L'\\');
     while (folder.size() > 3 && folder.back() == L'\\') folder.pop_back();
-    const CompiledQuery compiled = ParseQuery(needle);
+    const CompiledQuery compiled = ParseQuery(query.needle);
+    {
+        std::lock_guard lock(out_mutex);
+        out = {};
+        out.order = query;
+    }
     std::vector<std::wstring> stack{folder};
     ULONGLONG last_progress = GetTickCount64();
     bool stopped = false;
-    bool first = true;
     bool unreported = false;
-    while (!stack.empty()) {
+    const bool ordered = query.rank || query.sort != ResultSort::Index;
+    const auto better = [&](const Hit& a, const Hit& b) { return BetterHit(a, b, query, compiled); };
+    constexpr size_t kBatchSize = 256;
+    std::vector<Hit> found;
+    found.reserve(kBatchSize);
+    const auto flush = [&] {
+        if (!found.empty()) {
+            std::lock_guard lock(out_mutex);
+            out.total += found.size();
+            for (auto& hit : found) {
+                if (out.hits.size() < kSearchPageCap) {
+                    out.hits.push_back(std::move(hit));
+                    if (ordered) std::push_heap(out.hits.begin(), out.hits.end(), better);
+                } else if (ordered && better(hit, out.hits.front())) {
+                    std::pop_heap(out.hits.begin(), out.hits.end(), better);
+                    out.hits.back() = std::move(hit);
+                    std::push_heap(out.hits.begin(), out.hits.end(), better);
+                }
+            }
+            found.clear();
+            unreported = true;
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (unreported && progress && now - last_progress >= 250) {
+            last_progress = now;
+            unreported = false;
+            progress();
+        }
+    };
+    while (!stack.empty() && !stopped) {
         if (cancelled && cancelled()) {
             stopped = true;
             break;
         }
         std::wstring directory = std::move(stack.back());
         stack.pop_back();
-        const bool top = first;
-        first = false;
         std::wstring pattern = LongPath(directory);
         if (pattern.back() != L'\\') pattern += L'\\';
         pattern += L'*';
@@ -1680,18 +1826,16 @@ void LiveNetworkWalk(const std::wstring& raw_folder, const std::wstring& needle,
                                       FindExSearchNameMatch, nullptr, 0);
         }
         if (handle == INVALID_HANDLE_VALUE) {
-            // Unreadable subfolders are skipped like Explorer does; only the
-            // search scope itself failing is an error.
-            if (top) {
-                const DWORD error = GetLastError();
+            const DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_NO_MORE_FILES) {
                 std::lock_guard<std::mutex> lock(out_mutex);
-                out.error = error ? error : ERROR_PATH_NOT_FOUND;
+                if (!out.error) out.error = error ? error : ERROR_GEN_FAILURE;
             }
             continue;
         }
         const std::wstring base = directory.back() == L'\\' ? directory : directory + L'\\';
-        std::vector<Hit> found;
         do {
+            if (cancelled && cancelled()) { stopped = true; break; }
             if (wcscmp(find.cFileName, L".") == 0 || wcscmp(find.cFileName, L"..") == 0)
                 continue;
             const bool is_dir = (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -1702,29 +1846,22 @@ void LiveNetworkWalk(const std::wstring& raw_folder, const std::wstring& needle,
                 : (static_cast<uint64_t>(find.nFileSizeHigh) << 32) | find.nFileSizeLow;
             record.mtime = FileTimeValue(find.ftLastWriteTime);
             const std::wstring_view name(find.cFileName);
-            if (MatchNetworkRecord(record, full, name, compiled, folders_only))
+            if (MatchNetworkRecord(record, full, name, compiled, query.folders_only))
                 found.push_back(Hit{full, std::wstring(name), is_dir, record.size, record.mtime});
+            if (found.size() >= kBatchSize) flush();
             if (is_dir && !(find.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
                 stack.push_back(std::move(full));
         } while (FindNextFileW(handle, &find));
-        FindClose(handle);
-        if (!found.empty()) {
+        const DWORD enumeration_error = GetLastError();
+        if (!stopped && enumeration_error != ERROR_NO_MORE_FILES) {
             std::lock_guard<std::mutex> lock(out_mutex);
-            out.total += found.size();
-            for (auto& hit : found) {
-                if (out.hits.size() >= kSearchPageCap) break;
-                out.hits.push_back(std::move(hit));
-            }
-            unreported = true;
+            if (!out.error) out.error = enumeration_error ? enumeration_error : ERROR_GEN_FAILURE;
         }
-        const ULONGLONG now = GetTickCount64();
-        if (unreported && progress && now - last_progress >= 250) {
-            last_progress = now;
-            unreported = false;
-            progress();
-        }
+        FindClose(handle);
+        flush();
     }
     std::lock_guard<std::mutex> lock(out_mutex);
+    out.finished = true;
     out.complete = !stopped;
 }
 
@@ -1732,6 +1869,14 @@ SearchResult SelectLiveNetworkHits(const Query& query, const LiveNetworkMatches&
     SearchResult result;
     result.total = matches.total;
     result.error = matches.error;
+    if (matches.total > matches.hits.size() &&
+        (query.rank != matches.order.rank || query.sort != matches.order.sort ||
+         query.sort_desc != matches.order.sort_desc)) {
+        // A differently ordered prefix cannot answer this page. Production
+        // cache reuse rejects this combination and starts another walk.
+        result.error = ERROR_INVALID_PARAMETER;
+        return result;
+    }
     const CompiledQuery compiled = ParseQuery(query.needle);
     struct Ranked {
         const Hit* hit = nullptr;
@@ -1770,7 +1915,7 @@ SearchResult SelectLiveNetworkHits(const Query& query, const LiveNetworkMatches&
 }
 
 SearchResult MergeSearchResults(const Query& query, SearchResult local,
-                                SearchResult network) {
+                                SearchResult network, bool deduplicate_paths) {
     SearchResult result;
     result.error = local.error ? local.error : network.error;
     result.total = local.total + network.total;
@@ -1783,6 +1928,18 @@ SearchResult MergeSearchResults(const Query& query, SearchResult local,
             return BetterHit(a, b, query, compiled);
         });
     }
+    if (deduplicate_paths) {
+        std::vector<Hit> unique;
+        unique.reserve(result.hits.size());
+        for (auto& hit : result.hits) {
+            if (std::any_of(unique.begin(), unique.end(), [&](const Hit& existing) {
+                return CompareStringOrdinal(existing.path.c_str(), -1, hit.path.c_str(), -1, TRUE) == CSTR_EQUAL;
+            })) {
+                if (result.total) --result.total;
+            } else unique.push_back(std::move(hit));
+        }
+        result.hits = std::move(unique);
+    }
     const size_t begin = (std::min)(query.offset, result.hits.size());
     const size_t end = (std::min)(result.hits.size(), begin + query.limit);
     if (begin) result.hits.erase(result.hits.begin(), result.hits.begin() + begin);
@@ -1791,3 +1948,13 @@ SearchResult MergeSearchResults(const Query& query, SearchResult local,
 }
 
 } // namespace pulse::index
+
+namespace pulse::index {
+void LiveNetworkWalk(const std::wstring& folder, const std::wstring& needle, bool folders_only,
+    LiveNetworkMatches& out, std::mutex& mutex, const std::function<bool()>& cancelled,
+    const std::function<void()>& progress, const Query* selection) {
+    if (selection) { auto query = *selection; query.path_prefix = folder; query.needle = needle;
+        query.folders_only = folders_only; LiveNetworkWalk(query, out, mutex, cancelled, progress); }
+    else LiveNetworkWalk(folder, needle, folders_only, out, mutex, cancelled, progress);
+}
+}

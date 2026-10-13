@@ -31,7 +31,10 @@ public:
     uint64_t Revision() const { return revision_.load(); }
     std::vector<VolumeInfo> Volumes() const;
     std::vector<std::wstring> ExcludedPaths() const;
+    // excluded also lists the folders hidden by the system folder switch.
     bool GetScope(std::vector<VolumeInfo>& volumes, std::vector<std::wstring>& excluded) const;
+    // False until a service that reports the system folder switch answers.
+    bool SystemExclusion(bool& enabled, std::vector<std::wstring>& groups) const;
     void RefreshVolumesAsync();
     bool RequestConfigureVolume(const std::wstring& volume_id, bool enabled);
     bool RequestRebuild();
@@ -40,7 +43,8 @@ public:
     static bool InstallServiceElevated(DWORD* error = nullptr);
     static bool ConfigureIndexPathElevated(const std::wstring& path, std::wstring* error = nullptr);
     static bool ConfigureExcludePathElevated(const std::wstring& path, bool enabled);
-    static bool ExportDiagnosticsElevated(const std::wstring& empty_directory);
+    static bool ConfigureSystemExclusionElevated(const std::wstring& group, bool enabled);
+    static bool ExportDiagnosticsElevated(const std::wstring& empty_directory, bool include_dumps = false);
 
     // Fire-and-forget. Reply arrives as search_msg (wParam = request id).
     void SearchAsync(const Query& q, uint32_t id);
@@ -57,6 +61,7 @@ private:
     void Writer();
     bool EnsureConnected();
     bool SpawnHelper();
+    void StartStoppedService();
     bool WriteMsg(uint32_t type, uint32_t id, const std::vector<uint8_t>& payload);
     bool ReadMsg(ipc::MsgHeader& hdr, std::vector<uint8_t>& payload);
     void HandleStatus(const uint8_t* p, size_t n);
@@ -71,6 +76,7 @@ private:
     std::wstring pipe_name_ = kPipeName;
     HANDLE child_proc_ = nullptr;
     HANDLE child_thread_ = nullptr;
+    ULONGLONG service_start_tick_ = 0;   // last StartStoppedService attempt (Worker thread only)
     std::thread worker_;
     std::thread writer_;
     std::atomic<bool> running_{false};
@@ -87,6 +93,10 @@ private:
     std::vector<VolumeInfo> volumes_;
     bool scope_ready_ = false;
     std::vector<std::wstring> excluded_paths_;
+    bool system_known_ = false;
+    bool exclude_system_ = false;
+    std::vector<std::wstring> system_groups_;
+    std::vector<std::wstring> system_paths_;
     uint32_t result_id_ = 0;
     SearchResult result_;
     std::mutex pipe_mu_;

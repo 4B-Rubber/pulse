@@ -24,5 +24,6 @@ struct FormulaLayout {
 
 // Consumes syntax nodes only; there is no source-string parsing in layout/draw.
 bool BuildMathLayout(IDWriteFactory2 *factory, IDWriteFontFace *face, const FontMathMetrics &metrics,
-                     const MathNode &root, float font_size, bool display, FormulaLayout &result);
+                     const MathNode &root, float font_size, bool display, FormulaLayout &result,
+                     float window_scale = 1.0f);
 } // namespace pulse::ui::math

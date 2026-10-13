@@ -50,6 +50,7 @@ std::wstring NetworkAgentClient::ExePath() {
 }
 
 bool NetworkAgentClient::EnsureAgent() {
+    if (pipe_name_.empty()) return false;
     if (agent_process_ && WaitForSingleObject(agent_process_, 0) == WAIT_TIMEOUT) return true;
     if (agent_process_) {
         CloseHandle(agent_process_);
@@ -59,7 +60,9 @@ bool NetworkAgentClient::EnsureAgent() {
     // owned by another Pulse window or outlive the Pulse instance that started it. Spawning a
     // duplicate would exit immediately and cause a respawn loop on every request (and a
     // flickering AppStarting cursor), so reuse whichever agent currently holds the singleton.
-    if (HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, kAgentSingletonName)) {
+    const auto singleton = agent::SingletonName();
+    if (singleton.empty()) return false;
+    if (HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, singleton.c_str())) {
         CloseHandle(existing);
         return true;
     }
@@ -82,13 +85,37 @@ bool NetworkAgentClient::EnsureAgent() {
 }
 
 bool NetworkAgentClient::OpenPipe(HANDLE& pipe) {
-    pipe = CreateFileW(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                       OPEN_EXISTING, 0, nullptr);
-    if (pipe != INVALID_HANDLE_VALUE) return true;
-    if (GetLastError() == ERROR_PIPE_BUSY) WaitNamedPipeW(pipe_name_.c_str(), 1000);
-    pipe = CreateFileW(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                       OPEN_EXISTING, 0, nullptr);
-    return pipe != INVALID_HANDLE_VALUE;
+    pipe = INVALID_HANDLE_VALUE;
+    if (pipe_name_.empty()) return false;
+    const auto open = [&] {
+        return CreateFileW(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            OPEN_EXISTING, SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
+    };
+    // Missing (agent still starting, or between instances) and busy endpoints
+    // are transient. Retrying for a bounded time keeps the first search after
+    // launch from failing with ERROR_CONNECTION_ABORTED (1236).
+    const ULONGLONG deadline = GetTickCount64() + kOpenPipeWaitMs;
+    for (;;) {
+        pipe = open();
+        if (pipe != INVALID_HANDLE_VALUE) break;
+        const DWORD error = GetLastError();
+        const ULONGLONG now = GetTickCount64();
+        if (!running_ || now >= deadline) return false;
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PIPE_BUSY) return false;
+        // The agent this client started has exited: its pipe will never appear.
+        if (error == ERROR_FILE_NOT_FOUND && agent_process_ &&
+            WaitForSingleObject(agent_process_, 0) != WAIT_TIMEOUT) return false;
+        const DWORD slice = static_cast<DWORD>((std::min)(deadline - now, ULONGLONG{100}));
+        if (error == ERROR_PIPE_BUSY) {
+            if (!WaitNamedPipeW(pipe_name_.c_str(), slice)) Sleep(slice);
+        } else {
+            Sleep(slice);
+        }
+    }
+    if (agent::AuthorizedServer(pipe)) return true;
+    CloseHandle(pipe);
+    pipe = INVALID_HANDLE_VALUE;
+    return false;
 }
 
 bool NetworkAgentClient::Request(uint32_t type, uint32_t id,

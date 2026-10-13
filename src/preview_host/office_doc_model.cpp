@@ -360,10 +360,11 @@ public:
         : model_(model), max_blocks_(max_blocks), max_rows_(max_rows) {}
 
     bool Full() const { return model_.blocks.size() >= max_blocks_; }
+    bool Truncated() const { return truncated_; }
 
     void Paragraph(const std::wstring& text, float points, bool bold, int align) {
         CloseTable();
-        if (Full()) return;
+        if (Full()) { truncated_ = true; return; }
         DocBlock block;
         block.text = Trim(text);
         block.points = (std::clamp)(points, 4.0f, 200.0f);
@@ -388,7 +389,10 @@ public:
     void EndRow() {
         in_table_ = true;
         if (!cell_.empty()) EndCell();
-        if (!row_.empty() && table_.rows.size() < max_rows_) table_.rows.push_back(std::move(row_));
+        if (!row_.empty()) {
+            if (table_.rows.size() < max_rows_) table_.rows.push_back(std::move(row_));
+            else truncated_ = true;
+        }
         row_.clear();
     }
     void CloseTable() {
@@ -397,7 +401,7 @@ public:
         if (!table_.rows.empty() && !Full()) {
             table_.table = true;
             model_.blocks.push_back(std::move(table_));
-        }
+        } else if (!table_.rows.empty()) truncated_ = true;
         table_ = DocBlock{};
         in_table_ = false;
     }
@@ -408,6 +412,7 @@ private:
     size_t max_blocks_;
     size_t max_rows_;
     bool in_table_ = false;
+    bool truncated_ = false;
     DocBlock table_;
     std::vector<std::wstring> row_;
     std::wstring cell_;
@@ -452,9 +457,12 @@ void ApplySection(const std::vector<uint8_t>& word, const std::vector<uint8_t>& 
 
 class RtfReader {
 public:
+    enum class Mode { FirstPage, Text };
     RtfReader(const std::string& data, DocModel& model, size_t max_blocks = kMaxBlocks,
-              size_t max_rows = kMaxTableRows)
-        : data_(data), model_(model), out_(model, max_blocks, max_rows) {}
+              size_t max_rows = kMaxTableRows, Mode mode = Mode::FirstPage)
+        : data_(data), model_(model), out_(model, max_blocks, max_rows), mode_(mode) {}
+
+    bool Truncated() const { return out_.Truncated() || (!stop_ && pos_ < data_.size()); }
 
     bool Run() {
         if (data_.compare(0, 5, "{\\rtf") != 0) return false;
@@ -593,8 +601,12 @@ private:
             skip_chars_ = state.uc;
             return;
         }
-        if (word == "par" || word == "sect") { EndParagraph(); if (word == "sect") stop_ = true; return; }
-        if (word == "page") { EndParagraph(); stop_ = true; return; }
+        if (word == "par") { EndParagraph(); return; }
+        if (word == "page" || word == "sect") {
+            EndParagraph();
+            stop_ = mode_ == Mode::FirstPage;
+            return;
+        }
         if (word == "line" || word == "tab" || word == "emspace" || word == "enspace") { Append(L' '); return; }
         if (word == "cell") { EndCellParagraph(); out_.EndCell(); return; }
         if (word == "nestcell") { EndCellParagraph(); return; }
@@ -633,6 +645,7 @@ private:
     const std::string& data_;
     DocModel& model_;
     BlockBuilder out_;
+    Mode mode_;
     std::vector<State> states_;
     std::string bytes_;
     std::wstring text_;
@@ -815,9 +828,9 @@ bool ReadRtfText(const std::wstring& path, std::wstring& text, bool* truncated, 
     std::string data(static_cast<size_t>((std::min<uint64_t>)(file.Size(), kRtfBytes)), '\0');
     if (data.empty() || !file.ReadAt(0, data.data(), data.size())) { SetError(error, L"rtf-read-failed"); return false; }
     DocModel model;
-    RtfReader reader(data, model, kTextBlocks, kTextRows);
+    RtfReader reader(data, model, kTextBlocks, kTextRows, RtfReader::Mode::Text);
     if (!reader.Run()) { SetError(error, L"rtf-not-rtf"); return false; }
-    bool cut = file.Size() > kRtfBytes || model.blocks.size() >= kTextBlocks;
+    bool cut = file.Size() > kRtfBytes || reader.Truncated();
     for (const DocBlock& block : model.blocks) {
         if (text.size() >= kTextChars) { cut = true; break; }
         if (!block.table) {
@@ -834,7 +847,13 @@ bool ReadRtfText(const std::wstring& path, std::wstring& text, bool* truncated, 
         }
     }
     while (!text.empty() && (text.back() == L'\n' || text.back() == L'\r')) text.pop_back();
-    if (text.size() > kTextChars) { text.resize(kTextChars); cut = true; }
+    if (text.size() > kTextChars) {
+        size_t length = kTextChars;
+        if (text[length - 1] >= 0xD800 && text[length - 1] <= 0xDBFF &&
+            text[length] >= 0xDC00 && text[length] <= 0xDFFF) --length;
+        text.resize(length);
+        cut = true;
+    }
     if (truncated) *truncated = cut;
     if (model.blocks.empty()) { SetError(error, L"rtf-empty"); return false; }
     return true;

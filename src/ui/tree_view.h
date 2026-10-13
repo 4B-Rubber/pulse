@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "FluentTokens.h"
 
@@ -62,6 +63,8 @@ private:
         uint32_t depth = 0;
         wchar_t type = L's';
         std::wstring key, value, text;
+        std::vector<std::pair<std::wstring, std::wstring>> attributes;
+        bool attributes_known = false;
         uint32_t children = 0;  // as in the document (may exceed what was sent)
         int parent = -1;
         uint32_t end = 0;       // one past the last node of the subtree
@@ -84,7 +87,7 @@ private:
     bool EnsureFormats(IDWriteFactory2* factory, float scale);
     std::wstring PathOf(size_t i) const;
     void AppendJson(size_t i, int indent, std::wstring& out) const;
-    void AppendXml(size_t i, int indent, std::wstring& out) const;
+    void AppendXml(size_t i, int indent, std::wstring& out, bool subtree_root = false) const;
 
     std::wstring payload_, source_, plain_, error_;
     uint32_t error_line_ = 0, error_column_ = 0;

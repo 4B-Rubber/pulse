@@ -1,3 +1,4 @@
+#include "../index/usn_enum_page.h"
 // measure_mft.cpp — Stage 0 MFT / USN journal benchmark
 // Usage: pulse_bench_mft [drive_letter]
 //   drive_letter: e.g. C (default C)
@@ -14,6 +15,7 @@
 #include <iomanip>
 #include <cstdint>
 #include <cctype>
+#include "../index/index_mft_enum_page.h"
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -153,7 +155,7 @@ static void read_usn_journal(HANDLE hvol, int64_t limit_records) {
     if (ms > 0) std::wcout << L"rate         = " << (records * 1000.0 / ms) << L" rec/s\n";
 }
 
-static void enum_mft(HANDLE hvol, wchar_t /*letter*/) {
+static bool enum_mft(HANDLE hvol, wchar_t /*letter*/) {
     std::wcout << L"\n=== Full MFT Enumeration (FSCTL_ENUM_USN_DATA) ===\n";
 
     MFT_ENUM_DATA_V0 med{};
@@ -165,6 +167,7 @@ static void enum_mft(HANDLE hvol, wchar_t /*letter*/) {
     std::vector<BYTE> buffer(buf_size);
     int64_t records = 0;
     bool truncated = false;
+    bool failed = false;
 
     const auto max_duration = std::chrono::minutes(5);
     auto t0 = std::chrono::steady_clock::now();
@@ -179,20 +182,19 @@ static void enum_mft(HANDLE hvol, wchar_t /*letter*/) {
             DWORD err = GetLastError();
             if (err == ERROR_HANDLE_EOF || err == ERROR_NO_MORE_ITEMS) break;
             std::wcout << L"FSCTL_ENUM_USN_DATA error=" << err << L"\n";
+            failed = true;
             break;
         }
-        if (bytes_read == 0) break;
-
-        PUSN_RECORD_V2 rec = reinterpret_cast<PUSN_RECORD_V2>(buffer.data());
-        DWORD remaining = bytes_read;
-        while (remaining > 0) {
-            if (rec->RecordLength == 0 || rec->RecordLength > remaining) break;
-            ++records;
-            remaining -= rec->RecordLength;
-            med.StartFileReferenceNumber = rec->FileReferenceNumber;
-            rec = reinterpret_cast<PUSN_RECORD_V2>(reinterpret_cast<BYTE*>(rec) + rec->RecordLength);
+        pulse::index::MftEnumPage page{};
+        if (bytes_read > buffer.size() ||
+            !pulse::index::ParseMftEnumPage({buffer.data(), bytes_read},
+                                          med.StartFileReferenceNumber, page)) {
+            std::wcout << L"FSCTL_ENUM_USN_DATA returned an invalid or non-advancing page.\n";
+            failed = true;
+            break;
         }
-        if (truncated) break;
+        records += static_cast<int64_t>(page.records);
+        med.StartFileReferenceNumber = page.next_cursor;
 
         auto elapsed = std::chrono::steady_clock::now() - t0;
         if (elapsed > max_duration) {
@@ -205,9 +207,12 @@ static void enum_mft(HANDLE hvol, wchar_t /*letter*/) {
     double ms = millis(t1 - t0);
 
     std::wcout << std::fixed << std::setprecision(2);
-    std::wcout << L"records enum = " << records << (truncated ? L" (truncated)" : L"") << L"\n";
+    std::wcout << L"records enum = " << records
+               << (failed ? L" (failed; incomplete)" : truncated ? L" (truncated)" : L" (complete)")
+               << L"\n";
     std::wcout << L"time         = " << ms << L" ms\n";
     if (ms > 0) std::wcout << L"rate         = " << (records * 1000.0 / ms) << L" rec/s\n";
+    if (failed) return false;
 
     double rec_per_s = (ms > 0) ? (records * 1000.0 / ms) : 0;
     // Rough guess: a consumer C: drive commonly holds ~1.0M files+dirs.
@@ -228,6 +233,7 @@ static void enum_mft(HANDLE hvol, wchar_t /*letter*/) {
     } else {
         std::wcout << L"  (no records enumerated; cannot estimate rate/memory)\n";
     }
+    return !truncated;
 }
 
 static int usage(const char* argv0) {
@@ -271,8 +277,8 @@ int wmain(int argc, wchar_t* argv[]) {
     query_usn_journal(hvol);
     read_usn_journal(hvol, 10000);
 
-    enum_mft(hvol, drive);
+    const bool complete = enum_mft(hvol, drive);
 
     CloseHandle(hvol);
-    return 0;
+    return complete ? 0 : 1;
 }

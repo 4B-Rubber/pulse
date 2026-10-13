@@ -1,6 +1,7 @@
 // ui_details_panel.cpp — Details panel draw and content height.
 #include "ui_renderer.h"
 #include "preview_footer_layout.h"
+#include "preview_notice.h"
 #include "ui_renderer_internal.h"
 #include "../common/localization.h"
 #include "tab_shape.h"
@@ -201,11 +202,12 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
         const D2D1_RECT_F overlayRc = D2D1::RectF(previewRc.left + 2.0f * s,
             previewRc.top + 2.0f * s, previewRc.right - 2.0f * s,
             previewRc.bottom - grip);
-        const D2D1_RECT_F contentRc = overlayRc;
+        D2D1_RECT_F contentRc = overlayRc;
         std::wstring previewText;
         bool truncated = false;
         uint32_t bytesRead = 0;
         std::wstring previewError;
+        preview::Integrity integrity;
         PreviewDrawResult previewResult = PreviewDrawResult::Failed;
         uint32_t pageCount = 1, pageDelay = 0;  // paged document: count > 1, delay 0
         if (preview_on && !d.is_dir && d.multi_count <= 1) {
@@ -217,8 +219,25 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
                     d.view_generation, d.modified_value, d.size_value, 1.0f,
                     &previewText, &truncated, &bytesRead, true, &previewError,
                     nullptr, nullptr, nullptr, nullptr, 0, &pageCount, &pageDelay, nullptr,
-                    nullptr, nullptr, nullptr, nullptr, &details_viewport_);
+                    nullptr, nullptr, nullptr, nullptr, &details_viewport_, nullptr,
+                    false, nullptr, nullptr, &integrity);
             }
+        }
+
+        const auto notice = PreviewNotice(previewError, previewText, integrity);
+        if (!handlerPreview && !notice.empty()) {
+            MakeBrush(dc, theme.fill_hover, brFillInput_);
+            dc->FillRectangle(overlayRc, brFillInput_.get());
+            const float noticeHeight = DrawPreviewNotice(dc, compositor_->DwriteFactory(),
+                compositor_->SmallFormat(), notice, overlayRc, s, theme.text, theme.fill_hover);
+            contentRc.top = std::min(contentRc.bottom, contentRc.top + noticeHeight);
+            if (previewResult == PreviewDrawResult::Bitmap && contentRc.bottom > contentRc.top)
+                details_cache_.Draw(dc, contentRc, d.path, d.attrs, 2048u,
+                    d.view_generation, d.modified_value, d.size_value, 1.0f,
+                    nullptr, nullptr, nullptr, true, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, &details_viewport_, nullptr,
+                    false, nullptr, nullptr, &integrity);
         }
 
         details_preview_ready_ = !placeholderOnly && !handlerPreview &&
@@ -374,17 +393,19 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
                     ((contentRc.bottom - contentRc.top) - groupHeight) * 0.5f;
                 const D2D1_RECT_F iconRc = D2D1::RectF(contentCenterX - icon * 0.5f,
                     iconTop, contentCenterX + icon * 0.5f, iconTop + icon);
+                const float hidden_alpha = HiddenEntryAlpha(d.attrs);
                 if (ID2D1Bitmap* bmp = icon_cache_.BitmapFor(d.path, d.name, d.is_dir, d.attrs,
                                                              icon)) {
-                    dc->DrawBitmap(bmp, &iconRc, 1.0f,
+                    dc->DrawBitmap(bmp, &iconRc, hidden_alpha,
                                    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
                 } else if (d.is_dir) {
-                    DrawFolderIcon(iconRc.left, iconRc.top, icon, theme);
+                    DrawFolderIcon(iconRc.left, iconRc.top, icon, theme, hidden_alpha);
                 } else {
-                    DrawFileIcon(iconRc.left, iconRc.top, icon, theme);
+                    DrawFileIcon(iconRc.left, iconRc.top, icon, theme, hidden_alpha);
                 }
                 if (d.is_link)
-                    DrawLinkOverlay(iconRc.left, iconRc.top, icon, theme);
+                    DrawLinkOverlay(iconRc.left, iconRc.top, icon, theme, hidden_alpha);
+                if (IsProtectedSystemEntry(d.attrs)) DrawProtectedBadge(dc, iconRc, scale_, theme);
                 if (showState && !state.empty())
                     centeredText(state,
                         D2D1::RectF(contentRc.left, iconRc.bottom + stateGap,

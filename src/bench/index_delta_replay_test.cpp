@@ -6,9 +6,88 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <cstring>
 
 namespace pulse::index {
 struct EngineTestAccess {
+    static bool NotifyRestart() {
+        bool ok = true;
+        auto check = [&](bool value, const char* label) {
+            std::cout << (value ? "[PASS] " : "[FAIL] ") << label << "\n"; ok &= value;
+        };
+        const auto root = std::filesystem::absolute(std::filesystem::path("bench_data") /
+            ("notify-restart-" + std::to_string(GetCurrentProcessId())));
+        const auto data = root / "files", cache = root / "cache";
+        std::filesystem::create_directories(data); std::filesystem::create_directories(cache);
+        SetMachineIndexScope(false); SetActiveIndexDirectory(cache.wstring());
+        auto write = [&](const wchar_t* name, const char* value) { std::ofstream(data / name) << value; };
+        auto notify = [&](Engine& engine, std::initializer_list<std::pair<DWORD, std::wstring>> events) {
+            std::vector<BYTE> packet;
+            for (const auto& [action, name] : events) {
+                const auto offset = packet.size();
+                const auto length = (offsetof(FILE_NOTIFY_INFORMATION, FileName) + name.size() * sizeof(wchar_t) + 3) & ~size_t{3};
+                packet.resize(offset + length);
+                auto event = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(packet.data() + offset);
+                event->NextEntryOffset = static_cast<DWORD>(length);
+                event->Action = action; event->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
+                memcpy(event->FileName, name.data(), event->FileNameLength);
+            }
+            size_t offset = 0;
+            while (offset < packet.size()) {
+                auto event = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(packet.data() + offset);
+                if (offset + event->NextEntryOffset == packet.size()) { event->NextEntryOffset = 0; break; }
+                offset += event->NextEntryOffset;
+            }
+            return engine.ApplyNotifyLocked(data.wstring(), packet.data(), static_cast<DWORD>(packet.size()));
+        };
+        write(L"old.txt", "old"); write(L"remove.txt", "remove");
+        {
+            Engine engine; engine.running_ = true; engine.ready_ = true; engine.built_unix_ = 123456;
+            engine.AddForTest((data / L"old.txt").wstring(), L"old.txt", false, 3);
+            engine.AddForTest((data / L"remove.txt").wstring(), L"remove.txt", false, 6);
+            check(PublishBase(engine), "publish initial walk snapshot");
+            engine.OpenDeltasLocked();
+            write(L"added.txt", "12345678");
+            notify(engine, {{FILE_ACTION_ADDED, L"added.txt"}});
+            std::filesystem::rename(data / L"old.txt", data / L"renamed.txt");
+            notify(engine, {{FILE_ACTION_RENAMED_OLD_NAME, L"old.txt"}, {FILE_ACTION_RENAMED_NEW_NAME, L"renamed.txt"}});
+            std::filesystem::remove(data / L"remove.txt");
+            notify(engine, {{FILE_ACTION_REMOVED, L"remove.txt"}});
+            engine.Stop();
+        }
+        for (int restart = 0; restart < 2; ++restart) {
+            Engine engine; engine.running_ = true;
+            check(engine.TryLoadCache(), "restart loads saved base and production notification WAL");
+            Query q; q.needle = L"ext:txt"; q.path_prefix = data.wstring(); q.limit = 100;
+            const auto result = engine.Search(q);
+            bool added = false, renamed = false, stale = false;
+            for (const auto& hit : result.hits) {
+                added |= hit.name == L"added.txt" && hit.size == 8;
+                renamed |= hit.name == L"renamed.txt";
+                stale |= hit.name == L"old.txt" || hit.name == L"remove.txt";
+            }
+            check(result.total == 2 && added && renamed && !stale, "two immediate restarts retain add/rename/delete changes");
+            engine.Stop();
+        }
+        write(L"offline.txt", "offline"); std::filesystem::remove(data / L"added.txt");
+        {
+            Engine engine; engine.StartFixture(nullptr, 0, data.wstring());
+            bool reconciled = false;
+            for (int attempt = 0; attempt < 300 && !reconciled; ++attempt) {
+                Query q; q.needle = L"ext:txt"; q.path_prefix = data.wstring(); q.limit = 100;
+                const auto result = engine.Search(q);
+                bool offline = false, added = false;
+                for (const auto& hit : result.hits) { offline |= hit.name == L"offline.txt"; added |= hit.name == L"added.txt"; }
+                reconciled = offline && !added && result.total == 2;
+                if (!reconciled) Sleep(50);
+            }
+            check(reconciled, "actual worker startup reconciles changes made while stopped");
+            engine.Stop();
+        }
+        SetActiveIndexDirectory(L"");
+        std::filesystem::remove_all(root);
+        return ok;
+    }
     static bool PublishBase(Engine& engine) {
         Engine::Store store;
         std::vector<Engine::VolState> volumes;
@@ -185,4 +264,8 @@ struct EngineTestAccess {
     }
 };
 }
-int main() { return pulse::index::EngineTestAccess::Run() ? 0 : 1; }
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--notify-restart-only")
+        return pulse::index::EngineTestAccess::NotifyRestart() ? 0 : 1;
+    return pulse::index::EngineTestAccess::Run() ? 0 : 1;
+}

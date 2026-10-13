@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pulse · 预览增强包 效果图</title>
+<style>
+:root{--font:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif}
+body.dark{
+  --bg:#202020;--chrome:#1b1b1b;--side:#1f1f1f;--card:#2b2b2b;--card2:#323232;--line:rgba(255,255,255,.06);
+  --text:#f3f3f3;--text2:#a8a8a8;--text3:#7a7a7a;--accent:#2f7cf6;--accent-soft:rgba(47,124,246,.18);--accent-text:#7fb0ff;
+  --chip:#383838;--btn:#373737;--btn-h:#404040;--sel:#2d3a52;--ok:#4cc38a;--warn:#e7a93b;--track:#3a3a3a;--input:#1e1e1e;
+}
+body.light{
+  --bg:#f3f3f3;--chrome:#ebebeb;--side:#efefef;--card:#fbfbfb;--card2:#f5f5f5;--line:rgba(0,0,0,.06);
+  --text:#1b1b1b;--text2:#5f5f5f;--text3:#8f8f8f;--accent:#2f7d62;--accent-soft:rgba(47,125,98,.14);--accent-text:#2f7d62;
+  --chip:#ececec;--btn:#fdfdfd;--btn-h:#f0f0f0;--sel:#e4e9e7;--ok:#2f8f5b;--warn:#b7791f;--track:#dcdcdc;--input:#fff;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{font-family:var(--font);background:#111;color:var(--text);font-size:13px;display:flex;flex-direction:column}
+body.light{background:#d9d9d9}
+.bar{display:flex;align-items:center;gap:10px;padding:10px 16px;color:#ddd;font-size:13px;flex-wrap:wrap}
+body.light .bar{color:#333}
+.bar b{font-size:14px}
+.bar .seg{margin-left:auto}
+.seg{display:inline-flex;background:var(--chip);border-radius:8px;padding:3px;gap:2px}
+.seg button{border:0;background:none;color:var(--text2);font:500 12.5px var(--font);height:28px;padding:0 14px;border-radius:6px;cursor:pointer}
+.seg button.on{background:var(--card);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.25)}
+.stage{flex:1;min-height:0;display:flex;justify-content:center;padding:0 16px 16px}
+.win{width:min(1240px,100%);height:100%;min-height:600px;background:var(--bg);border-radius:10px;overflow:hidden;display:flex;flex-direction:column;
+  box-shadow:0 20px 60px rgba(0,0,0,.45),0 0 0 1px rgba(255,255,255,.06)}
+/* 标题栏（仿 Pulse） */
+.title{height:40px;background:var(--chrome);display:flex;align-items:center;gap:10px;padding:0 0 0 14px;flex:none}
+.title .logo{width:18px;height:18px;border-radius:5px;background:linear-gradient(135deg,#3d7bf7,#6aa5ff)}
+.title .app{font-weight:700;font-size:14px}.title .sub{color:var(--text2);font-size:12px}
+.title .ic{width:30px;height:28px;display:grid;place-items:center;color:var(--text2)}
+.tab{display:flex;align-items:center;gap:8px;height:32px;margin-top:8px;padding:0 12px;background:var(--bg);border-radius:8px 8px 0 0;min-width:170px;font-size:12.5px}
+.tab .x{margin-left:auto;color:var(--text3)}
+.wctl{margin-left:auto;display:flex}.wctl span{width:46px;height:40px;display:grid;place-items:center;color:var(--text2)}
+.title svg,.wctl svg{width:15px;height:15px}
+.body{flex:1;min-height:0;display:flex}
+.side{width:200px;background:var(--side);padding:10px 8px;display:flex;flex-direction:column;gap:2px;flex:none}
+.nav{display:flex;align-items:center;gap:10px;height:36px;padding:0 12px;border-radius:6px;color:var(--text);font-size:13.5px;position:relative;cursor:default}
+.nav svg{width:16px;height:16px;color:var(--text2)}
+.nav.on{background:var(--sel)}
+.nav.on::before{content:"";position:absolute;left:0;top:10px;bottom:10px;width:3px;border-radius:3px;background:var(--accent)}
+.nav .new{margin-left:auto;font-size:10.5px;padding:1px 6px;border-radius:5px;background:var(--accent);color:#fff}
+.side .grow{flex:1}.side .ver{color:var(--text2);font-size:12px;padding:8px 12px}
+.main{flex:1;min-width:0;overflow:auto;padding:22px 28px 40px}
+.main::-webkit-scrollbar{width:10px}.main::-webkit-scrollbar-thumb{background:var(--track);border-radius:9px;border:3px solid var(--bg)}
+h1{font-size:26px;margin:0 0 6px;font-weight:700}
+.lead{color:var(--text2);margin:0 0 18px;font-size:13px}
+.summary{display:flex;align-items:center;gap:18px;background:var(--card);border-radius:8px;padding:14px 16px;margin-bottom:22px}
+.summary .stat b{font-size:20px;display:block}.summary .stat span{color:var(--text2);font-size:12px}
+.summary .vs{width:1px;height:34px;background:var(--line)}
+.summary .path{color:var(--text2);font-family:Consolas,monospace;font-size:12px}
+.summary .sp{flex:1}
+h2{font-size:14px;font-weight:600;margin:22px 0 8px}
+.pack{background:var(--card);border-radius:8px;margin-bottom:6px;overflow:hidden}
+.prow{display:flex;align-items:flex-start;gap:14px;padding:14px 16px}
+.picon{width:40px;height:40px;border-radius:10px;display:grid;place-items:center;flex:none;color:#fff}
+.picon svg{width:22px;height:22px}
+.pmain{flex:1;min-width:0}
+.pname{font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tag{font-size:11px;font-weight:500;padding:1px 7px;border-radius:5px;background:var(--chip);color:var(--text2)}
+.tag.ok{background:rgba(76,195,138,.16);color:var(--ok)}
+.tag.up{background:var(--accent-soft);color:var(--accent-text)}
+.tag.warn{background:rgba(231,169,59,.16);color:var(--warn)}
+.pdesc{color:var(--text2);margin:4px 0 8px;line-height:1.5}
+.caps{display:flex;flex-wrap:wrap;gap:6px}
+.cap{font-size:11.5px;padding:3px 9px;border-radius:999px;background:var(--chip);color:var(--text)}
+.meta{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;color:var(--text3);font-size:12px;margin-top:9px}
+.meta a{color:var(--accent-text);text-decoration:none}
+.pact{display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex:none;min-width:150px}
+.btn{height:32px;padding:0 14px;border-radius:6px;border:1px solid var(--line);background:var(--btn);color:var(--text);font:500 13px var(--font);cursor:pointer;white-space:nowrap}
+.btn:hover{background:var(--btn-h)}
+.btn.primary{background:var(--accent);border-color:transparent;color:#fff}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost{border-color:transparent;background:none;color:var(--text2)}
+.btnrow{display:flex;gap:6px}
+.prog{width:150px}
+.prog .t{display:flex;justify-content:space-between;color:var(--text2);font-size:12px;margin-bottom:5px}
+.prog .b{height:4px;border-radius:4px;background:var(--track);overflow:hidden}.prog .b i{display:block;height:100%;background:var(--accent);border-radius:4px;transition:width .2s}
+.formats{border-top:1px solid var(--line);padding:10px 16px 12px 70px;display:none}
+.formats.open{display:block}
+.formats .fl{display:flex;flex-wrap:wrap;gap:5px}
+.formats .fl span{font-family:Consolas,monospace;font-size:11.5px;padding:2px 7px;border-radius:5px;background:var(--card2);color:var(--text2)}
+.more{color:var(--accent-text);cursor:pointer;font-size:12px}
+.toggle{width:40px;height:20px;border-radius:999px;border:1px solid var(--text2);position:relative;cursor:pointer;flex:none}
+.toggle::after{content:"";position:absolute;top:3px;left:3px;width:12px;height:12px;border-radius:50%;background:var(--text2);transition:left .2s}
+.toggle.on{background:var(--accent);border-color:var(--accent)}
+.toggle.on::after{left:23px;background:#fff}
+/* 设置行（仿 Pulse 现有卡片行） */
+.card{background:var(--card);border-radius:8px;overflow:hidden}
+.row{display:flex;align-items:center;gap:14px;padding:12px 16px;border-top:1px solid var(--line)}
+.row:first-child{border-top:0}
+.row .ri{width:18px;height:18px;color:var(--text2);flex:none}
+.row .rt{flex:1;min-width:0}.row .rt b{font-weight:500;font-size:13.5px;display:block}.row .rt span{color:var(--text2);font-size:12px}
+.input{height:32px;border-radius:6px;background:var(--input);border:1px solid var(--line);border-bottom:1px solid var(--text3);padding:0 10px;display:flex;align-items:center;
+  font-family:Consolas,monospace;font-size:12px;color:var(--text2);min-width:300px}
+.detect{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text2);margin-top:6px}
+.detect .dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.note{color:var(--text3);font-size:12px;margin-top:22px;line-height:1.6}
+
+/* Quick Look 视图 */
+#vQL{display:none}
+.ql{flex:1;display:flex;flex-direction:column;background:var(--bg)}
+.qlbar{height:44px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--line)}
+.qlbar b{font-size:13.5px}.qlbar span{color:var(--text2);font-size:12px}
+.qlbody{flex:1;display:flex;min-height:0}
+.qlview{flex:1;display:flex;align-items:center;justify-content:center;padding:26px;position:relative}
+.qlpanel{width:300px;border-left:1px solid var(--line);padding:16px 18px;overflow:auto;flex:none}
+.qlpanel h3{font-size:12.5px;color:var(--text2);font-weight:600;margin:14px 0 8px}
+.kv{display:grid;grid-template-columns:86px 1fr;gap:6px 10px;font-size:12.5px}
+.kv span:nth-child(odd){color:var(--text2)}
+.screen{width:100%;max-width:760px;aspect-ratio:16/9;border-radius:10px;background:#0b0b0b;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center}
+.wave{position:absolute;left:24px;right:24px;bottom:58px;height:44px;display:flex;align-items:center;gap:2px;opacity:.55}
+.wave i{flex:1;background:#6c8fd8;border-radius:2px}
+.ctrl{position:absolute;left:0;right:0;bottom:0;height:44px;display:flex;align-items:center;gap:12px;padding:0 16px;color:#ddd;font-size:12px;background:#0b0b0b}
+.ctrl .tl{flex:1;height:4px;border-radius:4px;background:rgba(255,255,255,.2)}.ctrl .tl i{display:block;width:18%;height:100%;background:#fff;border-radius:4px}
+.prompt{position:relative;z-index:2;width:min(460px,86%);background:rgba(32,32,32,.92);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:20px 22px;color:#eee;
+  box-shadow:0 20px 50px rgba(0,0,0,.5)}
+body.light .prompt{background:rgba(252,252,252,.96);color:#1b1b1b;border-color:rgba(0,0,0,.08)}
+.prompt .h{display:flex;gap:12px;align-items:flex-start}
+.prompt .h svg{width:22px;height:22px;color:var(--warn);flex:none;margin-top:1px}
+.prompt b{font-size:14.5px;display:block;margin-bottom:4px}
+.prompt p{margin:0;color:#aaa;font-size:12.5px;line-height:1.55}
+body.light .prompt p{color:#666}
+.prompt .acts{display:flex;flex-direction:column;gap:8px;margin-top:16px}
+.prompt .acts .btn{height:36px;width:100%}
+.prompt .acts small{color:#888;font-size:11.5px;text-align:center}
+.story{position:absolute;inset:0 0 44px 0;display:none;grid-template-columns:repeat(4,1fr);grid-template-rows:repeat(3,1fr);gap:3px;padding:3px;background:#000}
+.story div{border-radius:4px;position:relative;overflow:hidden}
+.story div span{position:absolute;right:5px;bottom:4px;font-size:10.5px;color:#fff;background:rgba(0,0,0,.55);padding:1px 5px;border-radius:4px;font-family:Consolas,monospace}
+.story div.hot{outline:2px solid #fff;outline-offset:-2px}
+.qlstate{position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:3}
+/* 网格缩略图 */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;padding:6px 0}
+.gi{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--text)}
+.gt{aspect-ratio:4/3;border-radius:8px;background:var(--card);position:relative;overflow:hidden;display:grid;place-items:center}
+.gt .ext{font-family:Consolas,monospace;font-size:13px;color:var(--text3);border:1.5px solid var(--text3);border-radius:6px;padding:10px 8px}
+.gt .dur{position:absolute;right:6px;bottom:6px;font-size:10.5px;color:#fff;background:rgba(0,0,0,.6);padding:1px 5px;border-radius:4px;font-family:Consolas,monospace}
+.gt .badge{position:absolute;left:6px;top:6px;font-size:10px;color:#fff;background:rgba(0,0,0,.55);padding:1px 6px;border-radius:4px}
+.gi small{color:var(--text3)}
+</style>
+</head>
+<body class="dark">
+<div class="bar">
+  <b>Pulse 预览增强包 · 效果图</b><span style="opacity:.6">按钮可点：安装 / 更新 / 展开格式 / 预览前后对比</span>
+  <div class="seg" id="segView"><button class="on" data-v="set">设置 › 预览增强包</button><button data-v="ql">Quick Look 提示</button><button data-v="grid">文件网格缩略图</button></div>
+  <div class="seg" id="segTheme"><button class="on" data-v="dark">深色</button><button data-v="light">浅色</button></div>
+</div>
+<div class="stage">
+<div class="win">
+  <div class="title">
+    <div class="logo"></div><span class="app">Pulse</span><span class="sub">文件管理器</span>
+    <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></span>
+    <div class="tab" id="tabTitle"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#e6a23c" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg><span>设置</span><span class="x">✕</span></div>
+    <span class="ic" style="color:var(--text3)">＋</span>
+    <div class="wctl"><span><svg viewBox="0 0 12 12"><path d="M1 6h10" stroke="currentColor"/></svg></span><span><svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" fill="none" stroke="currentColor"/></svg></span><span><svg viewBox="0 0 12 12"><path d="M1.5 1.5l9 9M10.5 1.5l-9 9" stroke="currentColor"/></svg></span></div>
+  </div>
+
+  <!-- ============ 设置 › 预览增强包 ============ -->
+  <div class="body" id="vSet">
+    <div class="side">
+      <div class="nav"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 11l8-7 8 7v9h-5v-6H9v6H4z"/></svg>通用</div>
+      <div class="nav"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>搜索与索引</div>
+      <div class="nav"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>本地右键菜单</div>
+      <div class="nav"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V4H4v12h4"/></svg>重复文件</div>
+      <div class="nav on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>预览增强包<span class="new">新</span></div>
+      <div class="grow"></div>
+      <div class="nav"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg>关于与诊断</div>
+      <div class="ver">Pulse 版本 1.0.53</div>
+    </div>
+    <div class="main">
+      <h1>预览增强包</h1>
+      <p class="lead">按需为预览、缩略图和搜索添加能力。预览增强包独立下载、在隔离进程中运行，可随时卸载，不影响 Pulse 本体。</p>
+
+      <div class="summary">
+        <div class="stat"><b id="sumCount">1</b><span>已安装</span></div><div class="vs"></div>
+        <div class="stat"><b id="sumSize">28 MB</b><span>占用空间</span></div><div class="vs"></div>
+        <div><div style="color:var(--text2);font-size:12px;margin-bottom:3px">存放位置</div><div class="path">%LOCALAPPDATA%\Pulse\packs</div></div>
+        <div class="sp"></div>
+        <button class="btn">打开文件夹</button><button class="btn">检查更新</button>
+      </div>
+
+      <h2>媒体</h2>
+      <div class="pack" data-size="28">
+        <div class="prow">
+          <div class="picon" style="background:linear-gradient(135deg,#1f9d55,#0f6b3a)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5v5l4-2.5z" fill="currentColor"/></svg></div>
+          <div class="pmain">
+            <div class="pname">FFmpeg 媒体增强 <span class="tag ok">已安装 7.1.1</span><span class="tag up">可更新到 7.1.2</span></div>
+            <div class="pdesc">系统缺少解码器的视频也能生成缩略图、显示时长和媒体信息；Quick Look 无法播放时自动改用 FFmpeg 播放。</div>
+            <div class="caps"><span class="cap">视频缩略图</span><span class="cap">时长徽标</span><span class="cap">媒体信息</span><span class="cap">故事板</span><span class="cap">播放兜底</span><span class="cap">音频格式</span></div>
+            <div class="meta"><span>新增 23 种格式 · <span class="more" data-t="f1">展开</span></span><span>28 MB</span><span>LGPL-2.1 · <a href="#">许可证</a> · <a href="#">源码</a></span><span>仅解码构建，已签名</span></div>
+          </div>
+          <div class="pact">
+            <div class="btnrow"><button class="btn primary act-update">更新</button><button class="btn act-remove">卸载</button></div>
+            <div style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px">启用<div class="toggle on"></div></div>
+          </div>
+        </div>
+        <div class="formats" id="f1"><div class="fl">
+          <span>mkv·HEVC</span><span>mp4·AV1</span><span>webm·VP9</span><span>mov·ProRes</span><span>flv</span><span>f4v</span><span>ts</span><span>m2t</span><span>vob</span><span>rmvb</span><span>rm</span><span>asf</span><span>ogv</span><span>mxf</span><span>divx</span><span>y4m</span>
+          <span>ape</span><span>wv</span><span>tta</span><span>dsf</span><span>dff</span><span>mka</span><span>ac3</span><span>dts</span><span>amr</span><span>caf</span></div></div>
+      </div>
+
+      <h2>图像</h2>
+      <div class="pack" data-size="9">
+        <div class="prow">
+          <div class="picon" style="background:linear-gradient(135deg,#7c4dff,#4527a0)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-9 9"/></svg></div>
+          <div class="pmain">
+            <div class="pname">现代图像格式 <span class="tag">未安装</span></div>
+            <div class="pdesc">不依赖微软商店扩展，直接预览 iPhone 照片（HEIC）、AVIF、JPEG XL 和 HDR/EXR 图像。</div>
+            <div class="caps"><span class="cap">HEIC / HEIF</span><span class="cap">AVIF</span><span class="cap">JPEG XL</span><span class="cap">OpenEXR / HDR</span><span class="cap">QOI</span></div>
+            <div class="meta"><span>新增 9 种格式</span><span>9 MB</span><span>libheif · dav1d · libjxl · <a href="#">许可证</a></span></div>
+          </div>
+          <div class="pact"><button class="btn primary act-install">安装 · 9 MB</button></div>
+        </div>
+      </div>
+      <div class="pack" data-size="3">
+        <div class="prow">
+          <div class="picon" style="background:linear-gradient(135deg,#ef6c00,#b23c00)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg></div>
+          <div class="pmain">
+            <div class="pname">RAW 相机照片 <span class="tag">未安装</span></div>
+            <div class="pdesc">Canon、Nikon、Sony、Fujifilm 等相机原片的缩略图、全尺寸预览与拍摄参数；缩略图优先读取内嵌 JPEG，速度很快。</div>
+            <div class="caps"><span class="cap">CR2 / CR3</span><span class="cap">NEF</span><span class="cap">ARW</span><span class="cap">DNG</span><span class="cap">RAF / ORF / RW2</span></div>
+            <div class="meta"><span>新增 14 种格式</span><span>3 MB</span><span>LibRaw · LGPL-2.1 / CDDL · <a href="#">许可证</a></span></div>
+          </div>
+          <div class="pact"><button class="btn primary act-install">安装 · 3 MB</button></div>
+        </div>
+      </div>
+
+      <h2>压缩与文档</h2>
+      <div class="pack" data-size="2">
+        <div class="prow">
+          <div class="picon" style="background:linear-gradient(135deg,#546e7a,#263238)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M12 3v2M12 7v2M12 11v2"/><rect x="10" y="14" width="4" height="4" rx="1"/></svg></div>
+          <div class="pmain">
+            <div class="pname">7-Zip 压缩包增强 <span class="tag warn">Windows 8.1 建议安装</span></div>
+            <div class="pdesc">更完整的压缩包内容预览：RAR5、分卷、加密文件名、ISO / CAB / WIM；不依赖系统组件，Windows 8.1 也能用。</div>
+            <div class="caps"><span class="cap">RAR5</span><span class="cap">分卷</span><span class="cap">加密文件名</span><span class="cap">ISO / CAB / WIM</span></div>
+            <div class="meta"><span>2 MB</span><span>7z.dll · LGPL-2.1 + unRAR 条款 · <a href="#">许可证</a></span></div>
+          </div>
+          <div class="pact"><button class="btn primary act-install">安装 · 2 MB</button></div>
+        </div>
+      </div>
+      <div class="pack" data-size="0">
+        <div class="prow">
+          <div class="picon" style="background:linear-gradient(135deg,#0277bd,#01579b)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 3h9l4 4v14H6z"/><path d="M15 3v4h4M9 12h7M9 15h7M9 18h4"/></svg></div>
+          <div class="pmain">
+            <div class="pname">Office 高保真预览 <span class="tag ok">检测到 LibreOffice 24.8</span></div>
+            <div class="pdesc">借用你已安装的 LibreOffice，把 Word / Excel / PowerPoint 按原样版式渲染；不额外下载，关闭后回到 Pulse 内置的快速预览。</div>
+            <div class="caps"><span class="cap">docx / doc</span><span class="cap">xlsx / xls</span><span class="cap">pptx / ppt</span><span class="cap">odt / ods / odp</span></div>
+            <div class="meta"><span>借用已安装软件 · 不占空间</span><span>C:\Program Files\LibreOffice</span></div>
+          </div>
+          <div class="pact"><div style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px">启用<div class="toggle"></div></div></div>
+        </div>
+      </div>
+
+      <h2>搜索</h2>
+      <div class="pack" data-size="32">
+        <div class="prow">
+          <div class="picon" style="background:linear-gradient(135deg,#c2185b,#880e4f)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 8V5a1 1 0 011-1h3M16 4h3a1 1 0 011 1v3M20 16v3a1 1 0 01-1 1h-3M8 20H5a1 1 0 01-1-1v-3"/><path d="M8 10h8M8 14h5"/></svg></div>
+          <div class="pmain">
+            <div class="pname">图片文字识别（OCR） <span class="tag">未安装</span></div>
+            <div class="pdesc">截图、扫描件和照片里的文字也能被搜索到；Quick Look 中可以直接选中复制。全部在本机识别，不上传。</div>
+            <div class="caps"><span class="cap">中文 / 英文</span><span class="cap">截图搜索</span><span class="cap">扫描 PDF</span><span class="cap">选中复制</span></div>
+            <div class="meta"><span>32 MB</span><span>PaddleOCR · ONNX Runtime · Apache-2.0 / MIT · <a href="#">许可证</a></span><span>建立索引会占用少量 CPU，可在“搜索与索引”中调整</span></div>
+          </div>
+          <div class="pact"><button class="btn primary act-install">安装 · 32 MB</button></div>
+        </div>
+      </div>
+
+      <h2>系统扩展（微软商店）</h2>
+      <div class="card">
+        <div class="row"><svg class="ri" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/></svg><div class="rt"><b>HEVC 视频扩展</b><span>播放 H.265 视频。也可以安装上方的 FFmpeg 预览增强包替代</span></div><span class="tag">未安装</span><button class="btn">在商店中打开</button></div>
+        <div class="row"><svg class="ri" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/></svg><div class="rt"><b>HEIF 图像扩展</b><span>HEIC 照片。也可以安装“现代图像格式”预览增强包替代</span></div><span class="tag ok">已安装</span><button class="btn ghost">已就绪</button></div>
+        <div class="row"><svg class="ri" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/></svg><div class="rt"><b>AV1 视频扩展</b><span>AV1 编码的视频</span></div><span class="tag ok">已安装</span><button class="btn ghost">已就绪</button></div>
+        <div class="row"><svg class="ri" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/></svg><div class="rt"><b>WebP 图像扩展</b><span>WebP 图片</span></div><span class="tag ok">已安装</span><button class="btn ghost">已就绪</button></div>
+      </div>
+
+      <h2>高级</h2>
+      <div class="card">
+        <div class="row" style="align-items:flex-start"><svg class="ri" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h10M4 17h6"/></svg>
+          <div class="rt"><b>使用已安装的 FFmpeg</b><span>改用系统里已有的 FFmpeg，代替上方预览增强包（不做完整性校验）</span>
+            <div class="detect"><i class="dot"></i>检测到 FFmpeg 7.0.2 · 通过 winget 安装 <span class="more">使用它</span></div></div>
+          <div class="input">C:\Tools\ffmpeg\bin\ffmpeg.exe</div><button class="btn">浏览…</button><div class="toggle"></div></div>
+        <div class="row"><svg class="ri" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 12a8 8 0 11-2.3-5.7M20 4v5h-5"/></svg><div class="rt"><b>自动更新预览增强包</b><span>随 Pulse 更新检查一起进行，在后台下载</span></div><div class="toggle on"></div></div>
+        <div class="row"><svg class="ri" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18"/></svg><div class="rt"><b>下载源</b><span>GitHub 访问慢时自动改用加速镜像</span></div>
+          <div class="seg"><button class="on">自动</button><button>GitHub</button><button>加速镜像</button></div></div>
+        <div class="row"><svg class="ri" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg><div class="rt"><b>卸载 Pulse 时删除预览增强包</b><span>否则保留，重新安装 Pulse 后可直接使用</span></div><div class="toggle on"></div></div>
+      </div>
+      <div class="note">注：效果图中的体积、版本和格式数量为估算示意。预览增强包在隔离的预览进程中运行，崩溃或超时只影响当前预览，Pulse 会回退到现有的缩略图 / 文本 / 十六进制视图。</div>
+    </div>
+  </div>
+
+  <!-- ============ Quick Look ============ -->
+  <div class="ql" id="vQL">
+    <div class="qlbar"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/></svg><b>旅行记录_2026.mkv</b><span>3.2 GB · 00:42:18</span>
+      <div style="margin-left:auto" class="seg" id="segQL"><button class="on" data-v="before">安装前</button><button data-v="after">安装后</button></div></div>
+    <div class="qlbody">
+      <div class="qlview">
+        <div class="screen">
+          <div class="wave" id="wave"></div>
+          <div class="prompt" id="prompt">
+            <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l9.5 17H2.5z"/><path d="M12 10v4M12 17v.5"/></svg>
+              <div><b>系统缺少 HEVC (H.265) 解码器，只能播放声音</b>
+              <p>安装 FFmpeg 预览增强包后即可预览画面，同时补齐 MKV、FLV、RMVB 等 23 种格式的缩略图和时长。</p></div></div>
+            <div class="acts">
+              <button class="btn primary" id="qlInstall">安装 FFmpeg 预览增强包 · 28 MB</button>
+              <button class="btn">从微软商店获取 HEVC 扩展</button>
+              <small>预览增强包可随时在“设置 › 预览增强包”中卸载</small>
+            </div>
+          </div>
+          <div class="story" id="story"></div>
+          <div class="ctrl"><span>▶</span><span>07:36</span><div class="tl"><i></i></div><span>42:18</span><span>🔊</span><span>1.0×</span></div>
+        </div>
+      </div>
+      <div class="qlpanel">
+        <h3 style="margin-top:0">媒体信息 <span class="tag" id="probeTag">需要预览增强包</span></h3>
+        <div class="kv" id="kv">
+          <span>容器</span><span>Matroska</span><span>时长</span><span>42:18</span><span>视频</span><span style="color:var(--text3)">—</span><span>音频</span><span>AAC · 48 kHz · 立体声</span>
+        </div>
+        <h3>文件</h3>
+        <div class="kv"><span>大小</span><span>3.2 GB</span><span>修改时间</span><span>今天 14:32</span><span>位置</span><span>D:\Videos\2026</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 网格 ============ -->
+  <div class="body" id="vGrid" style="display:none">
+    <div class="main">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px"><h1 style="margin:0;font-size:20px">D:\Videos\2026</h1>
+        <div class="seg" id="segGrid" style="margin-left:auto"><button class="on" data-v="before">安装前</button><button data-v="after">安装 FFmpeg 预览增强包后</button></div></div>
+      <div class="grid" id="grid"></div>
+      <div class="note" id="gridNote">安装前：系统缺少解码器的视频只显示格式图标，也没有时长徽标。</div>
+    </div>
+  </div>
+</div>
+</div>
+<script>
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+function seg(id,fn){const r=document.getElementById(id);r.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+  r.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));fn&&fn(b.dataset.v)});}
+seg('segTheme',v=>{document.body.className=v});
+seg('segView',v=>{$('#vSet').style.display=v==='set'?'flex':'none';$('#vQL').style.display=v==='ql'?'flex':'none';$('#vGrid').style.display=v==='grid'?'flex':'none';
+  $('#tabTitle span').textContent=v==='set'?'设置':(v==='ql'?'快速预览':'Videos');});
+document.querySelectorAll('.seg:not([id])').forEach(r=>r.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;r.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b))}));
+$$('.toggle').forEach(t=>t.addEventListener('click',()=>t.classList.toggle('on')));
+$$('.more[data-t]').forEach(m=>m.addEventListener('click',()=>{const f=document.getElementById(m.dataset.t);f.classList.toggle('open');m.textContent=f.classList.contains('open')?'收起':'展开'}));
+
+/* 安装 / 更新 模拟 */
+function recount(){const inst=$$('.pack.installed');$('#sumCount').textContent=inst.length;
+  $('#sumSize').textContent=inst.reduce((a,p)=>a+(+p.dataset.size||0),0)+' MB';}
+$$('.pack').forEach(p=>{if(p.querySelector('.tag.ok')&&+p.dataset.size>0)p.classList.add('installed')});
+function progress(act,label,done){const box=document.createElement('div');box.className='prog';
+  box.innerHTML=`<div class="t"><span>${label}</span><span>0%</span></div><div class="b"><i style="width:0"></i></div>`;
+  act.replaceChildren(box);let v=0;const t=setInterval(()=>{v+=Math.random()*9+4;if(v>=100){v=100;clearInterval(t);
+    box.querySelector('.t span').textContent='校验中…';setTimeout(done,500)}box.querySelector('.t span:last-child').textContent=Math.floor(v)+'%';box.querySelector('i').style.width=v+'%'},120);}
+function installedUI(p,ver){const act=p.querySelector('.pact');
+  act.innerHTML=`<div class="btnrow"><button class="btn act-remove">卸载</button></div><div style="display:flex;align-items:center;gap:8px;color:var(--text2);font-size:12px">启用<div class="toggle on"></div></div>`;
+  act.querySelector('.toggle').onclick=e=>e.target.classList.toggle('on');act.querySelector('.act-remove').onclick=()=>removeUI(p);
+  const tag=p.querySelector('.pname .tag');tag.className='tag ok';tag.textContent='已安装 '+ver;p.querySelector('.tag.up')?.remove();p.classList.add('installed');recount();}
+function removeUI(p){const act=p.querySelector('.pact');const size=p.dataset.size;
+  act.innerHTML=`<button class="btn primary act-install">安装 · ${size} MB</button>`;act.querySelector('button').onclick=()=>install(p);
+  const tag=p.querySelector('.pname .tag');tag.className='tag';tag.textContent='未安装';p.classList.remove('installed');recount();}
+function install(p){progress(p.querySelector('.pact'),'下载中',()=>installedUI(p,'1.0'))}
+$$('.act-install').forEach(b=>b.onclick=()=>install(b.closest('.pack')));
+$$('.act-remove').forEach(b=>b.onclick=()=>removeUI(b.closest('.pack')));
+$$('.act-update').forEach(b=>b.onclick=()=>{const p=b.closest('.pack');progress(p.querySelector('.pact'),'更新中',()=>installedUI(p,'7.1.2'))});
+recount();
+
+/* Quick Look */
+const wave=$('#wave');for(let i=0;i<120;i++){const h=12+Math.abs(Math.sin(i*.37)*Math.cos(i*.11))*88;wave.insertAdjacentHTML('beforeend',`<i style="height:${h}%"></i>`)}
+const pal=[['#0e3b5c','#f2a65a'],['#173f2f','#9fd6a5'],['#3b1d4a','#e58ab0'],['#5c3b0e','#f6d27a'],['#10202f','#6fb3e0'],['#2c2c2c','#d9d9d9']];
+const story=$('#story');for(let i=0;i<12;i++){const [a,b]=pal[i%pal.length];const m=Math.floor(i*42.3/12),s=Math.floor((i*42.3/12%1)*60);
+  story.insertAdjacentHTML('beforeend',`<div style="background:radial-gradient(circle at ${30+i*5%50}% ${40+i*7%30}%,${b} 0,transparent 45%),linear-gradient(160deg,${a},#000)"><span>${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}</span></div>`)}
+story.addEventListener('mousemove',e=>{const d=e.target.closest('div');story.querySelectorAll('div').forEach(x=>x.classList.toggle('hot',x===d))});
+function ql(v){const after=v==='after';$('#prompt').style.display=after?'none':'block';$('#wave').style.display=after?'none':'flex';story.style.display=after?'grid':'none';
+  $('#probeTag').className=after?'tag ok':'tag';$('#probeTag').textContent=after?'FFmpeg':'需要预览增强包';
+  $('#kv').innerHTML=after?'<span>容器</span><span>Matroska</span><span>时长</span><span>42:18</span><span>视频</span><span>HEVC Main 10 · 3840×2160 · 29.97 fps · HDR10</span><span>码率</span><span>10.1 Mb/s</span><span>音频</span><span>AAC · 48 kHz · 立体声</span><span>字幕</span><span>中文（SRT）· 英文（ASS）</span><span>章节</span><span>8 个</span>'
+    :'<span>容器</span><span>Matroska</span><span>时长</span><span>42:18</span><span>视频</span><span style="color:var(--text3)">—</span><span>音频</span><span>AAC · 48 kHz · 立体声</span>';}
+seg('segQL',ql);
+$('#qlInstall').onclick=()=>{const b=$('#qlInstall');let v=0;b.disabled=true;const t=setInterval(()=>{v+=7;b.textContent=`下载中 ${Math.min(v,100)}%`;if(v>=100){clearInterval(t);
+  b.textContent='校验中…';setTimeout(()=>{b.disabled=false;b.textContent='安装 FFmpeg 预览增强包 · 28 MB';$$('#segQL button').forEach(x=>x.classList.toggle('on',x.dataset.v==='after'));ql('after')},500)}},90)};
+
+/* 网格 */
+const files=[['海边日落.mp4','mp4','00:03:12',1,'H.264'],['旅行记录_2026.mkv','mkv','00:42:18',0,'HEVC'],['发布会录屏.webm','webm','00:18:05',0,'VP9'],['老电影.rmvb','rmvb','01:32:40',0,'RV40'],
+  ['航拍素材.mov','mov','00:01:48',0,'ProRes'],['直播回放.flv','flv','02:10:33',0,'H.264'],['演唱会.ts','ts','00:56:21',0,'MPEG-2'],['猫.mp4','mp4','00:00:24',1,'H.264'],
+  ['课程第3讲.mp4','mp4','00:45:10',0,'AV1'],['无损专辑.ape','ape','00:52:44',0,'APE']];
+function grid(after){$('#grid').innerHTML=files.map(([n,e,d,native,c],i)=>{const [a,b]=pal[i%pal.length];const show=native||after;
+  const audio=e==='ape';
+  const thumb=show?(audio?`<div style="position:absolute;inset:0;background:linear-gradient(135deg,#2b2b2b,#444);display:grid;place-items:center;color:#ccc;font-size:28px">♪</div>`
+    :`<div style="position:absolute;inset:0;background:radial-gradient(circle at ${30+i*9%50}% 40%,${b} 0,transparent 50%),linear-gradient(160deg,${a},#000)"></div>`)
+    :`<span class="ext">.${e}</span>`;
+  return `<div class="gi"><div class="gt">${thumb}${show?`<span class="dur">${d}</span>`:''}${after&&!native?'<span class="badge">'+c+'</span>':''}</div><div>${n}</div><small>${show?c:'无法生成缩略图'}</small></div>`}).join('');
+  $('#gridNote').textContent=after?'安装后：缩略图与时长由 FFmpeg 在隔离的预览进程中生成，并照常写入缩略图缓存；系统能处理的文件（如 H.264 MP4）仍走原来的路径。':'安装前：系统缺少解码器的视频只显示格式图标，也没有时长徽标。';}
+grid(false);seg('segGrid',v=>grid(v==='after'));
+</script>
+</body>
+</html>

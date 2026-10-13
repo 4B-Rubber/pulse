@@ -54,38 +54,55 @@ std::wstring Parent(const std::wstring& path) {
 }
 
 template <typename Fn>
-void ForEachChild(const std::wstring& dir, Fn&& fn) {
+DWORD ForEachChild(const std::wstring& dir, Fn&& fn, const DropEnumerationApi& api = {}) {
     WIN32_FIND_DATAW data{};
-    HANDLE find = FindFirstFileExW((Long(dir) + L"\\*").c_str(), FindExInfoBasic, &data,
+    HANDLE find = api.first((Long(dir) + L"\\*").c_str(), FindExInfoBasic, &data,
                                    FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-    if (find == INVALID_HANDLE_VALUE) return;
+    if (find == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND) {
+            const DWORD attrs = GetFileAttributesW(Long(dir).c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) return ERROR_SUCCESS;
+        }
+        return error;
+    }
+    DWORD error = ERROR_SUCCESS;
     do {
         if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) continue;
-        if (!fn(data)) break;
-    } while (FindNextFileW(find, &data));
+        if (!fn(data)) { error = ERROR_CANCELLED; break; }
+    } while (api.next(find, &data));
+    if (!error) {
+        error = GetLastError();
+        if (error == ERROR_NO_MORE_FILES) error = ERROR_SUCCESS;
+    }
     FindClose(find);
+    return error;
 }
 
 // Hard links share the source's data, which survives the archive manager
 // deleting its own name. Read-only files are copied instead, so removing a
 // stage never has to change attributes that a link would share.
-bool LinkOrCopyTree(const std::wstring& from, const std::wstring& to) {
+DWORD LinkOrCopyTree(const std::wstring& from, const std::wstring& to, std::wstring& failed_source, const DropEnumerationApi& api) {
+    failed_source = from;
     const DWORD attrs = GetFileAttributesW(Long(from).c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+    if (attrs == INVALID_FILE_ATTRIBUTES) return GetLastError();
     if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
-        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return false;  // never follow junctions
-        if (!CreateDirectoryW(Long(to).c_str(), nullptr)) return false;
-        bool ok = true;
-        ForEachChild(from, [&](const WIN32_FIND_DATAW& child) {
-            ok = LinkOrCopyTree(Plain(from) + L"\\" + child.cFileName, Plain(to) + L"\\" + child.cFileName);
-            return ok;
-        });
-        return ok;
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return ERROR_NOT_SUPPORTED;
+        if (!CreateDirectoryW(Long(to).c_str(), nullptr)) return GetLastError();
+        DWORD child_error = ERROR_SUCCESS;
+        const DWORD enumeration_error = ForEachChild(from, [&](const WIN32_FIND_DATAW& child) {
+            child_error = LinkOrCopyTree(Plain(from) + L"\\" + child.cFileName,
+                Plain(to) + L"\\" + child.cFileName, failed_source, api);
+            return child_error == ERROR_SUCCESS;
+        }, api);
+        if (child_error) return child_error;
+        if (enumeration_error) failed_source = from;
+        return enumeration_error;
     }
     if (!(attrs & FILE_ATTRIBUTE_READONLY) &&
         CreateHardLinkW(Long(to).c_str(), Long(from).c_str(), nullptr))
-        return true;
-    return CopyFileW(Long(from).c_str(), Long(to).c_str(), TRUE) != FALSE;
+        return ERROR_SUCCESS;
+    return CopyFileW(Long(from).c_str(), Long(to).c_str(), TRUE) ? ERROR_SUCCESS : GetLastError();
 }
 
 void RemoveTree(const std::wstring& path) {
@@ -139,38 +156,62 @@ bool IsTemporaryDropSource(const std::wstring& path, const std::wstring& temp_di
            CompareStringOrdinal(Expanded(path).c_str(), -1, Expanded(stage_root).c_str(), -1, TRUE) != CSTR_EQUAL;
 }
 
-bool StageDropSources(const std::vector<std::wstring>& sources, const std::wstring& temp_dir,
-                      const std::wstring& stage_root, std::vector<std::wstring>& staged) {
+static DropStageResult StageDropSourcesImpl(const std::vector<std::wstring>& sources, const std::wstring& temp_dir,
+                      const std::wstring& stage_root, std::vector<std::wstring>& staged, const DropEnumerationApi& api) {
     static std::atomic<unsigned> counter{0};
     staged = sources;
-    if (stage_root.empty()) return false;
+    auto candidate = sources;
     std::wstring stage;
     bool any = false;
     for (size_t i = 0; i < sources.size(); ++i) {
         const std::wstring& source = sources[i];
         if (!IsTemporaryDropSource(source, temp_dir, stage_root)) continue;
+        auto fail = [&](DWORD error, const std::wstring& failed_source) {
+            if (!stage.empty()) RemoveTree(stage);
+            return DropStageResult{false, error, failed_source};
+        };
+        if (stage_root.empty()) return fail(ERROR_PATH_NOT_FOUND, source);
         if (stage.empty()) {
-            CreateDirectoryW(Long(stage_root).c_str(), nullptr);
+            if (!CreateDirectoryW(Long(stage_root).c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+                return fail(GetLastError(), source);
             stage = Plain(stage_root) + L"\\" + std::to_wstring(GetCurrentProcessId()) + L"-" +
                     std::to_wstring(++counter) + L"-" + std::to_wstring(GetTickCount64());
-            if (!CreateDirectoryW(Long(stage).c_str(), nullptr)) return false;
+            if (!CreateDirectoryW(Long(stage).c_str(), nullptr)) {
+                const DWORD error = GetLastError();
+                stage.clear(); // Never clean a pre-existing directory we did not create.
+                return fail(error, source);
+            }
         }
         // Named like the original parent (7zE44D7D628), which dialogs show.
         std::wstring parent = Leaf(Parent(source));
         if (parent.empty()) parent = L"Temp";
         const std::wstring folder = stage + L"\\" + parent;
-        CreateDirectoryW(Long(folder).c_str(), nullptr);
+        if (!CreateDirectoryW(Long(folder).c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+            return fail(GetLastError(), source);
         const std::wstring target = folder + L"\\" + Leaf(source);
-        if (GetFileAttributesW(Long(target).c_str()) != INVALID_FILE_ATTRIBUTES) continue;  // name taken
-        if (!LinkOrCopyTree(source, target)) {
-            RemoveTree(target);
-            continue;
-        }
-        staged[i] = target;
+        if (GetFileAttributesW(Long(target).c_str()) != INVALID_FILE_ATTRIBUTES)
+            return fail(ERROR_ALREADY_EXISTS, source);
+        std::wstring failed_source;
+        const DWORD error = LinkOrCopyTree(source, target, failed_source, api);
+        if (error) return fail(error, failed_source);
+        candidate[i] = target;
         any = true;
     }
     if (!any && !stage.empty()) RemoveTree(stage);
-    return any;
+    staged = std::move(candidate);
+    return {any, ERROR_SUCCESS, {}};
+}
+
+DropStageResult StageDropSources(const std::vector<std::wstring>& sources, const std::wstring& temp_dir,
+    const std::wstring& stage_root, std::vector<std::wstring>& staged) {
+    return StageDropSourcesImpl(sources, temp_dir, stage_root, staged, {});
+}
+bool StageDropSources(const std::vector<std::wstring>& sources, const std::wstring& temp_dir,
+    const std::wstring& stage_root, std::vector<std::wstring>& staged,
+    DropStageError* error, const DropEnumerationApi& api) {
+    const auto result = StageDropSourcesImpl(sources, temp_dir, stage_root, staged, api);
+    if (error) *error = {result.error, result.source};
+    return result.any;
 }
 
 void SweepDropStages(const std::wstring& stage_root, bool include_own) {

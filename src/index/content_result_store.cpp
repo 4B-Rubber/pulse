@@ -73,6 +73,7 @@ struct ContentResultStore::Impl {
     std::atomic<uint64_t> sort_epoch{0};
     std::atomic<bool> sorting{false};
     std::atomic<bool> stream_order{false};
+    bool dynamic_visible = false;
     Impl(HWND n, UINT m):notify(n),message(m) {}
     ~Impl() {
         if (db) sqlite3_close(db);
@@ -92,6 +93,38 @@ struct ContentResultStore::Impl {
         indexed_order=next_order;
         return true;
     }
+    std::string RowsQuery() const {
+        if (!dynamic_visible) return kRows;
+        return "SELECT name,path,size,mtime,line,snippet,file_id FROM hits INDEXED BY hits_display_order "
+            "WHERE seq IN (SELECT seq FROM visible_members) ORDER BY " + order +
+            " LIMIT (?2-?1) OFFSET ?1";
+    }
+    // Positions are derived on demand; streaming writes only changed membership.
+    // Each representation switch commits before changing its in-memory mode.
+    bool UseDynamicVisible(const std::string& next_order) {
+        if (dynamic_visible && order == next_order) return true;
+        if (!Exec("BEGIN")) return false;
+        bool ok = dynamic_visible ? Exec("DROP VIEW visible") :
+            Exec("CREATE TABLE visible_members(seq INTEGER PRIMARY KEY REFERENCES hits(seq) ON DELETE CASCADE);"
+                 "INSERT INTO visible_members SELECT seq FROM visible; DROP TABLE visible;");
+        ok = ok && Exec(("CREATE VIEW visible AS SELECT row_number() OVER (ORDER BY " + next_order +
+            ")-1 AS pos,seq FROM hits INDEXED BY hits_display_order "
+            "WHERE seq IN (SELECT seq FROM visible_members)").c_str());
+        if (!ok || !Exec("COMMIT")) { Exec("ROLLBACK"); return false; }
+        dynamic_visible = true;
+        order = next_order;
+        return true;
+    }
+    bool MaterializeVisible() {
+        if (!dynamic_visible) return true;
+        if (!Exec("BEGIN")) return false;
+        const bool ok = Exec("CREATE TABLE materialized_visible(pos INTEGER PRIMARY KEY,seq INTEGER);"
+            "INSERT INTO materialized_visible SELECT pos,seq FROM visible; DROP VIEW visible;"
+            "ALTER TABLE materialized_visible RENAME TO visible; DROP TABLE visible_members;");
+        if (!ok || !Exec("COMMIT")) { Exec("ROLLBACK"); return false; }
+        dynamic_visible = false;
+        return true;
+    }
     bool Open() {
         if(db) return true;
         wchar_t directory[32768]{};
@@ -106,7 +139,7 @@ struct ContentResultStore::Impl {
         if(sqlite3_open16(path.c_str(),&db)!=SQLITE_OK) return false;
         sqlite3_create_collation(db,"PULSE_ORDINAL",SQLITE_UTF16,nullptr,OrdinalCollation);
         sqlite3_create_function_v2(db,"pulse_extension",1,SQLITE_UTF16|SQLITE_DETERMINISTIC,nullptr,SqlExtension,nullptr,nullptr,nullptr);
-        return Exec("PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; CREATE TABLE hits(seq INTEGER PRIMARY KEY,name TEXT,path TEXT,size INTEGER,mtime INTEGER,line INTEGER,snippet TEXT,file_id INTEGER NOT NULL DEFAULT 0); CREATE UNIQUE INDEX hits_identity ON hits(file_id) WHERE file_id<>0; CREATE TABLE visible(pos INTEGER PRIMARY KEY,seq INTEGER);");
+        return Exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; CREATE TABLE hits(seq INTEGER PRIMARY KEY,name TEXT,path TEXT,size INTEGER,mtime INTEGER,line INTEGER,snippet TEXT,file_id INTEGER NOT NULL DEFAULT 0); CREATE UNIQUE INDEX hits_identity ON hits(file_id) WHERE file_id<>0; CREATE TABLE visible(pos INTEGER PRIMARY KEY,seq INTEGER);");
     }
     void Enqueue(std::function<void()> task) {
         { std::lock_guard lock(mu); if(stopping) return; tasks.push_back(std::move(task)); }
@@ -128,7 +161,7 @@ struct ContentResultStore::Impl {
         {
             std::lock_guard lock(io);
             if(!stopping && epoch==page_epoch && Open()) {
-                Statement query(db,kRows);
+                Statement query(db,RowsQuery().c_str());
                 if(query.p) {
                     query.Int(1,page*kPageSize); query.Int(2,(page+1)*kPageSize);
                     int rc=SQLITE_DONE;
@@ -158,7 +191,7 @@ struct ContentResultStore::Impl {
         }
         for (size_t page : recent) {
             if (page*kPageSize>=new_count) continue;
-            Statement read(db,kRows);
+            Statement read(db,RowsQuery().c_str());
             read.Int(1,page*kPageSize); read.Int(2,(page+1)*kPageSize);
             auto& rows=replacement[page];
             int rc=SQLITE_DONE;
@@ -183,22 +216,25 @@ bool ContentResultStore::Append(const std::vector<ContentHit>& hits) {
         std::lock_guard cache(p.mu);
         order=p.requested_order;
     }
-    if(p.stopping || !p.Open() || !p.EnsureOrderIndex(order) || !p.Exec("BEGIN")) { p.error=ERROR_DATABASE_FAILURE; p.Notify(); return false; }
+    if(p.stopping || !p.Open() || !p.MaterializeVisible() || !p.EnsureOrderIndex(order) || !p.Exec("BEGIN")) { p.error=ERROR_DATABASE_FAILURE; p.Notify(); return false; }
     Statement insert(p.db,"INSERT INTO hits VALUES(?1,?2,?3,?4,?5,?6,?7,?8)");
     Statement visible(p.db,"INSERT INTO visible VALUES(?1,?2)");
+    Statement sequence(p.db,"SELECT coalesce(max(seq),-1)+1 FROM hits");
     size_t raw=p.raw, count=p.count;
-    bool ok=insert.p && visible.p;
+    bool ok=insert.p && visible.p && sequence.p && sqlite3_step(sequence.p)==SQLITE_ROW;
+    uint64_t next_seq=ok ? static_cast<uint64_t>(sqlite3_column_int64(sequence.p,0)) : 0;
+    sequence.Reset();
     for(const auto& hit:hits) {
         if(!ok || p.stopping) { ok=false; break; }
-        insert.Int(1,raw); insert.Text(2,hit.name); insert.Text(3,hit.path);
+        insert.Int(1,next_seq); insert.Text(2,hit.name); insert.Text(3,hit.path);
         insert.Int(4,hit.size); insert.Int(5,hit.modified); insert.Int(6,hit.line); insert.Text(7,hit.snippet); insert.Int(8,hit.file_id);
         ok=insert.Step(); insert.Reset();
         fs::DirEntry entry; entry.name=hit.name; entry.full_path=hit.path; entry.size=hit.size; entry.attrs=FILE_ATTRIBUTE_NORMAL;
         entry.mtime={static_cast<DWORD>(hit.modified),static_cast<DWORD>(hit.modified >> 32)};
         if(ok && (!p.filter || p.filter(entry))) {
-            visible.Int(1,count++); visible.Int(2,raw); ok=visible.Step(); visible.Reset();
+            visible.Int(1,count++); visible.Int(2,next_seq); ok=visible.Step(); visible.Reset();
         }
-        ++raw;
+        ++raw; ++next_seq;
     }
     if (ok && !order.empty()) {
         // New hits have already passed the active filter. Merge their display
@@ -232,7 +268,9 @@ bool ContentResultStore::UpsertChanges(const std::vector<ContentHit>& hits, Cont
         std::lock_guard cache(p.mu);
         if (!p.requested_order.empty()) order=p.requested_order;
     }
-    if (p.stopping || !p.Open() || (streaming && !p.EnsureOrderIndex(order)) || !p.Exec("BEGIN")) { p.error=ERROR_DATABASE_FAILURE; p.Notify(); return false; }
+    if (p.stopping || !p.Open() ||
+        (streaming ? (!p.EnsureOrderIndex(order) || !p.UseDynamicVisible(order)) : !p.MaterializeVisible()) ||
+        !p.Exec("BEGIN")) { p.error=ERROR_DATABASE_FAILURE; p.Notify(); return false; }
     bool ok = p.Exec("CREATE UNIQUE INDEX IF NOT EXISTS hits_path ON hits(path COLLATE PULSE_ORDINAL)");
     Statement remove(p.db, "DELETE FROM hits WHERE path=?1 COLLATE PULSE_ORDINAL AND (?2=0 OR file_id=?2)");
     // A temporary task result gaining its index identity is still the same
@@ -240,39 +278,66 @@ bool ContentResultStore::UpsertChanges(const std::vector<ContentHit>& hits, Cont
     Statement conflict(p.db, "DELETE FROM hits WHERE path=?1 COLLATE PULSE_ORDINAL AND file_id<>?2 AND (file_id<>0 OR EXISTS(SELECT 1 FROM hits WHERE file_id=?2))");
     Statement identity(p.db, "UPDATE hits SET path=?1 WHERE file_id=?2 AND ?2<>0");
     Statement put(p.db, "INSERT INTO hits(seq,name,path,size,mtime,line,snippet,file_id) VALUES((SELECT coalesce(max(seq),-1)+1 FROM hits),?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(path) DO UPDATE SET name=excluded.name,size=excluded.size,mtime=excluded.mtime,line=excluded.line,snippet=excluded.snippet,file_id=CASE WHEN excluded.file_id=0 THEN hits.file_id ELSE excluded.file_id END");
-    if (streaming && p.filter) ok=ok && p.Exec("CREATE TEMP TABLE changed_visible(seq INTEGER PRIMARY KEY,admitted INTEGER)");
-    Statement changed(p.db,streaming && p.filter ? "INSERT OR REPLACE INTO changed_visible SELECT seq,?2 FROM hits WHERE path=?1 COLLATE PULSE_ORDINAL" : "SELECT 1");
+    Statement present(p.db,"SELECT 1 FROM hits WHERE path=?1 COLLATE PULSE_ORDINAL");
+    Statement admit(p.db,streaming ? "INSERT OR IGNORE INTO visible_members SELECT seq FROM hits WHERE path=?1 COLLATE PULSE_ORDINAL" : "SELECT 1");
+    Statement exclude(p.db,streaming ? "DELETE FROM visible_members WHERE seq IN (SELECT seq FROM hits WHERE path=?1 COLLATE PULSE_ORDINAL)" : "SELECT 1");
+    size_t stream_raw=p.raw, stream_count=p.count;
+    // There are no application triggers here: the only indirect changes made
+    // by a hits deletion are its ON DELETE CASCADE membership deletions.
+    auto account_deleted = [&](sqlite3_int64 before) {
+        if (!streaming) return;
+        const auto deleted = sqlite3_changes64(p.db);
+        stream_raw -= static_cast<size_t>(deleted);
+        stream_count -= static_cast<size_t>(sqlite3_total_changes64(p.db) - before - deleted);
+    };
     for (const auto& hit : hits) {
         if (!ok || p.stopping) { ok = false; break; }
-        if (hit.removed) { remove.Text(1,hit.path); remove.Int(2,hit.file_id); ok=remove.Step(); remove.Reset(); }
+        if (hit.removed) {
+            remove.Text(1,hit.path); remove.Int(2,hit.file_id);
+            const auto before = sqlite3_total_changes64(p.db);
+            ok=remove.Step();
+            if (ok) account_deleted(before);
+            remove.Reset();
+        }
         else {
             if (hit.file_id) {
-                conflict.Text(1,hit.path); conflict.Int(2,hit.file_id); ok=conflict.Step(); conflict.Reset();
+                conflict.Text(1,hit.path); conflict.Int(2,hit.file_id);
+                const auto before = sqlite3_total_changes64(p.db);
+                ok=conflict.Step();
+                if (ok) account_deleted(before);
+                conflict.Reset();
                 identity.Text(1,hit.path); identity.Int(2,hit.file_id); ok=ok && identity.Step(); identity.Reset();
+                if (!ok) break;
+            }
+            bool inserted = false;
+            if (streaming) {
+                present.Text(1,hit.path);
+                const int rc = present.p ? sqlite3_step(present.p) : SQLITE_ERROR;
+                ok = rc == SQLITE_ROW || rc == SQLITE_DONE;
+                inserted = rc == SQLITE_DONE;
+                present.Reset();
                 if (!ok) break;
             }
             put.Text(1,hit.name); put.Text(2,hit.path); put.Int(3,hit.size); put.Int(4,hit.modified);
             put.Int(5,hit.line); put.Text(6,hit.snippet); put.Int(7,hit.file_id); ok=put.Step(); put.Reset();
-            if (ok && streaming && p.filter) {
+            if (ok && streaming) {
+                if (inserted) ++stream_raw;
                 fs::DirEntry entry; entry.name=hit.name; entry.full_path=hit.path; entry.size=hit.size; entry.attrs=FILE_ATTRIBUTE_NORMAL;
                 entry.mtime={static_cast<DWORD>(hit.modified),static_cast<DWORD>(hit.modified>>32)};
-                changed.Text(1,hit.path); changed.Int(2,p.filter(entry) ? 1:0); ok=changed.Step(); changed.Reset();
+                const bool admitted = !p.filter || p.filter(entry);
+                auto& changed = admitted ? admit : exclude;
+                changed.Text(1,hit.path); ok=changed.Step();
+                if (ok) {
+                    const auto changes = static_cast<size_t>(sqlite3_changes64(p.db));
+                    if (admitted) stream_count += changes; else stream_count -= changes;
+                }
+                changed.Reset();
             }
         }
     }
     if (streaming) {
-        const std::string membership=p.filter ? " WHERE seq IN (SELECT seq FROM visible WHERE seq NOT IN (SELECT seq FROM changed_visible)) OR seq IN (SELECT seq FROM changed_visible WHERE admitted=1)" : "";
-        ok=ok && p.Exec("CREATE TABLE upsert_order(pos INTEGER PRIMARY KEY,seq INTEGER)") &&
-            p.Exec(("INSERT INTO upsert_order SELECT row_number() OVER (ORDER BY "+order+")-1,seq FROM hits INDEXED BY hits_display_order"+membership).c_str()) &&
-            p.Exec("DROP TABLE visible; ALTER TABLE upsert_order RENAME TO visible;");
-        if (p.filter) ok=ok && p.Exec("DROP TABLE changed_visible");
-        Statement counts(p.db,"SELECT (SELECT count(*) FROM hits),(SELECT count(*) FROM visible)");
-        ok=ok && counts.p && sqlite3_step(counts.p)==SQLITE_ROW;
-        const auto raw=ok ? static_cast<size_t>(sqlite3_column_int64(counts.p,0)):0;
-        const auto count=ok ? static_cast<size_t>(sqlite3_column_int64(counts.p,1)):0;
-        counts.Reset();
         if (!ok || !p.Exec("COMMIT")) { p.Exec("ROLLBACK"); p.error=ERROR_DATABASE_FAILURE; p.Notify(); return false; }
-        p.order=std::move(order); p.raw=raw; p.RefreshPages(count); p.Notify(); return true;
+        p.raw=stream_raw; p.RefreshPages(stream_count); p.Notify(); return true;
     }
     // Rebuild only the compact display order; unchanged bodies and hit rows
     // stay in the disk spool. Page caches remain bounded after every mutation.
@@ -356,7 +421,7 @@ void ContentResultStore::SetFilter(Filter filter) {
         {
             std::lock_guard lock(p->io);
             if(epoch!=p->filter_epoch || p->stopping) return;
-            if(!p->Open() || !p->Exec("BEGIN; DELETE FROM visible;")) { p->error=ERROR_DATABASE_FAILURE; p->filtering=false; p->Notify(); return; }
+            if(!p->Open() || !p->MaterializeVisible() || !p->Exec("BEGIN; DELETE FROM visible;")) { p->error=ERROR_DATABASE_FAILURE; p->filtering=false; p->Notify(); return; }
             Statement read(p->db,("SELECT name,path,size,mtime,line,snippet,file_id,seq FROM hits ORDER BY " + p->order).c_str());
             Statement write(p->db,"INSERT INTO visible VALUES(?1,?2)");
             size_t count=0; int rc=SQLITE_DONE; bool ok=read.p && write.p;
@@ -395,7 +460,7 @@ void ContentResultStore::SetSort(ContentResultSort sort, bool descending) {
         if (p->stopping || epoch!=p->sort_epoch) return;
         // Sort only identities already admitted by the current filter. No body
         // matching or filter callback is needed for a direction change.
-        if (!p->Open() || !p->Exec("BEGIN; CREATE TEMP TABLE sorted(pos INTEGER PRIMARY KEY,seq INTEGER);")) {
+        if (!p->Open() || !p->MaterializeVisible() || !p->Exec("BEGIN; CREATE TEMP TABLE sorted(pos INTEGER PRIMARY KEY,seq INTEGER);")) {
             p->Exec("ROLLBACK"); p->error=ERROR_DATABASE_FAILURE;
             p->FinishSort(epoch);
             p->Notify(); return;
@@ -438,7 +503,7 @@ void ContentResultStore::Resolve(std::vector<int> indices,bool all,size_t count,
             std::lock_guard lock(p->io);
             if(p->stopping || epoch!=p->page_epoch || !p->Open()) result.error=ERROR_CANCELLED;
             else {
-                Statement read(p->db,kRows);
+                Statement read(p->db,p->RowsQuery().c_str());
                 if(!read.p) result.error=ERROR_DATABASE_FAILURE;
                 else if(all) {
                     read.Int(1,0); read.Int(2,count); size_t index=0; int rc=SQLITE_DONE;

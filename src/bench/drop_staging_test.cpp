@@ -33,6 +33,24 @@ void ForceRemove(const fsys::path& root) {
         SetFileAttributesW(it->path().c_str(), FILE_ATTRIBUTE_NORMAL);
     fsys::remove_all(root, ec);
 }
+int enum_mode = 0;
+int enum_files = 0;
+HANDLE WINAPI TestFirst(LPCWSTR pattern, FINDEX_INFO_LEVELS level, LPVOID data,
+                       FINDEX_SEARCH_OPS search, LPVOID filter, DWORD flags) {
+    if (enum_mode == 1 || (enum_mode == 3 && std::wstring(pattern).find(L"denied") != std::wstring::npos)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    const HANDLE result = FindFirstFileExW(pattern, level, data, search, filter, flags);
+    if (result != INVALID_HANDLE_VALUE && static_cast<WIN32_FIND_DATAW*>(data)->cFileName[0] != L'.') ++enum_files;
+    return result;
+}
+BOOL WINAPI TestNext(HANDLE find, LPWIN32_FIND_DATAW data) {
+    if (enum_mode == 2 && enum_files > 0) { SetLastError(ERROR_CRC); return FALSE; }
+    const BOOL result = FindNextFileW(find, data);
+    if (result && data->cFileName[0] != L'.') ++enum_files;
+    return result;
+}
 }  // namespace
 
 int wmain() {
@@ -89,6 +107,32 @@ int wmain() {
     Check(!StageDropSources({(other / L"keep.txt").wstring()}, temp.wstring(), stage_root.wstring(), untouched) &&
           untouched.size() == 1 && untouched[0] == (other / L"keep.txt").wstring(),
           L"nothing is staged when no source is temporary");
+
+    const fsys::path fault_source = temp / L"fault-source";
+    const fsys::path fault_stage = temp / L"FaultStage";
+    fsys::create_directory(fault_source);
+    DropStageError error;
+    std::vector<std::wstring> fault_staged;
+    Check(StageDropSources({fault_source.wstring()}, temp.wstring(), fault_stage.wstring(), fault_staged, &error) &&
+          error.code == ERROR_SUCCESS && fsys::is_empty(fault_staged[0]), L"real empty source directory stages successfully");
+    SweepDropStages(fault_stage.wstring(), true);
+    Write(fault_source / L"first.txt", "prefix copied before enumeration fails");
+    Write(fault_source / L"second.txt", "unseen suffix");
+    fsys::create_directory(fault_source / L"denied");
+    Write(fault_source / L"denied" / L"secret.txt", "deep subtree");
+    const DropEnumerationApi api{TestFirst, TestNext};
+    for (enum_mode = 1; enum_mode <= 3; ++enum_mode) {
+        enum_files = 0;
+        const std::vector<std::wstring> batch{(other / L"keep.txt").wstring(), fault_source.wstring()};
+        // The directory whose enumeration failed is reported: the dropped root when
+        // its first lookup fails, else "denied", which NTFS enumerates first.
+        const std::wstring failed_directory = (enum_mode == 1 ? fault_source : fault_source / L"denied").wstring();
+        Check(!StageDropSources(batch, temp.wstring(), fault_stage.wstring(), fault_staged, &error, api) &&
+              error.code == static_cast<DWORD>(enum_mode == 2 ? ERROR_CRC : ERROR_ACCESS_DENIED) && error.source == failed_directory &&
+              fault_staged == batch && fsys::is_empty(fault_stage) && Read(fault_source / L"first.txt").size() > 0,
+              L"first/middle/deep enumeration error rejects complete batch and removes partial stage");
+    }
+    enum_mode = 0;
 
     // 999999 is not a multiple of four, so no process can have it.
     const fsys::path dead = stage_root / L"999999-1-1";

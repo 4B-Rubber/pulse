@@ -142,6 +142,49 @@ int wmain() {
     Check(quoted_date.date == app::DatePreset::Any,
           L"quoted dm:thismonth does not flip the date preset");
 
+    for (const auto* raw : {L"a|b", L"!ext:log", L"ext:txt | ext:log", L"!draft !temp",
+                            L"report dm:2020", L"report dm:2020-01-01..2020-12-31"}) {
+        auto parsed = app::ParseSearchQuery(raw);
+        Check(app::CompileSearchQuery(parsed) == raw, L"unchanged structured roundtrip preserves complete native syntax");
+        parsed.location = app::LocationScope::CustomFolder; parsed.custom_folder = L"C:\\wanted";
+        const auto scoped_roundtrip = index::ParseQuery(app::CompileSearchQuery(parsed));
+        const auto original = index::ParseQuery(raw);
+        Check(scoped_roundtrip.groups.size() == original.groups.size() && scoped_roundtrip.path_prefix == L"C:\\wanted",
+              L"scope-only editing preserves boolean branches and applies requested location");
+        for (const auto* name : {L"a.txt", L"b.log", L"draft.txt", L"temp.log", L"report.txt"}) {
+            auto matches = [&](const auto& query) {
+                for (const auto& group : query.groups) {
+                    bool yes = true;
+                    for (const auto& term : group) yes &= index::MatchTerm(name, name, false, 2000000, 132300000000000000ull, term);
+                    if (yes) return true;
+                }
+                return query.groups.empty();
+            };
+            Check(matches(scoped_roundtrip) == matches(original), L"scope edit preserves filename/date/negation membership");
+        }
+    }
+    const auto custom_date = app::ParseSearchQuery(L"dm:2020-01-01..2020-12-31");
+    Check(custom_date.date_from == L"2020-01-01" && custom_date.date_to == L"2020-12-31", L"custom date bounds are restored into form");
+    auto boolean = app::ParseSearchQuery(L"a|b"); boolean.kind = index::SearchKind::Custom; boolean.custom_exts = L"txt";
+    const auto filtered = index::ParseQuery(app::CompileSearchQuery(boolean));
+    Check(filtered.groups.size() == 2 && filtered.groups[0].size() == 2 && filtered.groups[1].size() == 2,
+          L"new structured extension filter constrains every original OR branch");
+    for (const auto* raw : {L"ext:pdf", L"size:>1mb", L"folder:", L"a|b", L"report ext:pdf", L"report"}) {
+        app::AdvancedSearchSpec typed; typed.name = raw; typed.name_is_query = true;
+        Check(app::CompileSearchQuery(typed) == raw, L"native address input matches global raw query independently of token count");
+    }
+    app::AdvancedSearchSpec typed_filters; typed_filters.name = L"a|b"; typed_filters.name_is_query = true;
+    typed_filters.kind = index::SearchKind::Custom; typed_filters.custom_exts = L"txt";
+    const auto combined = index::ParseQuery(app::CompileSearchQuery(typed_filters));
+    Check(combined.groups.size() == 2 && combined.groups[0].size() == 2 && combined.groups[1].size() == 2,
+          L"native OR input combines structured filters into every branch");
+    app::AdvancedSearchSpec literal; literal.name = L"ext:pdf";
+    Check(app::CompileSearchQuery(literal) == L"\"ext:pdf\"", L"advanced literal-name field retains explicit quoting contract");
+
+    literal.name = L"report ext:pdf";
+    Check(!index::QueryHasExtFilter(index::ParseQuery(app::CompileSearchQuery(literal))),
+          L"advanced literal name does not gain native operators when another word is added");
+
     if (failures) {
         std::wcout << L"FAILED " << failures << L"\n";
         return 1;

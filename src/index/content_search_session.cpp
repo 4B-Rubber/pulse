@@ -26,6 +26,19 @@ std::optional<ContentSearchUpdate> ContentSearchSession::Accept(ContentSearchUpd
         update.hits.clear(); update.results = results_;
         return update;
     }
+    if (results_ && task_scan_) {
+        pending_hits_.insert(pending_hits_.end(), std::make_move_iterator(update.hits.begin()),
+                             std::make_move_iterator(update.hits.end()));
+        update.hits.clear();
+        const auto now = GetTickCount64();
+        // Publish the first hit immediately. Later hits share a bounded batch;
+        // periodic progress, completion and failures always drain pending rows.
+        if (last_publish_ && pending_hits_.size() < 64 && !update.progress.done &&
+            !update.progress.error && now - last_publish_ < 100) return std::nullopt;
+        if (!pending_hits_.empty()) {
+            update.hits.swap(pending_hits_);
+        }
+    }
     if (results_) {
         if (!(task_scan_ ? results_->StreamUpsert(update.hits,sort_,descending_) : results_->Append(update.hits))) {
             update.progress.error = results_->Error();
@@ -33,6 +46,7 @@ std::optional<ContentSearchUpdate> ContentSearchSession::Accept(ContentSearchUpd
         } else if (task_scan_) {
             for (const auto& hit:update.hits) TraceSearch("content_task_visible",generation_,hit.path);
         }
+        if (task_scan_ && !update.hits.empty()) last_publish_ = GetTickCount64();
         update.hits.clear();
         // An empty progress notification is not a replacement result list.
         if (results_->RawCount() || update.progress.done) update.results = results_;

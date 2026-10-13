@@ -19,12 +19,6 @@ struct SeenMenuItem {
     bool flyout = false;
     bool from_com = false;
     ipc::CtxMenuCategory category = ipc::CtxMenuCategory::Software;
-
-    // Lets ContextMenuPrefs::Save() tell a local edit from another window's write.
-    bool operator==(const SeenMenuItem& other) const {
-        return key == other.key && text == other.text && flyout == other.flyout &&
-               from_com == other.from_com && category == other.category;
-    }
 };
 
 struct SlowComExt {
@@ -33,17 +27,15 @@ struct SlowComExt {
     uint32_t timeout_hits = 0; // times >= 1000ms
     bool deferred = false;     // still query async, never block first frame
     bool disabled = false;     // skip COM query entirely
-
-    bool operator==(const SlowComExt& other) const {
-        return last_ms == other.last_ms && slow_hits == other.slow_hits &&
-               timeout_hits == other.timeout_hits && deferred == other.deferred &&
-               disabled == other.disabled;
-    }
 };
 
-// Everything context_menu.json stores. Split out so the object can also keep the
-// state that last agreed with the file and compare the two field by field.
-struct ContextMenuPrefsValues {
+struct ContextMenuPrefs {
+    bool persist = true;
+    bool load_failed = false;
+    // FromJson rewrote state an older build persisted (see kPrefsVersion);
+    // Load saves the cleaned file once.
+    bool migrated = false;
+
     // Explorer shows 软件功能 / 打开方式 / 打印 and leaves 发送到 plus the image
     // and system verbs out unless the type registers them; those two groups stay
     // off by default and the settings page turns them on. Only the COM-sourced
@@ -66,10 +58,8 @@ struct ContextMenuPrefsValues {
     std::unordered_map<std::wstring, SlowComExt> slow_ext;
     // Pulse's own menu rows / row buttons the user turned off (BuiltinMenuBit).
     uint32_t builtin_hidden = 0;
-};
-
-struct ContextMenuPrefs : ContextMenuPrefsValues {
-    bool persist = true;
+    // Their order per BuiltinMenuSurface; empty = table order.
+    BuiltinMenuOrder builtin_order[static_cast<size_t>(BuiltinMenuSurface::Count)];
 
     void ResetToDefaults();
     // Re-keys the seen catalog through CatalogKey and carries the per-item
@@ -79,12 +69,17 @@ struct ContextMenuPrefs : ContextMenuPrefsValues {
     bool GroupEnabled(ipc::CtxMenuGroup g) const;
     void SetGroupEnabled(ipc::CtxMenuGroup g, bool on);
     bool ItemEnabled(const std::wstring& key, ipc::CtxMenuCategory c, bool from_com) const;
+    // Settings-page view of a row (#77): a handler the slow-extension
+    // auto-disable turned off must not display as on just because no explicit
+    // override exists. Toggling such a row on also clears the disable.
+    bool RowEnabled(const std::wstring& key, ipc::CtxMenuCategory c, bool from_com) const;
     void SetItemEnabled(const std::wstring& key, bool on);
     bool HandlerEnabled(const std::wstring& clsid) const;
     std::vector<std::wstring> DisabledHandlerClsids() const;
     bool RecordSeen(const std::wstring& key, const std::wstring& text, bool flyout,
                     ipc::CtxMenuCategory category, bool from_com = false);
-    // key: ".dwg" / ":folder" / ":drive" / ":bg" / ":file". Returns true if prefs changed.
+    // key: "h:{CLSID}" of a handler the host reported hung. Returns true if
+    // prefs changed.
     bool RecordComTiming(const std::wstring& key, uint32_t elapsed_ms);
     bool ComDeferred(const std::wstring& key) const;
     bool ComDisabled(const std::wstring& key) const;
@@ -93,34 +88,20 @@ struct ContextMenuPrefs : ContextMenuPrefsValues {
         return (builtin_hidden & BuiltinMenuBit(item)) == 0;
     }
     void SetBuiltinVisible(BuiltinMenuItem item, bool on);
+    // Normalized order of a surface (the table order unless the user moved rows).
+    BuiltinMenuOrder BuiltinOrder(BuiltinMenuSurface surface) const;
+    bool BuiltinOrderCustom(BuiltinMenuSurface surface) const;
+    // Stores `order`; the table order is stored as empty.
+    void SetBuiltinOrder(BuiltinMenuSurface surface, const BuiltinMenuOrder& order);
+    void ResetBuiltinOrder();
 
     std::wstring ToJson() const;
     bool FromJson(const std::wstring& json);
     bool Load();
     bool Save() const;
 
-    // True when the last Load() found a usable state in context_menu.json or its
-    // backup.
-    bool loaded_from_file() const noexcept { return loaded_from_file_; }
-
 private:
     void CoalesceCompressCatalog();
-
-    // The values the file held at the last Load() or Save(). Save() merges against
-    // them, so a second Pulse window cannot roll back what another one wrote.
-    // mutable: Save() is const, like AppPrefs::Save().
-    mutable ContextMenuPrefsValues disk_state_;
-    bool loaded_from_file_ = false;
-
-    // Reads context_menu.json, falling back to context_menu.json.bak. |main_exists|
-    // separates "no file" from "a file nothing can read"; |used_backup| (optional)
-    // reports that the main file was unusable.
-    bool ReadDiskState(ContextMenuPrefsValues& values, bool& main_exists,
-                       bool* used_backup = nullptr) const;
-    // Fields changed here since disk_state_ keep the local value; the rest take what
-    // the file holds now. A field missing from MergedWithDisk() keeps the local
-    // value, so forgetting one is never a lost setting.
-    ContextMenuPrefsValues MergedWithDisk(const ContextMenuPrefsValues& disk) const;
 };
 
 } // namespace pulse::app

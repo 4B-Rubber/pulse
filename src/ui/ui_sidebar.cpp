@@ -233,6 +233,37 @@ void MainRenderer::DrawSidebar(const WindowViewModel& vm, const D2D1_RECT_F& rec
                         slot.rc.bottom - slot.rc.top, glyph, fallback,
                         theme.text_secondary, 0.92f);
                 }
+                // Tags read as their own group on the rail: a short divider
+                // above the section, and when folded the first tag colors peek
+                // out of the icon's corner so the section never looks empty.
+                bool tag_section = false;
+                for (const auto& it : group.items) {
+                    if (it.is_tag) { tag_section = true; break; }
+                }
+                if (tag_section && slot.run > 0) {
+                    MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
+                    FillRect(dc, brStrokeDivider_.get(), slot.rc.left + 10.0f * scale_,
+                             slot.rc.top - 1.0f, slot.rc.right - slot.rc.left - 20.0f * scale_, 1.0f);
+                }
+                if (tag_section && group.collapsed && !IsHighContrast()) {
+                    const float mini = 4.0f * scale_;
+                    float mx = rail_rc.right + 1.0f * scale_;
+                    const float my = rail_rc.bottom - 1.0f * scale_;
+                    D2D1_COLOR_F halo = vm.dark ? D2D1_COLOR_F{0.125f, 0.125f, 0.125f, 1.0f}
+                                                : D2D1_COLOR_F{0.97f, 0.973f, 0.957f, 1.0f};
+                    int shown = 0;
+                    for (const auto& it : group.items) {
+                        if (!it.is_tag || it.tag_dot.a <= 0.0f) continue;
+                        if (++shown > 3) break;
+                        MakeBrush(dc, halo, brFillHover_);
+                        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(mx, my), mini + 1.5f * scale_,
+                                                      mini + 1.5f * scale_), brFillHover_.get());
+                        MakeBrush(dc, it.tag_dot, brFillHover_);
+                        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(mx, my), mini, mini),
+                                        brFillHover_.get());
+                        mx -= mini * 2.0f;
+                    }
+                }
                 // Separator between the section row and its expanded rows.
                 if (!group.collapsed) {
                     MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
@@ -240,6 +271,30 @@ void MainRenderer::DrawSidebar(const WindowViewModel& vm, const D2D1_RECT_F& rec
                              slot.rc.bottom - 1.0f,
                              slot.rc.right - slot.rc.left - 16.0f * scale_, 1.0f);
                 }
+                continue;
+            }
+            if (slot.kind == SidebarSlot::RailMore) {
+                // "+N": rows of this section that did not fit on the rail.
+                wchar_t label[16]{};
+                swprintf_s(label, L"+%d", slot.batch);
+                const float cw = 30.0f * scale_;
+                const float ch = 20.0f * scale_;
+                const float cx = (slot.rc.left + slot.rc.right) * 0.5f;
+                const float cy = (slot.rc.top + slot.rc.bottom) * 0.5f;
+                const D2D1_RECT_F chip = D2D1::RectF(cx - cw * 0.5f, cy - ch * 0.5f,
+                                                     cx + cw * 0.5f, cy + ch * 0.5f);
+                MakeBrush(dc, theme.fill_hover, brFillSelected_);
+                FillRoundedRect(dc, brFillSelected_.get(), chip.left, chip.top, cw, ch, ch * 0.5f);
+                IDWriteTextFormat* fmt = compositor_->SmallFormat();
+                const DWRITE_TEXT_ALIGNMENT oldAlign = fmt->GetTextAlignment();
+                const DWRITE_PARAGRAPH_ALIGNMENT oldPara = fmt->GetParagraphAlignment();
+                fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                MakeBrush(dc, theme.text_secondary, brText_);
+                dc->DrawText(label, static_cast<UINT32>(wcslen(label)), fmt, chip, brText_.get(),
+                             D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+                fmt->SetTextAlignment(oldAlign);
+                fmt->SetParagraphAlignment(oldPara);
                 continue;
             }
             if (slot.group < 0 || slot.item < 0) continue;
@@ -252,6 +307,16 @@ void MainRenderer::DrawSidebar(const WindowViewModel& vm, const D2D1_RECT_F& rec
                 FillRoundedRect(dc, brFillSelected_.get(), slot.rc.left, slot.rc.top,
                     slot.rc.right - slot.rc.left, slot.rc.bottom - slot.rc.top,
                     theme.radius_control * scale_);
+            }
+            if (item.is_tag) {
+                // One colored dot per tag, the same color as the wide sidebar's.
+                const float r = 6.0f * scale_;
+                const D2D1_POINT_2F c = D2D1::Point2F((slot.rc.left + slot.rc.right) * 0.5f,
+                                                      (slot.rc.top + slot.rc.bottom) * 0.5f);
+                const D2D1_COLOR_F dot_color = item.tag_dot.a > 0 ? item.tag_dot : theme.accent;
+                MakeBrush(dc, dot_color, brFillHover_);
+                dc->FillEllipse(D2D1::Ellipse(c, r, r), brFillHover_.get());
+                continue;
             }
             const D2D1_COLOR_F iconColor = item.icon_color.a > 0 ? item.icon_color
                                          : item.tag_dot.a > 0 ? item.tag_dot : theme.text;

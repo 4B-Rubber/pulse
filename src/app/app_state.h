@@ -1,14 +1,17 @@
 // app_state.h — Window process state, shot request, and WM_APP message ids.
 #pragma once
+#include "tray_compare_metadata.h"
+#include "../common/path_utils.h"
 
 #include "../ui/ui_compositor.h"
 #include "../ui/notification_toast.h"
 #include "../ui/ui_renderer.h"
 #include "../ui/fluent_menu.h"
 #include "../ui/drag_drop.h"
-#include "../ui/drag_ghost.h"
 #include "../ui/file_operation_dialog.h"
 #include "../ui/quick_preview_window.h"
+#include "list_type_ahead.h"
+#include "preview_selection_follow.h"
 #include "../ui/text_diff_window.h"
 #include "../ui/bloom_accent_picker.h"
 #include "../fs/fs_enum.h"
@@ -16,7 +19,13 @@
 #include "../fs/fs_snapshot.h"
 #include "../fs/fs_watch.h"
 #include "app_model.h"
+#include "window_identity.h"
+#include "window_overview.h"
+#include "window_switcher.h"
+#include "live_network_search.h"
+#include "tray_compare_metadata.h"
 #include "frame_pump.h"
+#include "ui_timer_pacer.h"
 #include <deque>
 #include <atomic>
 #include <memory>
@@ -24,6 +33,7 @@
 #include "content_results_ui.h"
 #include "app_worker.h"
 #include "places.h"
+#include "app_network_locations.h"
 #include "details_meta.h"
 #include "folder_sizes.h"
 #include "context_menu_prefs.h"
@@ -51,6 +61,8 @@
 #include "../index/network_agent_client.h"
 #include "../index/content_search_client.h"
 #include "../ops/ops_manager.h"
+#include "app_core.h"
+#include "app_messages.h"
 #include <windows.h>
 #include <atomic>
 #include <chrono>
@@ -66,42 +78,9 @@
 
 namespace pulse {
 
-constexpr UINT WM_WORKER_RESULT = WM_APP + 1;
-constexpr UINT WM_OPS_NOTIFY = WM_APP + 2;
-constexpr UINT WM_INDEX_NOTIFY = WM_APP + 40;
-constexpr UINT WM_INDEX_SEARCH = WM_APP + 42;
-constexpr UINT WM_NET_PROBE = WM_APP + 41;
-constexpr UINT WM_TAG_ADS_WARNING = WM_APP + 43;
-constexpr UINT WM_TAG_ADS_DISCOVERED = WM_APP + 44;
-// Explorer context-menu integration (优化.md §7). lParam owns a heap payload.
-constexpr UINT WM_SHELLCTX_ITEMS = WM_APP + 45;  // ShellCtxItemsPayload*
-constexpr UINT WM_SHELL_VERBS = WM_APP + 46;     // ShellVerbsResult*
-constexpr UINT WM_DETAILS_META = WM_APP + 47;    // DetailsMetaResult*
-constexpr UINT WM_SETTINGS_TASK_RESULT = WM_APP + 48;
-constexpr UINT WM_SHELL_CACHE_INVALIDATE = WM_APP + 49;
-constexpr UINT WM_NETWORK_INDEX_NOTIFY = WM_APP + 51;
-constexpr UINT WM_NETWORK_INDEX_SEARCH = WM_APP + 52;
-constexpr UINT WM_CONTENT_SEARCH = WM_APP + 53;
-constexpr UINT WM_CONTENT_SELECTION = WM_APP + 64;
-constexpr UINT WM_DUPLICATE_SCAN = WM_APP + 58;
-constexpr UINT WM_QUICK_PREVIEW_NAVIGATE = WM_APP + 54;
-constexpr UINT WM_QUICK_PREVIEW_OPEN = WM_APP + 55;
-constexpr UINT WM_QUICK_PREVIEW_COMMAND = WM_APP + 65;  // wParam ui::QuickPreviewAction, lParam bit0 = Shift
-constexpr UINT WM_SHOW_RELEASE_NOTES = WM_APP + 66;  // "updated" toast clicked
-constexpr UINT WM_UPDATE_RESULT = WM_APP + 56;
-constexpr UINT WM_RECYCLE_INFO = WM_APP + 57;
-constexpr UINT WM_DUP_VOLUMES = WM_APP + 59;
-constexpr UINT WM_UPDATE_DOWNLOADED = WM_APP + 60;
-constexpr UINT WM_UPDATE_INSTALL = WM_APP + 61;
-constexpr UINT WM_SEARCH_HISTORY = WM_APP + 62;
-constexpr UINT WM_CHANGE_TRACKING = WM_APP + 63;
-constexpr UINT WM_FRAME_PUMP = WM_APP + 67;  // app::FramePump: one display frame of motion
-constexpr UINT WM_SHELL_SELECT = WM_APP + 68;  // app::ShellSelectRequest* (shell_window_sync.h)
-constexpr UINT WM_EXPLORER_TAKEOVER = WM_APP + 69;  // app::ExplorerTakeoverRequest* (shell_window_sync.h)
-constexpr UINT WM_NETWORK_LIVE_SEARCH = WM_APP + 71;  // shared_ptr<LiveNetworkSearch>* (#74 live walk progressed)
-constexpr UINT WM_SHELL_VERB_SEED = WM_APP + 70;
-constexpr UINT WM_EXIT_PULSE = WM_APP + 72;  // palette "Exit Pulse" (#57)  // ShellVerbSeed* (machine verb cache read off the UI thread)
 constexpr UINT kTimerUi = 1;
+// Scrolls the list while a marquee is dragged past its edge.
+constexpr UINT_PTR kTimerMarqueeScroll = 0x4D51;
 
 enum class OmnibarMode { Path, Mixed, Command, Project };
 
@@ -155,22 +134,122 @@ struct TrayTextProbe {
     std::atomic<int> state{0}; // 0 running, 1 both text, 2 binary / unreadable
 };
 
-// #74: live walk of an unindexed network search scope. Reused for later pages
-// and re-sorts of the same query; F5 or a finished file operation drops it.
-struct LiveNetworkSearch {
-    std::wstring key;
-    std::wstring folder;
-    std::mutex mutex;
-    index::LiveNetworkMatches matches;  // guarded by mutex
-    std::atomic<bool> cancel{false};
-    std::atomic<uint32_t> latest_id{0};  // newest request answered from this walk
+struct SidebarRefreshLoad;
+// The last window merged into this one (M6c), for the toast's undo: the
+// merged tabs in their old order with their old groups, the active one, and
+// the window's place and layout (`place` has no tab snapshots).
+struct WindowMergeUndo {
+    std::vector<const app::LayoutTab*> tabs;
+    std::vector<int> groups;  // each tab's old group id (0: none)
+    std::vector<app::TabGroup> tab_groups;
+    size_t active = 0;  // index into `tabs`
+    app::ClosedWindow place;
 };
 
-struct AppState {
+struct AppState : AppCoreOwner {
+    // Stand-alone window state with its own AppCore (tests and selftest probes).
+    AppState() : AppCoreOwner(std::make_unique<AppCore>()), core(*owned_core) {}
+    // A window of the running process; `shared` must outlive this state.
+    explicit AppState(AppCore& shared) : core(shared) {}
+    AppState(const AppState&) = delete;
+    AppState& operator=(const AppState&) = delete;
+
+    // Process-wide services and data (app_core.h). The references below are
+    // transitional aliases so existing `s.store` call sites keep compiling;
+    // new code should write `s.core.store`.
+    AppCore& core;
+    using DirNotifyBatch = AppCore::DirNotifyBatch;
+    using CoalescedSizePatch = AppCore::CoalescedSizePatch;
+    using PendingIndexSearch = AppCore::PendingIndexSearch;
+    decltype(AppCore::store)& store = core.store;
+    decltype(AppCore::worker)& worker = core.worker;
+    decltype(AppCore::watches)& watches = core.watches;
+    decltype(AppCore::notify_mu)& notify_mu = core.notify_mu;
+    decltype(AppCore::notify_queue)& notify_queue = core.notify_queue;
+    decltype(AppCore::size_patches)& size_patches = core.size_patches;
+    decltype(AppCore::last_unc_poll)& last_unc_poll = core.last_unc_poll;
+    decltype(AppCore::sidebar)& sidebar = core.sidebar;
+    decltype(AppCore::sidebarRefresh)& sidebarRefresh = core.sidebarRefresh;
+    decltype(AppCore::networkLocations)& networkLocations = core.networkLocations;
+    decltype(AppCore::recycle_info)& recycle_info = core.recycle_info;
+    decltype(AppCore::recycle_refresh_at)& recycle_refresh_at = core.recycle_refresh_at;
+    decltype(AppCore::recycle_refresh_left)& recycle_refresh_left = core.recycle_refresh_left;
+    decltype(AppCore::recycle_ignore_items)& recycle_ignore_items = core.recycle_ignore_items;
+    decltype(AppCore::recycle_info_guard)& recycle_info_guard = core.recycle_info_guard;
+    decltype(AppCore::tray)& tray = core.tray;
+    decltype(AppCore::places)& places = core.places;
+    decltype(AppCore::ctxMenuPrefs)& ctxMenuPrefs = core.ctxMenuPrefs;
+    decltype(AppCore::context_menu)& context_menu = core.context_menu;
+    decltype(AppCore::appPrefs)& appPrefs = core.appPrefs;
+    decltype(AppCore::searchHistory)& searchHistory = core.searchHistory;
+    decltype(AppCore::searchHistoryWriter)& searchHistoryWriter = core.searchHistoryWriter;
+    decltype(AppCore::settings)& settings = core.settings;
+    decltype(AppCore::update_checker)& update_checker = core.update_checker;
+    decltype(AppCore::update_result)& update_result = core.update_result;
+    decltype(AppCore::update_result_ready)& update_result_ready = core.update_result_ready;
+    decltype(AppCore::update_installer)& update_installer = core.update_installer;
+    decltype(AppCore::update_install_error)& update_install_error = core.update_install_error;
+    decltype(AppCore::next_update_progress_paint)& next_update_progress_paint = core.next_update_progress_paint;
+    decltype(AppCore::next_update_check)& next_update_check = core.next_update_check;
+    decltype(AppCore::notified_update_version)& notified_update_version = core.notified_update_version;
+    decltype(AppCore::whatsNewVersion)& whatsNewVersion = core.whatsNewVersion;
+    decltype(AppCore::whatsNewAt)& whatsNewAt = core.whatsNewAt;
+    decltype(AppCore::tray_controller)& tray_controller = core.tray_controller;
+    decltype(AppCore::globalSearchHotkey)& globalSearchHotkey = core.globalSearchHotkey;
+    decltype(AppCore::globalSearchWindow)& globalSearchWindow = core.globalSearchWindow;
+    decltype(AppCore::single_instance)& single_instance = core.single_instance;
+    decltype(AppCore::tagAdsResultRevision)& tagAdsResultRevision = core.tagAdsResultRevision;
+    decltype(AppCore::tagAdsDiscoveryQueued)& tagAdsDiscoveryQueued = core.tagAdsDiscoveryQueued;
+    decltype(AppCore::tagAdsDiscoveryChecked)& tagAdsDiscoveryChecked = core.tagAdsDiscoveryChecked;
+    decltype(AppCore::index)& index = core.index;
+    decltype(AppCore::folderSizes)& folderSizes = core.folderSizes;
+    decltype(AppCore::changes)& changes = core.changes;
+    decltype(AppCore::networkIndex)& networkIndex = core.networkIndex;
+    decltype(AppCore::contentSearch)& contentSearch = core.contentSearch;
+    decltype(AppCore::duplicateSearch)& duplicateSearch = core.duplicateSearch;
+    decltype(AppCore::duplicateScan)& duplicateScan = core.duplicateScan;
+    decltype(AppCore::dup_volume_cache)& dup_volume_cache = core.dup_volume_cache;
+    decltype(AppCore::dup_volume_cache_tick)& dup_volume_cache_tick = core.dup_volume_cache_tick;
+    decltype(AppCore::dup_volume_cache_pending)& dup_volume_cache_pending = core.dup_volume_cache_pending;
+    decltype(AppCore::savedSearches)& savedSearches = core.savedSearches;
+    decltype(AppCore::pendingIndexSearches)& pendingIndexSearches = core.pendingIndexSearches;
+    decltype(AppCore::liveNetworkSearches)& liveNetworkSearches = core.liveNetworkSearches;
+    decltype(AppCore::sessionSavedJson)& sessionSavedJson = core.sessionSavedJson;
+    decltype(AppCore::updateSessionPrepared)& updateSessionPrepared = core.updateSessionPrepared;
+    decltype(AppCore::restoreUpdateSession)& restoreUpdateSession = core.restoreUpdateSession;
+    decltype(AppCore::prefsSavedJson)& prefsSavedJson = core.prefsSavedJson;
+    decltype(AppCore::sessionAutosaveCheck)& sessionAutosaveCheck = core.sessionAutosaveCheck;
+    decltype(AppCore::nextIndexReq)& nextIndexReq = core.nextIndexReq;
+    decltype(AppCore::probe_scheduler)& probe_scheduler = core.probe_scheduler;
+    decltype(AppCore::probeUnc)& probeUnc = core.probeUnc;
+    decltype(AppCore::probeQueue)& probeQueue = core.probeQueue;
+    decltype(AppCore::darkMode)& darkMode = core.darkMode;
+    decltype(AppCore::themeOverride)& themeOverride = core.themeOverride;
+    decltype(AppCore::safeMode)& safeMode = core.safeMode;
+    decltype(AppCore::startupComplete)& startupComplete = core.startupComplete;
+    decltype(AppCore::isolatedTest)& isolatedTest = core.isolatedTest;
+    decltype(AppCore::isolatedTestPersist)& isolatedTestPersist = core.isolatedTestPersist;
+    decltype(AppCore::contentIndexObserver)& contentIndexObserver = core.contentIndexObserver;
+    decltype(AppCore::accentColor)& accentColor = core.accentColor;
+    decltype(AppCore::session_path)& session_path = core.session_path;
+    decltype(AppCore::gitRoots)& gitRoots = core.gitRoots;
+    decltype(AppCore::resultMutex)& resultMutex = core.resultMutex;
+    decltype(AppCore::results)& results = core.results;
+    decltype(AppCore::ops)& ops = core.ops;
+    decltype(AppCore::shell_windows)& shell_windows = core.shell_windows;
+    decltype(AppCore::shell_windows_published)& shell_windows_published = core.shell_windows_published;
+    decltype(AppCore::explorer_takeover)& explorer_takeover = core.explorer_takeover;
+    decltype(AppCore::cutPaths)& cutPaths = core.cutPaths;
+    decltype(AppCore::pendingCutClipboardSequence)& pendingCutClipboardSequence = core.pendingCutClipboardSequence;
+    decltype(AppCore::trayClipboardSequence)& trayClipboardSequence = core.trayClipboardSequence;
+    decltype(AppCore::trayClipboardBatchId)& trayClipboardBatchId = core.trayClipboardBatchId;
+    decltype(AppCore::pendingCutClipboardPaths)& pendingCutClipboardPaths = core.pendingCutClipboardPaths;
+    decltype(AppCore::completedCutClipboardPaths)& completedCutClipboardPaths = core.completedCutClipboardPaths;
+
     HWND hwnd = nullptr;
     ui::Compositor compositor;
     ui::NotificationToast notification_toast;
-    ui::MainRenderer renderer;
+    ui::MainRenderer renderer{core.render_caches};
     // Vsync-paced frames while highlight glides / list shifts run (frame_pump.h).
     app::FramePump framePump;
     ui::QuickPreviewWindow quickPreview;
@@ -178,38 +257,15 @@ struct AppState {
     // it; SyncQuickPreview re-anchors there once the listing drops the entry
     // so the preview steps to the neighbouring file instead of closing.
     int quickPreviewAnchorView = -1;
+    app::PreviewSelectionFollow quickPreviewSelection;
+    app::ListTypeAhead listTypeAhead;
+    const app::Tab* listTypeAheadTab = nullptr;
+    std::wstring listTypeAheadFolder;
 
     app::WindowTabs window_tabs;
     app::Pane* pane = nullptr;          // focused leaf of the current layout tab
-    app::Pane* targetPane = nullptr;    // Ctrl+D marked destination
+    app::Pane* targetPane = nullptr;    // Ctrl+Alt+D marked destination
 
-    fs::SnapshotStore store;
-    app::WorkerPool worker;
-    fs::DirWatchSet watches;
-    struct DirNotifyBatch {
-        std::wstring path;
-        bool overflow = false;
-        std::vector<fs::DirNotifyEvent> events;
-    };
-    std::mutex notify_mu;
-    std::vector<DirNotifyBatch> notify_queue;
-    struct CoalescedSizePatch {
-        std::wstring path;
-        std::wstring name;
-        ULONGLONG due = 0;
-    };
-    std::vector<CoalescedSizePatch> size_patches;
-    ULONGLONG last_unc_poll = 0;
-
-    app::SidebarModel sidebar;
-    fs::RecycleBinInfo recycle_info;
-    // SHQueryRecycleBin and $I files lag IFileOperation; retry occupancy/list
-    // after recycle mutations and ignore occupancy that still matches the
-    // pre-mutation count while an optimistic update is showing.
-    ULONGLONG recycle_refresh_at = 0;
-    int recycle_refresh_left = 0;
-    uint64_t recycle_ignore_items = 0;
-    bool recycle_info_guard = false;
     uint32_t sidebarCollapsedMask = 0;
     ULONGLONG sidebarPeekArmAt = 0;     // rail hover start; 0 = not armed
     uint32_t sidebarHiddenMask = 0;  // Section menu: hidden groups are not drawn.
@@ -220,66 +276,42 @@ struct AppState {
     uint32_t sidebarQuickAccessHiddenMask = 0;
     bool starredExpanded = true;
     float sidebarScroll = 0.0f;
-    app::StagingTray tray;
-    app::PlacesCatalog places;
-    app::ContextMenuPrefs ctxMenuPrefs;
-    // Explorer COM/static menu session, caches, and delayed refresh state.
-    app::ContextMenuController context_menu;
-    app::AppPrefs appPrefs;
-    app::SearchHistory searchHistory;
-    app::SearchHistoryWriter searchHistoryWriter;
-    app::SettingsController settings;
-    app::UpdateChecker update_checker;
-    app::UpdateResult update_result;
-    bool update_result_ready = false;
-    app::UpdateInstaller update_installer;
-    DWORD update_install_error = ERROR_SUCCESS;
-    ULONGLONG next_update_progress_paint = 0;
-    ULONGLONG next_update_check = GetTickCount64() + 15000;
-    std::wstring notified_update_version;
     int settingsReleaseExpanded = 0;   // Settings > About release-note row that is open, -1 none
-    std::wstring whatsNewVersion;      // set once after an upgrade; toast shown at whatsNewAt
-    ULONGLONG whatsNewAt = 0;
     app::TabController tabs;
-    app::TrayController tray_controller;
     bool hidden_to_tray = false;       // the close button hid the window (tray_reveal.h)
-    GlobalSearchHotkey globalSearchHotkey;
-    GlobalSearchWindow globalSearchWindow;
-    app::SingleInstanceCoordinator single_instance;
+    // A window opened by OpenPulseWindow (window_factory.h) starts with one tab
+    // here ("" = This PC) instead of the saved session or launch path.
+    bool has_window_start = false;
+    std::wstring window_start_path;
+    std::optional<app::ClosedWindow> window_restore;  // tabs a reopened window starts with (M4c)
+    AppState* window_adopt_from = nullptr;  // Ctrl+Shift+M: the window whose tab moves in (M5c)
+    size_t window_adopt_index = 0;
+    // M6c; M7e: every window of one "merge all", undone together.
+    std::vector<WindowMergeUndo> window_merge_undo;
+    // Its name and color (M7c, window_identity_ui.h) and the taskbar dot
+    // drawn from them.
+    app::WindowIdentity identity;
+    HICON identity_overlay = nullptr;
+    // The Ctrl+` switcher while this window shows it (M7d, window_switcher_ui.h).
+    app::WindowSwitcherState switcher;
+    // The Ctrl+Shift+O overview while this window shows it (M7e, window_overview_ui.h).
+    app::WindowOverviewState overview;
+    int tabDropIndex = -1;  // a tab dragged from another window would land here (M6b)
+    // A tab dragged over the content area (M6d): where it would go, client px.
+    bool contentDrop = false;
+    bool contentDropAsTab = false;  // a new tab; otherwise one or more panes
+    std::vector<D2D1_RECT_F> contentDropRects;  // where each pane it brings goes (M7h)
+    ui::DragGhostView dragGhost;    // the dragged tab, drawn here while its window hides (M7h)
+    bool first_present_reported = false;  // test instances: first frame timed once (Render, M4f)
+    // This window's kTimerUi period (M4f). One shared pacer handed a period
+    // change to whichever window ticked first, so another could keep the fast
+    // period while idle, or the active window poll at the idle period.
+    app::UiTimerPacer uiTimerPacer;
     ui::BloomAccentPicker bloom_accent;
-    std::unordered_set<std::wstring> tagFallbackVolumes;
-    std::unordered_set<std::wstring> tagAdsDiscoveryQueued;
-    std::unordered_set<std::wstring> tagAdsDiscoveryChecked;
-    const void* tagAdsLastSnapshot = nullptr;
-    std::wstring tagAdsLastViewPath;
-    std::wstring tagAdsLastFilter;
-    int tagAdsLastFirstRow = -1;
-    int tagAdsLastLastRow = -1;
-    index::IndexClient index;
-    app::FolderSizes folderSizes;
-    ChangeTrackingUi changes;
-    index::NetworkAgentClient networkIndex;
-    index::ContentSearchClient contentSearch;
     std::shared_ptr<ContentSelectionAction> contentSelectionAction;
-    index::ContentSearchClient duplicateSearch;
-    app::DuplicateScanSession duplicateScan;
     uint64_t dup_view_epoch = 0;
     std::wstring dup_view_language;
     std::vector<ui::DuplicateGroupView> dup_view_cache;
-    std::vector<index::VolumeInfo> dup_volume_cache;
-    ULONGLONG dup_volume_cache_tick = 0;
-    bool dup_volume_cache_pending = false;
-    app::SavedSearchStore savedSearches;
-    struct PendingIndexSearch {
-        index::Query query;
-        index::SearchResult local;
-        index::SearchResult network;
-        bool local_ready = false;
-        bool network_ready = false;
-        std::wstring live_network_root;  // #74: scope walked live instead of the network index
-    };
-    std::unordered_map<uint32_t, PendingIndexSearch> pendingIndexSearches;
-    std::shared_ptr<LiveNetworkSearch> liveNetworkSearch;
     std::vector<index::Hit> paletteHits;
     size_t paletteTotal = 0;
     std::wstring paletteQuery;
@@ -290,43 +322,9 @@ struct AppState {
     // Live match count for the open advanced-search dialog.
     uint32_t advancedCountId = 0;
     HWND advancedCountHwnd = nullptr;
-    // Session autosave: last written JSON, so unchanged state is never rewritten.
-    std::wstring sessionSavedJson;
-    bool updateSessionPrepared = false;
-    bool restoreUpdateSession = false;
-    std::wstring prefsSavedJson;
-    ULONGLONG sessionAutosaveCheck = 0;
-    uint32_t nextIndexReq = 1;
     bool paletteSearching = false;
-    app::UncProbeScheduler probe_scheduler;
-    std::wstring probeUnc;
-    std::vector<std::wstring> probeQueue;
 
-    bool darkMode = false;
     unsigned settingsExpanded = ui::kSettingsDefaultExpandedMask;
-    ui::ThemeMode themeOverride = ui::ThemeMode::Auto;
-    bool safeMode = false;
-    bool isolatedTest = false;
-    bool isolatedTestPersist = false; // selftest builds: test instance saves into PULSE_TEST_DATA_DIR
-    // This process was started as an extra window (`--new-window`): it skips the
-    // singleton, owns no tray icon and no global hotkey, and leaves the persisted
-    // session to the primary instance.
-    bool secondaryInstance = false;
-    // This window took the last tab of a sibling, which closed because of it:
-    // its own session snapshot must not be written any more, and closing it must
-    // not hide it in the tray (there is nothing left to hide).
-    bool mergedAway = false;
-    // `--entry` / `--focus` from a tear-off: the rows the tab had selected in the
-    // window it left. Handed to the tab this window creates.
-    std::vector<std::wstring> pending_handoff_names;
-    std::wstring pending_handoff_focus;
-    // Taking over the singleton resources (mutex, tray, hotkey, session) from a
-    // sibling that is closing. Retried from the UI tick until it succeeds.
-    bool adoptPending = false;
-    ULONGLONG adoptDeadline = 0;
-    ULONGLONG adoptLastTry = 0;
-    bool contentIndexObserver = false;
-    D2D1_COLOR_F accentColor;
     float scale = 1.0f;
     bool maximized = false;
     bool backdropActive = true;
@@ -388,6 +386,15 @@ struct AppState {
     bool tabDragging = false;
     int tabDragIndex = -1;               // window_tabs.items index of the dragged tab
     POINT tabDragStartPt{};
+    // A press on the header of one of several panes (M6d): dragged far
+    // enough, that pane leaves the split as a window (TryDetachDraggedPane).
+    bool paneDragPending = false;
+    app::Pane* paneDragPane = nullptr;
+    POINT paneDragStartPt{};
+    // Double-click close (pulse::HandleTabDoubleClick): the tab the last press
+    // landed on (strip tab or vertical tab row, never a close button) and when.
+    const void* tabPressTab = nullptr;
+    LONG tabPressTime = 0;
     int tabDragLastX = 0;
     float tabDragPressLeft = 0.0f;       // rest-slot left at press (for grab-offset follow)
     float tabDragFloatLeft = 0.0f;       // dragged tab left (px, cursor-delta driven)
@@ -399,12 +406,6 @@ struct AppState {
     int tabDragRunPos = 0;               // run start within tabOrder (group drags)
     int tabDragRunLen = 1;               // >1: the whole group run moves as a block
     bool tabDragFromChip = false;        // drag started on the group chip
-    bool tabDragExternal = false;        // cursor left the window: candidate for another window
-    int tabDragGrabDx = 0;               // where inside the tab the press landed (px)
-    int tabDragGrabDy = 0;
-    // The card that follows the cursor while the tab is over another window: this
-    // window cannot draw outside its own client area.
-    ui::TabDragGhost tabDragGhost;
     int tabDragGroupId = 0;              // chip drag: app::TabGroup::id
     float tabDragSlots = 1.0f;           // visual width of the drag block in slots
     float tabDragBlockW = 0.0f;          // >0: collapsed chip drag block (chip+gap, px)
@@ -419,6 +420,8 @@ struct AppState {
     // Smooth scroll animation.
     bool scrollAnimating = false;
     float scrollTargetY = 0.0f;
+    float scrollTargetX = 0.0f;
+    bool scrollHorizontal = false;
     std::chrono::steady_clock::time_point scrollLastUpdateTime;
     // Keep wheel input visually attached to the content. A longer response
     // reads as lag when a frame is already close to the 16.7 ms budget.
@@ -427,11 +430,9 @@ struct AppState {
     ShotRequest shot;
     std::wstring open_path;   // folder to open as a new tab after session restore
     Timing timing;
-    std::wstring session_path;
     std::vector<app::LayoutTabSnapshot> session_layout_tabs;
     std::vector<app::GroupSessionSnapshot> session_tab_groups;
     int session_active_layout_tab = 0;
-    std::unordered_map<std::wstring, std::wstring> gitRoots;
 
     // 1B-2 GUI verification: render the context menu to a PNG, no interaction.
     bool menushot = false;
@@ -459,12 +460,10 @@ struct AppState {
     bool shot_tooltip = false;
     // GUI verification for the details panel: open it with a pre-selection.
     bool shot_details = false;
+    int shot_group = 0;   // --shot-group N: group the shot folder (1 name .. 6 location)
     bool shot_details_multi = false;
     float shot_scale_override = 0.0f;
     bool shot_high_contrast = false;
-
-    std::mutex resultMutex;
-    std::queue<app::WorkResult> results;
 
     HWND hwndAddressEdit = nullptr;
     bool addressEditing = false;
@@ -506,8 +505,6 @@ struct AppState {
     std::wstring filterSelectRestore;
     std::wstring filterCue;
 
-    // Stage 1B-1: ops layer (queue + undo), inline rename overlay.
-    ops::OpsManager ops;
     std::wstring pending_undo_json; // loaded from session, imported in WM_CREATE
     uint64_t opsCompleted = 0;
     std::unique_ptr<ui::FileOperationWindow> operationWindow;
@@ -521,6 +518,10 @@ struct AppState {
     std::chrono::steady_clock::time_point operationFinishedAt{};
     HWND hwndRenameEdit = nullptr;
     int renameIndex = -1;
+    // Last key press, click or wheel turn in this window, any of its child
+    // controls included (GetTickCount64; the message loop, NoteUserInput).
+    // External opens avoid interrupting a window in use (M7a, plan §6).
+    uint64_t last_input_tick = 0;
     bool renameIgnoreKillFocus = false;
     bool renameClickCandidate = false;
     app::Pane* renameClickPane = nullptr;
@@ -549,17 +550,6 @@ struct AppState {
     // Name of the hovered sidebar row or section: the collapsed rail shows icons
     // only, so its tooltips read this.
     std::wstring hoverLabel;
-    // Edge-style hover card for a tab-group chip. groupCardGroupId == 0 means
-    // hidden; chipIndex is the index into WindowTabs::tab_groups it belongs to.
-    int groupCardGroupId = 0;
-    int groupCardChipIndex = -1;
-    int groupCardHoverRow = -1;
-    ULONGLONG groupCardSince = 0;
-    // group id -> the member tab that was active the last time the window left
-    // that group, so its chip card can mark "the tab you last used here". The
-    // pointers are identity tokens only: they are compared, never dereferenced
-    // (see RememberGroupActivation / PruneGroupActivations).
-    std::unordered_map<int, const app::LayoutTab*> lastActiveInGroup;
 
     // Drag-over feedback state (rendered via WindowViewModel).
     int dropRow = -1;
@@ -574,13 +564,10 @@ struct AppState {
     bool trayDragOut = false;          // tray contents are being dragged out (not a tray target)
     ULONGLONG trayProbeAt = 0;         // last staging-tray existence probe (UI timer, 2 s)
     bool trayCompare = false;          // two-file compare table replaces the card stack
+    std::unique_ptr<app::TrayCompareMetadata> trayMetadata;
     std::shared_ptr<TrayCompareJob> trayCmpJob; // on-demand byte comparison
     std::shared_ptr<TrayTextProbe> trayTextProbe; // text/binary probe for "view diff"
     std::unique_ptr<ui::TextDiffWindow> textDiff; // stand-alone text compare window
-    // Panes as shell windows for "open file location" (shell_window_sync.h).
-    std::unique_ptr<app::ShellWindowRegistry> shell_windows;
-    std::vector<app::ShellWindowEntry> shell_windows_published;
-    std::unique_ptr<app::ExplorerWindowTakeover> explorer_takeover;   // experimental (B站 #1 2b)
     // One-time teaching bubbles (tips_seen bits in appPrefs).
     int teachTip = -1;                 // visible tip, -1 = none
     int teachCandidate = -1;           // trigger currently holding
@@ -588,11 +575,16 @@ struct AppState {
     ULONGLONG teachShownAt = 0;
     bool teachShownThisSession = false; // at most one tip per launch
     std::wstring dropDestDir;                 // resolved drop destination ("" = none/tray)
+    std::wstring dropLaunchProgram;           // program row that opens the dropped items
 
     // Spring-loaded folder enter during drag-over (ui.md §7.8).
     int springRow = -1;
     ULONGLONG springStart = 0;
     bool springEntered = false;
+    // A file drag resting on another tab of the strip (M6e): after
+    // app::kTabSpringMs that tab opens (tab_spring.h), in any window.
+    int springTab = -1;
+    ULONGLONG springTabStart = 0;
 
     // Drag-out bookkeeping.
     bool dragPending = false;
@@ -782,17 +774,27 @@ struct AppState {
     POINT marqueeStart{};
     POINT marqueeCur{};
     std::unordered_set<int> marqueeBase;
-
-    // Cut state mirrored into list rows (ui.md §5.2 rule 6: 55% opacity).
-    std::vector<std::wstring> cutPaths;
-    DWORD pendingCutClipboardSequence = 0;
-    std::vector<std::wstring> pendingCutClipboardPaths;
-    std::vector<std::wstring> completedCutClipboardPaths;
+    // Tab scroll offset when the marquee started. marqueeStart is in that
+    // moment's pane pixels, so scrolling carries the start with the content.
+    float marqueeOriginScrollX = 0.0f;
+    float marqueeOriginScrollY = 0.0f;
+    // Edge auto-scroll is on. Frames follow the display clock (framePump);
+    // kTimerMarqueeScroll only keeps them coming when the pump is unavailable.
+    bool marqueeAutoScroll = false;
+    std::chrono::steady_clock::time_point marqueeScrollLast{};
+    // Pointer moved since the band was last applied; Render applies it once
+    // per frame instead of once per mouse message.
+    bool marqueeSelectionDirty = false;
 
     // After a "new folder/file" op lands, select it and start renaming.
-    std::wstring pendingRenameName;
 
 };
+
+// Where process-level notifications go (multi-window M2): the hidden host
+// window, or the state's own window when there is no host (tests, probes).
+inline HWND ServiceWindow(const AppState& s) {
+    return s.core.host.Hwnd() ? s.core.host.Hwnd() : s.hwnd;
+}
 
 // WM_SHELL_VERBS heap payload (posted by the registry enumeration thread).
 struct ShellVerbsResult {
@@ -833,9 +835,7 @@ inline AppState* GetAppState(HWND hwnd) {
 }
 
 inline std::wstring ClipboardPath(const std::wstring& p) {
-    if (p.starts_with(L"\\\\?\\UNC\\")) return L"\\\\" + p.substr(8);
-    if (p.starts_with(L"\\\\?\\")) return p.substr(4);
-    return p;
+    return path::StripExtendedPathPrefix(p);
 }
 
 } // namespace pulse

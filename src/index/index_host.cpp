@@ -8,6 +8,8 @@
 //   Pulse.Index.exe --install    UAC once; creates AUTO_START service
 //   Pulse.Index.exe --uninstall  removes the service
 #include "index_protocol.h"
+#include "../ipc/deadline_pipe.h"
+#include "index_directory_security.h"
 #include "index_engine.h"
 #include "search_trace.h"
 #include "index_service_start.h"
@@ -67,6 +69,12 @@ constexpr DWORD kMaxClients = 16;
 struct Client {
     std::atomic<HANDLE> pipe{INVALID_HANDLE_VALUE};
     std::mutex write_mu;
+    std::condition_variable write_cv;
+    struct Frame { MsgHeader header; std::vector<uint8_t> payload; ULONGLONG deadline; };
+    std::deque<Frame> outgoing;
+    size_t outgoing_bytes = 0;
+    bool writing = false;
+    std::thread writer;
     std::atomic<bool> alive{true};
     std::atomic<uint32_t> latest_search{0};
     struct Subscription { uint32_t id = 0; Query query; std::shared_ptr<std::atomic<uint32_t>> latest = std::make_shared<std::atomic<uint32_t>>(0); uint32_t sent_id = 0; uint64_t sent_hash = 0; };
@@ -106,6 +114,7 @@ struct Host {
     Engine engine;
     HWND hwnd = nullptr;
     HANDLE stop = nullptr;
+    std::mutex stop_mu;
     HANDLE mutex = nullptr;
     std::atomic<bool> running{true};
     bool as_service = false;
@@ -192,45 +201,66 @@ SECURITY_ATTRIBUTES* PipeSa() {
     return sd ? &sa : nullptr;
 }
 
-bool ClientIo(Client& client, HANDLE pipe, uint8_t* bytes, DWORD size, bool write) {
-    while (size) {
-        if (!g.running || !client.alive || (g.stop && WaitForSingleObject(g.stop, 0) == WAIT_OBJECT_0)) return false;
-        OVERLAPPED operation{};
-        operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!operation.hEvent) return false;
-        DWORD transferred = 0;
-        BOOL ok = write ? WriteFile(pipe, bytes, size, &transferred, &operation)
-                        : ReadFile(pipe, bytes, size, &transferred, &operation);
-        if (!ok && GetLastError() == ERROR_IO_PENDING) {
-            HANDLE waits[] = {operation.hEvent, g.stop};
-            DWORD wait = WAIT_TIMEOUT;
-            while (wait == WAIT_TIMEOUT && g.running && client.alive)
-                wait = WaitForMultipleObjects(g.stop ? 2u : 1u, waits, FALSE, 1000);
-            if (wait != WAIT_OBJECT_0) {
-                CancelIoEx(pipe, &operation);
-                GetOverlappedResult(pipe, &operation, &transferred, TRUE);
-                CloseHandle(operation.hEvent);
-                return false;
-            }
-            ok = GetOverlappedResult(pipe, &operation, &transferred, FALSE);
+bool ClientIo(Client& client, HANDLE pipe, uint8_t* bytes, DWORD size, bool write, ULONGLONG deadline = 0) {
+    return pulse::ipc::DeadlinePipeIo(pipe, bytes, size, write, deadline, [&] {
+        return !g.running || !client.alive || (g.stop && WaitForSingleObject(g.stop, 0) == WAIT_OBJECT_0);
+    });
+}
+
+void StopClientLocked(Client& c) {
+    c.alive = false;
+    ++c.latest_search;
+    c.outgoing.clear();
+    c.outgoing_bytes = 0;
+    const HANDLE pipe = c.pipe.load();
+    if (pipe != INVALID_HANDLE_VALUE) CancelIoEx(pipe, nullptr);
+    c.write_cv.notify_all();
+}
+
+void ClientWriter(const std::shared_ptr<Client>& c) {
+    for (;;) {
+        Client::Frame frame;
+        {
+            std::unique_lock lock(c->write_mu);
+            c->write_cv.wait(lock, [&] { return !c->alive || !g.running || !c->outgoing.empty(); });
+            if (!c->alive || !g.running) return;
+            frame = std::move(c->outgoing.front());
+            c->outgoing.pop_front();
+            c->writing = true;
         }
-        CloseHandle(operation.hEvent);
-        if (!ok || !transferred) return false;
-        bytes += transferred; size -= transferred;
+        const HANDLE pipe = c->pipe.load();
+        if (!ClientIo(*c, pipe, reinterpret_cast<uint8_t*>(&frame.header), sizeof(frame.header), true, frame.deadline) ||
+            (!frame.payload.empty() && !ClientIo(*c, pipe, frame.payload.data(),
+                static_cast<DWORD>(frame.payload.size()), true, frame.deadline))) {
+            std::lock_guard lock(c->write_mu);
+            StopClientLocked(*c);
+            return;
+        }
+        {
+            std::lock_guard lock(c->write_mu);
+            if (!c->alive) return;
+            c->outgoing_bytes -= sizeof(MsgHeader) + frame.payload.size();
+            c->writing = false;
+        }
     }
-    return true;
 }
 
 bool WriteFrame(Client& c, uint32_t type, uint32_t id, const std::vector<uint8_t>& payload) {
-    std::lock_guard<std::mutex> lock(c.write_mu);
-    const HANDLE pipe = c.pipe.load();
-    if (pipe == INVALID_HANDLE_VALUE || !g.running || !c.alive) return false;
-    auto hdr = MakeIndexHdr(type, id, static_cast<uint32_t>(payload.size()));
-    if (!ClientIo(c, pipe, reinterpret_cast<uint8_t*>(&hdr), sizeof(hdr), true))
+    // Bound queued and in-flight memory and total time, including queue wait.
+    constexpr size_t kQueueBytes = kIndexMaxPayload + sizeof(MsgHeader);
+    constexpr size_t kQueueFrames = 64;
+    constexpr ULONGLONG kWriteDeadlineMs = 3000;
+    std::lock_guard lock(c.write_mu);
+    if (!g.running || !c.alive) return false;
+    const size_t size = sizeof(MsgHeader) + payload.size();
+    if (size > kQueueBytes || c.outgoing.size() + (c.writing ? 1u : 0u) >= kQueueFrames || c.outgoing_bytes > kQueueBytes - size) {
+        StopClientLocked(c);
         return false;
-    if (!payload.empty() &&
-        !ClientIo(c, pipe, const_cast<uint8_t*>(payload.data()), static_cast<DWORD>(payload.size()), true))
-        return false;
+    }
+    c.outgoing.push_back({MakeIndexHdr(type, id, static_cast<uint32_t>(payload.size())),
+        payload, GetTickCount64() + kWriteDeadlineMs});
+    c.outgoing_bytes += size;
+    c.write_cv.notify_one();
     return true;
 }
 
@@ -307,6 +337,14 @@ std::vector<uint8_t> VolumesPayload() {
         // Sent after the volume rows so newer clients receive the exclusion list.
         w.PutU32(static_cast<uint32_t>(config.excluded_paths.size()));
         for (const auto& path : config.excluded_paths) w.PutString(path);
+        // Appended for clients that show the system folder switch; older
+        // clients stop reading after the user list.
+        w.PutU32(config.exclude_system ? 1u : 0u);
+        w.PutU32(static_cast<uint32_t>(config.system_groups.size()));
+        for (const auto& group : config.system_groups) w.PutString(group);
+        const auto system_paths = SystemExclusionPaths(config);
+        w.PutU32(static_cast<uint32_t>(system_paths.size()));
+        for (const auto& path : system_paths) w.PutString(path);
     } else {
         w.PutU32(0);
     }
@@ -507,19 +545,20 @@ void SetTrackingLease(Client& c, const std::wstring& owner, bool enabled) {
 void DropClient(const std::shared_ptr<Client>& c) {
     if (!c) return;
     if (!c->tracking_owner.empty()) SetTrackingLease(*c, c->tracking_owner, false);
-    c->alive = false;
-    ++c->latest_search;
-    // A writer holds write_mu while awaiting overlapped IO. Cancel it before
-    // acquiring that mutex so a disconnected reader cannot strand the host.
-    const HANDLE active_pipe = c->pipe.load();
-    if (active_pipe != INVALID_HANDLE_VALUE) CancelIoEx(active_pipe, nullptr);
     {
-        std::lock_guard<std::mutex> lock(c->write_mu);
+        std::lock_guard lock(c->write_mu);
+        StopClientLocked(*c);
+    }
+    {
+        std::lock_guard lock(c->subscriptions_mu);
+        for (auto& [session, subscription] : c->subscriptions) ++*subscription.latest;
+        c->subscriptions.clear();
+    }
+    if (c->writer.joinable()) c->writer.join();
+    {
+        std::lock_guard lock(c->write_mu);
         const HANDLE pipe = c->pipe.exchange(INVALID_HANDLE_VALUE);
-        if (pipe != INVALID_HANDLE_VALUE) {
-            CancelIoEx(pipe, nullptr);
-            CloseHandle(pipe);
-        }
+        if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
     }
     std::lock_guard<std::mutex> lock(g.clients_mu);
     g.clients.erase(std::remove(g.clients.begin(), g.clients.end(), c), g.clients.end());
@@ -774,6 +813,7 @@ void AcceptLoop() {
             c->pipe = INVALID_HANDLE_VALUE;
             continue;
         }
+        c->writer = std::thread(ClientWriter, c);
         g.client_workers.push_back(ClientWorker{c, std::thread(ClientThread, c)});
         WriteFrame(*c, RSP_IDX_STATUS, 0, StatusPayload());
     }
@@ -847,6 +887,7 @@ int RunHost(bool as_service, bool test_mode = false,
     g.mutex_name = std::move(mutex_name);
     ServiceTrace(L"RunHost entered");
     SetMachineIndexScope(as_service);
+    PrivateIndexDirectoryLock index_directory_lock;
     if (as_service) {
         (void)MachineDataRoot();
         IndexConfig config;
@@ -865,8 +906,17 @@ int RunHost(bool as_service, bool test_mode = false,
         if (CompareStringOrdinal(config.index_path.c_str(), -1, (MachineDataRoot() + L"\\Index").c_str(), -1,
                                  TRUE) == CSTR_EQUAL)
             (void)MachineIndexRoot();
-        else
-            (void)ProtectIndexDirectory(config.index_path);
+        const bool pinned = index_directory_lock.Acquire(std::filesystem::path(config.index_path));
+        bool private_directory = pinned && ProtectIndexDirectory(config.index_path);
+        if (pinned && !private_directory && AdoptIndexDirectory(std::filesystem::path(config.index_path))) {
+            ServiceTrace(L"Index directory left readable by an older release was made private");
+            private_directory = ProtectIndexDirectory(config.index_path);
+        }
+        if (!private_directory) {
+            ServiceTrace(L"Index directory is not private; refusing to expose service metadata");
+            SetSvc(SERVICE_STOPPED, kIndexDirectoryNotPrivate);
+            return static_cast<int>(kIndexDirectoryNotPrivate);
+        }
         SetActiveIndexDirectory(config.index_path);
         const std::wstring probe = config.index_path + L"\\.pulse-write-check-" +
             std::to_wstring(GetCurrentProcessId());
@@ -922,9 +972,14 @@ int RunHost(bool as_service, bool test_mode = false,
     ServiceTrace(L"accept thread started");
 
     MSG msg{};
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    while (g.running) {
+        const DWORD wait = MsgWaitForMultipleObjects(1, &g.stop, FALSE, INFINITE, QS_ALLINPUT);
+        if (wait != WAIT_OBJECT_0 + 1) break;
+        while (g.running && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { g.running = false; break; }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
     ServiceTrace(L"message loop exited");
     TraceSearch("filename_shutdown_message_loop_done");
@@ -936,10 +991,8 @@ int RunHost(bool as_service, bool test_mode = false,
         std::lock_guard<std::mutex> lock(g.clients_mu);
         for (auto& c : g.clients) {
             if (!c) continue;
-            c->alive = false;
-            ++c->latest_search;
-            const HANDLE pipe = c->pipe.load();
-            if (pipe != INVALID_HANDLE_VALUE) CancelIoEx(pipe, nullptr);
+            std::lock_guard write_lock(c->write_mu);
+            StopClientLocked(*c);
         }
     }
     g.search_cv.notify_all();
@@ -959,8 +1012,9 @@ int RunHost(bool as_service, bool test_mode = false,
         CloseHandle(g.mutex);
         g.mutex = nullptr;
     }
-    if (g.stop) {
-        CloseHandle(g.stop);
+    {
+        std::lock_guard lock(g.stop_mu);
+        if (g.stop) CloseHandle(g.stop);
         g.stop = nullptr;
     }
     if (as_service) SetSvc(SERVICE_STOPPED);
@@ -974,7 +1028,12 @@ DWORD WINAPI SvcCtrl(DWORD ctrl, DWORD, LPVOID, LPVOID) {
     }
     if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN) {
         SetSvc(SERVICE_STOP_PENDING);
-        if (g.hwnd) PostMessageW(g.hwnd, WM_QUIT_HOST, 0, 0);
+        g.running = false;
+        {
+            std::lock_guard lock(g.stop_mu);
+            if (g.stop) SetEvent(g.stop);
+        }
+        g.search_cv.notify_all();
     }
     return NO_ERROR;
 }
@@ -989,6 +1048,35 @@ std::wstring SelfPath() {
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
     return path;
+}
+
+// A host that dies (crash, hang ended by setup) or quits with an error must
+// not leave search waiting until someone reinstalls the service:
+//  - SCM restarts it. The first delay is long on purpose: setup ends a host
+//    that does not stop and then replaces the files; an early restart would
+//    run the old binary, and --install would find it running and keep it.
+//  - Interactive users may start it, so Pulse can bring back a stopped host
+//    (IndexClient). Everything else matches the default service DACL.
+void ConfigureServiceRecovery(SC_HANDLE svc) {
+    SC_ACTION actions[3] = {{SC_ACTION_RESTART, 60000}, {SC_ACTION_RESTART, 120000}, {SC_ACTION_RESTART, 300000}};
+    SERVICE_FAILURE_ACTIONSW failure{};
+    failure.dwResetPeriod = 24 * 60 * 60;
+    failure.cActions = ARRAYSIZE(actions);
+    failure.lpsaActions = actions;
+    if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure))
+        ServiceTrace(L"failure actions not set");
+    SERVICE_FAILURE_ACTIONS_FLAG flag{TRUE};
+    if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &flag))
+        ServiceTrace(L"failure actions flag not set");
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)"
+            L"(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)",
+            SDDL_REVISION_1, &sd, nullptr)) {
+        if (!SetServiceObjectSecurity(svc, DACL_SECURITY_INFORMATION, sd))
+            ServiceTrace(L"service DACL not set");
+        LocalFree(sd);
+    }
 }
 
 int InstallService() {
@@ -1009,7 +1097,7 @@ int InstallService() {
 
         SC_HANDLE svc = OpenServiceW(scm, kServiceName,
                                      SERVICE_START | SERVICE_QUERY_STATUS |
-                                         SERVICE_CHANGE_CONFIG);
+                                         SERVICE_CHANGE_CONFIG | READ_CONTROL | WRITE_DAC);
         if (!svc && GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
             svc = CreateServiceW(scm, kServiceName, L"Pulse Index",
                                  SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
@@ -1033,6 +1121,7 @@ int InstallService() {
             wchar_t text[] = L"Pulse file-name index (MFT + USN). UI talks to this over a named pipe.";
             desc.lpDescription = text;
             ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
+            ConfigureServiceRecovery(svc);
             last_err = EnsureServiceRunning(
                 [&](SERVICE_STATUS_PROCESS& status) -> DWORD {
                     DWORD needed = 0;
@@ -1109,6 +1198,11 @@ int ConfigureCommand(const std::vector<std::wstring>& args) {
         const bool disabled = args.size() >= 4 && args[3] == L"--disable";
         if (!enabled && !disabled) return ERROR_INVALID_PARAMETER;
         ok = ConfigureExcludePath(args[2], enabled, &error);
+    } else if (args.size() >= 3 && args[1] == L"--configure-system-exclusion") {
+        const bool enabled = args.size() >= 4 && args[3] == L"--enable";
+        const bool disabled = args.size() >= 4 && args[3] == L"--disable";
+        if (!enabled && !disabled) return ERROR_INVALID_PARAMETER;
+        ok = ConfigureSystemExclusion(args[2], enabled, &error);
     } else if (args.size() >= 2 && args[1] == L"--rebuild-index") {
         ok = true;
     }
@@ -1118,12 +1212,14 @@ int ConfigureCommand(const std::vector<std::wstring>& args) {
 }
 
 int ExportDiagnosticsCommand(const std::vector<std::wstring>& args) {
-    if (args.size() != 3) return ERROR_INVALID_PARAMETER;
+    if (args.size() != 3 && !(args.size() == 4 && args[3] == L"--include-dumps")) return ERROR_INVALID_PARAMETER;
     if (!IsElevated()) return ERROR_ELEVATION_REQUIRED;
     pulse::diagnostics::ExportOptions options;
     options.source_root = MachineDataRoot();
     options.destination = args[2];
-    options.include_dumps = true;
+    options.include_dumps = args.size() == 4;
+    options.support_report = true;
+    options.configuration_file = MachineConfigPath();
     options.require_empty_destination = true;
     std::wstring error;
     return pulse::diagnostics::Export(options, &error) ? 0 : ERROR_WRITE_FAULT;
@@ -1188,7 +1284,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (a1 == L"--uninstall") return UninstallService();
     if (a1 == L"--export-diagnostics") return ExportDiagnosticsCommand(args);
     if (a1 == L"--configure-volume" || a1 == L"--set-index-path" ||
-        a1 == L"--configure-exclude" ||
+        a1 == L"--configure-exclude" || a1 == L"--configure-system-exclusion" ||
         a1 == L"--rebuild-index") return ConfigureCommand(args);
     if (a1 == L"--service") {
         SERVICE_TABLE_ENTRYW table[] = {
@@ -1199,6 +1295,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 0;
     }
     if (a1 == L"--network-agent") return RunNetworkAgent();
+    if (a1 == L"--test-network-agent" && args.size() == 3) return RunNetworkAgentTest(args[2]);
     if (a1 == L"--content-instant-agent" && args.size() == 4) return RunPersistentContentAgent(args[2], wcstoul(args[3].c_str(), nullptr, 10), ContentAgentMode::Instant);
     if (a1 == L"--content-index-agent" && args.size() == 4) return RunPersistentContentAgent(args[2], wcstoul(args[3].c_str(), nullptr, 10));
     if (a1 == L"--content-index-observer" && args.size() == 4) return RunPersistentContentAgent(args[2], wcstoul(args[3].c_str(), nullptr, 10), true);

@@ -1,4 +1,4 @@
-param([string]$BuildDir = 'build_realtime')
+param([string]$BuildDir = 'build_realtime', [switch]$SelectionIdentity)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path $PSScriptRoot -Parent
 Push-Location $taskRoot
@@ -20,7 +20,11 @@ try {
     try {
         & link.exe /nologo '@global_search_window_fixture_link.rsp'
         if ($LASTEXITCODE) { throw 'Window fixture linking failed.' }
-        & '.\pulse_global_search_window_fixture.exe' (Join-Path $taskRoot 'bench_data/global-search-window')
+        if ($SelectionIdentity) {
+            & '.\pulse_global_search_window_fixture.exe' '--selection-identity'
+        } else {
+            & '.\pulse_global_search_window_fixture.exe' (Join-Path $taskRoot 'bench_data/global-search-window')
+        }
         if ($LASTEXITCODE) { throw 'Window fixture failed.' }
     } finally { Pop-Location }
 } finally { Pop-Location }

@@ -9,16 +9,6 @@
 
 namespace pulse {
 
-std::wstring GlobalSearchHandoffPath(const GlobalSearchHandoff& request) {
-    if (request.query.empty()) return {};
-    app::AdvancedSearchSpec spec;
-    if (request.content) spec.content = request.query;
-    else spec.name = request.query;
-    spec.current_folder = request.folder;
-    spec.location = request.folder.empty() ? app::LocationScope::Indexed : app::LocationScope::CurrentFolder;
-    return app::MakeSearchPath(app::CompileSearchQuery(spec));
-}
-
 void ContinueGlobalSearchInMain(AppState& s, const GlobalSearchHandoff& request) {
     // Taken here so the tray hook below does not start over a second time.
     const bool fresh = TakeFreshStart(s);
@@ -34,7 +24,7 @@ void ContinueGlobalSearchInMain(AppState& s, const GlobalSearchHandoff& request)
     } else if (fresh) {
         StartFreshAt(s, app::DefaultLocation(s.appPrefs));
     }
-    s.tray_controller.RestoreWindow();
+    RevealWindow(s);
     if (path.empty()) ShowAddressSearch(s);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }

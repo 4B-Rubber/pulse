@@ -37,6 +37,15 @@
 namespace pulse::index {
 
 inline constexpr size_t kSearchPageCap = 100000;
+// Consecutive base-merge failures back off 5 s, 10 s, 20 s ... capped at ten
+// minutes, so a deterministic failure cannot rewrite the full base every 5 s.
+constexpr ULONGLONG MergeRetryDelayMs(uint32_t consecutive_failures) noexcept {
+    constexpr ULONGLONG base = 5000, cap = 10ull * 60ull * 1000ull;
+    if (consecutive_failures == 0) return 0;
+    const uint32_t shift = consecutive_failures - 1 < 7 ? consecutive_failures - 1 : 7;
+    const ULONGLONG delay = base << shift;
+    return delay < cap ? delay : cap;
+}
 inline constexpr size_t kSearchUiPageSize = 2048;
 
 struct Hit {
@@ -175,7 +184,16 @@ private:
     ULONGLONG folder_size_retry_after_ = 0;
     bool folder_size_usn_update_ = false;
     std::atomic<bool> folder_size_gap_{false};
+    // Totals are aggregated under a shared lock so searches keep running; edits
+    // published in between are detected by this counter (guarded by mutex_).
+    uint64_t folder_size_mutations_ = 0;
+    std::mutex folder_size_build_mutex_;
+    // A running service aggregates on its worker and answers clients at once.
+    bool folder_size_background_ = false;
+    std::atomic<bool> folder_size_wanted_{false};
     FolderSizeIndex::Item FolderSizeItem(int32_t id) const;
+    bool FolderSizeIdsLocked(const std::vector<std::wstring>& paths, std::vector<int32_t>& ids) const;
+    bool BuildFolderTotals();
     ChangeTracker changes_;
     std::mutex change_seed_mutex_;
     std::unordered_set<std::wstring> change_seed_owners_;
@@ -193,6 +211,9 @@ private:
         int32_t index = -1;
         bool is_dir = false;
         uint8_t name_type = 0xFF;
+        // An additional hard link name of `frn` (see MftFile::links). The
+        // build keeps one node per link; only the primary resolves parents.
+        bool extra_link = false;
     };
     static constexpr uint8_t kFlagDir = 1;
     static constexpr uint8_t kFlagHidden = 2;
@@ -379,6 +400,8 @@ private:
     int32_t SubtreeEndLocked(int32_t node) const;
     bool VolumeSpan(const VolState& v, int32_t& lo, int32_t& hi) const;
     int32_t FindByFrnLocked(const VolState& v, uint64_t frn) const;
+    // Every live (non-tombstoned) node mapped to `frn`: one per hard link.
+    void CollectFrnLocked(const VolState& v, uint64_t frn, std::vector<int32_t>& out) const;
     static void MapFrnLocked(VolState& v, uint64_t frn, int32_t idx);
 
     int32_t AddNodeLocked(Store& s, int32_t parent, std::wstring_view name, uint8_t flags,
@@ -396,6 +419,7 @@ private:
     void UpdateVolumeVisibilityLocked(const std::vector<VolumeInfo>& active, bool only_hide = false);
     void InvalidateFilterLocked() {
         ++filter_epoch_;
+        ++folder_size_mutations_;
         if (!folder_size_usn_update_) {
             folder_sizes_.Reset();
             folder_size_retry_after_ = 0;
@@ -403,7 +427,11 @@ private:
     }
     void SetStatus(std::wstring s);
     bool IsExcludedPath(std::wstring_view path) const;
-    static bool ShouldSkipName(std::wstring_view name);
+    void PublishExcludedPaths(const IndexConfig& config,
+                              const std::function<void()>& locked_action = {});
+    bool ShouldSkipName(std::wstring_view name) const;
+    // ShouldSkipName plus the NTFS metadata files directly below a volume root.
+    bool ShouldSkipChild(bool parent_is_root, std::wstring_view name) const;
     void RefreshSubtreeVisibilityLocked(int32_t root, DeltaLog* delta);
     void PingNotify(bool force = false);
 
@@ -452,8 +480,10 @@ private:
     wchar_t index_dir_letter_ = 0;
     std::atomic<bool> merging_{false};
     size_t struct_changes_ = 0;
+    bool subtree_intervals_valid_ = true;
     ULONGLONG last_merge_tick_ = 0;
     ULONGLONG merge_retry_after_tick_ = 0;
+    uint32_t merge_failures_ = 0;
     ULONGLONG last_struct_tick_ = 0;
     ULONGLONG last_delta_flush_tick_ = 0;
     std::unordered_map<std::wstring, ULONGLONG> volume_retry_after_;
@@ -470,6 +500,8 @@ private:
     std::vector<WalkWatch> watches_;
     std::vector<std::wstring> walk_roots_;
     std::vector<std::wstring> excluded_paths_;
+    // System group "node_modules": dependency folders stay out of search.
+    bool hide_node_modules_ = true;
 
     // Auxiliary IDs are tied to one immutable filename snapshot, never persisted
     // in the filename format. Mutable names always use the current overlay.

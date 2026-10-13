@@ -8,12 +8,11 @@ namespace {
 
 constexpr DWORD kRecallOnOpen = 0x00040000; // FILE_ATTRIBUTE_RECALL_ON_OPEN
 constexpr DWORD kRecallOnData = 0x00400000; // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
-constexpr DWORD kPinned = 0x00080000; // FILE_ATTRIBUTE_PINNED
 
 } // namespace
 
 bool IsOfflinePlaceholder(DWORD attrs) {
-    return (attrs & (kRecallOnOpen | kRecallOnData)) && !(attrs & kPinned);
+    return (attrs & (FILE_ATTRIBUTE_OFFLINE | kRecallOnOpen | kRecallOnData)) != 0;
 }
 
 std::wstring ExtensionOf(const std::wstring& path) {

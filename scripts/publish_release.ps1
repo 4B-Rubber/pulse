@@ -73,5 +73,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the release draft' }
 & gh release upload $tag --repo $repository "dist/$normal" "dist/$win81" "dist/$portable" `
     dist/update-manifest.json dist/update-manifest-win81.json --clobber
 if ($LASTEXITCODE -ne 0) { throw 'Could not upload release assets; release remains a draft' }
+$packArgs = @('--tag', $tag, '--repository', $repository, '--asset-directory', 'dist/preview-packs')
+if ($env:PULSE_PREVIEW_PACK_SOURCE_TAG) { $packArgs += @('--source-tag', $env:PULSE_PREVIEW_PACK_SOURCE_TAG) }
+& python "$PSScriptRoot/ensure_release_packs.py" @packArgs
+if ($LASTEXITCODE -ne 0) { throw 'Preview pack verification failed; release remains a draft' }
 & gh release edit $tag --repo $repository --draft=false --latest
 if ($LASTEXITCODE -ne 0) { throw 'Could not publish the release' }

@@ -1,17 +1,17 @@
 #requires -Version 7.2
-param([string]$BuildDir = 'build')
+param([string]$BuildDir = 'build', [string]$OutputDir = '')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $build = (Resolve-Path -LiteralPath $BuildDir).Path
 $version = (Get-Content (Join-Path $repo 'version.txt') -Raw).Trim()
 if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid version' }
 & "$PSScriptRoot/check_release_payload.ps1" -BuildDir $build
-$files = @('pulse.exe', 'Pulse.Index.exe', 'Pulse.Document.exe', 'Pulse.Preview.exe',
-    'pulse_shell.exe', 'pulse_integration.exe', 'lumatext.dll', 'pdfium.dll')
+. "$PSScriptRoot/release_payload.ps1"
+$files = $PulseReleasePayload
 foreach ($file in $files) {
     if (-not (Test-Path -LiteralPath (Join-Path $build $file))) { throw "Missing portable dependency: $file" }
 }
-$dist = Join-Path $repo 'dist'
+$dist = if ($OutputDir) { [IO.Path]::GetFullPath($OutputDir) } else { Join-Path $repo 'dist' }
 $stage = Join-Path $dist ("portable-stage-" + [guid]::NewGuid().ToString('N'))
 $payload = Join-Path $stage "Pulse-$version-portable"
 New-Item -ItemType Directory -Path $payload -Force | Out-Null
@@ -41,4 +41,13 @@ In-app updates launch an installer; download a new portable ZIP to continue usin
 "@ | Set-Content -LiteralPath (Join-Path $payload 'README.txt') -Encoding utf8
 $archive = Join-Path $dist "Pulse-$version-portable-win-x64.zip"
 Compress-Archive -LiteralPath $payload -DestinationPath $archive -Force
+$zip = [IO.Compression.ZipFile]::OpenRead($archive)
+try {
+    foreach ($file in $files) {
+        $entry = $zip.GetEntry("Pulse-$version-portable/$file")
+        if (-not $entry -or $entry.Length -ne (Get-Item -LiteralPath (Join-Path $build $file)).Length) {
+            throw "Final portable archive is missing or truncates: $file"
+        }
+    }
+} finally { $zip.Dispose() }
 Write-Output $archive

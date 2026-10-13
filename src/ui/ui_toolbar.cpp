@@ -16,8 +16,11 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
             const auto r=layout.navigation[i];
             if (r.right<=r.left) continue;
             const bool enabled=i==0 ? vm.can_go_back : i==1 ? vm.can_go_forward : true;
-            DrawButton(r,theme,enabled && IsHovered(vm,nav_hits[i]) ? theme.fill_hover : kTransparent,
-                nav_glyphs[i],L"",enabled ? theme.text_secondary : theme.text_disabled,true,true);
+            fluent::ButtonSpec button;
+            button.bounds = r; button.glyph = nav_glyphs[i];
+            button.state.enabled = enabled;
+            button.state.hovered = enabled && IsHovered(vm, nav_hits[i]);
+            painter_.DrawCommandButton(button);
         }
         // Breadcrumb address bar: segments clickable, empty area -> edit mode.
         D2D1_RECT_F addrRc = AddressBarRect(rect.right);
@@ -78,6 +81,8 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
     DrawAddressSearchChrome(vm, rect.right, theme);
     MakeBrush(dc,theme.stroke_divider,brStrokeDivider_);
     FillRect(dc,brStrokeDivider_.get(),left+margin_,title_bar_height_+44*scale_,rect.right-left-2*margin_,scale_);
+    // Embedded hosts (the file picker) keep the address row only.
+    if (embedded_) return;
     const std::wstring label=l10n::Get(l10n::StringId::New);
     fluent::ButtonSpec create;
     create.bounds=layout.create; create.text=compact ? std::wstring_view{} : std::wstring_view{label};
@@ -185,13 +190,7 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
                 painter_.FillRoundedRect(x,(x.bottom-x.top)*0.5f,xf);
             }
             DrawIconText(x.left,x.top,x.right-x.left,x.bottom-x.top,kIconCloseSmall,L"x",theme.accent,0.5f);
-            constexpr l10n::StringId names[]={l10n::StringId::GroupByName,l10n::StringId::GroupByDate,
-                l10n::StringId::GroupByType,l10n::StringId::GroupBySize,l10n::StringId::GroupByTag,
-                l10n::StringId::Location};
-            std::wstring group_label=l10n::Get(l10n::StringId::ToolbarGroupActive);
-            const size_t at=group_label.find(L"{g}");
-            if (at!=std::wstring::npos)
-                group_label.replace(at,3,l10n::Get(names[std::clamp(toolbar_group_,1,6)-1]));
+            std::wstring group_label=ToolbarGroupLabel();
             const D2D1_RECT_F text_rc=D2D1::RectF(g.left+30*scale_,g.top,x.left-2*scale_,g.bottom);
             if (IDWriteFactory2* f=compositor_->DwriteFactory()) {
                 group_label=FitEndEllipsis(group_label,std::max(0.0f,text_rc.right-text_rc.left),
@@ -200,5 +199,14 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
             painter_.DrawText(group_label,text_rc,compositor_->TextFormat(),theme.accent);
         }
     }
+}
+std::wstring MainRenderer::ToolbarGroupLabel() const {
+    constexpr l10n::StringId names[]={l10n::StringId::GroupByName,l10n::StringId::GroupByDate,
+        l10n::StringId::GroupByType,l10n::StringId::GroupBySize,l10n::StringId::GroupByTag,
+        l10n::StringId::Location};
+    std::wstring label=l10n::Get(l10n::StringId::ToolbarGroupActive);
+    const size_t at=label.find(L"{g}");
+    if (at!=std::wstring::npos) label.replace(at,3,l10n::Get(names[std::clamp(toolbar_group_,1,6)-1]));
+    return label;
 }
 }

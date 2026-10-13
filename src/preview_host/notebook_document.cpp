@@ -190,12 +190,17 @@ std::wstring StripAnsi(const std::wstring& s) {
     return out;
 }
 
-std::wstring ClipOutput(std::wstring s) {
+std::wstring ClipOutput(std::wstring s, bool& clipped) {
     while (!s.empty() && (s.back() == L'\n' || s.back() == L'\r')) s.pop_back();
     size_t lines = 0;
     for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == L'\n' && ++lines >= kMaxOutputLines) { s.erase(i); s += L"\n\x2026"; return s; }
-        if (i >= kMaxOutputChars) { s.erase(i); s += L"\x2026"; return s; }
+        if (s[i] == L'\n' && ++lines >= kMaxOutputLines) { clipped = true; s.erase(i); s += L"\n\x2026"; return s; }
+        if (i >= kMaxOutputChars) {
+            clipped = true;
+            if (i && s[i - 1] >= 0xD800 && s[i - 1] <= 0xDBFF &&
+                s[i] >= 0xDC00 && s[i] <= 0xDFFF) --i;
+            s.erase(i); s += L"\x2026"; return s;
+        }
     }
     return s;
 }
@@ -214,6 +219,7 @@ public:
         : out_(payload), limit_(limit), language_(std::move(language)) {}
 
     bool full() const noexcept { return full_; }
+    bool clipped() const noexcept { return clipped_; }
 
     void Markdown(const std::wstring& text) {
         if (full_ || text.empty()) return;
@@ -224,7 +230,7 @@ public:
     }
     void Raw(const std::wstring& text) { Block(L'c', L"", L"l", text); }
     void Output(const std::wstring& text, const std::wstring& label) {
-        std::wstring clipped = ClipOutput(text);
+        std::wstring clipped = ClipOutput(text, clipped_);
         if (clipped.empty()) return;
         Block(L'c', L"", L"n" + label, clipped);
     }
@@ -245,6 +251,7 @@ private:
     size_t limit_;
     std::wstring language_;
     bool full_ = false;
+    bool clipped_ = false;
 };
 
 void WriteOutputs(const Json& outputs, Writer& w, PreviewImageCache& images, const Json* count) {
@@ -374,7 +381,7 @@ bool MakeNotebookDocument(const std::wstring& path, std::wstring& payload, uint3
             w.Raw(body);
         }
     }
-    truncated = w.full();
+    truncated = w.full() || w.clipped();
     out += L"S\t";
     AppendField(out, source);
     out += L'\n';

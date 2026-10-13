@@ -1,4 +1,5 @@
 #include "content_search.h"
+#include "content_directory_listing.h"
 #include "document_reader.h"
 #include "../common/text_decode.h"
 
@@ -249,11 +250,9 @@ void EnsureFileId(Candidate& file) {
 
 HANDLE OpenDirectoryListing(const std::wstring& dir, WIN32_FIND_DATAW& data) {
     const std::wstring query = JoinPath(Win32Path(dir), L"*");
-    HANDLE find = FindFirstFileExW(query.c_str(), FindExInfoBasic, &data,
-        FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    HANDLE find = content_listing::First(query, data, FIND_FIRST_EX_LARGE_FETCH);
     if (find != INVALID_HANDLE_VALUE) return find;
-    return FindFirstFileExW(query.c_str(), FindExInfoBasic, &data,
-        FindExSearchNameMatch, nullptr, 0);
+    return content_listing::First(query, data, 0);
 }
 
 bool EnumerateCandidates(const ContentSearchRequest& request,
@@ -278,8 +277,9 @@ bool EnumerateCandidates(const ContentSearchRequest& request,
         last_published = visited;
         return callback(progress, {});
     };
-    DWORD last_error = ERROR_SUCCESS;
-    bool opened = false;
+    auto record_failure = [&](DWORD error) {
+        if (!progress.error) progress.error = error ? error : ERROR_GEN_FAILURE;
+    };
     for (const auto& root : roots) {
         if (cancelled.load()) return false;
         progress.current_root = root;
@@ -292,13 +292,14 @@ bool EnumerateCandidates(const ContentSearchRequest& request,
             WIN32_FIND_DATAW data{};
             HANDLE find = OpenDirectoryListing(dir, data);
             if (find == INVALID_HANDLE_VALUE) {
-                last_error = GetLastError();
+                const DWORD enumeration_error = GetLastError();
+                if (!content_listing::EmptyDirectoryResult(Win32Path(dir), enumeration_error))
+                    record_failure(enumeration_error);
                 continue;
             }
-            opened = true;
             do {
                 if (cancelled.load()) {
-                    FindClose(find);
+                    content_listing::Close(find);
                     return false;
                 }
                 if (IsDotOrDotDot(data.cFileName)) continue;
@@ -320,17 +321,15 @@ bool EnumerateCandidates(const ContentSearchRequest& request,
                                   request.minimum_file_bytes, candidate))
                     files.push_back(std::move(candidate));
                 if (!publish_progress(false)) {
-                    FindClose(find);
+                    content_listing::Close(find);
                     return false;
                 }
-            } while (FindNextFileW(find, &data));
-            FindClose(find);
+            } while (content_listing::Next(find, data));
+            const DWORD enumeration_error = GetLastError();
+            if (enumeration_error != ERROR_NO_MORE_FILES) record_failure(enumeration_error);
+            content_listing::Close(find);
             if (!publish_progress(false)) return false;
         }
-    }
-    if (!opened) {
-        progress.error = last_error ? last_error : ERROR_PATH_NOT_FOUND;
-        return false;
     }
     if (request.mode == ContentSearchMode::Duplicates)
         progress.scanned_files = visited;
@@ -436,7 +435,7 @@ bool RunDuplicateSearch(const ContentSearchRequest& request,
     for (const auto& [size, candidates] : by_size)
         if (candidates.size() >= 2) hash_work += candidates.size();
     progress.phase = ContentSearchPhase::Hashing;
-    progress.total_files = hash_work;
+    progress.total_files = progress.error ? 0 : hash_work;
     progress.scanned_files = 0;
     if (!callback(progress, {})) return false;
     auto last_progress = std::chrono::steady_clock::now();
@@ -520,10 +519,7 @@ bool MatchContentFilename(const std::wstring& path, uint64_t size, uint64_t modi
     for (const auto& group : q.groups) {
         bool match = true;
         for (const auto& term : group) {
-            const auto& text = term.name_in_path ? path : name;
-            if (term.folder || !MatchName(text.data(), static_cast<uint32_t>(text.size()), term) ||
-                !MatchExt(name.data(), static_cast<uint32_t>(name.size()), term) ||
-                !MatchSize(size, term) || !MatchDate(modified, term)) { match = false; break; }
+            if (!MatchTerm(path, name, false, size, modified, term)) { match = false; break; }
         }
         if (match) return true;
     }
@@ -567,16 +563,19 @@ bool RunContentSearch(const ContentSearchRequest& request, const std::atomic<boo
         callback(progress, {});
         return false;
     }
+    // A failed subtree still leaves useful candidates. Finish processing them,
+    // then publish one terminal partial result with the original enumeration error.
+    const DWORD enumeration_error = progress.error;
     if (request.mode == ContentSearchMode::Duplicates) {
         const bool ok = RunDuplicateSearch(request, cancelled, files, progress, callback);
         progress.done = true;
         if (!ok && cancelled.load()) progress.error = ERROR_CANCELLED;
         callback(progress, {});
-        return ok;
+        return ok && enumeration_error == ERROR_SUCCESS;
     }
 
     DocumentReadSession document_session;
-    progress.total_files = files.size();
+    progress.total_files = enumeration_error ? 0 : files.size();
     progress.scanned_files = 0;
     if (!callback(progress, {})) return false;
     if(request.sort!=ContentResultSort::Index) std::sort(files.begin(),files.end(),[&](const Candidate& a,const Candidate& b) {
@@ -636,7 +635,7 @@ bool RunContentSearch(const ContentSearchRequest& request, const std::atomic<boo
     progress.done = true;
     if (cancelled.load()) progress.error = ERROR_CANCELLED;
     callback(progress, {});
-    return !cancelled.load();
+    return !cancelled.load() && enumeration_error == ERROR_SUCCESS;
 }
 
 } // namespace pulse::index

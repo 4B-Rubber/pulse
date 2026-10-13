@@ -5,6 +5,22 @@
 #include <aclapi.h>
 
 namespace {
+#ifdef PULSE_INTEGRATION_TEST
+int writes = 0;
+bool FailEnableAndRollback(const std::wstring&, const std::wstring&) {
+    ++writes;
+    return writes != 4 && writes != 5;
+}
+struct InterruptedUpgrade {};
+bool InterruptUpgrade(const std::wstring&, const std::wstring&) {
+    if (++writes == 3) throw InterruptedUpgrade{};
+    return true;
+}
+bool FailRepairAndRollback(const std::wstring&, const std::wstring&) {
+    ++writes;
+    return writes != 3 && writes != 4;
+}
+#endif
 int failures = 0;
 void Check(bool ok, const char* label) { std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", label); if (!ok) ++failures; }
 struct Value { bool exists = false; DWORD type = REG_NONE; std::vector<BYTE> bytes; bool operator==(const Value&) const = default; };
@@ -38,6 +54,16 @@ void DeleteValue(const std::wstring& path, const wchar_t* name) {
         RegCloseKey(key);
     }
 }
+void SetLegacyOrphans() {
+    for (const auto* group : {L"Directory", L"Drive"}) {
+        const auto shell = std::wstring(L"Software\\Classes\\") + group + L"\\shell";
+        Set(shell, L"", L"open");
+        Set(shell + L"\\open", L"DelegateExecute", L"");
+    }
+    Set(L"Software\\Classes\\CLSID\\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\\shell\\opennewwindow\\command", L"DelegateExecute", L"");
+    Set(L"Software\\Classes\\CLSID\\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\shell", L"", L"open");
+    Set(L"Software\\Classes\\CLSID\\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\shell\\open\\command", L"DelegateExecute", L"");
+}
 }
 
 int wmain() {
@@ -50,6 +76,34 @@ int wmain() {
     const std::wstring shell = L"Software\\Classes\\Directory\\shell", command = shell + L"\\open\\command";
     const std::wstring win = L"Software\\Classes\\CLSID\\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\\shell\\opennewwindow\\command";
     const std::wstring pc = L"Software\\Classes\\CLSID\\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\shell";
+    SetLegacyOrphans();
+    Check(HasLegacyShellIntegrationResidue(), "remote seven-value orphan signature is detected without a command or snapshot");
+    Check(ApplyShellIntegration(ShellIntegrationKind::ThisPc, exe, false) && HasLegacyShellIntegrationResidue(),
+        "ordinary disable does not infer ownership of a legacy orphan");
+    Check(!ApplyShellIntegration(ShellIntegrationKind::ThisPc, exe, true) && HasLegacyShellIntegrationResidue() &&
+        !Read(L"Software\\Pulse\\ShellIntegration\\Backups\\v1\\ThisPc", L"Snapshot").exists,
+        "enable requires explicit repair instead of backing up damaged legacy overrides as originals");
+    Check(LastShellIntegrationFailure().kind == ShellIntegrationFailureKind::LegacyResidue,
+        "legacy residue is reported as its own failure reason");
+    Set(shell + L"\\ThirdParty\\command", L"", L"third party command");
+    Check(RepairLegacyShellIntegrationResidue() && !HasLegacyShellIntegrationResidue() &&
+        !KeyExists(pc) && !KeyExists(win) && !Read(shell).exists &&
+        Read(shell + L"\\ThirdParty\\command").exists &&
+        Read(L"Software\\Pulse\\ShellIntegration\\Backups\\v1\\LegacyOrphanRepair", L"Snapshot").exists,
+        "explicit legacy repair backs up seven values and preserves third-party menus");
+    Check(!RepairLegacyShellIntegrationResidue() && Read(shell + L"\\ThirdParty\\command").exists,
+        "repeated repair makes no changes after residue is gone");
+    Clear(); SetLegacyOrphans(); Set(pc + L"\\open\\command", L"", L"foreign command");
+    Check(!HasLegacyShellIntegrationResidue() && !RepairLegacyShellIntegrationResidue() && Read(shell).exists,
+        "a new command aborts the entire legacy repair before writes");
+    Clear(); SetLegacyOrphans(); Set(win, L"DelegateExecute", L"foreign delegate");
+    Check(!HasLegacyShellIntegrationResidue() && !RepairLegacyShellIntegrationResidue() && Read(shell).exists,
+        "a changed delegate aborts the entire legacy repair before writes");
+    Clear(); SetLegacyOrphans();
+    Set(L"Software\\Pulse\\ShellIntegration\\Backups\\v1\\LegacyOrphanRepair", L"Snapshot", L"different existing backup", REG_BINARY);
+    Check(!RepairLegacyShellIntegrationResidue() && HasLegacyShellIntegrationResidue(),
+        "an incompatible backup prevents all repair writes");
+    Clear();
     Set(command, L"", L"%OTHER%\\manager.exe %1", REG_EXPAND_SZ);
     Set(command, L"DelegateExecute", L"", REG_SZ);
     Set(shell, L"", L"browse", REG_EXPAND_SZ);
@@ -58,6 +112,7 @@ int wmain() {
     const auto original = Read(command), delegate = Read(command, L"DelegateExecute"), verb = Read(shell), old_win = Read(win), old_pc = Read(pc);
     bool enabled = true;
     for (auto kind : {ShellIntegrationKind::Folders, ShellIntegrationKind::WinE, ShellIntegrationKind::ThisPc}) enabled = ApplyShellIntegration(kind, exe, true) && ReadShellIntegration(kind, exe) && enabled;
+    Check(LastShellIntegrationFailure().kind == ShellIntegrationFailureKind::None, "a successful apply clears the failure reason");
     Check(enabled, "enable all associations and read actual state");
     Check(ApplyShellIntegration(ShellIntegrationKind::Folders, exe, true), "repeated enable retains original snapshot");
     bool restored = true;
@@ -92,6 +147,33 @@ int wmain() {
     Set(pc + L"\\open\\command", L"DelegateExecute", L"");
     Check(!ApplyShellIntegration(ShellIntegrationKind::ThisPc, exe, false) && !KeyExists(pc.substr(0, pc.find(L"\\shell"))),
         "legacy This PC restore releases the system CLSID handler");
+    {
+        // Desktop Recycle Bin: same CLSID verb shape as This PC.
+        const std::wstring bin = L"Software\\Classes\\CLSID\\{645FF040-5081-101B-9F08-00AA002F954E}\\shell";
+        Clear();
+        Check(!ReadShellIntegration(ShellIntegrationKind::RecycleBin, exe) &&
+            ApplyShellIntegration(ShellIntegrationKind::RecycleBin, exe, true) &&
+            ReadShellIntegration(ShellIntegrationKind::RecycleBin, exe) &&
+            HasShellIntegrationOwnership(ShellIntegrationKind::RecycleBin, exe),
+            "Recycle Bin takeover applies and reads back");
+        const Value bin_command = Read(bin + L"\\open\\command");
+        const std::wstring expected = L"\"" + exe + L"\" \"::{645FF040-5081-101B-9F08-00AA002F954E}\"";
+        Check(bin_command.exists && bin_command.bytes.size() == (expected.size() + 1) * sizeof(wchar_t) &&
+            std::wstring(reinterpret_cast<const wchar_t*>(bin_command.bytes.data())) == expected &&
+            Read(bin + L"\\open\\command", L"DelegateExecute").exists && Read(bin).exists,
+            "Recycle Bin open verb runs Pulse with the parsing name and is the default verb");
+        Check(!ReadShellIntegration(ShellIntegrationKind::ThisPc, exe) && !KeyExists(pc),
+            "Recycle Bin takeover leaves This PC alone");
+        Check(ApplyShellIntegration(ShellIntegrationKind::RecycleBin, exe, false) && !KeyExists(bin.substr(0, bin.find(L"\\shell"))) &&
+            !HasShellIntegrationOwnership(ShellIntegrationKind::RecycleBin, exe),
+            "Recycle Bin restore removes the per-user CLSID override it created");
+        Clear();
+        Set(bin, L"", L"empty");
+        const Value before = Read(bin);
+        Check(ApplyShellIntegration(ShellIntegrationKind::RecycleBin, exe, true) &&
+            ApplyShellIntegration(ShellIntegrationKind::RecycleBin, exe, false) && Read(bin) == before &&
+            !Read(bin + L"\\open\\command").exists, "Recycle Bin restore brings back an earlier default verb");
+    }
     for (const bool reenable : {false, true}) {
         Clear();
         Set(win, L"", L"\"" + exe + L"\""); Set(win, L"DelegateExecute", L"");
@@ -101,11 +183,26 @@ int wmain() {
         Check(!ApplyShellIntegration(ShellIntegrationKind::WinE, exe, false) && !KeyExists(win.substr(0, win.find(L"\\shell"))),
             "snapshot-backed partial restore is repairable without preserving the broken override");
     }
+    for (const auto kind : {ShellIntegrationKind::WinE, ShellIntegrationKind::ThisPc}) {
+        Clear();
+        const auto path = kind == ShellIntegrationKind::WinE ? win : pc + L"\\open\\command";
+        Check(ApplyShellIntegration(kind, exe, true), "enable isolated namespace override");
+        DeleteValue(path, L"");
+        Check(HasShellIntegrationOwnership(kind, exe) && !ReadShellIntegration(kind, exe),
+            "removed command retains detectable snapshot-backed Explorer override for repair");
+        Check(!HasShellIntegrationOwnership(kind, next), "partial restore provenance belongs to the recorded executable");
+        Check(ApplyShellIntegration(kind, exe, false) && !KeyExists(path.substr(0, path.find(L"\\shell"))) &&
+            !HasShellIntegrationOwnership(kind, exe), "retry clears partial namespace override and repair state");
+        Check(ApplyShellIntegration(kind, exe, true), "capture completed restore provenance");
+        RegDeleteTreeW(HKEY_CURRENT_USER, path.substr(0, path.find(L"\\shell")).c_str());
+        Check(!HasShellIntegrationOwnership(kind, exe), "stale snapshot without remaining overrides is not ownership");
+    }
     Clear();
     Set(win, L"", L"\"" + exe + L"\""); Set(win, L"DelegateExecute", L"");
     Check(ApplyShellIntegration(ShellIntegrationKind::WinE, exe, true), "capture legacy ownership for external handler test");
     DeleteValue(win, L""); Set(win, L"DelegateExecute", L"{11111111-2222-3333-4444-555555555555}");
     const auto later_delegate = Read(win, L"DelegateExecute");
+    Check(!HasShellIntegrationOwnership(ShellIntegrationKind::WinE, exe), "external COM handler is not reported as a Pulse residual");
     ApplyShellIntegration(ShellIntegrationKind::WinE, exe, false);
     Check(Read(win, L"DelegateExecute") == later_delegate, "partial restore preserves a later external COM handler");
     Clear();
@@ -144,6 +241,11 @@ int wmain() {
     secured=secured && SetEntriesInAclW(1,&deny,old_acl,&denied_acl)==ERROR_SUCCESS;
     secured=secured && SetSecurityInfo(protected_key,SE_REGISTRY_KEY,DACL_SECURITY_INFORMATION|PROTECTED_DACL_SECURITY_INFORMATION,nullptr,nullptr,denied_acl,nullptr)==ERROR_SUCCESS;
     Check(secured && !ApplyShellIntegration(ShellIntegrationKind::Directory,exe,true) && Read(command)==protected_original && !HasShellIntegrationOwnership(ShellIntegrationKind::Directory,exe), "denied write reports failure and leaves original association");
+    if (secured) {
+        const auto denied = LastShellIntegrationFailure();
+        Check(denied.kind==ShellIntegrationFailureKind::AccessDenied && denied.status==ERROR_ACCESS_DENIED && denied.key==command,
+              "denied write is reported as access denied with its key");
+    }
     if (secured) Check(SetSecurityInfo(protected_key,SE_REGISTRY_KEY,DACL_SECURITY_INFORMATION|UNPROTECTED_DACL_SECURITY_INFORMATION,nullptr,nullptr,old_acl,nullptr)==ERROR_SUCCESS,"isolated ACL restored");
     if (secured) {
         Check(ApplyShellIntegration(ShellIntegrationKind::Directory,exe,true),"retry succeeds after write access is restored");
@@ -154,6 +256,50 @@ int wmain() {
         Check(restored_acl && ApplyShellIntegration(ShellIntegrationKind::Directory,exe,false) && Read(command)==protected_original,"partial restore can be retried without losing original values");
     }
     if (denied_acl) LocalFree(denied_acl); if (descriptor) LocalFree(descriptor); if (protected_key) RegCloseKey(protected_key);
+#ifdef PULSE_INTEGRATION_TEST
+    for (bool retry_upgrade : {false, true}) {
+        Clear(); Set(command, L"", L"original manager.exe %1");
+        const auto original_upgrade = Read(command);
+        Check(ApplyShellIntegration(ShellIntegrationKind::Directory, exe, true), "upgrade interruption fixture owns original command");
+        writes = 0;
+        SetIntegrationWriteHookForTesting(InterruptUpgrade);
+        bool interrupted = false;
+        try { UpgradeShellIntegration(ShellIntegrationKind::Directory, exe, next); }
+        catch (const InterruptedUpgrade&) { interrupted = true; }
+        SetIntegrationWriteHookForTesting(nullptr);
+        Check(interrupted && ReadShellIntegration(ShellIntegrationKind::Directory, exe),
+              "interruption after new snapshot commit retains old command and old ownership journal");
+        const auto& owner = retry_upgrade ? next : exe;
+        const bool recovered = !retry_upgrade || UpgradeShellIntegration(ShellIntegrationKind::Directory, exe, next);
+        Check(recovered && ApplyShellIntegration(ShellIntegrationKind::Directory, owner, false) && Read(command) == original_upgrade,
+              "interrupted upgrade supports direct restore or upgrade retry without losing original association");
+    }
+    Clear(); SetLegacyOrphans(); writes = 0;
+    SetIntegrationWriteHookForTesting(FailRepairAndRollback);
+    const bool repaired_with_failure = RepairLegacyShellIntegrationResidue();
+    SetIntegrationWriteHookForTesting(nullptr);
+    Check(!repaired_with_failure && HasLegacyShellIntegrationResidue(),
+          "partial legacy repair remains discoverable using its exact backup");
+    Check(RepairLegacyShellIntegrationResidue() && !HasLegacyShellIntegrationResidue(),
+          "retry resumes partial legacy repair without requiring original full signature");
+    Clear();
+    Set(command, L"", L"third-party.exe %1");
+    Set(command, L"DelegateExecute", L"third-party-delegate");
+    Set(shell, L"", L"browse");
+    const auto rollback_command = Read(command), rollback_delegate = Read(command, L"DelegateExecute");
+    writes = 0;
+    SetIntegrationWriteHookForTesting(FailEnableAndRollback);
+    const bool enabled_with_failure = ApplyShellIntegration(ShellIntegrationKind::Directory, exe, true);
+    SetIntegrationWriteHookForTesting(nullptr);
+    const auto hook_failure = LastShellIntegrationFailure();
+    Check(!enabled_with_failure && HasShellIntegrationOwnership(ShellIntegrationKind::Directory, exe),
+          "enable and compensation failures retain command ownership anchor");
+    Check(hook_failure.kind == ShellIntegrationFailureKind::WriteError && !hook_failure.key.empty(),
+          "the first failed write is reported, not the compensation");
+    Check(ApplyShellIntegration(ShellIntegrationKind::Directory, exe, false) &&
+          Read(command) == rollback_command && Read(command, L"DelegateExecute") == rollback_delegate,
+          "retry after failed enable compensation restores original command and delegate");
+#endif
     RegOverridePredefKey(HKEY_CURRENT_USER,nullptr); RegCloseKey(root);
     const LONG cleanup=RegDeleteTreeW(HKEY_CURRENT_USER,sandbox.c_str());
     Check(cleanup==ERROR_SUCCESS, "isolated registry fixture removed");

@@ -40,9 +40,11 @@ $testNames = @('pulse_rename_ops_test', 'pulse_child_edit_test', 'pulse_localiza
     'pulse_update_test', 'pulse_update_installer_test', 'pulse_update_session_test', 'pulse_app_controllers_test',
     'pulse_change_tracking_polling_test', 'pulse_change_tracking_test', 'pulse_index_delta_replay_test',
     'pulse_runtime_log_test', 'pulse_diagnostics_export_test', 'pulse_shell_command_test', 'pulse_reparse_entry_test',
-    'pulse_link_destination_test', 'pulse_link_pill_test', 'pulse_shell_icons_test',
+    'pulse_link_destination_test', 'pulse_link_pill_test', 'pulse_shell_icons_test', 'pulse_network_locations_test',
+    'pulse_archive_integrity_test', 'pulse_document_completeness_test', 'pulse_preview_command_test',
+    'pulse_image_preview_integrity_test', 'pulse_udf_listing_test', 'pulse_preview_integrity_test',
     'pulse_change_tracking_memory_test', 'pulse_change_feed_memory_test', 'pulse_usn_packet_queue_test',
-    'pulse_content_progress_ui_test', 'pulse_operation_presentation_test', 'pulse_column_strip_test',
+    'pulse_content_progress_ui_test', 'pulse_operation_presentation_test', 'pulse_column_strip_test', 'pulse_entry_sort_key_test',
     'pulse_file_lock_test', 'pulse_dialogs_test')
 $testTargets = (@('pulse', 'pulse_index_engine_test', 'pulse_index_host_stress',
     'pulse_preview_test', 'pulse_preview_handler_probe', 'pulse_playback_controls_test', 'pulse_ops_test') + $testNames) -join ' '
@@ -67,6 +69,8 @@ foreach ($testName in $testNames) {
 }
 & (Join-Path $build 'pulse_ops_test.exe') --update-shutdown
 if ($LASTEXITCODE -ne 0) { throw 'Update shutdown and automatic wait regression failed' }
+& (Join-Path $build 'pulse_ops_test.exe') --delete-progress-only
+if ($LASTEXITCODE -ne 0) { throw 'Delete progress rate and remaining-time regression failed' }
 & (Join-Path $build 'pulse_playback_controls_test.exe') --timeline-only
 if ($LASTEXITCODE -ne 0) { throw 'Playback timeline regression failed' }
 & (Join-Path $build 'pulse_preview_test.exe') --vector-only
@@ -85,6 +89,10 @@ foreach ($mode in @('--parent-cycle-only', '--quiet-maintenance-only', '--name-p
 }
 & (Join-Path $build 'pulse_app_controllers_test.exe') --layout-search-prefs
 if ($LASTEXITCODE -ne 0) { throw 'Panel layout/preferences regression failed' }
+foreach ($mode in @('--layout-active-pane', '--network-locations-view')) {
+    & (Join-Path $build 'pulse_app_controllers_test.exe') $mode
+    if ($LASTEXITCODE -ne 0) { throw "Panel/network navigation regression $mode failed" }
+}
 & (Join-Path $build 'pulse_change_feed_memory_test.exe') --probe
 if ($LASTEXITCODE -ne 0) { throw 'Opt-in memory probe regression failed' }
 foreach ($mode in @('--service-start-only', '--shutdown-only', '--live-dedup-only', '--folder-sizes-only')) {
@@ -149,14 +157,9 @@ if ($Channel -eq 'win81') {
 $licenses = Join-Path $build 'licenses/LumaText'
 New-Item -ItemType Directory -Path $licenses -Force | Out-Null
 Copy-Item -Path (Join-Path $sdkRoot 'share/LumaText/licenses/*') -Destination $licenses
-$iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-if (-not $iscc) { throw 'Inno Setup 6 is required' }
-$version = (Get-Content version.txt -Raw).Trim()
-$arguments = @("/DAppVersion=$version", "/DBuildDir=$build")
-if ($Channel -eq 'win81') { $arguments += '/DWin81Candidate=1' }
-& $iscc @arguments installer/PulseSetup.iss
-if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
+# Pulse setup: bootstrapper + xz payload (scripts/pack_setup.bat).
+& (Join-Path $repo 'scripts/pack_setup.bat') $build $Channel
+if ($LASTEXITCODE -ne 0) { throw 'Installer packaging failed' }
 # The portable ZIP targets Windows 10/11 x64, so only the normal channel packages it,
 # from the same verified production build as the installer.
 if ($Channel -eq 'windows') {

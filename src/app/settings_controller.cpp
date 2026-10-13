@@ -3,13 +3,20 @@
 #include "settings_controller.h"
 #include "blank_pane_click.h"
 #include "default_file_manager.h"
+#include "shell_integration_registry.h"
 #include "../index/index_client.h"
+#include "../index/index_config.h"
 #include "../index/network_agent_client.h"
+#include "../common/preview_packs.h"
+#include "pack_catalog.h"
+#include "../ui/quick_preview_command.h"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <cwchar>
+#include <string>
 #include <thread>
 
 namespace pulse::app {
@@ -23,6 +30,73 @@ bool SelectValue(int index, const int (&values)[Size], int& target) {
     return true;
 }
 
+// Bug 2: say which item failed and why; only blame security software when the
+// registry refused the write or the value disappeared right after it.
+std::wstring IntegrationFailureText(const ShellIntegrationFailure& failure) {
+    using K = ShellIntegrationFailureKind;
+    const std::wstring code = std::to_wstring(failure.status);
+    switch (failure.kind) {
+    case K::AccessDenied:
+        return l10n::Pick(L"系统拒绝写入，可能被安全软件拦截", L"the write was denied, possibly by security software");
+    case K::Reverted:
+        return l10n::Pick(L"写入后被改回，可能被安全软件拦截", L"it was undone right after writing, possibly by security software");
+    case K::WriteError:
+        return std::wstring(l10n::Pick(L"写入注册表失败，错误 ", L"registry write failed, error ")) + code;
+    case K::ReadError:
+        return std::wstring(l10n::Pick(L"读取注册表失败，错误 ", L"registry read failed, error ")) + code;
+    case K::LegacyResidue:
+        return l10n::Pick(L"发现旧版本留下的关联，点「重试」会先清理", L"old associations from an earlier version were found; Try again cleans them first");
+    case K::BadBackup:
+        return l10n::Pick(L"原设置的备份已损坏，为免丢失原设置已停止", L"the backup of the original setting is damaged, so nothing was changed");
+    case K::PendingUpgrade:
+        return l10n::Pick(L"上次升级的关联迁移没有完成", L"the association update from the last upgrade did not finish");
+    case K::ChangedByOther:
+        return l10n::Pick(L"已被其他程序修改，为免覆盖已停止", L"another program changed it, so it was not overwritten");
+    case K::None:
+        return l10n::Pick(L"写入后读取结果不一致", L"the setting did not read back as written");
+    case K::Unknown: break;
+    }
+    return l10n::Pick(L"原因未知", L"unknown reason");
+}
+
+std::wstring IntegrationLogPath() {
+    wchar_t base[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (!length || length >= MAX_PATH) return {};
+    std::wstring dir = std::wstring(base) + L"\\Pulse";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    dir += L"\\logs";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\integration.log";
+}
+
+// One UTF-8 line per failed item in %LOCALAPPDATA%\Pulse\logs\integration.log.
+void LogIntegrationFailure(const wchar_t* item, bool on, const ShellIntegrationFailure& failure) {
+    const std::wstring path = IntegrationLogPath();
+    if (path.empty()) return;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t line[2048]{};
+    swprintf_s(line, L"%04u-%02u-%02u %02u:%02u:%02u.%03u item=%s want=%s result=%s status=%ld key=HKCU\\%s value=%s\r\n",
+               now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, item,
+               on ? L"on" : L"off", ShellIntegrationFailureName(failure.kind), failure.status,
+               failure.key.empty() ? L"-" : failure.key.c_str(),
+               failure.name.empty() ? L"(default)" : failure.name.c_str());
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, nullptr, 0, nullptr, nullptr);
+    if (bytes <= 1) return;
+    std::string text(static_cast<size_t>(bytes - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, line, -1, text.data(), bytes, nullptr, nullptr);
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(file, &size) && size.QuadPart < 512 * 1024) {
+        DWORD written = 0;
+        WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+    }
+    CloseHandle(file);
+}
+
 } // namespace
 
 SettingsController::~SettingsController() {
@@ -34,6 +108,7 @@ int SettingsController::PageFromName(std::wstring_view name) noexcept {
     if (name == L"context") return 2;
     if (name == L"about") return 3;
     if (name == L"duplicates") return 4;
+    if (name == L"packs") return 5;
     return 0;
 }
 
@@ -42,13 +117,343 @@ const wchar_t* SettingsController::PageName(int page) noexcept {
     if (page == 2) return L"context";
     if (page == 3) return L"about";
     if (page == 4) return L"duplicates";
+    if (page == 5) return L"packs";
     return L"general";
 }
 
 void SettingsController::SelectPage(int page) noexcept {
     CancelGlobalSearchHotkeyCapture();
-    page_ = std::clamp(page, 0, 4);
+    page_ = std::clamp(page, 0, 5);
     scroll_ = 0.0f;
+    packs_checked_ = 0;  // re-read the packs when their page opens
+}
+
+// ---- 预览增强包 ----------------------------------------------------------------
+
+namespace {
+
+uint64_t DirectoryBytes(const std::wstring& directory, int depth = 0) {
+    if (depth > 4) return 0;
+    uint64_t total = 0;
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileExW((directory + L"\\*").c_str(), FindExInfoBasic, &data,
+                                   FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (find == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L"..")) continue;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            total += DirectoryBytes(directory + L"\\" + data.cFileName, depth + 1);
+        else
+            total += (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+    return total;
+}
+
+bool IsFfmpegExe(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    const std::wstring name = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    return _wcsicmp(name.c_str(), L"ffmpeg.exe") == 0 && packs::IsRegularFile(path);
+}
+
+} // namespace
+
+void SettingsController::RefreshPacks() {
+    using packs::PackId;
+    PackState state;
+    state.notice = std::move(packs_.notice);
+    state.images_notice = std::move(packs_.images_notice);
+    state.raw_notice = std::move(packs_.raw_notice);
+    const auto raw = packs::ReadInstalledPack(PackId::Raw);
+    state.raw_installed = raw.present;
+    state.raw_version = raw.version;
+    state.archive_notice = std::move(packs_.archive_notice);
+    const auto archive = packs::ReadInstalledPack(PackId::Archives);
+    state.archive_installed = archive.present;
+    state.archive_version = archive.version;
+    state.root = packs::PacksRoot();
+    const packs::PackSettings settings = packs::LoadPackSettings();
+    state.raw_enabled = settings.enabled[static_cast<uint32_t>(PackId::Raw)];
+    state.archive_enabled = settings.enabled[static_cast<uint32_t>(PackId::Archives)];
+    state.media_available = kMediaPackRelease.file_count != 0;
+    state.images_available = kImagePackRelease.file_count != 0;
+    state.raw_available = kRawPackRelease.file_count != 0;
+    state.archive_available = kArchivePackRelease.file_count != 0;
+    state.enabled = settings.enabled[static_cast<uint32_t>(PackId::Media)];
+    state.images_enabled = settings.enabled[static_cast<uint32_t>(PackId::Images)];
+    state.use_custom = settings.use_custom_ffmpeg;
+    state.custom_path = settings.custom_ffmpeg;
+    state.remove_on_uninstall = settings.remove_on_uninstall;
+    const packs::InstalledPack media = packs::ReadInstalledPack(PackId::Media);
+    state.media_installed = media.present;
+    state.version = media.version;
+    const packs::InstalledPack images = packs::ReadInstalledPack(PackId::Images);
+    state.images_installed = images.present;
+    state.images_version = images.version;
+    state.installed = (media.present ? 1u : 0u) + (images.present ? 1u : 0u) + (raw.present ? 1u : 0u) + (archive.present ? 1u : 0u);
+    // What the preview host would use, ignoring the on/off switch so the card
+    // can still say which FFmpeg it is switching.
+    if (state.use_custom) {
+        if (IsFfmpegExe(state.custom_path)) state.ffmpeg = 2;
+    } else if (media.present) state.ffmpeg = 1;
+    wchar_t found[MAX_PATH]{};
+    if (SearchPathW(nullptr, L"ffmpeg.exe", nullptr, MAX_PATH, found, nullptr) && IsFfmpegExe(found))
+        state.detected_path = found;
+    if (!state.root.empty()) state.bytes = DirectoryBytes(state.root);
+    packs_ = std::move(state);
+    packs_checked_ = GetTickCount64();
+    offer_checked_ = 0;
+    image_offer_checked_ = 0;
+}
+
+namespace {
+uint64_t DownloadBytes(const PackRelease& release) {
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < release.file_count; ++i) bytes += release.files[i].packed_size;
+    return bytes;
+}
+} // namespace
+
+void SettingsController::FillMediaPackOffer(ui::MediaPackOffer& offer) {
+    const ULONGLONG now = GetTickCount64();
+    if (!offer_checked_ || now - offer_checked_ >= 2000) {
+        // An installed but switched-off pack is the user's choice: not offered.
+        offer_missing_ = kMediaPackRelease.file_count &&
+            !packs::ReadInstalledPack(packs::PackId::Media).present &&
+            packs::ResolvePack(packs::PackId::Media).source == packs::ToolSource::None;
+        offer_checked_ = now ? now : 1;
+    }
+    offer.installing = media_installer_.running();
+    offer.installable = offer_missing_ || offer.installing;
+    offer.progress = offer.installing ? media_installer_.progress() : 0.0f;
+    offer.download_bytes = DownloadBytes(kMediaPackRelease);
+    offer.notice = offer.installing ? std::wstring{} : packs_.notice;
+}
+
+void SettingsController::FillImagePackOffer(ui::MediaPackOffer& offer) {
+    const ULONGLONG now = GetTickCount64();
+    if (!image_offer_checked_ || now - image_offer_checked_ >= 2000) {
+        image_offer_missing_ = kImagePackRelease.file_count &&
+            !packs::ReadInstalledPack(packs::PackId::Images).present;
+        image_offer_checked_ = now ? now : 1;
+    }
+    offer.installing = image_installer_.running();
+    offer.installable = image_offer_missing_ || offer.installing;
+    offer.progress = offer.installing ? image_installer_.progress() : 0.0f;
+    offer.download_bytes = DownloadBytes(kImagePackRelease);
+    offer.notice = offer.installing ? std::wstring{} : packs_.images_notice;
+}
+
+const SettingsController::PackState& SettingsController::Packs() {
+    if (!packs_checked_ || GetTickCount64() - packs_checked_ >= 2000) RefreshPacks();
+    packs_.installing = media_installer_.running();
+    packs_.progress = packs_.installing ? media_installer_.progress() : 0.0f;
+    packs_.images_installing = image_installer_.running();
+    packs_.images_progress = packs_.images_installing ? image_installer_.progress() : 0.0f;
+    packs_.raw_installing = raw_installer_.running();
+    packs_.raw_progress = packs_.raw_installing ? raw_installer_.progress() : 0.0f;
+    packs_.archive_installing = archive_installer_.running();
+    packs_.archive_progress = packs_.archive_installing ? archive_installer_.progress() : 0.0f;
+    return packs_;
+}
+
+PackInstaller& SettingsController::InstallerFor(packs::PackId id) {
+    switch (id) {
+    case packs::PackId::Images: return image_installer_;
+    case packs::PackId::Raw: return raw_installer_;
+    case packs::PackId::Archives: return archive_installer_;
+    default: return media_installer_;
+    }
+}
+
+std::wstring& SettingsController::NoticeFor(packs::PackId id) {
+    switch (id) {
+    case packs::PackId::Images: return packs_.images_notice;
+    case packs::PackId::Raw: return packs_.raw_notice;
+    case packs::PackId::Archives: return packs_.archive_notice;
+    default: return packs_.notice;
+    }
+}
+
+bool SettingsController::InstallPack(packs::PackId id, HWND notify) {
+    const bool images = id == packs::PackId::Images;
+    PackInstaller& installer = InstallerFor(id);
+    const PackRelease& release = id == packs::PackId::Raw ? kRawPackRelease :
+        id == packs::PackId::Archives ? kArchivePackRelease : images ? kImagePackRelease : kMediaPackRelease;
+    std::wstring& notice = NoticeFor(id);
+    if (installer.running()) {
+        installer.Cancel();
+        return false;
+    }
+    notice.clear();
+    if (!release.file_count) {
+        // No release is advertised until its downloadable files are published.
+        notice = l10n::Pick(L"此预览增强包尚未发布下载。",
+                            L"This preview pack has not been published for download.");
+        return false;
+    }
+    if (!installer.Start(release, notify)) return false;
+    Packs();
+    return false;
+}
+
+bool SettingsController::InstallMediaPack(HWND notify) { return InstallPack(packs::PackId::Media, notify); }
+bool SettingsController::InstallImagePack(HWND notify) { return InstallPack(packs::PackId::Images, notify); }
+
+bool SettingsController::TakePackResult(packs::PackId id) {
+    DWORD error = ERROR_SUCCESS;
+    const PackInstallOutcome outcome = InstallerFor(id).TakeOutcome(error);
+    if (outcome == PackInstallOutcome::None) return false;
+    RefreshPacks();
+    std::wstring& notice = NoticeFor(id);
+    switch (outcome) {
+    case PackInstallOutcome::Installed: {
+        notice.clear();
+        if (id == packs::PackId::Media) {
+            auto settings = packs::LoadPackSettings();
+            settings.use_custom_ffmpeg = false;
+            settings.enabled[0] = true;
+            if (!packs::SavePackSettings(settings)) {
+                notice = l10n::Pick(L"增强包已安装，但未能保存来源设置。请关闭“使用已有 FFmpeg”以切换到增强包。",
+                    L"Pack installed, but the source setting could not be saved. Turn off Use existing FFmpeg to select the pack.");
+            }
+            RefreshPacks();
+        }
+        return true;
+    }
+    case PackInstallOutcome::Cancelled:
+        notice = l10n::Pick(L"已取消下载。", L"Download cancelled.");
+        break;
+    default:
+        if (error == ERROR_INVALID_DATA) {
+            notice = l10n::Pick(L"下载的文件校验失败，已丢弃。请稍后重试。",
+                                L"The download did not pass verification and was discarded. Try again later.");
+        } else if (error == ERROR_SHARING_VIOLATION) {
+            notice = id != packs::PackId::Media
+                ? l10n::Pick(L"旧版本的文件正在使用，请稍后再试一次。",
+                             L"Files of the old version are in use. Try again in a moment.")
+                : l10n::Pick(L"旧版本的文件正在使用。关闭正在播放的视频后再试一次。",
+                             L"Files of the old version are in use. Close playing videos and try again.");
+        } else if (error == ERROR_NOT_SUPPORTED) {
+            notice = l10n::Pick(L"这台电脑缺少解压所需的系统组件，无法安装。",
+                                L"This PC lacks the Windows component needed to unpack the download.");
+        } else {
+            notice = l10n::Pick(L"下载失败，请检查网络后重试。",
+                                L"The download failed. Check the connection and try again.");
+        }
+        break;
+    }
+    return false;
+}
+
+bool SettingsController::TakeMediaPackResult() { return TakePackResult(packs::PackId::Media); }
+bool SettingsController::TakeImagePackResult() { return TakePackResult(packs::PackId::Images); }
+
+bool SettingsController::RemovePack(packs::PackId id) {
+    if (InstallerFor(id).running()) return false;
+    const std::wstring root = packs::PacksRoot();
+    if (root.empty()) return false;
+    const bool removed = RemovePackTree(root + L"\\" + packs::PackKey(id));
+    std::wstring message;
+    if (!removed) {
+        message = id != packs::PackId::Media
+            ? l10n::Pick(L"有文件正在使用，未能全部删除。请稍后再试一次。",
+                         L"Some files are in use and were not removed. Try again in a moment.")
+            : l10n::Pick(L"有文件正在使用，未能全部删除。关闭正在播放的视频后再试一次。",
+                         L"Some files are in use and were not removed. Close playing videos and try again.");
+    }
+    NoticeFor(id) = std::move(message);
+    RefreshPacks();
+    return true;
+}
+
+bool SettingsController::RemoveMediaPack() { return RemovePack(packs::PackId::Media); }
+bool SettingsController::RemoveImagePack() { return RemovePack(packs::PackId::Images); }
+
+namespace {
+bool UpdatePackSettings(const std::function<void(packs::PackSettings&)>& change) {
+    packs::PackSettings settings = packs::LoadPackSettings();
+    change(settings);
+    return packs::SavePackSettings(settings);
+}
+} // namespace
+
+bool SettingsController::ToggleMediaPack() {
+    const bool saved = UpdatePackSettings([](packs::PackSettings& s) { s.enabled[0] = !s.enabled[0]; });
+    packs_.notice.clear();
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::ToggleImagePack() {
+    constexpr uint32_t kImages = static_cast<uint32_t>(packs::PackId::Images);
+    const bool saved = UpdatePackSettings([](packs::PackSettings& s) { s.enabled[kImages] = !s.enabled[kImages]; });
+    packs_.images_notice.clear();
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::InstallRawPack(HWND notify) { return InstallPack(packs::PackId::Raw, notify); }
+bool SettingsController::TakeRawPackResult() { return TakePackResult(packs::PackId::Raw); }
+bool SettingsController::RemoveRawPack() { return RemovePack(packs::PackId::Raw); }
+bool SettingsController::ToggleRawPack() {
+    constexpr uint32_t index = static_cast<uint32_t>(packs::PackId::Raw);
+    const bool saved = UpdatePackSettings([](packs::PackSettings& s) { s.enabled[index] = !s.enabled[index]; });
+    packs_.raw_notice.clear();
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::InstallArchivePack(HWND notify) { return InstallPack(packs::PackId::Archives, notify); }
+bool SettingsController::TakeArchivePackResult() { return TakePackResult(packs::PackId::Archives); }
+bool SettingsController::RemoveArchivePack() { return RemovePack(packs::PackId::Archives); }
+bool SettingsController::ToggleArchivePack() {
+    constexpr uint32_t index = static_cast<uint32_t>(packs::PackId::Archives);
+    const bool saved = UpdatePackSettings([](packs::PackSettings& s) { s.enabled[index] = !s.enabled[index]; });
+    packs_.archive_notice.clear();
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::ToggleCustomFfmpeg() {
+    const std::wstring detected = Packs().detected_path;
+    const bool saved = UpdatePackSettings([&](packs::PackSettings& s) {
+        s.use_custom_ffmpeg = !s.use_custom_ffmpeg;
+        if (s.use_custom_ffmpeg) s.enabled[0] = true;
+        if (s.use_custom_ffmpeg && !packs::IsRegularFile(s.custom_ffmpeg) && !detected.empty())
+            s.custom_ffmpeg = detected;
+    });
+    packs_.notice = saved ? std::wstring{} : l10n::Pick(L"无法保存 FFmpeg 来源设置，请重试。",
+        L"Could not save the FFmpeg source setting. Try again.");
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::SetCustomFfmpeg(const std::wstring& path) {
+    if (!IsFfmpegExe(path)) {
+        packs_.notice = l10n::Pick(L"请选择名为 ffmpeg.exe 的程序。", L"Choose the program named ffmpeg.exe.");
+        return false;
+    }
+    const bool saved = UpdatePackSettings([&](packs::PackSettings& s) {
+        s.custom_ffmpeg = path;
+        s.use_custom_ffmpeg = true;
+        s.enabled[0] = true;
+    });
+    packs_.notice = saved ? std::wstring{} : l10n::Pick(L"无法保存 FFmpeg 来源设置，请重试。",
+        L"Could not save the FFmpeg source setting. Try again.");
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::UseDetectedFfmpeg() {
+    const std::wstring detected = Packs().detected_path;
+    return !detected.empty() && SetCustomFfmpeg(detected);
+}
+
+void SettingsController::ToggleRemovePacksOnUninstall() {
+    UpdatePackSettings([](packs::PackSettings& s) { s.remove_on_uninstall = !s.remove_on_uninstall; });
+    RefreshPacks();
 }
 
 void SettingsController::SetScroll(float value, float maximum) noexcept {
@@ -154,14 +559,27 @@ bool SettingsController::StartUiTask(SettingsTask task) {
     if (IsNetworkTask(task.kind) && !network) return false;
     return StartTask(std::move(task), [network, diagnostics_export](
                                       const SettingsTask& value, std::wstring& error) {
+        // Local index settings run Pulse.Index.exe elevated. Report a missing
+        // executable here (localized via ServiceText) instead of a shell dialog.
+        if (!IsNetworkTask(value.kind) && value.kind != SettingsTaskKind::DiagnosticsExport &&
+            GetFileAttributesW(index::IndexClient::ExePath().c_str()) == INVALID_FILE_ATTRIBUTES) {
+            error = L"找不到 Pulse.Index.exe";
+            return false;
+        }
         switch (value.kind) {
         case SettingsTaskKind::Volume:
             return index::IndexClient::ConfigureVolumeElevated(value.key, value.enabled);
         case SettingsTaskKind::Exclude:
             return index::IndexClient::ConfigureExcludePathElevated(value.path, value.enabled);
+        case SettingsTaskKind::SystemExclusion:
+            return index::IndexClient::ConfigureSystemExclusionElevated(value.key, value.enabled);
         case SettingsTaskKind::InstallService: {
             DWORD code = 0;
             if (index::IndexClient::InstallServiceElevated(&code)) return true;
+            if (code == index::kIndexDirectoryNotPrivate) {
+                error = l10n::Get(l10n::StringId::SettingsIndexDirNotPrivate);
+                return false;
+            }
             wchar_t detail[512]{};
             FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                 nullptr, code, 0, detail, ARRAYSIZE(detail), nullptr);
@@ -184,7 +602,7 @@ bool SettingsController::StartUiTask(SettingsTask task) {
             return true;
         case SettingsTaskKind::DiagnosticsExport:
             return diagnostics_export &&
-                diagnostics_export(value.path, value.enabled, error);
+                diagnostics_export(value.path, value.enabled, value.pin, error);
         }
         return false;
     }, ui_.task_completion);
@@ -321,6 +739,12 @@ void SettingsController::NewTabOpen(int index) {
         SaveAndApply(SettingsEffect::None);
 }
 
+void SettingsController::ExternalOpen(int index) {
+    static constexpr int values[] = {0, 1, 2};
+    if (prefs_ && SelectValue(index, values, prefs_->external_open))
+        SaveAndApply(SettingsEffect::None);
+}
+
 void SettingsController::BlankClick(int index) {
     static constexpr int values[] = {kBlankClickOff, kBlankClickBack, kBlankClickUp};
     if (prefs_ && SelectValue(index, values, prefs_->blank_click_action))
@@ -380,6 +804,30 @@ bool SettingsController::SliderValue(int which, int value) {
     if (target == value) return false;
     target = value;
     return true;
+}
+
+void SettingsController::BeginMenuDrag(int item, float pos, float grab) noexcept {
+    menu_drag_item_ = item;
+    menu_drag_live_ = false;
+    menu_drag_start_ = menu_drag_pos_ = pos;
+    menu_drag_grab_ = grab;
+}
+
+bool SettingsController::MenuDragMove(float pos) noexcept {
+    if (menu_drag_item_ < 0) return false;
+    if (!menu_drag_live_ && std::fabs(pos - menu_drag_start_) < 3.0f) return false;
+    menu_drag_live_ = true;
+    menu_drag_pos_ = pos;
+    return true;
+}
+
+void SettingsController::SetMenuOrder(const BuiltinMenuOrder& order) {
+    if (!context_) return;
+    const auto surface = context_tab_ == 1 ? BuiltinMenuSurface::Background
+                       : context_tab_ == 2 ? BuiltinMenuSurface::RowButtons : BuiltinMenuSurface::Item;
+    context_->SetBuiltinOrder(surface, order);
+    context_->Save();
+    if (surface == BuiltinMenuSurface::RowButtons) Apply(SettingsEffect::ListStyle);
 }
 
 void SettingsController::EndSlider() {
@@ -465,7 +913,8 @@ std::wstring SettingsController::GlobalSearchHotkeyText() const {
 
 bool SettingsController::IntegrationCanRestore() const noexcept {
     return prefs_ && (prefs_->integration_enabled || prefs_->open_folders_in_pulse ||
-        prefs_->take_over_win_e || prefs_->take_over_this_pc || prefs_->integration_residual ||
+        prefs_->take_over_win_e || prefs_->take_over_this_pc || prefs_->take_over_recycle_bin ||
+        prefs_->integration_residual ||
         IntegrationCanRetry());
 }
 
@@ -475,10 +924,11 @@ int SettingsController::IntegrationState() const noexcept {
     const auto& p = *prefs_;
     if (p.integration_incomplete) return 2;
     const bool active = p.open_folders_in_pulse || p.take_over_win_e || p.take_over_this_pc ||
-        p.integration_residual;
+        p.take_over_recycle_bin || p.integration_residual;
     if (!p.integration_enabled) return active ? 2 : 0;
     if (p.open_folders_in_pulse != p.integration_folders ||
-        p.take_over_win_e != p.integration_win_e || p.take_over_this_pc != p.integration_this_pc)
+        p.take_over_win_e != p.integration_win_e || p.take_over_this_pc != p.integration_this_pc ||
+        p.take_over_recycle_bin != p.integration_recycle_bin)
         return 2;
     return active || p.take_over_explorer_windows ? 1 : 0;
 }
@@ -490,7 +940,8 @@ std::wstring SettingsController::IntegrationSummary() const {
         std::wstring message;
         if (!integration_error_.empty())
             message = std::wstring(l10n::Pick(L"没能设置：", L"Could not apply: ")) + integration_error_ +
-                l10n::Pick(L"。可能被安全软件拦截，可以重试。", L". Security software may have blocked it; try again.");
+                l10n::Pick(L"。详情见 %LOCALAPPDATA%\\Pulse\\logs\\integration.log。",
+                           L". Details: %LOCALAPPDATA%\\Pulse\\logs\\integration.log.");
         if (integration_save_failed_) {
             if (!message.empty()) message += L" ";
             message += l10n::Pick(L"你的选择没能保存，重启后可能变回原来的设置。",
@@ -503,7 +954,7 @@ std::wstring SettingsController::IntegrationSummary() const {
 }
 
 void SettingsController::IntegrationAction(int index) {
-    if (!prefs_ || index < 0 || index > 6) return;
+    if (!prefs_ || index < 0 || index > 7) return;
     if (ui_.integration_changing) ui_.integration_changing();
     auto& p = *prefs_;
     p.integration_configured = true;
@@ -513,23 +964,38 @@ void SettingsController::IntegrationAction(int index) {
     else if (index == 3) p.integration_this_pc = !p.integration_this_pc;
     else if (index == 4) p.take_over_explorer_windows = !p.take_over_explorer_windows;
     else if (index == 6) p.integration_enabled = false;
+    else if (index == 7) p.integration_recycle_bin = !p.integration_recycle_bin;
     // Editing a disabled integration only changes the saved selection.
     if (p.integration_enabled || index == 0 || index == 5 || index == 6) {
         integration_error_.clear();
-        auto failed = [&](const wchar_t* label) {
-            if (!integration_error_.empty()) integration_error_ += l10n::Pick(L"、", L", ");
+        auto failed = [&](const wchar_t* label, const wchar_t* item, bool on, bool explained) {
+            if (!integration_error_.empty()) integration_error_ += l10n::Pick(L"；", L"; ");
             integration_error_ += label;
+            if (!explained) return;
+            const auto failure = LastShellIntegrationFailure();
+            integration_error_ += l10n::Pick(L"（", L" (") + IntegrationFailureText(failure) + l10n::Pick(L"）", L")");
+            LogIntegrationFailure(item, on, failure);
         };
-        if (!p.ApplyFolderOpen(p.integration_enabled && p.integration_folders))
-            failed(l10n::Pick(L"文件夹和磁盘", L"Folders and drives"));
-        if (!p.ApplyWinE(p.integration_enabled && p.integration_win_e))
-            failed(L"Win + E");
-        if (!ApplyThisPcOpen(p, p.integration_enabled && p.integration_this_pc))
-            failed(l10n::Pick(L"桌面上的「此电脑」", L"This PC on the desktop"));
+        if ((index == 5 || index == 6) && HasLegacyShellIntegrationResidue() &&
+            !RepairLegacyShellIntegrationResidue())
+            failed(l10n::Pick(L"旧版资源管理器关联", L"Legacy Explorer associations"), L"legacy", false, false);
+        const bool folders_on = p.integration_enabled && p.integration_folders;
+        if (!p.ApplyFolderOpen(folders_on))
+            failed(l10n::Pick(L"文件夹和磁盘", L"Folders and drives"), L"folders", folders_on, true);
+        const bool win_e_on = p.integration_enabled && p.integration_win_e;
+        if (!p.ApplyWinE(win_e_on))
+            failed(L"Win + E", L"win-e", win_e_on, true);
+        const bool this_pc_on = p.integration_enabled && p.integration_this_pc;
+        if (!ApplyThisPcOpen(p, this_pc_on))
+            failed(l10n::Pick(L"桌面上的「此电脑」", L"This PC on the desktop"), L"this-pc", this_pc_on, true);
+        const bool recycle_bin_on = p.integration_enabled && p.integration_recycle_bin;
+        if (!ApplyRecycleBinOpen(p, recycle_bin_on))
+            failed(l10n::Pick(L"桌面上的「回收站」", L"Recycle Bin on the desktop"), L"recycle-bin", recycle_bin_on, true);
     }
     integration_save_failed_ = !p.Save();
     if (ui_.integration_changed) ui_.integration_changed();
-    Apply(SettingsEffect::None);
+    // Explorer window takeover keeps Pulse in the tray on close (KeepsRunningInBackground).
+    Apply(SettingsEffect::TrayVisibility);
 }
 
 void SettingsController::ToggleUi(int index) {
@@ -554,9 +1020,6 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 6) {
         prefs_->show_pinned_tab_names = !prefs_->show_pinned_tab_names;
         SaveAndApply(SettingsEffect::None);
-    } else if (index == 34) {
-        prefs_->multi_instance_mode = !prefs_->multi_instance_mode;
-        SaveAndApply(SettingsEffect::MultiInstance);
     } else if (index == 20) {
         IntegrationAction(2);
     } else if (index == 28) {
@@ -580,15 +1043,13 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 9) {
         prefs_->search_pinyin = !prefs_->search_pinyin;
         SaveAndApply(SettingsEffect::None);
-    } else if (index == 21) {
-        // The list-row switches from main's 1.0.39 rework. Ids 21-23, because 17-19 already
-        // mean tooltips, file hashing and the title-bar mark on this branch.
+    } else if (index == 17) {
         prefs_->list_smart_date = !prefs_->list_smart_date;
         SaveAndApply(SettingsEffect::ListStyle);
-    } else if (index == 22) {
+    } else if (index == 18) {
         prefs_->list_zebra_rows = !prefs_->list_zebra_rows;
         SaveAndApply(SettingsEffect::ListStyle);
-    } else if (index == 23) {
+    } else if (index == 19) {
         prefs_->list_size_bar = !prefs_->list_size_bar;
         SaveAndApply(SettingsEffect::ListStyle);
     } else if (index == 22) {
@@ -596,6 +1057,9 @@ void SettingsController::ToggleUi(int index) {
         SaveAndApply(SettingsEffect::ListStyle);
     } else if (index == 33) {
         prefs_->list_selection_outline = !prefs_->list_selection_outline;
+        SaveAndApply(SettingsEffect::ListStyle);
+    } else if (index == 34) {
+        prefs_->list_thumbnail_badges = !prefs_->list_thumbnail_badges;
         SaveAndApply(SettingsEffect::ListStyle);
     } else if (index == 23) {
         prefs_->vertical_tabs = !prefs_->vertical_tabs;
@@ -608,6 +1072,9 @@ void SettingsController::ToggleUi(int index) {
         SaveAndApply(SettingsEffect::None);
     } else if (index == 26) {
         prefs_->close_window_with_last_tab = !prefs_->close_window_with_last_tab;
+        SaveAndApply(SettingsEffect::None);
+    } else if (index == 35) {
+        prefs_->close_tab_on_double_click = !prefs_->close_tab_on_double_click;
         SaveAndApply(SettingsEffect::None);
     } else if (index == 32) {
         prefs_->confirm_recycle_delete = !prefs_->confirm_recycle_delete;
@@ -624,6 +1091,23 @@ void SettingsController::ToggleUi(int index) {
         }
         global_search_error_.clear();
         Apply(SettingsEffect::GlobalSearch);
+    } else if (index >= 60 && index < 63) {
+        // Pulse menu presets (精简 / 标准 / 完整).
+        context_->builtin_hidden =
+            BuiltinMenuPresetHidden(static_cast<BuiltinMenuPreset>(index - 60));
+        context_->Save();
+        Apply(SettingsEffect::ListStyle);
+    } else if (index >= 64 && index < 67) {
+        context_tab_ = index - 64;
+    } else if (index == 67) {
+        // The card's 恢复默认 resets Pulse's own rows only: shown and order.
+        context_->builtin_hidden = 0;
+        context_->ResetBuiltinOrder();
+        context_->Save();
+        Apply(SettingsEffect::ListStyle);
+    } else if (index == 68) {
+        // The preview's 恢复默认顺序: the current tab's order only.
+        SetMenuOrder({});
     } else if (index >= 10 && index < 15) {
         static constexpr ipc::CtxMenuGroup groups[] = {
             ipc::CtxMenuGroup::Software, ipc::CtxMenuGroup::OpenWith,
@@ -648,7 +1132,9 @@ void SettingsController::ToggleUi(int index) {
             return;
         }
         const auto& seen = context_->seen[item];
-        const bool enabled = context_->ItemEnabled(seen.key, seen.category, seen.from_com);
+        // RowEnabled (#77): a slow-disabled handler shows as off, so one
+        // toggle re-enables it and clears the timeout skip via SetItemEnabled.
+        const bool enabled = context_->RowEnabled(seen.key, seen.category, seen.from_com);
         context_->SetItemEnabled(seen.key, !enabled);
         if (!enabled)
             context_->SetGroupEnabled(ipc::GroupOf(seen.category), true);
@@ -687,6 +1173,30 @@ void SettingsController::RemoveExclude(int position) {
     ClearError();
     SettingsTask task{SettingsTaskKind::Exclude};
     task.path = paths[static_cast<size_t>(position)];
+    StartUiTask(std::move(task));
+}
+
+void SettingsController::SystemExclusionAction(int action) {
+    if (action == 2) {
+        system_exclusion_expanded_ = !system_exclusion_expanded_;
+        return;
+    }
+    if (!index_ || !index_->ServiceMode() || !ui_.task_completion) return;
+    bool enabled = false;
+    std::vector<std::wstring> groups;
+    if (!index_->SystemExclusion(enabled, groups)) return;
+    SettingsTask task{SettingsTaskKind::SystemExclusion};
+    if (action == 1) {
+        task.key = L"all";
+        task.enabled = !enabled;
+    } else {
+        const int group = action - 10;
+        if (!enabled || group < 0 ||
+            group >= static_cast<int>(std::size(index::kSystemExclusionGroups))) return;
+        task.key = index::kSystemExclusionGroups[group];
+        task.enabled = std::find(groups.begin(), groups.end(), task.key) == groups.end();
+    }
+    ClearError();
     StartUiTask(std::move(task));
 }
 
@@ -754,12 +1264,14 @@ void SettingsController::DiagnosticsAction(int action) {
         !ui_.export_diagnostics || !ui_.task_completion) return;
     std::wstring destination;
     bool include_service = false;
-    if (!ui_.prepare_diagnostics_export(destination, include_service) ||
+    bool include_dumps = false;
+    if (!ui_.prepare_diagnostics_export(destination, include_service, include_dumps) ||
         destination.empty()) return;
     ClearError();
     SettingsTask task{SettingsTaskKind::DiagnosticsExport};
     task.path = std::move(destination);
     task.enabled = include_service;
+    task.pin = include_dumps;
     StartUiTask(std::move(task));
 }
 

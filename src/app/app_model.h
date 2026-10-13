@@ -5,9 +5,11 @@
 #include "../fs/fs_snapshot.h"
 #include "../ui/ui_renderer.h"
 #include "places.h"
+#include "tag_ads_sync.h"
 #include "column_view_model.h"
 #include "explorer_handoff.h"
 #include "entry_order_hold.h"
+#include "create_rename_intent.h"
 #include "pane_header_animation.h"
 #include "../index/content_result_store.h"
 #include <map>
@@ -50,6 +52,7 @@ struct Tab {
     float scroll_x = 0.0f;
     ui::ViewMode view_mode = ui::ViewMode::Details;
     uint64_t view_generation = 1;
+    std::vector<CreateRenameIntent> create_rename_intents;
     ui::SortColumn sort_column = ui::SortColumn::Name;
     ui::SortDirection sort_direction = ui::SortDirection::Asc;
     // "Group by" (app::GroupBy value) for current_path. Only list-like views
@@ -75,6 +78,7 @@ struct Tab {
     std::wstring virtual_title; // tag/search views; empty for real folders
     std::wstring banner_title;
     std::wstring banner_message;
+    TagAdsNoticeState tag_ads_notice;
     std::wstring network_live_root;        // #74: banner offers adding this share to the network index
     std::wstring network_live_added_root;  // #74: share added from the banner, crawl pending
     bool net_readonly = false;
@@ -95,7 +99,9 @@ struct Tab {
     size_t directory_count = 0;
     size_t file_count = 0;
     std::wstring pending_selected_name;
+    std::wstring pending_preview_rename;
     std::vector<std::wstring> pending_selected_names;
+    uint64_t pending_selection_revision = UINT64_MAX;
     bool pending_ensure_selection_visible = false;
     // File Explorer order hold (#13): change patches and non-explicit
     // refreshes keep rows in place until F5, a new sort or reopening.
@@ -215,11 +221,11 @@ struct Tab {
     void MaterializeSelection();
     void SelectOnly(int index);
     void ToggleSelect(int index);
-    void SelectRange(int from, int to);
+    void SelectRange(int from, int to, const ui::PaneViewModel* view = nullptr);
     void SelectAll();
     void SelectIndices(const std::vector<int>& indices);
     void InvertIndices(const std::vector<int>& universe);
-    void MoveFocus(int index, bool extend);
+    void MoveFocus(int index, bool extend, const ui::PaneViewModel* view = nullptr);
     bool IsSelected(int index) const;
     int SelectedCount() const;
     std::vector<int> SelectedIndices() const;
@@ -227,7 +233,16 @@ struct Tab {
     // selection revision + snapshot so the status bar stays O(1) per paint.
     // Not for content_results tabs (use ContentSelectionSize).
     void SelectionSizeSummary(uint64_t* bytes, int* files, int* folders) const;
-    void RemapSelection(const std::vector<std::wstring>& names, const std::wstring& focus_name);
+    void RemapSelection(const std::vector<std::wstring>& names, const std::wstring& focus_name,
+                        bool select_first_if_missing = true);
+    // A freshly opened folder focuses its first row without selecting it (as
+    // in File Explorer): copy, cut, delete and rename need a real selection.
+    // The hint lasts until the selection changes.
+    void FocusFirstEntry();
+    bool HasFocusHint() const {
+        return focus_hint_revision == selection_revision && selected_index < 0 && CountBound() > 0;
+    }
+    uint64_t focus_hint_revision = UINT64_MAX;
 
     // Navigation helpers.
     void NavigateTo(const std::wstring& path);
@@ -271,13 +286,6 @@ bool ChipBlockCrossed(float block_left, float block_w, float neighbor_center, in
 // sits at old_rest + cur_off and must land at new_rest.
 float DisplacedRestDelta(float old_rest, float cur_off, float new_rest);
 
-// Centre (px) a dragged tab's leading edge must pass to cross a neighbor run:
-// the member it meets for an expanded run ([block_left, block_right] px, one
-// slot wide: slot_w), or the whole block for a folded chip, which is already
-// that cheap. dir < 0 moves left (the right-hand member leads), dir > 0 right.
-float RunCrossCenter(bool collapsed, float block_left, float block_right,
-                     float slot_w, int dir);
-
 // Contiguous run [pos, pos+len) of group gid's members in a strip order
 // (display position -> tab index; tab_group_of maps tab index -> group id)
 // that contains display position at. {0,0} when at is out of range or the
@@ -317,6 +325,9 @@ enum class LayoutPreset : int {
     TwoHorizontal = 2,
     Three = 3,
     FourGrid = 4,
+    // M7k: a free split tree (a dropped tab split one pane in half) that is
+    // none of the shapes above. Its pane count is its leaves.
+    Custom = 5,
 };
 
 struct SplitContainer {
@@ -385,6 +396,11 @@ struct LayoutTab {
     const Pane* FocusedPane() const;
     Tab* ActiveFolder();
     const Tab* ActiveFolder() const;
+    std::vector<Pane*> VisiblePanes() const {
+        std::vector<Pane*> result;
+        if (root) root->CollectPanes(result);
+        return result;
+    }
 };
 
 struct WindowTabs {
@@ -399,16 +415,27 @@ struct WindowTabs {
     void EnsureDefault();
     LayoutTab& NewTab(const std::wstring& path);
     LayoutTab& NewTabAt(size_t index, const std::wstring& path);
-    void CloseTab(size_t idx);
-    // True when closing tab `idx` means closing the window instead of removing
-    // a tab: it is the window's last tab, and a pinned tab has no close
-    // affordance at all. The model never posts messages; the window owner turns
-    // this into WM_CLOSE, so the tray settings decide hide-versus-exit.
-    bool ClosingLastTab(size_t idx) const {
-        return idx < items.size() && items.size() == 1 && !items[idx]->pinned;
+    // Empty is an explicit This PC location, not an omitted default folder.
+    LayoutTab& NewTabAtLocation(size_t index, const std::wstring& path) {
+        auto& created = NewTabAt(index, path);
+        if (path.empty()) {
+            if (auto* folder = created.ActiveFolder()) folder->current_path.clear();
+        }
+        return created;
     }
+    void CloseTab(size_t idx);
     void SwitchTab(size_t idx);
     void MoveTab(size_t from, size_t to);
+    // Moving a tab between windows (M5b). TakeTab removes tab `idx` with its
+    // panes intact; it refuses the last tab (a window keeps one) unless
+    // `allow_last` (the window is about to close, M6a), but lets a pinned tab
+    // go. The tab leaves its group, and a group it leaves empty is dropped;
+    // `active` follows as in CloseTab.
+    std::unique_ptr<LayoutTab> TakeTab(size_t idx, bool allow_last = false);
+    // InsertTab places such a tab at `index`, clamped to its region (pinned
+    // tabs first) and moved past a group run it would split, and makes it
+    // active. Returns the index it landed at.
+    size_t InsertTab(std::unique_ptr<LayoutTab> tab, size_t index);
 };
 
 std::unique_ptr<LayoutTab> MakeSingleLayoutTab(const std::wstring& path,
@@ -417,33 +444,22 @@ void RebuildLayoutRoot(LayoutTab& tab);
 std::wstring LayoutTabTitle(const LayoutTab& tab);
 std::wstring TabTitle(const std::wstring& path);
 void FillWindowTabStrip(ui::WindowViewModel& vm, const WindowTabs& tabs);
-// Rows of the group-chip hover card: one row per member tab (collapsed groups
-// only, separated from the actions) followed by "New tab in group" and
-// "Edit group". Empty when the group no longer exists.
-// `group_last_active` is the tab the window last used inside that group (see
-// RememberGroupActivation); it is marked with `was_active` only while the group
-// does not own the active tab, so the card can tell "you are here" apart from
-// "you were here".
-std::vector<ui::TabGroupCardRow> TabGroupCardRows(const WindowTabs& tabs, int group_id,
-                                                  const LayoutTab* group_last_active = nullptr);
 
 // Pull every group's members into one contiguous run (group order by first
 // appearance; member order preserved). Chromium keeps groups always
 // contiguous (TabGroup::ListTabs contract); call after membership changes
 // that can split a run. Remaps WindowTabs::active by pointer identity.
 void NormalizeGroupRuns(WindowTabs& tabs);
-
-// Drop every group that owns no member tab. A group whose tabs are all gone has
-// nothing left to show and nothing to ungroup, so its chip would be a ghost;
-// call this after any tab close. Group ids are never reused, so the surviving
-// groups keep their identity. Only the group list changes: tab order, the
-// active tab and WindowTabs::next_tab_group_id are left alone.
-void PruneEmptyGroups(WindowTabs& tabs);
+bool SetTabGroup(WindowTabs& tabs, size_t index, int group);
 
 // ---------------------------------------------------------------------------
 // Staging tray: collect file paths into batches.
 // ---------------------------------------------------------------------------
 struct TrayItem {
+    uint64_t id = 0;
+    uint64_t inflight_task = 0;
+    bool inflight_move = false;
+    std::wstring inflight_source;
     std::wstring path;
     bool exists = true;
     bool is_dir = false;
@@ -452,6 +468,7 @@ struct TrayItem {
 };
 
 struct TrayBatch {
+    uint64_t id = 0;
     std::vector<TrayItem> items;
     bool move_intent = false;
     uint64_t total_size = 0;
@@ -468,13 +485,21 @@ public:
     void ReplacePath(const std::wstring& from, const std::wstring& to);
     // Re-probe local items (moved/deleted outside Pulse); true when any flag flipped.
     bool RefreshExists();
+    // Apply a completed background probe without performing I/O on the caller.
+    void ApplyMetadata(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& data);
     // Drop every item whose file is gone; returns how many were removed.
     size_t RemoveMissing();
     // Flip a batch between copy and move on release (tray intent chip).
     void SetMoveIntent(size_t idx, bool move_intent);
     void RemoveItem(size_t batch_idx, size_t item_idx);
     void RemoveDeleted(const std::vector<std::wstring>& paths);
+    void MarkPendingMove(uint64_t task_id, const std::vector<std::wstring>& paths,
+                         std::optional<size_t> batch = {});
+    void CompleteMove(uint64_t task_id, const std::vector<std::wstring>& moved);
     void Clear();
+    void MarkInFlight(uint64_t task_id, const std::vector<uint64_t>& item_ids, bool move);
+    void CompleteTask(uint64_t task_id, const std::vector<std::wstring>& moved_sources);
+    bool IsInFlight(const std::wstring& path) const;
 
     // For serialization.
     void ToJson(std::wstring& out) const;
@@ -482,6 +507,8 @@ public:
 
 private:
     std::vector<TrayBatch> batches_;
+    uint64_t next_id_ = 1;
+    std::map<uint64_t, std::vector<std::wstring>> inflight_sources_;
 };
 
 // ---------------------------------------------------------------------------
@@ -552,6 +579,7 @@ std::vector<int> DefaultSidebarOrder();
 int SidebarSectionIndex(const ui::WindowViewModel& vm, int section_id);
 
 struct SidebarModel {
+    std::vector<SidebarEntry> system_networks;
     std::vector<SidebarEntry> quick_access;
     std::vector<SidebarEntry> saved_searches;
     std::vector<SidebarEntry> drives;
@@ -560,6 +588,8 @@ struct SidebarModel {
 };
 
 SidebarModel BuildSidebarModel(const fs::RecycleBinInfo* recycle = nullptr);
+// Blocking volume queries: call only on a background worker.
+void RefreshSidebarDriveCapacity(std::vector<SidebarEntry>& drives);
 
 // ---------------------------------------------------------------------------
 // View-model builders.

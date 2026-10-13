@@ -1,6 +1,7 @@
 #pragma once
 
 #include "network_agent_protocol.h"
+#include "network_agent_security.h"
 #include "network_index.h"
 #include <atomic>
 #include <condition_variable>
@@ -33,7 +34,7 @@ public:
 
 private:
     friend struct NetworkAgentClientTestAccess;
-    std::wstring pipe_name_ = agent::kPipeName;
+    std::wstring pipe_name_ = agent::PipeName();
     bool EnsureAgent();
     bool OpenPipe(HANDLE& pipe);
     bool Request(uint32_t type, uint32_t id, const std::vector<uint8_t>& payload,
@@ -70,8 +71,10 @@ private:
     HANDLE agent_process_ = nullptr;
     ULONGLONG last_spawn_tick_ = 0;  // guarded by request_mu_
     static constexpr ULONGLONG kRespawnBackoffMs = 5000;
+    // A freshly started agent creates its pipe only after loading its roots,
+    // and a busy agent briefly has no free instance; wait this long for either.
+    static constexpr ULONGLONG kOpenPipeWaitMs = 3000;
     // Must match the mutex created by RunAgent() in network_agent_main.cpp.
-    static constexpr const wchar_t* kAgentSingletonName = L"Local\\Pulse.Index.NetworkAgent.Singleton";
 };
 
 } // namespace pulse::index

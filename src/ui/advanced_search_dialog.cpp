@@ -1,4 +1,5 @@
 #include "edit_host.h"
+#include "dialog_recovery_test.h"
 #include "../common/windows_compat.h"
 #include "advanced_search_dialog.h"
 #include "FluentTokens.h"
@@ -37,6 +38,7 @@ constexpr float kPad = 24.0f;
 constexpr float kLabelW = 84.0f;
 constexpr float kPillH = 30.0f;
 constexpr UINT_PTR kCountTimer = 73;
+constexpr UINT_PTR kRecoveryTimer = 74;
 
 enum HitId : int {
     kHitNone = 0, kHitSearch = 1, kHitCancel = 2, kHitClose = 3,
@@ -157,9 +159,43 @@ struct RowLabel {
 
 class AdvancedSearchWindow {
 public:
+#ifdef PULSE_WITH_SELFTEST
+    bool TestDeviceRecovery(HWND host) {
+        hwnd_ = host;
+        if (!compositor_.Init(host)) return false;
+        compositor_.RecreateTextFormats(scale_);
+        Layout();
+        compositor_.NotifyDeviceLost(D2DERR_RECREATE_TARGET);
+        Render();
+        return !compositor_.NeedsRecovery() && compositor_.Dc() && compositor_.TextFormat();
+    }
+#endif
+#ifdef PULSE_ADVANCED_QUERY_TEST
+    AdvancedSearchDialogResult TestQuery(app::AdvancedSearchSpec spec, int field,
+                                         const std::wstring& value) {
+        spec_ = std::move(spec);
+        content_mode_ = !spec_.content.empty();
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.hInstance = GetModuleHandleW(nullptr); wc.lpfnWndProc = WndProc;
+        wc.lpszClassName = kClass;
+        if (!GetClassInfoExW(wc.hInstance, kClass, &wc)) RegisterClassExW(&wc);
+        hwnd_ = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW, kClass,
+            L"Private query fixture", WS_POPUP, 0, 0, 760, 680, nullptr, nullptr, wc.hInstance, this);
+        if (!hwnd_) return {};
+        Recompute(false);
+        if (field == 1) SetWindowTextW(edit_kw_, value.c_str());
+        if (field == 2) SetWindowTextW(edit_exts_, value.c_str());
+        if (field == 3) SetWindowTextW(edit_exclude_, value.c_str());
+        SendMessageW(hwnd_, WM_COMMAND, IDOK, 0);
+        if (IsWindow(hwnd_)) DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+        return result_;
+    }
+#endif
     AdvancedSearchDialogResult Show(HWND owner, app::AdvancedSearchSpec spec, bool dark,
-                                    D2D1_COLOR_F accent, AdvancedSearchCountRequest count) {
+                                    D2D1_COLOR_F accent, AdvancedSearchCountRequest count, bool selection_outline) {
         owner_ = owner;
+        selection_outline_ = selection_outline;
         spec_ = std::move(spec);
         dark_ = dark;
         accent_ = accent;
@@ -212,6 +248,62 @@ public:
         return result_;
     }
 
+
+#ifdef PULSE_WITH_SELFTEST
+    void TestRecovery(HWND owner, float scale, bool dark, const std::wstring& png,
+                      const DialogRecoveryCheck& check) {
+        owner_ = owner; scale_ = scale; dark_ = dark; more_ = true;
+        accent_ = D2D1::ColorF(0.1f, 0.4f, 0.8f);
+        spec_.name = L"draft 搜索 report";
+        WNDCLASSEXW wc{ sizeof(wc) };
+        wc.hInstance = GetModuleHandleW(nullptr); wc.lpfnWndProc = WndProc;
+        wc.lpszClassName = kClass; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        if (!GetClassInfoExW(wc.hInstance, kClass, &wc)) RegisterClassExW(&wc);
+        hwnd_ = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW, kClass, L"Recovery fixture",
+            WS_POPUP, 0, 0, static_cast<int>(kDlgW * scale_), static_cast<int>(560 * scale_),
+            owner, nullptr, wc.hInstance, this);
+        check(hwnd_ && edit_kw_, "advanced private production window and EDIT created");
+        if (!hwnd_) return;
+        Recompute(false);
+        ShowWindow(hwnd_, SW_SHOWNOACTIVATE); LayoutEdits(); Render();
+        SetFocus(edit_kw_); SendMessageW(edit_kw_, EM_SETSEL, 2, 8);
+        const HWND edit = edit_kw_;
+        const auto draft = EditText(edit);
+        check(GetFocus() == edit, "advanced real EDIT owns focus before loss");
+        auto* old_dc = compositor_.Dc();
+        if (old_dc) old_dc->AddRef();
+        compositor_.NotifyDeviceLost(DXGI_ERROR_DEVICE_REMOVED); Render();
+        check(!compositor_.NeedsRecovery() && compositor_.Dc() && compositor_.Dc() != old_dc,
+              "advanced replaces lost device resources");
+        if (old_dc) old_dc->Release();
+        auto state_kept = [&] {
+            DWORD begin = 0, end = 0; SendMessageW(edit, EM_GETSEL,
+                reinterpret_cast<WPARAM>(&begin), reinterpret_cast<LPARAM>(&end));
+            return edit_kw_ == edit && IsWindow(edit) && EditText(edit) == draft &&
+                GetFocus() == edit && begin == 2 && end == 8;
+        };
+        check(state_kept(), "advanced recovery preserves draft HWND focus and selection");
+        snapshot_path_ = png;
+        Render();
+        check(snapshot_saved_, "advanced recovered frame captured before flip presentation");
+        snapshot_path_.clear();
+        SetPropW(hwnd_, L"Pulse.Test.RecoveryFailure", reinterpret_cast<HANDLE>(1));
+        compositor_.NotifyDeviceLost(DXGI_ERROR_DEVICE_REMOVED); Render();
+        const auto attempts = recovery_attempts_;
+        for (int i = 0; i < 20; ++i) Render();
+        check(compositor_.NeedsRecovery() && recovery_attempts_ == attempts,
+              "advanced failed recovery backs off instead of repaint spin");
+        RemovePropW(hwnd_, L"Pulse.Test.RecoveryFailure");
+        Sleep(275); Render();
+        check(!compositor_.NeedsRecovery() && state_kept(), "advanced retries transient failure with state retained");
+        SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L"changed"));
+        check(EditText(edit) != draft, "advanced recovered editor accepts replacement");
+        SendMessageW(edit, EM_UNDO, 0, 0);
+        check(EditText(edit) == draft, "advanced recovered editor preserves native undo");
+        DestroyEdits(); DestroyWindow(hwnd_); hwnd_ = nullptr;
+    }
+#endif
+
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
         auto* self = reinterpret_cast<AdvancedSearchWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -260,19 +352,16 @@ private:
     }
 
     void SyncFromEdits() {
+        if (!edits_ready_) return;
         const std::wstring keyword = EditText(edit_kw_);
         const std::wstring exclude = EditText(edit_exclude_);
         if (content_mode_) {
             spec_.content = keyword;
             spec_.name = EditText(edit_name_also_);
             spec_.content_exclude = exclude;
-            spec_.exclude_name.clear();
         } else {
             spec_.name = keyword;
-            spec_.content.clear();
-            spec_.content_exclude.clear();
             spec_.exclude_name = exclude;
-            spec_.whole_word = spec_.case_sensitive = false;
         }
         spec_.custom_exts = app::NormalizeExtensionList(EditText(edit_exts_));
         if (!spec_.custom_exts.empty()) spec_.kind = index::SearchKind::Custom;
@@ -520,8 +609,6 @@ private:
         SetWindowTheme(edit, L"", L"");
         const auto& cue = l10n::Get(cue_id);
         SendMessageW(edit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(cue.c_str()));
-        if (!compositor_.LumaTextEnabled())
-            SetLayeredWindowAttributes(edit, 0, 255, LWA_ALPHA);
         if (font_) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
         SetWindowSubclass(edit, EditProc, static_cast<UINT_PTR>(id), reinterpret_cast<DWORD_PTR>(this));
         return edit;
@@ -546,17 +633,7 @@ private:
                   static_cast<int>(std::lround(cell.top)) };
         const int w = std::max(40, static_cast<int>(std::lround(cell.right - cell.left - 20.0f * scale_)));
         const int cell_h = std::max(18, static_cast<int>(std::lround(cell.bottom - cell.top)));
-        int line_h = cell_h;
-        if (font_) {
-            HDC hdc = GetDC(hwnd);
-            HFONT old = static_cast<HFONT>(SelectObject(hdc, font_));
-            TEXTMETRICW tm{};
-            GetTextMetricsW(hdc, &tm);
-            SelectObject(hdc, old);
-            ReleaseDC(hwnd, hdc);
-            line_h = std::max(1, static_cast<int>(tm.tmHeight));
-        }
-        line_h = std::min(line_h, cell_h);
+        const int line_h = EditLineHeight(hwnd, font_, cell_h);
         pt.y += std::max(0, (cell_h - line_h) / 2);
         SetWindowPos(hwnd, HWND_TOP, pt.x, pt.y, w, line_h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         // Layered children need an initial bitmap before they can receive clicks.
@@ -645,6 +722,7 @@ private:
 
     // Re-reads the edits, recompiles the query, re-lays out and (if needed) resizes.
     void Recompute(bool resize = true) {
+        if (!edits_ready_) return;
         SyncFromEdits();
         preview_ = app::CompileSearchQuery(spec_);
         const auto split = app::SplitSearchQueryText(preview_);
@@ -679,6 +757,14 @@ private:
         if (content == content_mode_) return;
         SyncFromEdits();
         content_mode_ = content;
+        // Clear inactive criteria only on an explicit mode switch, not when an
+        // existing mixed query is read back from the controls.
+        if (content) spec_.exclude_name.clear();
+        else {
+            spec_.content.clear();
+            spec_.content_exclude.clear();
+            spec_.whole_word = spec_.case_sensitive = false;
+        }
         if (!content && edit_name_also_) SetWindowTextW(edit_name_also_, L"");
         SetCue(edit_kw_, KeywordHint());
         SetCue(edit_exclude_, ExcludeHint());
@@ -753,6 +839,7 @@ private:
             const int v = id - kHitLocation;
             if (v == 2) {
                 FolderPickerSpec picker;
+                picker.selection_outline = selection_outline_;
                 picker.title = l10n::Get(I::AdvSearchBrowse);
                 picker.initial_path = spec_.custom_folder;
                 std::wstring folder;
@@ -799,6 +886,39 @@ private:
     // ---- painting ------------------------------------------------------------------
 
     void Render() {
+        if (compositor_.NeedsRecovery()) {
+            const auto now = GetTickCount64();
+            if (now < next_recovery_) {
+                SetTimer(hwnd_, kRecoveryTimer, static_cast<UINT>(next_recovery_ - now), nullptr);
+                return;
+            }
+            // Release all device-bound Painter resources even if a replacement
+            // context happens to reuse the old context's address.
+            painter_.SetCompositor(nullptr);
+            bool recovered = false;
+#ifdef PULSE_WITH_SELFTEST
+            ++recovery_attempts_;
+            if (!GetPropW(hwnd_, L"Pulse.Test.RecoveryFailure"))
+#endif
+                recovered = compositor_.Recover();
+            if (!recovered) {
+                next_recovery_ = GetTickCount64() + recovery_delay_;
+                SetTimer(hwnd_, kRecoveryTimer, recovery_delay_, nullptr);
+                recovery_delay_ = (std::min)(recovery_delay_ * 2, 2000u);
+                return;
+            }
+            KillTimer(hwnd_, kRecoveryTimer);
+            next_recovery_ = 0;
+            recovery_delay_ = 250;
+            compositor_.RecreateTextFormats(scale_);
+            painter_.SetCompositor(&compositor_);
+            painter_.SetScale(scale_);
+            painter_.InvalidateTypography();
+            // The native EDITs retain their text, undo, focus and selection.
+            // Only their presentation resources belong to the lost device.
+            LayoutEdits();
+            for (const auto edit : VisibleEdits()) InvalidateRect(edit, nullptr, FALSE);
+        }
         if (!compositor_.Dc()) return;
         Theme theme = MakeTheme(dark_, accent_);
         if (IsHighContrast()) theme = MakeHighContrastTheme();
@@ -918,27 +1038,29 @@ private:
         close_state.hovered = hover_ == kHitClose;
         close_state.pressed = pressed_ == kHitClose;
         painter_.DrawTitleBarButton(CloseRect(), fluent::TitleBarButtonRole::Close, {}, close_state);
+#ifdef PULSE_WITH_SELFTEST
+        if (!snapshot_path_.empty()) {
+            // A flip-chain back buffer is no longer the submitted frame after Present.
+            const HRESULT drawn = compositor_.Dc()->EndDraw();
+            snapshot_saved_ = SUCCEEDED(drawn) && compositor_.SaveSnapshot(snapshot_path_.c_str());
+            if (SUCCEEDED(drawn)) compositor_.Present();
+            else compositor_.NotifyDeviceLost(drawn);
+            return;
+        }
+#endif
         EndSurface(compositor_);
     }
 
     LRESULT Handle(UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
         case WM_CREATE: {
+            edits_ready_ = false;
             if (!compositor_.Init(hwnd_)) return -1;
             compositor_.RecreateTextFormats(scale_);
             painter_.SetCompositor(&compositor_);
             painter_.SetScale(scale_);
             backdrop_ = ApplyBackdrop(hwnd_, dark_);
-            const int height = -std::max(1, static_cast<int>(std::lround(14.0f * scale_)));
-            const wchar_t* family = typography::PreferredTextFamily();
-            font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE, family);
-            if (!font_) {
-                font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                    DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            }
+            font_ = typography::CreateEditFont(scale_);
             if (edit_brush_) { DeleteObject(edit_brush_); edit_brush_ = nullptr; }
             edit_brush_ = CreateSolidBrush(dark_ ? RGB(30, 30, 30) : RGB(255, 255, 255));
             edit_kw_ = CreateField(1, content_mode_ ? spec_.content : spec_.name, KeywordHint());
@@ -947,16 +1069,26 @@ private:
             edit_exclude_ = CreateField(3, content_mode_ ? spec_.content_exclude : spec_.exclude_name,
                                         ExcludeHint());
             edit_name_also_ = CreateField(4, content_mode_ ? spec_.name : L"", I::AdvNameAlso);
+            // Creating a native EDIT can synchronously send EN_CHANGE before its
+            // handle is assigned. Do not read a partially constructed form.
+            edits_ready_ = edit_kw_ && edit_exts_ && edit_exclude_ && edit_name_also_;
+            if (!edits_ready_) return -1;
             return 0;
         }
         case WM_DESTROY:
             KillTimer(hwnd_, kCountTimer);
+            KillTimer(hwnd_, kRecoveryTimer);
             if (font_) { DeleteObject(font_); font_ = nullptr; }
             if (edit_brush_) { DeleteObject(edit_brush_); edit_brush_ = nullptr; }
             compositor_.Shutdown();
             done_ = true;
             return 0;
         case WM_TIMER:
+            if (wparam == kRecoveryTimer) {
+                KillTimer(hwnd_, kRecoveryTimer);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             if (wparam == kCountTimer) {
                 KillTimer(hwnd_, kCountTimer);
                 count_timer_ = false;
@@ -1124,8 +1256,17 @@ private:
     bool dark_ = true;
     bool backdrop_ = false;
     bool done_ = false;
+    bool edits_ready_ = false;
     bool scope_error_ = false;
     float scale_ = 1.0f;
+    bool selection_outline_ = false;
+    ULONGLONG next_recovery_ = 0;
+    UINT recovery_delay_ = 250;
+#ifdef PULSE_WITH_SELFTEST
+    unsigned recovery_attempts_ = 0;
+    std::wstring snapshot_path_;
+    bool snapshot_saved_ = false;
+#endif
     D2D1_COLOR_F accent_{};
     int hover_ = 0;
     int pressed_ = 0;
@@ -1133,11 +1274,34 @@ private:
 
 } // namespace
 
+#ifdef PULSE_ADVANCED_QUERY_TEST
+AdvancedSearchDialogResult TestAdvancedSearchQuery(app::AdvancedSearchSpec spec, int field,
+                                                  const std::wstring& value) {
+    AdvancedSearchWindow window;
+    return window.TestQuery(std::move(spec), field, value);
+}
+#endif
+
+#ifdef PULSE_WITH_SELFTEST
+void TestAdvancedSearchRecovery(HWND owner, float scale, bool dark, const std::wstring& png,
+                               const DialogRecoveryCheck& check) {
+    AdvancedSearchWindow window;
+    window.TestRecovery(owner, scale, dark, png, check);
+}
+#endif
+
 AdvancedSearchDialogResult ShowAdvancedSearchDialog(HWND owner, app::AdvancedSearchSpec spec,
                                                     bool dark, D2D1_COLOR_F accent,
-                                                    AdvancedSearchCountRequest count) {
+                                                    AdvancedSearchCountRequest count, bool selection_outline) {
     AdvancedSearchWindow window;
-    return window.Show(owner, std::move(spec), dark, accent, std::move(count));
+    return window.Show(owner, std::move(spec), dark, accent, std::move(count), selection_outline);
 }
+
+#ifdef PULSE_WITH_SELFTEST
+bool TestAdvancedSearchDeviceRecovery(HWND host) {
+    AdvancedSearchWindow window;
+    return window.TestDeviceRecovery(host);
+}
+#endif
 
 } // namespace pulse::ui

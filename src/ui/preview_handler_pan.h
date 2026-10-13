@@ -26,6 +26,7 @@ public:
         host_ = host;
         if (!input_) {
             input_ = std::make_shared<InputState>();
+            input_->api = input_api_;
             auto* argument = new std::shared_ptr<InputState>(input_);
             input_->thread = CreateThread(nullptr, 0, InputMain, argument, 0, nullptr);
             if (!input_->thread) {
@@ -85,6 +86,16 @@ public:
 
 private:
     friend struct PreviewHandlerPanTest;
+    friend struct PreviewHandlerPanThreadTest;
+    struct InputApi {
+        decltype(&SetWindowsHookExW) set_hook = SetWindowsHookExW;
+        decltype(&UnhookWindowsHookEx) unhook = UnhookWindowsHookEx;
+        decltype(&GetMessageW) get_message = GetMessageW;
+        decltype(&PeekMessageW) peek_message = PeekMessageW;
+        decltype(&CallNextHookEx) call_next = CallNextHookEx;
+        decltype(&WindowFromPoint) window_from_point = WindowFromPoint;
+    };
+    struct InputState;
 
     // The low-level hook is machine wide: while it is installed every mouse
     // event is marshalled into this process, so it must only stay live while a
@@ -92,28 +103,21 @@ private:
     // is the only thread that may receive its callbacks.
     void RequestHook(bool install) {
         if (!input_) return;
+        input_->desired_hook = install;
         const DWORD thread = input_->thread_id.load();
-        if (thread) PostThreadMessageW(thread, kHookCommand, install ? 1 : 0, 0);
-    }
-
-    static void SetHook(HHOOK& hook, bool install) {
-        if (install == (hook != nullptr)) return;
-        if (install) {
-            hook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
-        } else {
-            UnhookWindowsHookEx(hook);
-            hook = nullptr;
-        }
+        if (thread) PostThreadMessageW(thread, kHookCommand, 0, 0);
     }
 
     struct InputState {
         ~InputState() { if (thread) CloseHandle(thread); }
+        InputApi api;
         HANDLE thread = nullptr;
         std::atomic<DWORD> thread_id{0};
         std::atomic<HWND> host{nullptr};
         std::atomic<UINT> generation{0};
         std::atomic<bool> active{false};
         std::atomic<bool> stop{false};
+        std::atomic<bool> desired_hook{false};
         // Only the input thread touches this, including after host destruction.
         bool suppress_left_up = false;
         bool pending = false;
@@ -123,6 +127,12 @@ private:
         UINT pending_generation = 0;
         std::atomic<HWND> target{nullptr};
     };
+
+    static void SetHook(InputState& input, HHOOK& hook, bool install) {
+        if (install == (hook != nullptr)) return;
+        if (install) hook = input.api.set_hook(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
+        else { input.api.unhook(hook); hook = nullptr; }
+    }
 
     struct Axis {
         HWND target = nullptr;
@@ -254,7 +264,7 @@ private:
 
     static bool ConsumeMouse(InputState& input, WPARAM message, POINT point) {
         HWND host = input.host.load();
-        if (input.pending && (host != input.pending_host ||
+        if (input.pending && (input.stop || !input.desired_hook || host != input.pending_host ||
             input.generation.load() != input.pending_generation)) input.pending = false;
         if (message == WM_LBUTTONUP) {
             input.pending = false;
@@ -263,11 +273,12 @@ private:
             input.active = false;
             if (host) PostMessageW(host, kEnd, input.generation.load(), MAKELPARAM(point.x, point.y));
             if (input.stop) PostQuitMessage(0);
+            else if (const DWORD thread = input.thread_id.load()) PostThreadMessageW(thread, kHookCommand, 0, 0);
             return true;
         }
-        if (!host) return false;
-        if (message == WM_LBUTTONDOWN && !input.active) {
-            HWND target = WindowFromPoint(point);
+        if (!host || input.stop || !input.desired_hook) return false;
+        if (message == WM_LBUTTONDOWN && !input.active && !input.suppress_left_up) {
+            HWND target = input.api.window_from_point(point);
             if (IsWindowVisible(host) && CanGrabContent(host, target, point))
                 TrackPress(input, host, target, point);
             // Let the provider receive the real press and release for clicks,
@@ -303,7 +314,8 @@ private:
             const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(parameter);
             if (ConsumeMouse(*current_input_, message, mouse->pt)) return 1;
         }
-        return CallNextHookEx(nullptr, code, message, parameter);
+        return current_input_ ? current_input_->api.call_next(nullptr, code, message, parameter)
+                              : CallNextHookEx(nullptr, code, message, parameter);
     }
 
     static DWORD WINAPI InputMain(void* parameter) {
@@ -311,28 +323,29 @@ private:
             static_cast<std::shared_ptr<InputState>*>(parameter));
         auto input = *argument;
         MSG message{};
-        PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
+        input->api.peek_message(&message, nullptr, 0, 0, PM_NOREMOVE);
         input->thread_id = GetCurrentThreadId();
         current_input_ = input.get();
         // This thread never calls preview providers. Even a blocked preview STA
         // cannot delay the mouse hook or leak a consumed gesture's release.
-        // The hook starts installed because Enable() may ask for it before this
-        // thread has a message queue to receive the request.
-        HHOOK hook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
-        while ((!input->stop || input->suppress_left_up) &&
-               GetMessageW(&message, nullptr, 0, 0) > 0) {
-            if (message.message == kHookCommand) {
-                SetHook(hook, message.wParam != 0);
-                continue;
-            }
+        HHOOK hook = nullptr;
+        for (;;) {
+            // Wake-up messages carry no state: Enable/Disable may precede queue
+            // creation or race each other. An intercepted drag owns its release
+            // even after the preview is hidden or this owner is destroyed.
+            SetHook(*input, hook, (!input->stop && input->desired_hook) || input->suppress_left_up);
+            if (input->stop && !input->suppress_left_up) break;
+            if (input->api.get_message(&message, nullptr, 0, 0) <= 0) break;
+            if (message.message == kHookCommand) continue;
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
-        SetHook(hook, false);
+        SetHook(*input, hook, false);
         current_input_ = nullptr;
         return 0;
     }
 
+    InputApi input_api_;
     HWND host_ = nullptr;
     std::shared_ptr<InputState> input_;
     bool dragging_ = false;

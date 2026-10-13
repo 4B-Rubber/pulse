@@ -2,8 +2,10 @@
 #pragma once
 #include "../index/index_query.h"
 #include "../index/search_kinds.h"
+#include <memory>
 #include <string>
 #include <string_view>
+#include <memory>
 
 namespace pulse::app {
 
@@ -12,8 +14,13 @@ enum class LocationScope : uint8_t { Indexed, CurrentFolder, CustomFolder };
 enum class SizePreset : uint8_t { Any, Empty, Lt1MB, From1To10MB, Gt10MB, Gt100MB, Gt1GB, Custom };
 enum class DatePreset : uint8_t { Any, Today, Yesterday, ThisWeek, ThisMonth, ThisYear, Custom };
 
+struct AdvancedSearchOrigin;
+
 struct AdvancedSearchSpec {
     std::wstring name;
+    bool name_is_query = false;
+    std::wstring original_query;
+    std::shared_ptr<const AdvancedSearchSpec> parsed_baseline;
     bool pinyin_enabled = true;
     NameMatchHow name_how = NameMatchHow::Contains;
     index::SearchKind kind = index::SearchKind::Any;
@@ -32,6 +39,7 @@ struct AdvancedSearchSpec {
     bool whole_word = false;
     bool case_sensitive = false;
     std::wstring exclude_name;
+    std::shared_ptr<const AdvancedSearchOrigin> origin;
 };
 
 struct SplitSearchQuery {
@@ -45,6 +53,9 @@ struct SplitSearchQuery {
 
 std::wstring QuoteQueryValue(std::wstring_view value);
 std::wstring CompileSearchQuery(const AdvancedSearchSpec& spec);
+// Native name-search input; an explicit folder overrides only the global path scope.
+std::wstring CompileNameQueryInput(std::wstring_view raw, std::wstring_view folder = {});
+std::wstring NameQueryDraft(std::wstring_view raw);
 AdvancedSearchSpec ParseSearchQuery(std::wstring_view raw, std::wstring_view current_folder = {});
 SplitSearchQuery SplitSearchQueryText(std::wstring_view raw);
 bool ContentSearchNeedsScope(const SplitSearchQuery& split);

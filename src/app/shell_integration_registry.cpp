@@ -8,7 +8,24 @@
 #include <vector>
 
 namespace pulse::app {
+#ifdef PULSE_INTEGRATION_TEST
+static thread_local IntegrationWriteHook write_hook = nullptr;
+void SetIntegrationWriteHookForTesting(IntegrationWriteHook hook) { write_hook = hook; }
+#endif
 namespace {
+
+// Only ApplyShellIntegration records; the first failure explains the result.
+thread_local bool t_recording = false;
+thread_local ShellIntegrationFailure t_failure;
+
+void Fail(ShellIntegrationFailureKind kind, const std::wstring& key = {}, const std::wstring& name = {},
+          long status = 0) {
+    if (!t_recording || t_failure.kind != ShellIntegrationFailureKind::None) return;
+    t_failure.kind = kind;
+    t_failure.key = key;
+    t_failure.name = name;
+    t_failure.status = status;
+}
 
 constexpr wchar_t kBackupRoot[] = L"Software\\Pulse\\ShellIntegration\\Backups\\v1\\";
 constexpr DWORD kSnapshotMagic = 0x31534950; // PIS1; one atomic REG_BINARY value per group.
@@ -50,36 +67,58 @@ bool Read(const std::wstring& key, const std::wstring& name, Value& value) {
     HKEY handle = nullptr;
     LONG status = RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &handle);
     if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND) return true;
-    if (status != ERROR_SUCCESS) return false;
+    if (status != ERROR_SUCCESS) { Fail(ShellIntegrationFailureKind::ReadError, key, name, status); return false; }
     DWORD size = 0;
     status = RegQueryValueExW(handle, name.c_str(), nullptr, &value.type, nullptr, &size);
     if (status == ERROR_FILE_NOT_FOUND) { RegCloseKey(handle); value = {}; return true; }
-    if (status != ERROR_SUCCESS || size > 8 * 1024 * 1024) { RegCloseKey(handle); return false; }
+    if (status != ERROR_SUCCESS || size > 8 * 1024 * 1024) {
+        RegCloseKey(handle);
+        Fail(ShellIntegrationFailureKind::ReadError, key, name, status);
+        return false;
+    }
     value.bytes.resize(size);
     status = RegQueryValueExW(handle, name.c_str(), nullptr, &value.type,
                              value.bytes.empty() ? nullptr : value.bytes.data(), &size);
     RegCloseKey(handle);
-    if (status != ERROR_SUCCESS) return false;
+    if (status != ERROR_SUCCESS) { Fail(ShellIntegrationFailureKind::ReadError, key, name, status); return false; }
     value.bytes.resize(size);
     value.exists = true;
     return true;
 }
 
 bool Write(const std::wstring& key, const std::wstring& name, const Value& value) {
+#ifdef PULSE_INTEGRATION_TEST
+    if (write_hook && !write_hook(key, name)) {
+        Fail(ShellIntegrationFailureKind::WriteError, key, name, ERROR_WRITE_FAULT);
+        return false;
+    }
+#endif
     HKEY handle = nullptr;
     LONG status = value.exists
         ? RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &handle, nullptr)
         : RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_SET_VALUE, &handle);
     if (!value.exists && (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND)) return true;
-    if (status != ERROR_SUCCESS) return false;
+    auto denied = [&](LONG code) {
+        Fail(code == ERROR_ACCESS_DENIED ? ShellIntegrationFailureKind::AccessDenied
+                                         : ShellIntegrationFailureKind::WriteError, key, name, code);
+        return false;
+    };
+    if (status != ERROR_SUCCESS) return denied(status);
     status = value.exists
         ? RegSetValueExW(handle, name.c_str(), 0, value.type, value.bytes.empty() ? nullptr : value.bytes.data(),
                          static_cast<DWORD>(value.bytes.size()))
         : RegDeleteValueW(handle, name.c_str());
     RegCloseKey(handle);
     if (!value.exists && status == ERROR_FILE_NOT_FOUND) status = ERROR_SUCCESS;
+    if (status != ERROR_SUCCESS) return denied(status);
     Value actual;
-    return status == ERROR_SUCCESS && Read(key, name, actual) && SameValue(actual, value);
+    if (!Read(key, name, actual)) return false;
+    if (!SameValue(actual, value)) {
+        // The call succeeded but the value is not there: something undid it.
+        Fail(ShellIntegrationFailureKind::Reverted, key, name, 0);
+        return false;
+    }
+    return true;
 }
 
 void Put(std::vector<BYTE>& bytes, DWORD number) {
@@ -142,6 +181,11 @@ std::vector<Binding> Bindings(const std::wstring& group, const std::wstring& exe
         shell = L"Software\\Classes\\CLSID\\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\shell";
         verb = shell + L"\\open";
         line = L"\"" + exe + L"\" \"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\"";
+    } else if (group == L"RecycleBin") {
+        // Same shape as This PC: the desktop icon runs CLSID\...\shell's default verb.
+        shell = L"Software\\Classes\\CLSID\\{645FF040-5081-101B-9F08-00AA002F954E}\\shell";
+        verb = shell + L"\\open";
+        line = L"\"" + exe + L"\" \"::{645FF040-5081-101B-9F08-00AA002F954E}\"";
     } else {
         shell = L"Software\\Classes\\" + group + L"\\shell";
         verb = shell + L"\\open";
@@ -159,6 +203,7 @@ std::vector<std::wstring> Groups(ShellIntegrationKind kind) {
     if (kind == ShellIntegrationKind::Folders) return {L"Directory", L"Drive"};
     if (kind == ShellIntegrationKind::Directory) return {L"Directory"};
     if (kind == ShellIntegrationKind::Drive) return {L"Drive"};
+    if (kind == ShellIntegrationKind::RecycleBin) return {L"RecycleBin"};
     return {kind == ShellIntegrationKind::WinE ? L"WinE" : L"ThisPc"};
 }
 
@@ -180,7 +225,196 @@ void DropEmptyKeys(std::wstring key) {
     }
 }
 
+bool Flush(const std::wstring& key, bool missing_ok = false) {
+    HKEY handle = nullptr;
+    const LONG opened = RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &handle);
+    if (missing_ok && (opened == ERROR_FILE_NOT_FOUND || opened == ERROR_PATH_NOT_FOUND)) return true;
+    if (opened != ERROR_SUCCESS) return false;
+    const LONG result = RegFlushKey(handle);
+    RegCloseKey(handle);
+    return result == ERROR_SUCCESS;
+}
+
+bool WriteDurable(const std::wstring& key, const std::wstring& name, const Value& value) {
+    return Write(key, name, value) && Flush(key);
+}
+
+bool LegacyResidue(std::vector<Binding>& bindings, std::vector<Value>& current) {
+    bindings.clear();
+    current.clear();
+    for (const auto* group : {L"Directory", L"Drive", L"WinE", L"ThisPc"}) {
+        const auto group_bindings = Bindings(group, L"");
+        HKEY backup = nullptr;
+        const auto status = RegOpenKeyExW(HKEY_CURRENT_USER, (std::wstring(kBackupRoot) + group).c_str(),
+                                         0, KEY_QUERY_VALUE, &backup);
+        if (backup) RegCloseKey(backup);
+        if (status != ERROR_FILE_NOT_FOUND && status != ERROR_PATH_NOT_FOUND) return false;
+        for (size_t i = 0; i < group_bindings.size(); ++i) {
+            const auto& binding = group_bindings[i];
+            Value actual, legacy;
+            if (!Read(binding.key, binding.name, actual)) return false;
+            const bool absent = i == 0 || (i == 1 && (group == std::wstring_view(L"Directory") ||
+                                                                     group == std::wstring_view(L"Drive")));
+            if (!SameValue(actual, absent ? Value{} : binding.desired)) return false;
+            for (const auto* name : {L"PulseBackup", L"PulseBackupDelegateExecute"})
+                if (!Read(binding.key, name, legacy) || legacy.exists) return false;
+            bindings.push_back(binding);
+            current.push_back(std::move(actual));
+        }
+        // The legacy namespace shape has no delegate on the verb itself.
+        if (group == std::wstring_view(L"WinE") || group == std::wstring_view(L"ThisPc")) {
+            auto verb = group_bindings.front().key;
+            verb.resize(verb.rfind(L'\\'));
+            Value value;
+            for (const auto* name : {L"DelegateExecute", L"PulseBackup", L"PulseBackupDelegateExecute"})
+                if (!Read(verb, name, value) || value.exists) return false;
+            if (group == std::wstring_view(L"WinE")) {
+                verb.resize(verb.rfind(L'\\'));
+                for (const auto* name : {L"", L"PulseBackup", L"PulseBackupDelegateExecute"})
+                    if (!Read(verb, name, value) || value.exists) return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool ReadLegacyRepair(std::vector<Binding>& bindings, Snapshot& journal, bool& exists) {
+    bindings.clear();
+    std::vector<Value> expected;
+    for (const auto* group : {L"Directory", L"Drive", L"WinE", L"ThisPc"}) {
+        const auto entries = Bindings(group, L"");
+        for (size_t i = 0; i < entries.size(); ++i) {
+            bindings.push_back(entries[i]);
+            const bool absent = i == 0 || (i == 1 &&
+                (group == std::wstring_view(L"Directory") || group == std::wstring_view(L"Drive")));
+            expected.push_back(absent ? Value{} : entries[i].desired);
+        }
+    }
+    Value stored;
+    if (!Read(std::wstring(kBackupRoot) + L"LegacyOrphanRepair", L"Snapshot", stored)) return false;
+    exists = stored.exists;
+    if (!exists) return true;
+    if (!Decode(stored, bindings.size(), journal)) return false;
+    for (size_t i = 0; i < bindings.size(); ++i)
+        if (!journal.before[i].known || !journal.written[i].known ||
+            !SameValue(journal.before[i], expected[i]) || journal.written[i].exists) return false;
+    return true;
+}
+
+struct UpgradeJournal {
+    Value stored;
+    Snapshot original;
+    Snapshot changes;
+    Snapshot next;
+};
+
+Value EncodeUpgrade(const UpgradeJournal& journal) {
+    return Encode(Snapshot{{journal.stored, Encode(journal.changes)},
+                           {Encode(journal.original), Encode(journal.next)}});
+}
+
+bool DecodeUpgrade(const Value& encoded, size_t count, UpgradeJournal& journal) {
+    Snapshot envelope;
+    if (!Decode(encoded, 2, envelope)) return false;
+    journal.stored = envelope.before[0];
+    return Decode(envelope.before[1], count, journal.changes) &&
+        Decode(envelope.written[0], count, journal.original) &&
+        Decode(envelope.written[1], count, journal.next);
+}
+
+bool JournalForExecutable(const UpgradeJournal& journal, const std::wstring& exe) {
+    return ShellCommandTargetsExecutable(Text(journal.original.written[0]), exe) ||
+           ShellCommandTargetsExecutable(Text(journal.next.written[0]), exe);
+}
+
+bool FinishUpgrade(const std::wstring& group, const UpgradeJournal& journal, bool restore) {
+    const auto bindings = Bindings(group, L"");
+    const auto key = std::wstring(kBackupRoot) + group;
+    // A previous journal write may have failed to flush. Never mutate Classes
+    // until this invocation has confirmed that the recovery proof is durable.
+    Value proof;
+    if (!Read(key, L"UpgradeJournal", proof) || !SameValue(proof, EncodeUpgrade(journal)) || !Flush(key)) return false;
+    Value stored;
+    if (!Read(key, L"Snapshot", stored) ||
+        (!SameValue(stored, journal.stored) && !SameValue(stored, Encode(journal.next)) &&
+         !(restore && !stored.exists))) return false;
+    std::vector<Value> target = journal.changes.written;
+    bool exact = true;
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        if (restore && (SameValue(journal.changes.before[i], journal.original.written[i]) ||
+                        SameValue(journal.changes.before[i], journal.next.written[i]) ||
+                        !SameValue(journal.changes.before[i], journal.changes.written[i]))) {
+            target[i] = journal.original.before[i];
+            exact = target[i].known && exact;
+        }
+        Value current;
+        if (!Read(bindings[i].key, bindings[i].name, current) ||
+            (!SameValue(current, journal.changes.before[i]) &&
+             !SameValue(current, journal.changes.written[i]) &&
+             !(restore && SameValue(current, target[i])))) return false;
+    }
+    // Commit the new snapshot before any association changes, so an upgrade
+    // interrupted here still has the old command plus the journal to resume.
+    if (!restore && !WriteDurable(key, L"Snapshot", Encode(journal.next))) return false;
+    // Restore the command last so an ordinary write failure retains its anchor.
+    for (size_t n = 0; n < bindings.size(); ++n) {
+        const size_t i = restore ? bindings.size() - 1 - n : n;
+        Value current;
+        if (!Read(bindings[i].key, bindings[i].name, current)) return false;
+        if (SameValue(current, target[i])) continue;
+        if (!SameValue(current, journal.changes.before[i]) &&
+            !SameValue(current, journal.changes.written[i])) return false;
+        if (!Write(bindings[i].key, bindings[i].name, target[i])) return false;
+    }
+    for (const auto& binding : bindings)
+        if (!Flush(binding.key, true)) return false;
+    if (restore && !WriteDurable(key, L"Snapshot", Value{})) return false;
+    if (!WriteDurable(key, L"PendingUpgrade", Value{})) return false;
+    if (!WriteDurable(key, L"UpgradeJournal", Value{})) return false;
+    return exact;
+}
+
+void RollbackUpgrade(const std::wstring& group, const UpgradeJournal& journal) {
+    const auto bindings = Bindings(group, L"");
+    const auto key = std::wstring(kBackupRoot) + group;
+    Value proof;
+    // Once the journal has been removed, the new Snapshot is already durable.
+    // A failing final flush must not start a fresh, unjournaled compensation.
+    if (!Read(key, L"UpgradeJournal", proof) || !SameValue(proof, EncodeUpgrade(journal))) return;
+    bool restored = true;
+    for (size_t i = bindings.size(); i-- > 0;) {
+        if (i == 0 && !restored) break;
+        Value current;
+        if (!Read(bindings[i].key, bindings[i].name, current)) { restored = false; continue; }
+        if (SameValue(current, journal.changes.before[i])) continue;
+        if (!SameValue(current, journal.changes.written[i])) { restored = false; continue; }
+        restored = Write(bindings[i].key, bindings[i].name, journal.changes.before[i]) && restored;
+    }
+    if (!restored) return;
+    for (const auto& binding : bindings)
+        if (!Flush(binding.key, true)) return;
+    if (WriteDurable(key, L"Snapshot", journal.stored))
+        WriteDurable(key, L"UpgradeJournal", Value{});
+}
+
 bool ApplyGroup(const std::wstring& group, const std::wstring& exe, bool on) {
+    const auto journal_key = std::wstring(kBackupRoot) + group;
+    Value pending_journal;
+    if (!Read(journal_key, L"UpgradeJournal", pending_journal)) return false;
+    if (pending_journal.exists) {
+        UpgradeJournal journal;
+        if (!DecodeUpgrade(pending_journal, Bindings(group, exe).size(), journal) ||
+            !JournalForExecutable(journal, exe) ||
+            (on && !ShellCommandTargetsExecutable(Text(journal.next.written[0]), exe))) {
+            Fail(ShellIntegrationFailureKind::PendingUpgrade, journal_key, L"UpgradeJournal");
+            return false;
+        }
+        if (!FinishUpgrade(group, journal, !on)) {
+            Fail(ShellIntegrationFailureKind::PendingUpgrade, journal_key, L"UpgradeJournal");
+            return false;
+        }
+        if (!on) return true;
+    }
     const auto bindings = Bindings(group, exe);
     std::vector<Value> current(bindings.size());
     for (size_t i = 0; i < bindings.size(); ++i)
@@ -198,7 +432,10 @@ bool ApplyGroup(const std::wstring& group, const std::wstring& exe, bool on) {
         ShellCommandTargetsExecutable(Text(previous.written[0]), exe);
 
     if (on) {
-        if (stored.exists && !valid) return false;
+        if (stored.exists && !valid) {
+            Fail(ShellIntegrationFailureKind::BadBackup, backup_key, L"Snapshot");
+            return false;
+        }
         Snapshot next;
         next.before = current;
         for (size_t i = 0; i < bindings.size(); ++i) {
@@ -214,14 +451,18 @@ bool ApplyGroup(const std::wstring& group, const std::wstring& exe, bool on) {
             }
         }
         const Value encoded = Encode(next);
-        if (!SameValue(encoded, stored) && !Write(backup_key, L"Snapshot", encoded)) return false;
+        if (!SameValue(encoded, stored) && !WriteDurable(backup_key, L"Snapshot", encoded)) return false;
         for (size_t i = 0; i < bindings.size(); ++i) {
             if (SameValue(current[i], bindings[i].desired)) continue;
             Value checked;
-            if (!Read(bindings[i].key, bindings[i].name, checked) || !SameValue(checked, current[i]) ||
+            const bool readable = Read(bindings[i].key, bindings[i].name, checked);
+            if (readable && !SameValue(checked, current[i]))
+                Fail(ShellIntegrationFailureKind::ChangedByOther, bindings[i].key, bindings[i].name);
+            if (!readable || !SameValue(checked, current[i]) ||
                 !Write(bindings[i].key, bindings[i].name, bindings[i].desired)) {
                 bool rolled_back = true;
                 for (size_t j = i + 1; j-- > 0;) {
+                    if (j == 0 && !rolled_back) break;
                     if (!Read(bindings[j].key, bindings[j].name, checked)) rolled_back = false;
                     else if (SameValue(checked, bindings[j].desired))
                         rolled_back = Write(bindings[j].key, bindings[j].name, current[j]) && rolled_back;
@@ -243,7 +484,10 @@ bool ApplyGroup(const std::wstring& group, const std::wstring& exe, bool on) {
             previous.written.push_back(i == 0 ? current[i] : bindings[i].desired);
         }
     }
-    if (valid && !owned && !removed_anchor) return false; // someone edited Pulse's command
+    if (valid && !owned && !removed_anchor) { // someone edited Pulse's command
+        Fail(ShellIntegrationFailureKind::ChangedByOther, bindings[0].key, bindings[0].name);
+        return false;
+    }
     bool ok = valid;
     bool write_failed = false;
     for (size_t i = bindings.size(); i-- > 0;) {
@@ -293,10 +537,47 @@ bool ShellCommandTargetsExecutable(const std::wstring& command, const std::wstri
 }
 
 bool ApplyShellIntegration(ShellIntegrationKind kind, const std::wstring& exe, bool on) {
-    if (exe.empty()) return false;
+    t_failure = {};
+    if (exe.empty()) { t_failure.kind = ShellIntegrationFailureKind::Unknown; return false; }
+    // Do not record damaged legacy overrides as the next "original" state.
+    // The explicit repair action must release them before enabling again.
+    if (on && HasLegacyShellIntegrationResidue()) {
+        t_failure.kind = ShellIntegrationFailureKind::LegacyResidue;
+        return false;
+    }
+    struct Recording {
+        Recording() { t_recording = true; }
+        ~Recording() { t_recording = false; }
+    } recording;
     bool ok = true;
-    for (const auto& group : Groups(kind)) ok = ApplyGroup(group, exe, on) && ok;
+    for (const auto& group : Groups(kind)) {
+        const bool applied = ApplyGroup(group, exe, on);
+        if (!applied && t_failure.kind == ShellIntegrationFailureKind::None) {
+            t_failure.kind = ShellIntegrationFailureKind::Unknown;
+            t_failure.key = std::wstring(kBackupRoot) + group;
+        }
+        ok = applied && ok;
+    }
+    if (ok) t_failure = {};
     return ok;
+}
+
+ShellIntegrationFailure LastShellIntegrationFailure() { return t_failure; }
+
+const wchar_t* ShellIntegrationFailureName(ShellIntegrationFailureKind kind) noexcept {
+    switch (kind) {
+    case ShellIntegrationFailureKind::None: return L"ok";
+    case ShellIntegrationFailureKind::AccessDenied: return L"access-denied";
+    case ShellIntegrationFailureKind::WriteError: return L"write-error";
+    case ShellIntegrationFailureKind::Reverted: return L"reverted-after-write";
+    case ShellIntegrationFailureKind::ReadError: return L"read-error";
+    case ShellIntegrationFailureKind::LegacyResidue: return L"legacy-residue";
+    case ShellIntegrationFailureKind::BadBackup: return L"bad-backup";
+    case ShellIntegrationFailureKind::PendingUpgrade: return L"pending-upgrade";
+    case ShellIntegrationFailureKind::ChangedByOther: return L"changed-by-other";
+    case ShellIntegrationFailureKind::Unknown: break;
+    }
+    return L"unknown";
 }
 
 bool ReadShellIntegration(ShellIntegrationKind kind, const std::wstring& exe) {
@@ -313,11 +594,83 @@ bool ReadShellIntegration(ShellIntegrationKind kind, const std::wstring& exe) {
 bool HasShellIntegrationOwnership(ShellIntegrationKind kind, const std::wstring& exe) {
     if (exe.empty()) return false;
     for (const auto& group : Groups(kind)) {
-        const auto binding = Bindings(group, exe).front();
+        const auto bindings = Bindings(group, exe);
+        Value pending;
+        UpgradeJournal journal;
+        if (Read(std::wstring(kBackupRoot) + group, L"UpgradeJournal", pending) && pending.exists &&
+            DecodeUpgrade(pending, bindings.size(), journal) && JournalForExecutable(journal, exe)) return true;
+        const auto& binding = bindings.front();
         Value actual;
-        if (Read(binding.key, binding.name, actual) && ShellCommandTargetsExecutable(Text(actual), exe)) return true;
+        if (!Read(binding.key, binding.name, actual)) continue;
+        if (ShellCommandTargetsExecutable(Text(actual), exe)) return true;
+        if (actual.exists) continue;
+        Value stored;
+        Snapshot snapshot;
+        if (!Read(std::wstring(kBackupRoot) + group, L"Snapshot", stored) ||
+            !Decode(stored, bindings.size(), snapshot) || snapshot.before[0].exists ||
+            !ShellCommandTargetsExecutable(Text(snapshot.written[0]), exe)) continue;
+        // A previous restore may have removed the command first. Keep repair
+        // available while a snapshot-proven override still masks Explorer.
+        for (size_t i = 1; i < bindings.size(); ++i) {
+            if (Read(bindings[i].key, bindings[i].name, actual) && actual.exists &&
+                SameValue(actual, snapshot.written[i]) &&
+                !SameValue(actual, snapshot.before[i])) return true;
+        }
     }
     return false;
+}
+
+bool HasLegacyShellIntegrationResidue() {
+    std::vector<Binding> bindings;
+    Snapshot journal;
+    bool exists = false;
+    if (!ReadLegacyRepair(bindings, journal, exists)) {
+        std::vector<Value> current;
+        return LegacyResidue(bindings, current);
+    }
+    if (exists) {
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            Value actual;
+            if (journal.before[i].exists && Read(bindings[i].key, bindings[i].name, actual) &&
+                SameValue(actual, journal.before[i])) return true;
+        }
+        return false;
+    }
+    std::vector<Value> current;
+    return LegacyResidue(bindings, current);
+}
+
+bool RepairLegacyShellIntegrationResidue() {
+    std::vector<Binding> bindings;
+    Snapshot journal;
+    bool exists = false;
+    if (!ReadLegacyRepair(bindings, journal, exists)) return false;
+    // Retain an exact backup before deleting anything. Never overwrite an
+    // earlier repair record, including after an interrupted repair.
+    const std::wstring backup_key = std::wstring(kBackupRoot) + L"LegacyOrphanRepair";
+    if (!exists) {
+        std::vector<Value> current;
+        if (!LegacyResidue(bindings, current)) return false;
+        journal = Snapshot{current, std::vector<Value>(current.size())};
+        if (!WriteDurable(backup_key, L"Snapshot", Encode(journal))) return false;
+    } else if (!Flush(backup_key)) return false;
+    bool remaining = false;
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        Value actual;
+        if (!Read(bindings[i].key, bindings[i].name, actual) ||
+            (actual.exists && !SameValue(actual, journal.before[i]))) return false;
+        remaining = remaining || actual.exists;
+    }
+    if (!remaining) return false;
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        Value actual;
+        if (!Read(bindings[i].key, bindings[i].name, actual)) return false;
+        if (!actual.exists) continue;
+        if (!SameValue(actual, journal.before[i]) ||
+            !WriteDurable(bindings[i].key, bindings[i].name, Value{})) return false;
+    }
+    for (const auto& binding : bindings) DropEmptyKeys(binding.key);
+    return true;
 }
 
 bool PrepareShellIntegrationUpgrade(ShellIntegrationKind kind, const std::wstring& exe) {
@@ -325,6 +678,13 @@ bool PrepareShellIntegrationUpgrade(ShellIntegrationKind kind, const std::wstrin
     bool ok = true;
     for (const auto& group : Groups(kind)) {
         const auto bindings = Bindings(group, exe);
+        Value pending_journal;
+        if (!Read(std::wstring(kBackupRoot) + group, L"UpgradeJournal", pending_journal)) { ok = false; continue; }
+        if (pending_journal.exists) {
+            UpgradeJournal journal;
+            ok = DecodeUpgrade(pending_journal, bindings.size(), journal) && JournalForExecutable(journal, exe) && ok;
+            continue; // The durable journal already owns this upgrade's backup.
+        }
         std::vector<Value> current(bindings.size());
         bool readable = true;
         for (size_t i = 0; i < bindings.size(); ++i)
@@ -366,12 +726,22 @@ bool UpgradeShellIntegration(ShellIntegrationKind kind, const std::wstring& prev
     for (const auto& group : Groups(kind)) {
         const auto old = Bindings(group, previous_exe);
         const auto wanted = Bindings(group, exe);
+        const std::wstring backup_key = std::wstring(kBackupRoot) + group;
+        Value pending_journal;
+        if (!Read(backup_key, L"UpgradeJournal", pending_journal)) { ok = false; continue; }
+        if (pending_journal.exists) {
+            UpgradeJournal journal;
+            if (!DecodeUpgrade(pending_journal, old.size(), journal) ||
+                !ShellCommandTargetsExecutable(Text(journal.original.written[0]), previous_exe) ||
+                !ShellCommandTargetsExecutable(Text(journal.next.written[0]), exe)) { ok = false; continue; }
+            ok = FinishUpgrade(group, journal, false) && ok;
+            continue;
+        }
         std::vector<Value> current(old.size());
         bool readable = true;
         for (size_t i = 0; i < old.size(); ++i)
             readable = Read(old[i].key, old[i].name, current[i]) && readable;
         if (!readable) { ok = false; continue; }
-        const std::wstring backup_key = std::wstring(kBackupRoot) + group;
         Value stored;
         if (!Read(backup_key, L"Snapshot", stored)) { ok = false; continue; }
         Snapshot snapshot;
@@ -402,26 +772,23 @@ bool UpgradeShellIntegration(ShellIntegrationKind kind, const std::wstring& prev
             }
         }
         const auto previous_written = snapshot.written;
+        UpgradeJournal journal;
+        journal.stored = stored;
+        journal.original = snapshot;
+        journal.changes.before = current;
+        journal.changes.written = current;
         for (size_t i = 0; i < wanted.size(); ++i) snapshot.written[i] = wanted[i].desired;
-        if (!Write(backup_key, L"Snapshot", Encode(snapshot))) { ok = false; continue; }
+        journal.next = snapshot;
         for (size_t i = 0; i < wanted.size(); ++i) {
             if (current[i].exists && !SameValue(current[i], previous_written[i]) &&
                 !(restored_by_uninstaller && SameValue(current[i], snapshot.before[i]))) continue;
-            Value checked;
-            if (!Read(wanted[i].key, wanted[i].name, checked) || !SameValue(checked, current[i]) ||
-                !Write(wanted[i].key, wanted[i].name, wanted[i].desired)) {
-                bool rolled_back = true;
-                for (size_t j = i + 1; j-- > 0;) {
-                    if (!Read(wanted[j].key, wanted[j].name, checked)) rolled_back = false;
-                    else if (SameValue(checked, wanted[j].desired))
-                        rolled_back = Write(wanted[j].key, wanted[j].name, current[j]) && rolled_back;
-                }
-                if (rolled_back) Write(backup_key, L"Snapshot", stored);
-                ok = false;
-                break;
-            }
+            journal.changes.written[i] = wanted[i].desired;
         }
-        if (ok) Write(backup_key, L"PendingUpgrade", Value{});
+        if (!WriteDurable(backup_key, L"UpgradeJournal", EncodeUpgrade(journal))) { ok = false; continue; }
+        if (!FinishUpgrade(group, journal, false)) {
+            RollbackUpgrade(group, journal);
+            ok = false;
+        }
     }
     return ok;
 }

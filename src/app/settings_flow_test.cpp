@@ -16,8 +16,8 @@ int RunSettingsWidthBorderTest(AppState& s, const wchar_t* output) {
         log << (ok ? "[PASS] " : "[FAIL] ") << label << '\n';
         if (!ok) ++failures;
     };
-    check((s.settingsExpanded & ui::kSettingsContextExpandedMask) == ui::kSettingsContextExpandedMask,
-        "all context-menu groups start expanded");
+    check((s.settingsExpanded & ui::kSettingsContextExpandedMask) == 0,
+        "third-party context-menu groups start collapsed");
     const float original_scale = s.scale;
     for (float scale : {1.0f, 1.25f, 1.5f, 2.0f}) {
         s.compositor.RecreateTextFormats(scale);
@@ -48,9 +48,9 @@ int RunSettingsWidthBorderTest(AppState& s, const wchar_t* output) {
     const bool enabled = s.ctxMenuPrefs.GroupEnabled(group);
     H hit; hit.region = H::SettingsDisclosure; hit.index = 8;
     HandleSettingsControl(s, hit);
-    check(!(s.settingsExpanded & (1u<<8)), "default-expanded group can be collapsed");
+    check((s.settingsExpanded & (1u<<8)) != 0, "collapsed group can be expanded");
     HandleSettingsControl(s, hit);
-    check((s.settingsExpanded & ui::kSettingsContextExpandedMask) == ui::kSettingsContextExpandedMask &&
+    check((s.settingsExpanded & ui::kSettingsContextExpandedMask) == 0 &&
         s.ctxMenuPrefs.GroupEnabled(group) == enabled, "expansion preserves context-menu preferences");
 
     // Render the real switch painter at fractional offsets and common DPI scales.
@@ -245,40 +245,6 @@ int RunAdaptiveColumnsTest(AppState& s, const wchar_t* output) {
         s.columnResizing = false;
         s.columnResizeIndex = -1;
         s.columnResizePane = -1;
-        // The Recycle Bin renders the search-style column set (it carries the path column)
-        // while its path kind is "recycle", not "search": a resize has to write the array
-        // that pane reads, or dragging and refitting both go nowhere.
-        const ui::DetailsColumnWidths recycle_details{140.0f, 150.0f, 90.0f, 0.0f, 0.0f};
-        const std::array<float, 4> recycle_search{200.0f, 140.0f, 150.0f, 90.0f};
-        tab->current_path = L"pulse:recycle";
-        tab->view_mode = ui::ViewMode::Details;
-        tab->details_column_dividers = recycle_details;
-        tab->search_column_dividers = recycle_search;
-        {
-            const auto recycle_vm = BuildVm(s, false);
-            size_t recycle_index = recycle_vm.pane_slots.size();
-            for (size_t i = 0; i < recycle_vm.pane_slots.size(); ++i)
-                if (PaneAtSlot(s, static_cast<int>(i)) == s.pane) { recycle_index = i; break; }
-            const bool found = recycle_index < recycle_vm.pane_slots.size();
-            check(found && recycle_vm.pane_slots[recycle_index].pane.is_search,
-                "recycle bin pane renders the search-style column set");
-            if (found) {
-                const auto& slot = recycle_vm.pane_slots[recycle_index];
-                const auto columns = s.renderer.DetailsColumns(slot.rect, slot.pane);
-                check(columns.Has(ui::MainRenderer::ColumnKind::Path),
-                    "recycle bin columns include the path column");
-                ResizePaneColumnDivider(s, *tab, recycle_vm,
-                    static_cast<int>(recycle_index), 0, columns.DividerX(0) - 40.0f * s.scale);
-                check(tab->search_column_dividers != recycle_search &&
-                      tab->details_column_dividers == recycle_details,
-                    "dragging a recycle bin divider moves the widths that pane shows");
-                AutoFitPaneColumnDivider(s, *tab, recycle_vm,
-                    static_cast<int>(recycle_index), 0);
-                check(tab->search_column_dividers[0] == 0.0f &&
-                      tab->details_column_dividers == recycle_details,
-                    "refitting a recycle bin divider resets only the search-style width");
-            }
-        }
         tab->current_path = saved_path;
         tab->view_mode = saved_view;
         tab->details_column_dividers = saved_details;
@@ -492,6 +458,7 @@ int RunSettingsIntegrationUiTest(AppState& s, const wchar_t* output) {
                     vm.settings_integration_enabled = state == 1 || state == 2 || state == 4;
                     vm.settings_integration_folders = vm.settings_integration_win_e = state != 4;
                     vm.settings_integration_this_pc = vm.settings_integration_experimental = state != 4;
+                    vm.settings_integration_recycle_bin = state != 4;
                     vm.settings_integration_can_retry = state == 2 || state == 3;
                     vm.settings_integration_can_restore = state != 0 && state != 4;
                     vm.settings_launch_on_startup = vm.settings_keep_running = false;
@@ -508,9 +475,11 @@ int RunSettingsIntegrationUiTest(AppState& s, const wchar_t* output) {
                         const auto h = hit(r); return h.region == H::SettingsIntegration && h.index == action;
                     };
                     const auto l = ui::MakeSettingsLayout(vm, window, scale, s.renderer.TitleBarHeight(), 28*scale, &painter);
-                    const D2D1_RECT_F rows[] = {l.startup_row[2], l.win_e_row, l.this_pc_row, l.explorer_windows_row};
+                    const D2D1_RECT_F rows[] = {l.startup_row[2], l.win_e_row, l.this_pc_row, l.recycle_bin_row,
+                        l.explorer_windows_row};
                     const I descriptions[] = {I::IntegrationFoldersDesc, I::SettingsWinEDesc,
-                        I::SettingsThisPcDesc, I::IntegrationExperimentalDesc};
+                        I::SettingsThisPcDesc, I::SettingsRecycleBinDesc, I::IntegrationExperimentalDesc};
+                    const int row_actions[] = {1, 2, 3, 7, 4};
                     separate &= l.integration_section.bottom <= l.integration_card.top &&
                         l.integration_card.bottom <= l.section[1].top &&
                         l.group[1].top == l.startup_row[0].top && l.default_manager_row.top == l.integration_card.top;
@@ -524,13 +493,13 @@ int RunSettingsIntegrationUiTest(AppState& s, const wchar_t* output) {
                     pill_fits &= nonempty(badge) && inside(badge, m) && badge.right <= m.right-60*scale+0.5f &&
                         (stacked || badge.left >= l.integration_text_right) &&
                         m.top+35*scale+master_h <= (stacked ? badge.top : m.bottom-12*scale)+0.5f;
-                    for (int i = 0; i < 4; ++i) {
+                    for (int i = 0; i < 5; ++i) {
                         visible &= nonempty(rows[i]) && inside(rows[i], l.integration_card);
-                        scope_hits &= is_action(rows[i], i+1);
+                        scope_hits &= is_action(rows[i], row_actions[i]);
                         const float text_left = rows[i].left+112*scale;
                         const float height = painter.MeasureWrappedCaptionHeight(l10n::Get(descriptions[i]),
                             rows[i].right-16*scale-text_left);
-                        const float limit = i == 3 ? l.integration_chip[0].top-8*scale : rows[i].bottom-12*scale;
+                        const float limit = i == 4 ? l.integration_chip[0].top-8*scale : rows[i].bottom-12*scale;
                         captions &= rows[i].top+31*scale+height <= limit+0.5f;
                     }
                     const auto& experimental = l.explorer_windows_row;
@@ -554,13 +523,13 @@ int RunSettingsIntegrationUiTest(AppState& s, const wchar_t* output) {
                         bar_fits &= !nonempty(l.integration_bar) && !nonempty(l.integration_retry) && !nonempty(l.integration_restore);
                     }
                     const auto hint = l10n::Get(!vm.settings_integration_enabled ? I::IntegrationInactiveHint
-                        : state == 4 ? I::IntegrationNoneHint : I::IntegrationRunningHint);
+                        : state == 4 ? I::IntegrationNoneHint : I::IntegrationHintLaunch);
                     const auto h = l.integration_hint;
                     hints &= nonempty(h) && h.top >= experimental.bottom && h.bottom <= l.integration_card.bottom &&
                         h.top+4*scale+painter.MeasureWrappedCaptionHeight(hint, h.right-16*scale-(h.left+78*scale)) <= h.bottom+0.5f;
                     if (state == 1) {
                         // Every background prerequisite met: no hint row at all.
-                        auto ready = vm; ready.settings_launch_on_startup = ready.settings_keep_running = true;
+                        auto ready = vm; ready.settings_launch_on_startup = true;   // close-to-tray follows takeover
                         const auto rl = ui::MakeSettingsLayout(ready, window, scale, s.renderer.TitleBarHeight(), 28*scale, &painter);
                         hints &= !nonempty(rl.integration_hint) && rl.integration_card.bottom < l.integration_card.bottom;
                     }
@@ -571,8 +540,8 @@ int RunSettingsIntegrationUiTest(AppState& s, const wchar_t* output) {
     check(labels, "integration resources exist in all three languages");
     check(search, "nonempty localized integration queries find their search destinations");
     check(separate, "integration owns a titled card before startup settings");
-    check(visible, "all four choices stay visible without expanding");
-    check(scope_hits, "all four choices remain editable with the master off at every width and DPI");
+    check(visible, "all five choices stay visible without expanding");
+    check(scope_hits, "all five choices remain editable with the master off at every width and DPI");
     check(action_hits, "master hits always; retry and restore hit only for drift or failure");
     check(pill_fits, "status pill fits beside or below the master text without touching the switch");
     check(captions && chips, "wrapped descriptions and experimental chips fit narrow and high-DPI layouts");
@@ -596,14 +565,14 @@ int RunSettingsIntegrationUiTest(AppState& s, const wchar_t* output) {
             vm.settings_integration_state = state == 4 ? 0 : state;
             vm.settings_integration_enabled = state == 1 || state == 2 || state == 4;
             vm.settings_integration_folders = vm.settings_integration_win_e = state != 4;
-            vm.settings_integration_this_pc = state != 4;
+            vm.settings_integration_this_pc = vm.settings_integration_recycle_bin = state != 4;
             vm.settings_integration_experimental = state == 1 || state == 3;
             vm.settings_launch_on_startup = state == 1; vm.settings_keep_running = false;
             vm.settings_integration_can_restore = state != 0 && state != 4;
             vm.settings_integration_can_retry = state == 2 || state == 3;
             vm.settings_integration_summary = state == 3 ? std::wstring(l10n::Pick(
-                L"没能设置：Win + E。可能被安全软件拦截，可以重试。",
-                L"Could not apply: Win + E. Security software may have blocked it; try again."))
+                L"没能设置：桌面上的「此电脑」（写入后被改回，可能被安全软件拦截）。详情见 %LOCALAPPDATA%\\Pulse\\logs\\integration.log。",
+                L"Could not apply: This PC on the desktop (it was undone right after writing, possibly by security software). Details: %LOCALAPPDATA%\\Pulse\\logs\\integration.log."))
                 : state == 2 ? l10n::Get(I::IntegrationDriftDesc) : std::wstring{};
             const auto window = D2D1::RectF(0, 0, static_cast<float>(width), static_cast<float>(height));
             const auto l = ui::MakeSettingsLayout(vm, window, 1, s.renderer.TitleBarHeight(), 28, &painter);

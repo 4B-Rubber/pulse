@@ -57,6 +57,10 @@ public:
 
     // Mark dirty (e.g. from DirWatch).
     void MarkDirty(const std::wstring& path);
+    // A fresh enumeration of path is being queued, as GetOrStart does when it
+    // starts one: earlier dirty marks are covered by it, and only changes
+    // marked after this call ask for another pass when its result arrives.
+    void BeginRefresh(const std::wstring& path);
 
     size_t EntryCount() const;
     size_t ResidentBytes() const;

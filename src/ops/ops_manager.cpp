@@ -1,8 +1,11 @@
+#include "shell_command_template.h"
 // ops_manager.cpp — See ops_manager.h for the contract.
 #include "ops_manager.h"
 #include "../common/runtime_log.h"
 #include "operation_presentation.h"
+#include "transfer_rate_estimator.h"
 #include "shell_command.h"
+#include "elevated_transfer.h"
 #include "../ipc/shell_client.h"
 #include "../common/json_utils.h"
 #include "../common/localization.h"
@@ -27,6 +30,12 @@
 #include <winioctl.h>
 
 namespace pulse::ops {
+
+#ifdef PULSE_ELEVATED_TEST_CLIENT
+void ObserveTransferScanForReview(OpsManager&, const std::wstring&);
+void ObserveTransferStartForReview(OpsManager&, uint64_t);
+void ObserveShellCallbacksForReview(const ipc::ShellClient::Callbacks&);
+#endif
 
 namespace {
 
@@ -126,33 +135,6 @@ std::wstring ParentOf(const std::wstring& path) {
     return prefix + temp;
 }
 
-void ReplaceAll(std::wstring& hay, std::wstring_view from, const std::wstring& to) {
-    if (from.empty()) return;
-    size_t i = 0;
-    while ((i = hay.find(from, i)) != std::wstring::npos) {
-        hay.replace(i, from.size(), to);
-        i += to.size();
-    }
-}
-
-std::wstring ExpandShellCommand(std::wstring command, const std::wstring& path) {
-    const std::wstring file = pulse::path::StripExtendedPathPrefix(path);
-    std::wstring quoted = L"\"";
-    quoted += file;
-    quoted += L'"';
-    ReplaceAll(command, L"\"%1\"", quoted);
-    ReplaceAll(command, L"\"%L\"", quoted);
-    ReplaceAll(command, L"\"%l\"", quoted);
-    ReplaceAll(command, L"\"%V\"", quoted);
-    ReplaceAll(command, L"\"%v\"", quoted);
-    ReplaceAll(command, L"%1", quoted);
-    ReplaceAll(command, L"%L", quoted);
-    ReplaceAll(command, L"%l", quoted);
-    ReplaceAll(command, L"%V", quoted);
-    ReplaceAll(command, L"%v", quoted);
-    ReplaceAll(command, L"%*", quoted);
-    return command;
-}
 
 bool IsVolumeRoot(const std::wstring& path) {
     std::wstring_view view = path;
@@ -260,11 +242,139 @@ bool IsRenameComponent(const std::wstring& name) {
     return IsRenameFilename(name);
 }
 
+std::wstring Win32Message(DWORD code);
+
+// Says why a name is refused instead of only "invalid".
+std::wstring RenameNameText(const std::wstring& name) {
+    switch (RenameFilenameProblem(name)) {
+    case RenameFilenameIssue::Empty:
+        return l10n::Pick(L"名称不能为空。", L"The name can't be empty.");
+    case RenameFilenameIssue::InvalidCharacter:
+        return l10n::Pick(L"名称不能包含以下字符：\\ / : * ? \" < > |",
+                          L"A name can't contain any of these characters: \\ / : * ? \" < > |");
+    case RenameFilenameIssue::TrailingDotOrSpace:
+        return l10n::Pick(L"名称不能以空格或句点结尾。", L"A name can't end with a space or a period.");
+    case RenameFilenameIssue::Reserved:
+        return l10n::Pick(L"这是 Windows 保留的名称（如 CON、NUL、COM1），请换一个名称。",
+                          L"Windows reserves this name (like CON, NUL or COM1). Choose a different name.");
+    case RenameFilenameIssue::None:
+        break;
+    }
+    return l10n::Pick(L"名称无效", L"Invalid name");
+}
+
+// The reason a rename failed, in the user's words; never a bare error number.
+// "目标名称已存在" stays the key the UI maps to its own localized text.
+std::wstring RenameFailureText(DWORD code) {
+    switch (code) {
+    case ERROR_ACCESS_DENIED:
+    case ERROR_PRIVILEGE_NOT_HELD:
+    case ERROR_ELEVATION_REQUIRED:
+        return l10n::Pick(L"可能需要管理员权限，或此项（或其中的文件）正被其他程序使用。",
+                          L"You may need administrator permission, or another program may be using this item or a file inside it.");
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+        return l10n::Pick(L"该项目正被其他程序使用。关闭相关程序后重试。",
+                          L"The item is in use by another program. Close it and try again.");
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+        return l10n::Pick(L"找不到此项，它可能已被移动、重命名或删除。请刷新后重试。",
+                          L"The item can't be found. It may have been moved, renamed or deleted. Refresh and try again.");
+    case ERROR_ALREADY_EXISTS:
+    case ERROR_FILE_EXISTS:
+        return l10n::Pick(L"目标名称已存在", L"The target name already exists");
+    case ERROR_INVALID_NAME:
+    case ERROR_BAD_PATHNAME:
+    case ERROR_DIRECTORY:
+        return l10n::Pick(L"此位置不接受这个名称，请换一个名称。",
+                          L"This location doesn't accept that name. Choose a different name.");
+    case ERROR_FILENAME_EXCED_RANGE:
+        return l10n::Pick(L"名称太长，或完整路径超出了系统限制。请缩短名称后重试。",
+                          L"The name is too long, or the full path exceeds the system limit. Use a shorter name.");
+    case ERROR_WRITE_PROTECT:
+        return l10n::Pick(L"该磁盘处于写保护状态，无法修改。", L"The disk is write-protected.");
+    case ERROR_NOT_READY:
+    case ERROR_DEV_NOT_EXIST:
+    case ERROR_BAD_NETPATH:
+    case ERROR_NETNAME_DELETED:
+    case ERROR_UNEXP_NET_ERR:
+    case ERROR_NETWORK_UNREACHABLE:
+        return l10n::Pick(L"该位置当前不可用，设备可能已断开或网络连接已中断。",
+                          L"This location isn't available. The device may be disconnected or the network connection lost.");
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL:
+        return l10n::Pick(L"磁盘空间不足。", L"There isn't enough disk space.");
+    case ERROR_NOT_SUPPORTED:
+    case ERROR_INVALID_FUNCTION:
+        return l10n::Pick(L"此位置不支持重命名。", L"This location doesn't support renaming.");
+    case ERROR_CANT_ACCESS_FILE:
+#ifdef ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING
+    case ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING:
+#endif
+#ifdef ERROR_CLOUD_FILE_IN_USE
+    case ERROR_CLOUD_FILE_IN_USE:
+#endif
+#ifdef ERROR_CLOUD_FILE_UNSUCCESSFUL
+    case ERROR_CLOUD_FILE_UNSUCCESSFUL:
+#endif
+        return l10n::Pick(L"云同步文件暂时无法修改。请确认同步客户端正在运行，等同步完成后重试。",
+                          L"This cloud file can't be changed right now. Make sure the sync app is running and try again after it syncs.");
+    default:
+        // The system's own sentence, in the system language, without the number.
+        return Win32Message(code);
+    }
+}
+
+// Why a new folder or text file could not be created. "没有权限" is the key
+// the UI maps to its write-permission message.
+std::wstring CreateFailureText(DWORD code) {
+    switch (code) {
+    case ERROR_ACCESS_DENIED:
+    case ERROR_PRIVILEGE_NOT_HELD:
+    case ERROR_ELEVATION_REQUIRED:
+        return l10n::Pick(L"没有权限在此位置新建", L"You don't have permission to create items here.");
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+        return l10n::Pick(L"当前文件夹已不存在，它可能已被移动或删除。请刷新后重试。",
+                          L"This folder no longer exists. It may have been moved or deleted. Refresh and try again.");
+    case ERROR_ALREADY_EXISTS:
+    case ERROR_FILE_EXISTS:
+        return l10n::Pick(L"已存在同名项目", L"An item with this name already exists");
+    case ERROR_NOT_SUPPORTED:
+    case ERROR_INVALID_FUNCTION:
+        return l10n::Pick(L"此位置不支持新建。", L"This location doesn't support creating items.");
+    default:
+        return RenameFailureText(code);
+    }
+}
+
+// New folder / new text file: the same plain Win32 creation the Shell host
+// ran, done here so a busy, restarting or unreachable host can never leave a
+// new folder waiting with no progress. The UI already picked a unique name.
+bool CreateInProcess(OpType type, const std::wstring& path, std::wstring* error) {
+    DWORD code = ERROR_SUCCESS;
+    if (path.empty()) {
+        code = ERROR_INVALID_NAME;
+    } else if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        code = ERROR_FILE_EXISTS;
+    } else if (type == OpType::CreateFolder) {
+        if (!CreateDirectoryW(path.c_str(), nullptr)) code = GetLastError();
+    } else {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                  CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) code = GetLastError();
+        else CloseHandle(file);
+    }
+    if (code != ERROR_SUCCESS && error) *error = CreateFailureText(code);
+    return code == ERROR_SUCCESS;
+}
+
 enum class RenameResult { Completed, Rejected };
 RenameResult RenameInProcess(const std::wstring& source, const std::wstring& new_name,
-                     std::wstring* error) {
+                     std::wstring* error, DWORD* code = nullptr) {
+    if (code) *code = ERROR_SUCCESS;
     if (source.empty() || !IsRenameComponent(new_name)) {
-        if (error) *error = l10n::Pick(L"名称无效", L"Invalid name");
+        if (error) *error = source.empty() ? l10n::Pick(L"名称无效", L"Invalid name") : RenameNameText(new_name);
         return RenameResult::Rejected;
     }
     const std::wstring target = JoinPath(ParentOf(source), new_name);
@@ -280,8 +390,9 @@ RenameResult RenameInProcess(const std::wstring& source, const std::wstring& new
         return RenameResult::Rejected;
     }
     if (!MoveFileW(source.c_str(), target.c_str())) {
-        const DWORD code = GetLastError();
-        if (error) *error = l10n::Pick(L"重命名失败（错误 ", L"Rename failed (error ") + std::to_wstring(code) + l10n::Pick(L"）", L")");
+        const DWORD failure = GetLastError();
+        if (code) *code = failure;
+        if (error) *error = RenameFailureText(failure);
         return RenameResult::Rejected;
     }
     return RenameResult::Completed;
@@ -308,93 +419,6 @@ struct CopyProgressContext {
     std::function<void(uint64_t, uint64_t)> report;
     bool pause_sent = false;
     ULONGLONG last_report = 0;
-};
-
-class TransferRateEstimator {
-public:
-    // Byte transfers only trust rates above 1 B/s (below that a countdown is noise);
-    // item counts run far slower, so they drop the floor to keep their ETA alive.
-    void SetEtaFloor(double floor) { eta_floor_ = floor; }
-
-    void Reset(ULONGLONG tick, uint64_t bytes) {
-        samples_.clear();
-        samples_.push_back({ tick, bytes });
-        smoothed_speed_ = 0.0;
-        eta_seconds_ = 0;
-        last_rate_tick_ = tick;
-        last_eta_tick_ = tick;
-    }
-
-    void Observe(ULONGLONG tick, uint64_t bytes, uint64_t total_bytes) {
-        if (samples_.empty() || bytes < samples_.back().bytes) {
-            Reset(tick, bytes);
-            return;
-        }
-
-        constexpr ULONGLONG kMinimumSampleMs = 100;
-        constexpr ULONGLONG kWindowMs = 4000;
-        constexpr ULONGLONG kWarmupMs = 750;
-        if (tick - samples_.back().tick < kMinimumSampleMs && bytes < total_bytes)
-            return;
-
-        if (tick == samples_.back().tick) {
-            samples_.back().bytes = bytes;
-        } else {
-            samples_.push_back({ tick, bytes });
-        }
-        while (samples_.size() > 2 && samples_[1].tick + kWindowMs <= tick)
-            samples_.pop_front();
-
-        const ULONGLONG span = tick - samples_.front().tick;
-        const uint64_t byte_delta = bytes - samples_.front().bytes;
-        if (span < kWarmupMs || byte_delta == 0) return;
-
-        const double window_speed = static_cast<double>(byte_delta) * 1000.0
-            / static_cast<double>(span);
-        if (smoothed_speed_ <= 0.0) {
-            smoothed_speed_ = window_speed;
-        } else {
-            const double seconds = static_cast<double>(tick - last_rate_tick_) / 1000.0;
-            const double alpha = 1.0 - std::exp(-seconds);
-            smoothed_speed_ += alpha * (window_speed - smoothed_speed_);
-        }
-        last_rate_tick_ = tick;
-
-        if (bytes >= total_bytes || smoothed_speed_ <= eta_floor_) {
-            eta_seconds_ = 0;
-            return;
-        }
-        if (eta_seconds_ != 0 && tick - last_eta_tick_ < 1000) return;
-
-        const double raw_eta = static_cast<double>(total_bytes - bytes) / smoothed_speed_;
-        if (eta_seconds_ == 0) {
-            eta_seconds_ = (std::max)(uint64_t{ 1 },
-                static_cast<uint64_t>(std::ceil(raw_eta)));
-        } else {
-            // React faster to a slowdown than to a transient speed-up.
-            const double alpha = raw_eta > static_cast<double>(eta_seconds_) ? 0.45 : 0.20;
-            const double blended = static_cast<double>(eta_seconds_)
-                + alpha * (raw_eta - static_cast<double>(eta_seconds_));
-            eta_seconds_ = (std::max)(uint64_t{ 1 },
-                static_cast<uint64_t>(std::llround(blended)));
-        }
-        last_eta_tick_ = tick;
-    }
-
-    double speed() const { return smoothed_speed_; }
-    uint64_t eta_seconds() const { return eta_seconds_; }
-
-private:
-    struct Sample {
-        ULONGLONG tick = 0;
-        uint64_t bytes = 0;
-    };
-    std::deque<Sample> samples_;
-    double eta_floor_ = 1.0;
-    double smoothed_speed_ = 0.0;
-    uint64_t eta_seconds_ = 0;
-    ULONGLONG last_rate_tick_ = 0;
-    ULONGLONG last_eta_tick_ = 0;
 };
 
 COPYFILE2_MESSAGE_ACTION CALLBACK CopyProgress(const COPYFILE2_MESSAGE* message,
@@ -863,22 +887,25 @@ void OpsManager::PersistJournal() {
     else WriteUtf8FileAtomic(journal_path_, text);
 }
 
-void OpsManager::Start(std::function<void()> notify) {
+void OpsManager::Start(std::function<void()> notify, bool own_shell_client) {
     if (running_) return;
+    own_shell_client_ = own_shell_client;
     notify_ = std::move(notify);
     stopping_ = false;
     running_ = true;
     {
         std::lock_guard<std::mutex> lock(menu_mutex_);
-        menu_running_ = true;
+        menu_running_ = own_shell_client_;
     }
     thread_ = std::thread([this] { WorkerThread(); });
-    menu_thread_ = std::thread([this] { MenuThread(); });
+#ifndef PULSE_ELEVATED_HOST
+    if (own_shell_client_) menu_thread_ = std::thread([this] { MenuThread(); });
     {
         std::lock_guard<std::mutex> lock(open_mutex_);
-        open_running_ = true;
+        open_running_ = own_shell_client_;
     }
-    open_thread_ = std::thread([this] { OpenThread(); });
+    if (own_shell_client_) open_thread_ = std::thread([this] { OpenThread(); });
+#endif
 }
 
 void OpsManager::Stop() {
@@ -904,7 +931,25 @@ void OpsManager::Stop() {
     cv_.notify_all();
     done_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& item : queue_)
+            if (item.open_path.empty()) finished_tasks_.push_back({item.seq, {}});
+    }
+    if (notify_) notify_();
+    {
+        std::scoped_lock lock(done_mutex_, menu_mutex_);
+        shell_request_ids_.clear(); done_results_.clear();
+        menu_queue_.clear(); menu_session_by_token_.clear(); menu_token_by_session_.clear();
+        ctx_invoke_ids_.clear(); menu_dispatching_ = false;
+    }
     PersistJournal();
+    // Queued requests were cancelled above. Preserve their recovery journal,
+    // but never execute an already-finished task if this manager is restarted.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.clear();
+    }
 }
 
 bool OpsManager::TryPrepareForUpdate() {
@@ -922,6 +967,8 @@ void OpsManager::CancelUpdatePreparation() {
 }
 
 uint64_t OpsManager::Submit(OpRequest req) {
+    if (!own_shell_client_ && req.type != OpType::Copy && req.type != OpType::Move &&
+        req.type != OpType::Rename) return 0;
     QueueItem item;
     item.req = std::move(req);
     uint64_t seq = 0;
@@ -940,7 +987,8 @@ uint64_t OpsManager::Submit(OpRequest req) {
 void OpsManager::OpenWith(const std::wstring& path) {
     QueueItem item;
     item.open_path = path;
-    item.open_verb = L"open";
+    // Some registered defaults expose "edit" or a delegated default action.
+    // Leave the verb empty so Windows selects the association's default.
     EnqueueOpen(std::move(item));
 }
 
@@ -964,7 +1012,7 @@ void OpsManager::ShowProperties(const std::vector<std::wstring>& paths) {
 void OpsManager::ExecuteVerb(const std::wstring& path, const std::wstring& verb) {
     QueueItem item;
     item.open_path = path;
-    item.open_verb = verb.empty() ? L"open" : verb;
+    item.open_verb = verb;
     // 打开方式… / 属性 are interactive dialogs: they must answer the click even
     // when a slow open is still in flight, so they go to the front of the queue.
     EnqueueOpen(std::move(item), true);
@@ -989,34 +1037,11 @@ void OpsManager::ExecuteCommand(const std::wstring& command, const std::wstring&
     EnqueueOpen(std::move(item));
 }
 
-std::wstring TerminalCommandLine(const std::wstring& dir) {
-    std::wstring quoted = L"\"";
-    size_t slashes = 0;
-    for (const wchar_t c : dir) {
-        if (c == L'\\') {
-            ++slashes;
-            continue;
-        }
-        if (c == L'\"') {
-            quoted.append(slashes * 2 + 1, L'\\');
-            quoted.push_back(c);
-        } else {
-            quoted.append(slashes, L'\\');
-            quoted.push_back(c);
-        }
-        slashes = 0;
-    }
-    // Backslashes immediately before a closing quote must be doubled.
-    quoted.append(slashes * 2, L'\\');
-    quoted.push_back(L'\"');
-    return L"-d " + quoted;
-}
-
 void OpsManager::OpenTerminal(const std::wstring& dir) {
     QueueItem item;
     item.open_path = dir;
     item.open_file = L"wt.exe";
-    item.open_verb = L"open";
+    item.open_verb = L"__terminal";
     item.open_args = TerminalCommandLine(dir);
     EnqueueOpen(std::move(item));
 }
@@ -1029,6 +1054,7 @@ void OpsManager::OpenProgramIn(const std::wstring& exe, const std::wstring& dir,
     item.open_file = exe;
     item.open_verb = L"open";
     if (_wcsicmp(exe.c_str(), L"wt.exe") == 0) {
+        item.open_verb = L"__terminal";
         item.open_args = TerminalCommandLine(dir);
         if (!args.empty()) item.open_args += L" " + args;
     } else {
@@ -1037,28 +1063,60 @@ void OpsManager::OpenProgramIn(const std::wstring& exe, const std::wstring& dir,
     EnqueueOpen(std::move(item));
 }
 
+OpsManager::QueueItem* OpsManager::CurrentTransferLocked() {
+    QueueItem* item = active_item_ ? &*active_item_ : queue_.empty() ? nullptr : &queue_.front();
+    return item && item->open_path.empty() &&
+        (item->req.type == OpType::Copy || item->req.type == OpType::Move) ? item : nullptr;
+}
+
 void OpsManager::CancelCurrent() {
-    if (transfer_active_.load()) {
-        transfer_cancel_.store(true);
-        transfer_pause_.store(false);
+    bool transfer = false;
+    uint64_t task = 0;
+    {
+        // The same locks protect request-owned state, engine initialization and
+        // pause wait predicates. No startup store can erase an accepted command.
+        std::scoped_lock lock(mutex_, transfer_control_mutex_);
+        auto* current = active_item_ ? &*active_item_ : queue_.empty() ? nullptr : &queue_.front();
+        if (current) {
+            current->cancel_requested = true;
+            shell_cancel_requested_ = true;
+        }
+        if (auto* item = CurrentTransferLocked()) {
+            item->transfer_cancelled = true;
+            item->transfer_paused = false;
+            task = item->seq;
+            transfer = true;
+        }
+        if (transfer_active_.load()) {
+            transfer_cancel_.store(true);
+            transfer_pause_.store(false);
+            if (!task) task = status_.task_id;
+            transfer = true;
+        }
+    }
+    if (transfer) {
         transfer_control_cv_.notify_all();
-        SetStatus([](OpStatus& status) {
-            if (status.active) status.phase = OpPhase::Cancelling;
+        SetStatus([&](OpStatus& status) {
+            if (status.active && status.task_id == task) status.phase = OpPhase::Cancelling;
         });
     }
-    shell_cancel_requested_ = true;
     uint32_t id = current_req_id_.load();
     if (id != 0) ipc::ShellClient::Instance().Cancel(id);
 }
 
 void OpsManager::PauseCurrent() {
-    if (!transfer_active_.load() || transfer_cancel_.load()) return;
-    transfer_pause_.store(true);
+    std::scoped_lock lock(mutex_, transfer_control_mutex_);
+    if (auto* item = CurrentTransferLocked(); item && !item->transfer_cancelled)
+        item->transfer_paused = true;
+    if (transfer_active_.load() && !transfer_cancel_.load()) transfer_pause_.store(true);
 }
 
 void OpsManager::ResumeCurrent() {
-    if (!transfer_active_.load()) return;
-    transfer_pause_.store(false);
+    {
+        std::scoped_lock lock(mutex_, transfer_control_mutex_);
+        if (auto* item = CurrentTransferLocked()) item->transfer_paused = false;
+        if (transfer_active_.load()) transfer_pause_.store(false);
+    }
     transfer_control_cv_.notify_all();
 }
 
@@ -1085,7 +1143,8 @@ LockReport OpsManager::ProbeLock(const OpRequest& req, uint64_t task_id, HRESULT
                                  const std::wstring& error) {
     LockReport report;
     const bool lockable = req.type == OpType::Copy || req.type == OpType::Move
-        || req.type == OpType::RecycleDelete || req.type == OpType::RealDelete;
+        || req.type == OpType::RecycleDelete || req.type == OpType::RealDelete
+        || req.type == OpType::Rename;
     if (lockable) {
         report = ProbeLockFailure(hr, error, req.sources, CurrentModuleDirectory());
     }
@@ -1225,11 +1284,14 @@ std::wstring OpsManager::UndoLabel() const {
     return L"Undo " + LowerFirst(Describe(r));
 }
 
-void OpsManager::PushUndo(const OpRequest& req,
+void OpsManager::PushUndo(const OpRequest& req, uint64_t task_id,
                           const std::vector<std::wstring>* actual_destinations) {
     CompletedOperation completed;
+    completed.task_id = task_id;
     completed.type = req.type;
     completed.sources = req.sources;
+    if (req.type == OpType::CreateFolder || req.type == OpType::CreateTextFile)
+        completed.destinations = req.sources;
     if (actual_destinations) {
         completed.destinations = *actual_destinations;
     } else if (req.type == OpType::Rename && !req.sources.empty()) {
@@ -1241,7 +1303,9 @@ void OpsManager::PushUndo(const OpRequest& req,
         }
     } else if (req.type == OpType::Copy || req.type == OpType::Move) {
         for (const auto& source : req.sources)
-            completed.destinations.push_back(JoinPath(req.dest_dir, FileName(source)));
+            completed.destinations.push_back(JoinPath(req.dest_dir,
+                req.type == OpType::Move && req.sources.size() == 1 && !req.new_name.empty()
+                    ? req.new_name : FileName(source)));
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1272,6 +1336,17 @@ std::vector<CompletedOperation> OpsManager::DrainCompletions() {
     return out;
 }
 
+std::vector<FinishedTask> OpsManager::DrainFinishedTasks() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<FinishedTask> out;
+    out.reserve(finished_tasks_.size());
+    while (!finished_tasks_.empty()) {
+        out.push_back(std::move(finished_tasks_.front()));
+        finished_tasks_.pop_front();
+    }
+    return out;
+}
+
 void OpsManager::Undo() {
     UndoEntry e;
     {
@@ -1292,7 +1367,7 @@ void OpsManager::Undo() {
 
     switch (e.type) {
     case OpType::Move: {
-        // Move each dest copy back to its original parent directory.
+        // Move each actual destination back to its exact original name and parent.
         for (size_t i = 0; i < e.sources.size(); ++i) {
             const auto& src = e.sources[i];
             OpRequest inv;
@@ -1301,6 +1376,7 @@ void OpsManager::Undo() {
             inv.sources.push_back(i < e.destinations.size()
                 ? e.destinations[i] : JoinPath(e.dest_dir, FileName(src)));
             inv.dest_dir = ParentOf(src);
+            inv.new_name = FileName(src);
             Submit(std::move(inv));
         }
         break;
@@ -1375,12 +1451,17 @@ void OpsManager::EnqueueOpen(QueueItem item, bool front) {
         item.enqueued_at = GetTickCount64();
         if (front) open_queue_.push_front(std::move(item));
         else open_queue_.push_back(std::move(item));
+        const auto& queued = front ? open_queue_.front() : open_queue_.back();
+        diagnostics::runtime::Event("shell_open_queued", {{"task", queued.seq},
+            {"default_verb", queued.open_verb.empty()}, {"explicit_app", !queued.open_file.empty()},
+            {"path_chars", static_cast<uint64_t>(queued.open_path.size())},
+            {"queue_size", static_cast<uint64_t>(open_queue_.size())}});
     }
     open_cv_.notify_one();
 }
 
 void OpsManager::OpenThread() {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     for (;;) {
         QueueItem item;
         {
@@ -1397,6 +1478,24 @@ void OpsManager::OpenThread() {
         // thread that has not registered its HWND yet.
         HWND dialog_owner = ui_hwnd_.load();
         if (!dialog_owner || !IsWindow(dialog_owner)) dialog_owner = GetForegroundWindow();
+
+        if (_wcsicmp(item.open_verb.c_str(), L"__terminal") == 0) {
+            const auto started = GetTickCount64();
+            const auto result = LaunchTerminal(item.open_file, item.open_args, item.open_path, dialog_owner);
+            diagnostics::runtime::Event("terminal_launch_result", {{"task", item.seq},
+                {"open_error", result.open_error}, {"error", result.error},
+                {"cancelled", result.error == ERROR_CANCELLED},
+                {"elevation_requested", result.elevation_requested}, {"elapsed_ms", GetTickCount64() - started}});
+            if (result.error && result.error != ERROR_CANCELLED) {
+                wchar_t detail[512]{};
+                FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+                    result.error, 0, detail, ARRAYSIZE(detail), nullptr);
+                const auto message = std::wstring(l10n::Pick(L"无法打开终端。", L"Could not open the terminal.")) +
+                    L"\n" + detail + L" (" + std::to_wstring(result.error) + L")";
+                MessageBoxW(dialog_owner, message.c_str(), L"Pulse", MB_OK | MB_ICONERROR);
+            }
+            continue;
+        }
 
         if (_wcsicmp(item.open_verb.c_str(), L"__cmdline") == 0) {
             const auto started = GetTickCount64();
@@ -1481,33 +1580,55 @@ void OpsManager::OpenThread() {
             continue;
         }
 
-        // Dedicated open thread: never wait behind transfers. Omit
-        // SEE_MASK_NOASYNC so association handoff does not block this worker.
-        SHELLEXECUTEINFOW sei{ sizeof(sei) };
-        sei.hwnd = dialog_owner;
-        sei.lpVerb = item.open_verb.empty() ? L"open" : item.open_verb.c_str();
-        // Like openas / properties above: the shell and association handlers
-        // reject \\?\ paths and answer "Windows cannot find" (#55).
+        // Association work stays on the dedicated STA, never the UI/transfer
+        // thread. Complete handoff here because the idle worker does not pump.
+        const ULONGLONG started = GetTickCount64();
+        diagnostics::runtime::Event("shell_open_begin", {{"task", item.seq},
+            {"default_verb", item.open_verb.empty()}, {"explicit_app", !item.open_file.empty()},
+            {"queue_ms", item.enqueued_at ? started - item.enqueued_at : 0},
+            {"com_hresult", static_cast<uint32_t>(com_hr)}});
         const std::wstring shell_path = pulse::path::StripExtendedPathPrefix(item.open_path);
-        sei.lpFile = item.open_file.empty() ? shell_path.c_str() : item.open_file.c_str();
-        sei.lpParameters = item.open_args.empty() ? nullptr : item.open_args.c_str();
-        // Like Explorer, start an opened item in its own folder: batch files
-        // and many tools resolve relative paths against the working directory.
-        const std::wstring item_dir =
-            item.open_file.empty() ? OpenItemWorkingDirectory(item.open_path) : std::wstring();
-        sei.lpDirectory = !item.open_file.empty() ? shell_path.c_str()
-                          : item_dir.empty()      ? nullptr
-                                                  : item_dir.c_str();
-        sei.nShow = SW_SHOWNORMAL;
-        sei.fMask = SEE_MASK_FLAG_NO_UI;
-        ShellExecuteExW(&sei); // best effort; errors surface via the OS association UI
+        const std::wstring target = item.open_file.empty() ? shell_path : item.open_file;
+        const std::wstring item_dir = item.open_file.empty()
+            ? OpenItemWorkingDirectory(item.open_path) : shell_path;
+        const auto result = LaunchShellItem(target, item.open_verb, item.open_args, item_dir, dialog_owner);
+        diagnostics::runtime::Event("shell_open_result", {{"task", item.seq},
+            {"default_verb", item.open_verb.empty()}, {"explicit_app", !item.open_file.empty()},
+            {"error", result.error}, {"cancelled", result.error == ERROR_CANCELLED},
+            {"process_id", result.process_id}, {"shell_mask", result.mask},
+            {"elapsed_ms", GetTickCount64() - started}});
+        if (result.error && result.error != ERROR_CANCELLED) {
+            wchar_t detail[512]{};
+            FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+                result.error, 0, detail, ARRAYSIZE(detail), nullptr);
+            const auto message = std::wstring(item.open_verb.empty()
+                ? l10n::Pick(L"无法使用默认应用打开此文件。", L"Could not open this file with its default application.")
+                : l10n::Pick(L"无法完成此打开操作。", L"Could not complete this open operation.")) +
+                L"\n" + target + L"\n" + detail + L" (" + std::to_wstring(result.error) + L")";
+            MessageBoxW(dialog_owner, message.c_str(), L"Pulse", MB_OK | MB_ICONERROR);
+        }
     }
-    CoUninitialize();
+    if (SUCCEEDED(com_hr)) CoUninitialize();
 }
 
-void OpsManager::WorkerThread() {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+void OpsManager::RecordShellDone(uint32_t id, uint32_t hr, bool cancelled, std::wstring error) {
+        if (ConsumeCtxInvokeDone(id)) {
+            ctx_invoke_done_.fetch_add(1, std::memory_order_acq_rel);
+            if (notify_) notify_();
+            return;
+        }
+        if (ConsumeCtxQueryDone(id)) return;
+        {
+            std::lock_guard<std::mutex> lock(done_mutex_);
+            if (!shell_request_ids_.contains(id) || done_results_.contains(id)) return;
+            done_results_.emplace(id, ShellDoneResult{hr, cancelled, std::move(error)});
+            shell_activity_tick_ = GetTickCount64();
+        }
+        done_cv_.notify_all();
+    }
 
+void OpsManager::ConfigureShellCallbacks() {
+#ifndef PULSE_ELEVATED_HOST
     ipc::ShellClient::Callbacks cb;
     // Item operations (delete, restore) only ever report item counts — the shell has no
     // byte callback for them — so their speed comes from counting items per second.
@@ -1519,8 +1640,9 @@ void OpsManager::WorkerThread() {
     shell_item_rate->SetEtaFloor(0.0);
     auto shell_rate_task = std::make_shared<uint64_t>(0);
     cb.progress = [this, shell_item_rate, shell_rate_task](
-                      uint32_t, float pct, std::wstring item,
+                      uint32_t id, float pct, std::wstring item,
                       uint32_t items_done, uint32_t total_items) {
+        if (id != current_req_id_.load()) return;
         shell_activity_tick_ = GetTickCount64();
         SetStatus([&](OpStatus& st) {
             st.percent = pct;
@@ -1550,25 +1672,10 @@ void OpsManager::WorkerThread() {
             }
         });
     };
-    // Done results land here (reader thread) and RunShellOp waits on them.
-    // Context-menu invoke completions share RSP_DONE; route them away first so
-    // they can never overwrite the file-op completion a RunShellOp is waiting on.
+    // Ownership is registered before Submit can emit any callback. Menu query
+    // failures and invoke completions must never become file-op terminal data.
     cb.done = [this](uint32_t id, uint32_t hr, bool cancelled, std::wstring error) {
-        shell_activity_tick_ = GetTickCount64();
-        if (ConsumeCtxInvokeDone(id)) {
-            ctx_invoke_done_.fetch_add(1, std::memory_order_acq_rel);
-            if (notify_) notify_();
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(done_mutex_);
-            done_id_ = id;
-            done_hr_ = hr;
-            done_cancelled_ = cancelled;
-            done_error_ = std::move(error);
-            done_ready_ = true;
-        }
-        done_cv_.notify_one();
+        RecordShellDone(id, hr, cancelled, std::move(error));
     };
     cb.ctx_items = [this](uint32_t id, std::vector<ipc::CtxMenuItem> items, bool partial,
                           std::vector<std::wstring> slow_clsids) {
@@ -1585,11 +1692,22 @@ void OpsManager::WorkerThread() {
             m.text = std::move(it.text);
             m.clsid = std::move(it.clsid);
             m.handler = std::move(it.handler);
+            m.mnemonic = it.mnemonic;
             out.push_back(std::move(m));
         }
         OnCtxItems(id, std::move(out), partial, std::move(slow_clsids));
     };
-    ipc::ShellClient::Instance().Start(cb);
+#ifdef PULSE_ELEVATED_TEST_CLIENT
+    ObserveShellCallbacksForReview(cb);
+#endif
+    if (own_shell_client_) ipc::ShellClient::Instance().Start(cb);
+#endif
+}
+
+void OpsManager::WorkerThread() {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    ConfigureShellCallbacks();
 
     for (;;) {
         QueueItem item;
@@ -1625,6 +1743,7 @@ void OpsManager::WorkerThread() {
 
         const bool run = (!item.req.lock_retry && item.req.close_first.empty()) ||
                          PrepareLockRetry(item.req, item.seq);
+        moved_sources_.clear();
         const auto diagnostic_started = GetTickCount64();
         diagnostics::runtime::Event("file_operation_begin", {{"task", item.seq},
             {"type", static_cast<uint64_t>(item.req.type)}, {"sources", item.req.sources.size()},
@@ -1643,12 +1762,25 @@ void OpsManager::WorkerThread() {
             {"elapsed_ms", GetTickCount64() - diagnostic_started}});
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            FinishedTask finished;
+            finished.task_id = item.seq;
+            finished.type = item.req.type;
+            finished.sources = item.req.sources;
+            finished.success = diagnostic_status.phase == OpPhase::Completed;
+            for (const auto& source : item.req.sources)
+                if (std::any_of(moved_sources_.begin(), moved_sources_.end(), [&](const auto& moved) {
+                    return _wcsicmp(source.c_str(), moved.c_str()) == 0;
+                })) finished.moved_sources.push_back(source);
+            finished_tasks_.push_back(std::move(finished));
             active_item_.reset();
         }
+        if (notify_) notify_();
         PersistJournal();
     }
 
-    ipc::ShellClient::Instance().Stop();
+#ifndef PULSE_ELEVATED_HOST
+    if (own_shell_client_) ipc::ShellClient::Instance().Stop();
+#endif
     CoUninitialize();
 }
 
@@ -1711,6 +1843,23 @@ void OpsManager::CloseShellMenu(uint32_t token) {
     menu_cv_.notify_one();
 }
 
+bool OpsManager::ConsumeCtxQueryDone(uint32_t id) {
+    ShellMenuCallback cb;
+    uint32_t token = 0;
+    {
+        std::lock_guard<std::mutex> lock(menu_mutex_);
+        const auto it = menu_token_by_session_.find(id);
+        if (it == menu_token_by_session_.end()) return false;
+        token = it->second;
+        menu_token_by_session_.erase(it);
+        menu_session_by_token_.erase(token);
+        cb = menu_cb_;
+    }
+    // An empty final response ends the UI token, including synchronous failures.
+    if (cb) cb(token, {}, false, {});
+    return true;
+}
+
 bool OpsManager::ConsumeCtxInvokeDone(uint32_t id) {
     std::lock_guard<std::mutex> lock(menu_mutex_);
     return ctx_invoke_ids_.erase(id) != 0;
@@ -1737,6 +1886,61 @@ void OpsManager::OnCtxItems(uint32_t client_id, std::vector<ShellMenuItem> items
     if (cb) cb(token, std::move(items), partial, std::move(slow_clsids));
 }
 
+void OpsManager::DispatchMenuJob(const MenuJob& job) {
+    auto& client = ipc::ShellClient::Instance();
+    switch (job.kind) {
+    case MenuJob::Kind::Query: {
+        const uint32_t id = client.QueryContextMenu(
+            job.paths, job.owner_hwnd, job.background, job.extended,
+            job.disabled_clsids, [this, token = job.token](uint32_t request) {
+                std::lock_guard<std::mutex> lock(menu_mutex_);
+                menu_session_by_token_[token] = request;
+                menu_token_by_session_[request] = token;
+            });
+        if (id == 0) {
+            ShellMenuCallback cb;
+            { std::lock_guard<std::mutex> lock(menu_mutex_); cb = menu_cb_; }
+            if (cb) cb(job.token, {}, false, {});
+        }
+        break;
+    }
+    case MenuJob::Kind::Invoke: {
+        uint32_t session = 0;
+        {
+            std::lock_guard<std::mutex> lock(menu_mutex_);
+            auto it = menu_session_by_token_.find(job.token);
+            if (it == menu_session_by_token_.end()) break;
+            session = it->second;
+            menu_session_by_token_.erase(it);
+            menu_token_by_session_.erase(session);
+        }
+        const uint32_t id = client.InvokeContextMenu(session, job.item_id,
+            job.verb, job.text, [this](uint32_t request) {
+                std::lock_guard<std::mutex> lock(menu_mutex_);
+                ctx_invoke_ids_.insert(request);
+            });
+        if (id == 0) {
+            ctx_invoke_done_.fetch_add(1, std::memory_order_acq_rel);
+            if (notify_) notify_();
+        }
+        break;
+    }
+    case MenuJob::Kind::Close: {
+        uint32_t session = 0;
+        {
+            std::lock_guard<std::mutex> lock(menu_mutex_);
+            auto it = menu_session_by_token_.find(job.token);
+            if (it == menu_session_by_token_.end()) break;
+            session = it->second;
+            menu_session_by_token_.erase(it);
+            menu_token_by_session_.erase(session);
+        }
+        client.CloseContextMenu(session);
+        break;
+    }
+    }
+}
+
 void OpsManager::MenuThread() {
     for (;;) {
         MenuJob job;
@@ -1748,51 +1952,7 @@ void OpsManager::MenuThread() {
             menu_queue_.pop_front();
             menu_dispatching_ = true;
         }
-        auto& client = ipc::ShellClient::Instance();
-        switch (job.kind) {
-        case MenuJob::Kind::Query: {
-            const uint32_t id = client.QueryContextMenu(
-                job.paths, job.owner_hwnd, job.background, job.extended,
-                job.disabled_clsids);
-            std::lock_guard<std::mutex> lock(menu_mutex_);
-            if (id != 0) {
-                menu_session_by_token_[job.token] = id;
-                menu_token_by_session_[id] = job.token;
-            }
-            break;
-        }
-        case MenuJob::Kind::Invoke: {
-            uint32_t session = 0;
-            {
-                std::lock_guard<std::mutex> lock(menu_mutex_);
-                auto it = menu_session_by_token_.find(job.token);
-                if (it == menu_session_by_token_.end()) break;
-                session = it->second;
-                menu_session_by_token_.erase(it);
-                menu_token_by_session_.erase(session);
-            }
-            const uint32_t id = client.InvokeContextMenu(session, job.item_id,
-                                                         job.verb, job.text);
-            if (id != 0) {
-                std::lock_guard<std::mutex> lock(menu_mutex_);
-                ctx_invoke_ids_.insert(id);
-            }
-            break;
-        }
-        case MenuJob::Kind::Close: {
-            uint32_t session = 0;
-            {
-                std::lock_guard<std::mutex> lock(menu_mutex_);
-                auto it = menu_session_by_token_.find(job.token);
-                if (it == menu_session_by_token_.end()) break;
-                session = it->second;
-                menu_session_by_token_.erase(it);
-                menu_token_by_session_.erase(session);
-            }
-            client.CloseContextMenu(session);
-            break;
-        }
-        }
+        DispatchMenuJob(job);
         {
             std::lock_guard<std::mutex> lock(menu_mutex_);
             menu_dispatching_ = false;
@@ -1801,17 +1961,24 @@ void OpsManager::MenuThread() {
 }
 
 void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
-    transfer_active_.store(true);
-    transfer_cancel_.store(false);
-    transfer_pause_.store(false);
+#ifdef PULSE_ELEVATED_TEST_CLIENT
+    ObserveTransferStartForReview(*this, task_id);
+#endif
     {
-        std::lock_guard<std::mutex> lock(transfer_control_mutex_);
+        std::scoped_lock lock(mutex_, transfer_control_mutex_);
+        const auto* item = active_item_ && active_item_->seq == task_id ? &*active_item_ : nullptr;
+        transfer_cancel_.store(item && item->transfer_cancelled);
+        transfer_pause_.store(item && item->transfer_paused && !item->transfer_cancelled);
         pending_conflict_.reset();
         resolved_conflict_token_ = 0;
+        transfer_active_.store(true);
     }
 
     SetStatus([&](OpStatus& st) {
         st.active = true;
+        st.can_pause = true;
+        st.authorization = AuthorizationState::None;
+        st.can_skip_authorization = false;
         st.type = req.type;
         st.task_id = task_id;
         st.phase = OpPhase::Scanning;
@@ -1836,7 +2003,64 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
 
     std::wstring failure;
     HRESULT failure_hr = S_OK;   // lets a lock-style failure be traced to its owner
-    bool cancelled = false;
+    std::optional<LockReport> move_lock_report;
+    bool cancelled = transfer_cancel_.load() || stopping_.load();
+    const auto stop_requested = [&] {
+        cancelled = cancelled || transfer_cancel_.load() || stopping_.load();
+        if (!cancelled && transfer_pause_.load()) {
+            const auto previous = Status();
+            SetStatus([&](OpStatus& st) {
+                st.phase = OpPhase::Paused;
+                st.summary = std::wstring(OpVerb(req.type)) + l10n::Pick(L"已暂停", L" paused");
+                st.bytes_per_second = 0.0;
+                st.eta_seconds = 0;
+            });
+            std::unique_lock lock(transfer_control_mutex_);
+            transfer_control_cv_.wait(lock, [&] {
+                return transfer_cancel_.load() || stopping_.load() || !transfer_pause_.load();
+            });
+            cancelled = transfer_cancel_.load() || stopping_.load();
+            lock.unlock();
+            if (!cancelled) SetStatus([&](OpStatus& st) {
+                st.phase = previous.phase;
+                st.summary = previous.summary;
+            });
+        }
+        return cancelled;
+    };
+    if (!req.new_name.empty() && (req.type != OpType::Move || req.sources.size() != 1 ||
+        !pulse::IsRenameFilename(req.new_name))) {
+        failure_hr = E_INVALIDARG;
+        failure = l10n::Pick(L"移动目标名称无效", L"The move destination name is invalid");
+    }
+    const auto root_name = [&](const std::wstring& source) {
+        return req.new_name.empty() ? FileName(source) : req.new_name;
+    };
+    // Reject a folder targeted at itself or its own subtree before any fast
+    // rename or authorization probe: MoveFileEx reports that as access denied.
+    if (failure.empty() && !req.dest_dir.empty()) {
+        for (const auto& source : req.sources) {
+            std::wstring folder = source;
+            while (folder.size() > 3 && (folder.back() == L'\\' || folder.back() == L'/')) folder.pop_back();
+            if (!folder.empty() && StartsWithPath(req.dest_dir, folder)) {
+                failure_hr = HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER);
+                failure = l10n::Pick(L"不能将目录复制或移动到其自身内部：", L"Cannot copy or move a folder into itself: ") + source;
+                break;
+            }
+        }
+    }
+    // Decide before the fast move mutates any source. A whole-request retry
+    // after partial completion could duplicate copies or move items twice.
+#ifndef PULSE_ELEVATED_HOST
+    if (failure.empty() && !stop_requested() &&
+        !req.sources.empty() && !req.dest_dir.empty() &&
+        NeedsShellTransfer(req.sources, req.dest_dir, req.type == OpType::Move, req.new_name)) {
+        RunAuthorizedTransfer(req, task_id);
+        return;
+    }
+#endif
+
+
     std::vector<TransferEntry> entries;
     std::vector<std::wstring> completed_sources;
     std::vector<std::wstring> completed_destinations;
@@ -1849,7 +2073,7 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
     if (req.sources.empty() || req.dest_dir.empty()) {
         failure = l10n::Pick(L"复制或移动请求缺少来源/目标", L"The copy or move request is missing a source or destination");
     }
-    if (failure.empty() && req.is_undo && req.type == OpType::Move) {
+    if (failure.empty() && !stop_requested() && req.is_undo && req.type == OpType::Move) {
         // A merged move can remove the now-empty source directories. Its
         // per-file undo must recreate them before attempting the fast rename.
         EnsureDirectories(req.dest_dir, failure);
@@ -1857,13 +2081,14 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
 
     // A single unobstructed same-volume move is an atomic rename and should
     // not be expanded into per-file work.
-    if (failure.empty() && req.type == OpType::Move && req.sources.size() == 1) {
-        const std::wstring destination = JoinPath(req.dest_dir, FileName(req.sources.front()));
-        if (!PathExists(destination)) {
+    if (failure.empty() && !stop_requested() && req.type == OpType::Move && req.sources.size() == 1) {
+        const std::wstring destination = JoinPath(req.dest_dir, root_name(req.sources.front()));
+        if (!PathExists(destination) && !stop_requested()) {
             if (MoveFileExW(req.sources.front().c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH)) {
                 completed_sources = req.sources;
+                moved_sources_ = req.sources;
                 completed_destinations.push_back(destination);
-                PushUndo(req, &completed_destinations);
+                PushUndo(req, task_id, &completed_destinations);
                 SetStatus([&](OpStatus& st) {
                     st.active = false;
                     st.phase = OpPhase::Completed;
@@ -1876,6 +2101,19 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
                 return;
             }
             const DWORD move_error = GetLastError();
+#ifndef PULSE_ELEVATED_HOST
+            if (move_error == ERROR_ACCESS_DENIED || move_error == ERROR_PRIVILEGE_NOT_HELD ||
+                move_error == ERROR_ELEVATION_REQUIRED) {
+                // A locked descendant also makes a directory rename return access
+                // denied. Elevation cannot release that handle; retain lock retry.
+                move_lock_report = ProbeLock(req, task_id, HRESULT_FROM_WIN32(move_error),
+                    Win32Message(move_error) + L" | " + req.sources.front());
+                if (move_lock_report->Empty()) {
+                    RunAuthorizedTransfer(req, task_id);
+                    return;
+                }
+            }
+#endif
             if (move_error != ERROR_NOT_SAME_DEVICE) {
                 failure_hr = HRESULT_FROM_WIN32(move_error);
                 failure = Win32Message(move_error) + L" | " + req.sources.front();
@@ -1884,11 +2122,15 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
     }
 
     namespace fsys = std::filesystem;
-    if (failure.empty()) {
+    if (failure.empty() && !stop_requested()) {
         for (const auto& source : req.sources) {
+#ifdef PULSE_ELEVATED_TEST_CLIENT
+            ObserveTransferScanForReview(*this, source);
+#endif
+            if (stop_requested()) break;
             TransferEntry root;
             root.source = source;
-            root.destination = JoinPath(req.dest_dir, FileName(source));
+            root.destination = JoinPath(req.dest_dir, root_name(source));
             if (!ReadEntryMetadata(source, root)) {
                 {
                     const DWORD code = GetLastError();
@@ -1916,9 +2158,11 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
             // (#60). Recorded as completed at once so a later failure still
             // offers undo for it; anything a rename cannot do (another volume,
             // a lock) takes the per-file path below.
+            if (stop_requested()) break;
             if (req.type == OpType::Move && !root.destination_preexisting &&
                 MoveFileExW(source.c_str(), root.destination.c_str(), MOVEFILE_WRITE_THROUGH)) {
                 root.renamed = true;
+                moved_sources_.push_back(root.source);
                 completed_sources.push_back(root.source);
                 completed_destinations.push_back(root.destination);
                 entries.push_back(root);
@@ -1929,17 +2173,18 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
 
             std::error_code ec;
             fsys::recursive_directory_iterator it(fsys::path(source),
-                fsys::directory_options::skip_permission_denied, ec);
+                fsys::directory_options::none, ec);
             fsys::recursive_directory_iterator end;
             if (ec) {
+                failure_hr = HRESULT_FROM_WIN32(static_cast<DWORD>(ec.value()));
                 failure = l10n::Pick(L"无法读取来源目录：", L"Could not read the source folder: ") + source + L" | " + Win32Message(ec.value());
                 break;
             }
-            for (; it != end; it.increment(ec)) {
-                if (ec) {
-                    failure = l10n::Pick(L"扫描来源目录失败：", L"Could not scan the source folder: ") + source + L" | " + Win32Message(ec.value());
-                    break;
-                }
+            for (; it != end;) {
+#ifdef PULSE_ELEVATED_TEST_CLIENT
+                ObserveTransferScanForReview(*this, it->path().wstring());
+#endif
+                if (stop_requested()) break;
                 TransferEntry child;
                 child.source = it->path().wstring();
                 child.destination = (fsys::path(root.destination) /
@@ -1952,16 +2197,27 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
                     }
                     break;
                 }
+                if (stop_requested()) break;
                 entries.push_back(std::move(child));
                 if (entries.back().reparse && entries.back().directory) it.disable_recursion_pending();
+                const auto scanned_path = it->path().wstring();
+                it.increment(ec);
+                // An error may also turn the iterator into end: inspect it now,
+                // not in a loop body that will never execute again.
+                if (ec) {
+                    failure_hr = HRESULT_FROM_WIN32(static_cast<DWORD>(ec.value()));
+                    failure = l10n::Pick(L"扫描来源目录失败：", L"Could not scan the source folder: ") +
+                        scanned_path + L" | " + Win32Message(ec.value());
+                    break;
+                }
             }
-            if (!failure.empty()) break;
+            if (!failure.empty() || cancelled) break;
         }
     }
 
     // Accidental same-folder drops leave zero work. Do not flash the status bar
     // with "移动 foo → dest 完成" for a no-op Explorer already ignores.
-    if (failure.empty() && entries.empty()) {
+    if (failure.empty() && !stop_requested() && entries.empty()) {
         SetStatus([&](OpStatus& st) {
             st.completed_ops++;
             st.active = false;
@@ -1984,7 +2240,7 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
     SetStatus([&](OpStatus& st) {
         st.total_bytes = total_bytes;
         st.total_items = entries.size();
-        if (failure.empty()) {
+        if (failure.empty() && !cancelled) {
             st.phase = OpPhase::Running;
             st.percent = 0.0f;
             st.summary = ProgressSummary(req.type, entries.size());
@@ -1995,6 +2251,7 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
     ConflictChoice repeated = req.collision_policy == CollisionPolicy::KeepBoth
         ? ConflictChoice::KeepBoth : ConflictChoice::Replace;
     std::vector<std::wstring> skipped_prefixes;
+    std::vector<std::wstring> skipped_sources;
     uint64_t committed_bytes = 0;
     uint64_t published_bytes = 0;
     uint64_t processed_items = 0;
@@ -2037,6 +2294,7 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
     };
 
     auto mark_skipped = [&](const TransferEntry& entry) {
+        skipped_sources.push_back(entry.source);
         total_bytes -= (std::min)(total_bytes, entry.bytes);
         ++processed_items;
         rate.Observe(GetTickCount64(), published_bytes, total_bytes);
@@ -2066,7 +2324,8 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
         return count;
     };
 
-    for (size_t index = 0; failure.empty() && index < entries.size(); ++index) {
+    for (size_t index = 0; failure.empty() && !cancelled && index < entries.size(); ++index) {
+        if (stop_requested()) break;
         auto& entry = entries[index];
         if (entry.renamed) {
             ++processed_items;
@@ -2202,6 +2461,7 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
                     }
                     break;
                 }
+                moved_sources_.push_back(entry.source);
             }
             completed_sources.push_back(entry.source);
             completed_destinations.push_back(entry.destination);
@@ -2388,6 +2648,7 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
                 }
                 break;
             }
+            moved_sources_.push_back(entry.source);
         }
         completed_sources.push_back(entry.source);
         completed_destinations.push_back(entry.destination);
@@ -2396,11 +2657,25 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
         committed_bytes += entry.bytes;
     }
 
-    if (failure.empty() && !cancelled) {
+    if (failure.empty() && !stop_requested()) {
         for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            if (stop_requested()) break;
             if (!it->directory_prepared) continue;
             if (req.type == OpType::Move) {
-                RemoveDirectoryW(it->source.c_str());
+                if (RemoveDirectoryW(it->source.c_str())) {
+                    moved_sources_.push_back(it->source);
+                } else {
+                    const DWORD error = GetLastError();
+                    const bool intentionally_retained = error == ERROR_DIR_NOT_EMPTY &&
+                        std::any_of(skipped_sources.begin(), skipped_sources.end(), [&](const auto& skipped) {
+                            return StartsWithPath(skipped, it->source);
+                        });
+                    if (!intentionally_retained && error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+                        if (failure.empty()) failure_hr = HRESULT_FROM_WIN32(error);
+                        if (!failure.empty()) failure += L"; ";
+                        failure += Win32Message(error) + L" | " + it->source;
+                    }
+                }
             } else if (!it->reparse) {
                 SetCopiedDirectoryMetadata(*it);
             }
@@ -2441,6 +2716,10 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
                     return StartsWithPath(completed_destinations[i], backup.original);
                 });
             if (restored) {
+                const auto& source = completed_sources[i];
+                std::erase_if(moved_sources_, [&](const auto& moved) {
+                    return _wcsicmp(moved.c_str(), source.c_str()) == 0;
+                });
                 completed_destinations.erase(completed_destinations.begin() + i);
                 completed_sources.erase(completed_sources.begin() + i);
             }
@@ -2457,7 +2736,7 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
             });
             if (found == entries.end()) continue;
             const std::wstring original_destination = JoinPath(req.dest_dir,
-                                                               FileName(req.sources[root_index]));
+                                                               root_name(req.sources[root_index]));
             const bool independent_root = !found->destination_preexisting
                 || _wcsicmp(found->destination.c_str(), original_destination.c_str()) != 0;
             if (independent_root) {
@@ -2472,11 +2751,11 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
                 }
             }
         }
-        if (!committed_destinations.empty()) PushUndo(committed, &committed_destinations);
+        if (!committed_destinations.empty()) PushUndo(committed, task_id, &committed_destinations);
     } else if (!completed_destinations.empty()) {
         OpRequest partial = req;
         partial.sources = completed_sources;
-        PushUndo(partial, &completed_destinations);
+        PushUndo(partial, task_id, &completed_destinations);
     }
 
     {
@@ -2488,7 +2767,8 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
         {"hresult", static_cast<uint32_t>(failure_hr)}, {"has_error", !failure.empty()},
         {"cancelled", transfer_cancelled}, {"completed_sources", completed_sources.size()}});
     const LockReport lock_report = !transfer_cancelled && !failure.empty()
-        ? ProbeLock(req, task_id, failure_hr, failure) : LockReport{};
+        ? (move_lock_report ? *move_lock_report : ProbeLock(req, task_id, failure_hr, failure))
+        : LockReport{};
     SetStatus([&](OpStatus& st) {
         st.active = false;
         st.completed_ops++;
@@ -2517,11 +2797,17 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
 }
 
 void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
-    shell_cancel_requested_ = false;
+    {
+        std::lock_guard lock(mutex_);
+        shell_cancel_requested_ = active_item_ && active_item_->seq == task_id && active_item_->cancel_requested;
+    }
     shell_activity_tick_ = GetTickCount64();
     // Status: active.
     SetStatus([&](OpStatus& st) {
         st.active = true;
+        st.can_pause = true;
+        st.authorization = AuthorizationState::None;
+        st.can_skip_authorization = false;
         st.type = req.type;
         st.task_id = task_id;
         st.phase = OpPhase::Running;
@@ -2564,6 +2850,12 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
         SetStatus([](OpStatus& st) { st.phase = OpPhase::Running; st.percent = 0.0f; });
     }
 
+#ifndef PULSE_ELEVATED_HOST
+    if (req.type == OpType::RecycleDelete || req.type == OpType::RealDelete) {
+        RunAuthorizedDelete(req, task_id);
+        return;
+    }
+#endif
     if (req.type == OpType::EmptyRecycle) {
         SHQUERYRBINFO start{};
         start.cbSize = sizeof(start);
@@ -2643,14 +2935,18 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
 
     if (req.type == OpType::Rename || req.type == OpType::BatchRename) {
         bool valid = !req.sources.empty() && (req.type != OpType::Rename || req.sources.size() == 1);
+        std::wstring invalid_reason;
         for (size_t i = 0; i < req.sources.size(); ++i) {
             const auto& name = req.type == OpType::BatchRename && i < req.new_names.size() ? req.new_names[i] : req.new_name;
+            if (valid && !req.sources[i].empty() && !IsRenameComponent(name)) invalid_reason = RenameNameText(name);
             valid = valid && !req.sources[i].empty() && IsRenameComponent(name);
         }
         if (!valid || shell_cancel_requested_.load() || stopping_.load()) {
             SetStatus([&](OpStatus& st) {
                 st.active = false; st.phase = OpPhase::Failed; st.percent = -1.0f;
-                ++st.completed_ops; st.last_error = valid ? l10n::Pick(L"已取消", L"Canceled") : l10n::Pick(L"名称无效", L"Invalid name");
+                ++st.completed_ops;
+                st.last_error = valid ? l10n::Pick(L"已取消", L"Canceled")
+                    : !invalid_reason.empty() ? invalid_reason : l10n::Pick(L"名称无效", L"Invalid name");
             });
             return;
         }
@@ -2690,7 +2986,7 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
             OpRequest recorded = req;
             recorded.sources = ok_sources;
             recorded.new_names = ok_names;
-            PushUndo(recorded, &ok_destinations);
+            PushUndo(recorded, task_id, &ok_destinations);
         }
         SetStatus([&](OpStatus& st) {
             st.active = false;
@@ -2716,16 +3012,23 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
     // A single rename shares the batch path's validation and no-overwrite rules.
     if (req.type == OpType::Rename && req.sources.size() == 1) {
         std::wstring local_error;
-        const auto local = RenameInProcess(req.sources.front(), req.new_name, &local_error);
+        DWORD local_code = ERROR_SUCCESS;
+        const auto local = RenameInProcess(req.sources.front(), req.new_name, &local_error, &local_code);
         if (local == RenameResult::Rejected) {
+            // A handle held elsewhere: name the program and offer the retry,
+            // like delete and move (the folder case probes files inside it).
+            const LockReport lock_report = local_code != ERROR_SUCCESS
+                ? ProbeLock(req, task_id, HRESULT_FROM_WIN32(local_code), local_error) : LockReport{};
             SetStatus([&](OpStatus& st) {
                 st.active = false; st.phase = OpPhase::Failed; st.percent = -1.0f;
                 ++st.completed_ops; st.last_error = local_error;
+                st.locked_path = lock_report.path;
+                st.lock_owners = lock_report.owners;
             });
             return;
         }
         if (local == RenameResult::Completed) {
-            PushUndo(req);
+            PushUndo(req, task_id);
             SetStatus([&](OpStatus& st) {
                 st.active = false;
                 st.percent = -1.0f;
@@ -2738,6 +3041,28 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
         }
     }
 
+    if (req.type == OpType::CreateFolder || req.type == OpType::CreateTextFile) {
+        std::wstring local_error;
+        const bool created = CreateInProcess(req.type,
+            req.sources.empty() ? std::wstring{} : req.sources.front(), &local_error);
+        if (created) PushUndo(req, task_id);
+        SetStatus([&](OpStatus& st) {
+            st.active = false;
+            st.percent = -1.0f;
+            st.completed_ops++;
+            if (created) {
+                st.completed_items = st.total_items;
+                st.phase = OpPhase::Completed;
+                st.summary = Describe(req) + l10n::Pick(L" 完成", L" completed");
+            } else {
+                st.phase = OpPhase::Failed;
+                st.last_error = local_error;
+            }
+        });
+        return;
+    }
+
+    const auto accepted = [this](uint32_t request) { RegisterShellRequest(request); };
     uint32_t id = 0;
     switch (req.type) {
     case OpType::Copy:
@@ -2745,21 +3070,17 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
     case OpType::EmptyRecycle:
     case OpType::BatchRename:
         break;
-    case OpType::RecycleDelete: id = client.DeleteRecycle(req.sources); break;
-    case OpType::RealDelete: id = client.RealDelete(req.sources); break;
+    case OpType::RecycleDelete: id = client.DeleteRecycle(req.sources, accepted); break;
+    case OpType::RealDelete: id = client.RealDelete(req.sources, accepted); break;
     case OpType::Rename: // Handled above; never send rename to the Shell host.
         break;
-    case OpType::CreateFolder:
-        if (!req.sources.empty()) id = client.CreateFolder(req.sources.front());
-        break;
+    case OpType::CreateFolder:   // Handled above, in process.
     case OpType::CreateTextFile:
-        if (!req.sources.empty()) id = client.CreateNewFile(req.sources.front());
         break;
     case OpType::RestoreRecycle:
-        id = client.RestoreRecycle(req.sources);
+        id = client.RestoreRecycle(req.sources, accepted);
         break;
     }
-    current_req_id_.store(id);
     if (shell_cancel_requested_.load() && id != 0) client.Cancel(id);
 
     if (id == 0) {
@@ -2781,7 +3102,7 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
         {"request", id}, {"hresult", hr}, {"cancelled", cancelled}});
 
     const bool ok = SUCCEEDED((HRESULT)hr) && !cancelled;
-    if (ok) PushUndo(req);
+    if (ok) PushUndo(req, task_id);
     const LockReport lock_report = !cancelled && FAILED((HRESULT)hr)
         ? ProbeLock(req, task_id, static_cast<HRESULT>(hr), error) : LockReport{};
 
@@ -2805,42 +3126,52 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
     });
 }
 
+void OpsManager::RegisterShellRequest(uint32_t id) {
+    if (!id) return;
+    std::lock_guard<std::mutex> lock(done_mutex_);
+    shell_request_ids_.insert(id);
+    current_req_id_.store(id);
+}
+
 bool OpsManager::WaitShellDone(uint32_t id, uint32_t& hr, bool& cancelled, std::wstring& error) {
     auto& client = ipc::ShellClient::Instance();
     constexpr ULONGLONG kShellInactivityTimeoutMs = 10ull * 60ull * 1000ull;
+    bool interrupted = false;
     {
         std::unique_lock<std::mutex> lock(done_mutex_);
-        while (!(done_ready_ && done_id_ == id) && !stopping_.load()) {
+        while (!done_results_.contains(id) && !stopping_.load()) {
             done_cv_.wait_for(lock, std::chrono::seconds(5));
-            if (GetTickCount64() - shell_activity_tick_.load() < kShellInactivityTimeoutMs)
-                continue;
+            if (done_results_.contains(id)) break;
+            const ULONGLONG activity = shell_activity_tick_.load();
+            if (GetTickCount64() - activity < kShellInactivityTimeoutMs) continue;
             lock.unlock();
             client.Abort(id);
             lock.lock();
         }
-        if (stopping_.load() && !(done_ready_ && done_id_ == id)) {
-            current_req_id_.store(0);
-            shell_cancel_requested_ = false;
-            SetStatus([](OpStatus& st) {
-                st.active = false;
-                st.phase = OpPhase::Failed;
-                st.last_error = l10n::Pick(L"操作已停止", L"Operation stopped");
-                st.summary = l10n::Pick(L"操作已停止", L"Operation stopped");
-                st.completed_ops++;
-            });
-            return false;
+        const auto result = done_results_.find(id);
+        interrupted = result == done_results_.end();
+        if (!interrupted) {
+            hr = result->second.hr;
+            cancelled = result->second.cancelled;
+            // Preserve raw host error text; the UI localizes known messages.
+            error = std::move(result->second.error);
+            done_results_.erase(result);
         }
+        shell_request_ids_.erase(id);
     }
-    hr = done_hr_;
-    cancelled = done_cancelled_;
-    // Shell host errors (Simplified text or a system message, often with the
-    // failed item appended) stay as reported: error matching needs the raw text
-    // and the UI localizes known messages with ServiceErrorText at display time.
-    error = done_error_;
-    done_error_.clear();
-    done_ready_ = false;
-    current_req_id_.store(0);
+    uint32_t expected = id;
+    current_req_id_.compare_exchange_strong(expected, 0);
     shell_cancel_requested_ = false;
+    if (interrupted) {
+        SetStatus([](OpStatus& st) {
+            st.active = false;
+            st.phase = OpPhase::Failed;
+            st.last_error = l10n::Pick(L"操作已停止", L"Operation stopped");
+            st.summary = l10n::Pick(L"操作已停止", L"Operation stopped");
+            st.completed_ops++;
+        });
+        return false;
+    }
     return true;
 }
 

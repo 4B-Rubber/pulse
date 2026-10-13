@@ -5,6 +5,15 @@
 
 namespace pulse::app {
 
+bool SetTabGroup(WindowTabs& tabs, size_t index, int group) {
+    if (index >= tabs.items.size() || (tabs.items[index]->pinned && group != 0)) return false;
+    if (group != 0 && std::none_of(tabs.tab_groups.begin(), tabs.tab_groups.end(),
+        [group](const TabGroup& value) { return value.id == group; })) return false;
+    tabs.items[index]->tab_group = group;
+    NormalizeGroupRuns(tabs);
+    return true;
+}
+
 int MoveTabRun(std::vector<int>& order, int pos, int len, int dir) {
     const int n = static_cast<int>(order.size());
     if (pos < 0 || len < 1 || pos + len > n) return pos;
@@ -33,13 +42,6 @@ bool ChipBlockCrossed(float block_left, float block_w, float neighbor_center, in
 
 float DisplacedRestDelta(float old_rest, float cur_off, float new_rest) {
     return old_rest + cur_off - new_rest;
-}
-
-float RunCrossCenter(bool collapsed, float block_left, float block_right,
-                     float slot_w, int dir) {
-    if (collapsed) return (block_left + block_right) * 0.5f;
-    if (dir < 0) return block_right - slot_w * 0.5f;
-    return block_left + slot_w * 0.5f;
 }
 
 GroupRun FindGroupRun(const std::vector<int>& order,
@@ -103,16 +105,6 @@ void NormalizeGroupRuns(WindowTabs& tabs) {
             break;
         }
     }
-}
-
-void PruneEmptyGroups(WindowTabs& tabs) {
-    tabs.tab_groups.erase(std::remove_if(tabs.tab_groups.begin(), tabs.tab_groups.end(),
-        [&tabs](const TabGroup& group) {
-            return std::none_of(tabs.items.begin(), tabs.items.end(),
-                [&group](const std::unique_ptr<LayoutTab>& tab) {
-                    return tab->tab_group == group.id;
-                });
-        }), tabs.tab_groups.end());
 }
 
 } // namespace pulse::app

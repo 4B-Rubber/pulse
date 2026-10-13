@@ -1,4 +1,5 @@
 #include "edit_host.h"
+#include "dialog_recovery_test.h"
 #include "FluentTokens.h"
 // color_picker.cpp — QFluent DropDownColorPickerButton popup replica.
 //
@@ -886,68 +887,19 @@ bool IsOurs(const State& s, HWND hwnd) {
     return EditIndexFromHwnd(s, hwnd) >= 0;
 }
 
-constexpr UINT_PTR kEditCaretTimer = 71;
-
-bool PaintLumaEditControl(State& s, HWND hwnd, HDC hdc) {
-    (void)hdc;
-    if (!s.compositor || !s.compositor->LumaTextEnabled()) return false;
-    HideCaret(hwnd);
-    const D2D1_COLOR_F fg = ColorFromRef(HcEditText(s.dark ? RGB(255, 255, 255) : RGB(32, 32, 32)));
-    const D2D1_COLOR_F bg = ColorFromRef(HcEditBack(s.dark ? RGB(45, 45, 45) : RGB(255, 255, 255)));
-    return s.compositor->PresentLumaEdit(hwnd, s.compositor->TextFormat(), fg, bg);
-}
-
 LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR,
                           DWORD_PTR ref) {
     auto* hook = reinterpret_cast<EditHook*>(ref);
     State* s = hook ? hook->s : nullptr;
     if (!s) return DefSubclassProc(hwnd, msg, wp, lp);
+    const D2D1_COLOR_F fg = ColorFromRef(HcEditText(s->dark ? RGB(255, 255, 255) : RGB(32, 32, 32)));
+    const D2D1_COLOR_F bg = ColorFromRef(HcEditBack(s->dark ? RGB(45, 45, 45) : RGB(255, 255, 255)));
+    if (s->compositor) {
+        LRESULT result = 0;
+        if (HandleChildEditMessage(*s->compositor, s->compositor->TextFormat(), fg, bg,
+            EditBackBrush(s->edit_brush), hwnd, msg, wp, lp, result)) return result;
+    }
     switch (msg) {
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONDBLCLK:
-    case WM_LBUTTONUP:
-    case WM_MOUSEMOVE:
-    case WM_CAPTURECHANGED:
-        if (s->compositor && s->compositor->LumaTextEnabled()) {
-            const LRESULT result = s->compositor->CallLumaEditMouse(
-                hwnd, msg, wp, lp, s->compositor->TextFormat());
-            if (msg != WM_MOUSEMOVE || GetCapture() == hwnd)
-                PaintLumaEditControl(*s, hwnd, nullptr);
-            return result;
-        }
-        break;
-    case WM_PAINT: {
-        if (!s->compositor || !s->compositor->LumaTextEnabled()) break;
-        if (!PaintLumaEditControl(*s, hwnd, nullptr)) {
-            PAINTSTRUCT ps{};
-            HDC hdc = BeginPaint(hwnd, &ps);
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-            FillRect(hdc, &rc, EditBackBrush(s->edit_brush));
-            EndPaint(hwnd, &ps);
-        }
-        return 0;
-    }
-    case WM_SETFOCUS: {
-        LRESULT lr = DefSubclassProc(hwnd, msg, wp, lp);
-        HideCaret(hwnd);
-        SetTimer(hwnd, kEditCaretTimer, GetCaretBlinkTime(), nullptr);
-        if (s->compositor && s->compositor->LumaTextEnabled())
-            PaintLumaEditControl(*s, hwnd, nullptr);
-        else
-            InvalidateRect(hwnd, nullptr, FALSE);
-        return lr;
-    }
-    case WM_KILLFOCUS:
-        KillTimer(hwnd, kEditCaretTimer);
-        break;
-    case WM_TIMER:
-        if (wp == kEditCaretTimer) {
-            if (GetCapture() != hwnd)
-                PaintLumaEditControl(*s, hwnd, nullptr);
-            return 0;
-        }
-        break;
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
             s->done = true;
@@ -974,7 +926,9 @@ LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR,
         }
         break;
     }
-    return DefSubclassProc(hwnd, msg, wp, lp);
+    if (!s->compositor) return DefSubclassProc(hwnd, msg, wp, lp);
+    return DefPresentedChildEditProc(*s->compositor, s->compositor->TextFormat(), fg, bg,
+        hwnd, msg, wp, lp);
 }
 
 void OnEditChange(State& s, int index) {
@@ -1152,32 +1106,12 @@ void CreateBrushes(State& s) {
 }
 
 void CreateEdits(State& s) {
-    const int height = -std::lround(14.0f * s.scale);
-    s.font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                         ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                         typography::PreferredTextFamily());
-    if (!s.font) {
-        s.font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                             L"Segoe UI");
-    }
-    if (s.font) {
-        HDC hdc = GetDC(nullptr);
-        HFONT old = static_cast<HFONT>(SelectObject(hdc, s.font));
-        TEXTMETRICW tm{};
-        GetTextMetricsW(hdc, &tm);
-        SelectObject(hdc, old);
-        ReleaseDC(nullptr, hdc);
-        s.line_h = (std::max)(1, static_cast<int>(tm.tmHeight));
-    }
+    s.font = typography::CreateEditFont(s.scale);
+    if (s.font) s.line_h = EditLineHeight(s.hwnd, s.font, 1 << 16);
     for (int i = 0; i < 5; ++i) {
         HWND e = CreateChildEdit(s.hwnd, L"", i < 4 ? ES_NUMBER : 0);
         if (!e) continue;
         SetWindowTheme(e, L"", L"");
-        if (!s.compositor || !s.compositor->LumaTextEnabled())
-            SetLayeredWindowAttributes(e, 0, 255, LWA_ALPHA);
         if (s.font) SendMessageW(e, WM_SETFONT, reinterpret_cast<WPARAM>(s.font), TRUE);
         SendMessageW(e, EM_SETLIMITTEXT, i < 4 ? 3 : 9, 0);
         s.hooks[static_cast<size_t>(i)].s = &s;
@@ -1219,6 +1153,91 @@ bool SavePng(const wchar_t* path, int w, int h, void* bits) {
 }
 
 } // namespace
+
+
+#ifdef PULSE_WITH_SELFTEST
+void TestColorPickerFallback(HWND owner, float scale, bool dark, const std::wstring& png,
+                             const DialogRecoveryCheck& check) {
+    Compositor compositor;
+    check(compositor.Init(owner), "color private compositor initialized");
+    if (!compositor.Dc()) return;
+    compositor.RecreateTextFormats(scale);
+    check(compositor.LumaTextEnabled(), "color Luma backend available for injected failure");
+    WNDCLASSEXW wc{ sizeof(wc) };
+    wc.hInstance = GetModuleHandleW(nullptr); wc.lpfnWndProc = Proc;
+    wc.lpszClassName = kClassName; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    if (!GetClassInfoExW(wc.hInstance, kClassName, &wc)) RegisterClassExW(&wc);
+    State s;
+    s.owner = owner; s.compositor = &compositor; s.scale = scale; s.dark = dark;
+    s.accent = D2D1::ColorF(0.1f, 0.4f, 0.8f); s.theme = MakeTheme(dark, s.accent);
+    s.argb = 0xff345678; s.hsv = HsvFromRgb(0x345678);
+    s.painter.SetCompositor(&compositor); s.painter.SetScale(scale); Layout(s);
+    s.hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, kClassName, L"Fallback fixture",
+        WS_POPUP, 0, 0, s.win_w, s.win_h, owner, nullptr, wc.hInstance, &s);
+    check(s.hwnd != nullptr, "color private production popup created");
+    if (!s.hwnd) return;
+    CreateBrushes(s); CreateEdits(s);
+    for (auto edit : s.edits) {
+        check(edit && !GetPropW(edit, L"Pulse.NativeEditFallback"), "color new EDIT has no inherited fallback");
+        SetPropW(edit, L"Pulse.Test.LumaPresentFailure", reinterpret_cast<HANDLE>(1));
+    }
+    SyncEdits(s, -1); Render(s); Present(s, 255, 0);
+    ShowWindow(s.hwnd, SW_SHOWNOACTIVATE); ShowEdits(s); Repaint(s);
+    for (int i = 0; i < 5; ++i) {
+        HWND edit = s.edits[i];
+        if (!edit) continue;
+        SetFocus(edit); SendMessageW(edit, EM_SETSEL, 0, 1);
+        InvalidateRect(edit, nullptr, FALSE); UpdateWindow(edit);
+        check(GetPropW(edit, L"Pulse.NativeEditFallback") != nullptr, "color failed Luma present activates native fallback");
+        BYTE alpha = 0; DWORD flags = 0;
+        check(GetLayeredWindowAttributes(edit, nullptr, &alpha, &flags) && alpha == 255 && (flags & LWA_ALPHA),
+              "color fallback child remains opaque and visible");
+        DWORD first = 0, last = 0;
+        SendMessageW(edit, EM_GETSEL, reinterpret_cast<WPARAM>(&first), reinterpret_cast<LPARAM>(&last));
+        check(GetFocus() == edit && first == 0 && last == 1, "color fallback preserves real focus and selection");
+        RemovePropW(edit, L"Pulse.Test.LumaPresentFailure");
+        // Disable model normalization for this native EDIT input/undo probe.
+        s.syncing = true;
+        SetWindowTextW(edit, i < 4 ? L"123" : L"#ff345678");
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+        SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(i < 4 ? L"42" : L"#ff123456"));
+        wchar_t text[32]{}; GetWindowTextW(edit, text, 32);
+        check(std::wstring(text) == (i < 4 ? L"42" : L"#ff123456"), "color native fallback accepts input");
+        SendMessageW(edit, EM_UNDO, 0, 0); GetWindowTextW(edit, text, 32);
+        check(std::wstring(text) == (i < 4 ? L"123" : L"#ff345678"), "color native fallback preserves undo");
+        s.syncing = false;
+        InvalidateRect(edit, nullptr, FALSE); UpdateWindow(edit);
+        check(GetPropW(edit, L"Pulse.NativeEditFallback") != nullptr, "color native fallback stays stable after fault removed");
+    }
+    SetWindowTextW(s.edits[4], L"#ff102030");
+    SendMessageW(s.edits[4], EM_SETSEL, 7, 9);
+    SendMessageW(s.edits[4], EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L"40"));
+    check(s.argb == 0xff102040, "color native input updates production color model");
+    OpenModeCombo(s); check(s.hsv_mode, "color fallback survives HSV mode");
+    OpenModeCombo(s); check(!s.hsv_mode, "color fallback survives RGB mode");
+    SetFocus(s.edits[0]); SendMessageW(s.edits[0], WM_KEYDOWN, VK_TAB, 0);
+    check(GetFocus() == s.edits[1], "color fallback preserves Tab focus chain");
+    const bool rendered = Render(s);
+    check(rendered && s.mem_dc && s.bits, "color production surface rendered");
+    // Compose actual native WM_PRINTCLIENT pixels into the production popup surface.
+    if (rendered && s.mem_dc && s.bits) for (auto edit : s.edits) {
+        RECT rect{}; GetWindowRect(edit, &rect); MapWindowPoints(nullptr, s.hwnd, reinterpret_cast<POINT*>(&rect), 2);
+        int saved = SaveDC(s.mem_dc); SetViewportOrgEx(s.mem_dc, rect.left, rect.top, nullptr);
+        SendMessageW(edit, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(s.mem_dc), PRF_CLIENT);
+        RestoreDC(s.mem_dc, saved);
+        auto* pixels = static_cast<uint32_t*>(s.bits);
+        for (int y = (std::max)(0L, rect.top); y < (std::min)(static_cast<LONG>(s.win_h), rect.bottom); ++y)
+            for (int x = (std::max)(0L, rect.left); x < (std::min)(static_cast<LONG>(s.win_w), rect.right); ++x)
+                pixels[y * s.win_w + x] |= 0xff000000u;
+    }
+    check(rendered && s.bits && SavePng(png.c_str(), s.win_w, s.win_h, s.bits), "color real native EDIT composite screenshot saved");
+    for (auto edit : s.edits) if (edit) DestroyWindow(edit);
+    DestroyWindow(s.hwnd); DestroySurface(s);
+    if (s.font) DeleteObject(s.font);
+    if (s.edit_brush) DeleteObject(s.edit_brush);
+    s.painter.SetCompositor(nullptr);
+}
+#endif
 
 bool ColorPickerPopup::Pick(HWND owner, Compositor* compositor, FluentMenu* menu,
                             float scale, POINT screen_pt, uint32_t initial_rgb, bool dark,
@@ -1340,5 +1359,44 @@ bool ColorPickerPopup::SaveDebugSnapshot(Compositor* compositor, const wchar_t* 
     DestroySurface(s);
     return ok;
 }
+
+#ifdef PULSE_WITH_SELFTEST
+bool TestColorPickerEditFallback(HWND host, Compositor& compositor) {
+    bool ok = true;
+    for (float scale : {1.0f, 1.5f, 2.0f}) {
+        State s;
+        s.hwnd = host;
+        s.compositor = &compositor;
+        s.scale = scale;
+        CreateBrushes(s);
+        CreateEdits(s);
+        for (HWND edit : s.edits) {
+            if (!edit) { ok = false; continue; }
+            SetWindowPos(edit, nullptr, 0, 0, 180, 32, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            SetEnvironmentVariableW(L"PULSE_TEST_LUMATEXT_PRESENT_FAILURE", L"1");
+            SendMessageW(edit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L"123"));
+            SendMessageW(edit, WM_PAINT, 0, 0);
+            SendMessageW(edit, WM_PAINT, 0, 0);
+            ok &= GetPropW(edit, L"Pulse.NativeEditFallback") != nullptr;
+            SetEnvironmentVariableW(L"PULSE_TEST_LUMATEXT_PRESENT_FAILURE", nullptr);
+            SendMessageW(edit, EM_SETSEL, 0, 3);
+            SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L"234"));
+            wchar_t text[16]{};
+            GetWindowTextW(edit, text, 16);
+            ok &= std::wstring(text) == L"234";
+            SendMessageW(edit, WM_UNDO, 0, 0);
+            GetWindowTextW(edit, text, 16);
+            ok &= std::wstring(text) == L"123";
+            s.hsv_mode = true;
+            SyncEdits(s, -1);
+            ok &= GetPropW(edit, L"Pulse.NativeEditFallback") != nullptr;
+        }
+        for (HWND edit : s.edits) if (edit) DestroyWindow(edit);
+        if (s.font) DeleteObject(s.font);
+        if (s.edit_brush) DeleteObject(s.edit_brush);
+    }
+    return ok;
+}
+#endif
 
 } // namespace pulse::ui

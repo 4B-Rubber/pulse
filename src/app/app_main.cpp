@@ -1,6 +1,9 @@
+#include "app_diagnostics.h"
 #include "../common/windows_compat.h"
 #include "../ui/FluentTokens.h"
 #include "quick_access.h"
+#include "update_stage.h"
+#include "tag_ads_sync.h"
 #include "app_prompts.h"
 #include "vertical_tabs.h"
 #include "filter_animation.h"
@@ -16,7 +19,10 @@
 #include "../ui/file_operation_dialog.h"
 #include "../ui/batch_rename_dialog.h"
 #include "../ui/quick_preview_window.h"
+#include "app_sidebar_refresh.h"
+#include "operation_intent_ui.h"
 #include "../ui/typography.h"
+#include "../ui/preview_format_catalog.h"
 #include "../common/crash_reporter.h"
 #include "../common/diagnostics_exporter.h"
 #include "../common/localization.h"
@@ -31,8 +37,8 @@
 #include "snapshot_patch.h"
 #include "session.h"
 #include "session_save.h"
-#include "instance_launcher.h"
-#include "jump_list.h"
+#include "window_placement.h"
+#include "bitlocker_unlock.h"
 #include "context_menu.h"
 #include "context_menu_controller.h"
 #include "shell_verbs.h"
@@ -49,18 +55,28 @@
 #include "search_query.h"
 #include "settings_controller.h"
 #include "single_instance_coordinator.h"
+#include "window_factory.h"
+#include "open_routing.h"
+#include "window_identity_ui.h"
+#include "tab_transfer.h"
+#include "tab_detach.h"
+#include "window_merge.h"
+#include "reopen_closed.h"
 #include "tray_controller.h"
 #include "global_search_controller.h"
 #include "tab_controller.h"
 #include "startup_location.h"
 #include "update_checker.h"
 #include "app_updates.h"
+#include "update_download_cleanup.h"
 #include "update_shutdown.h"
 #include "link_resolve.h"
 #include "../ui/color_picker.h"
 #include "../ui/bloom_accent_picker.h"
+#include "../ui/folder_picker_dialog.h"
 #ifdef PULSE_WITH_SELFTEST
 #include "selftest_1b2.h"
+#include "../bench/startup_rollback_test.h"
 #endif
 #include "resource.h"
 #include "../index/index_client.h"
@@ -68,6 +84,7 @@
 #include "../index/network_agent_client.h"
 #include "../index/content_search_client.h"
 #include "../ops/ops_manager.h"
+#include "../ops/elevated_transfer_client.h"
 #include "../ops/clipboard.h"
 #include "../ipc/ctx_menu_util.h"
 #include "../common/text_format.h"
@@ -106,13 +123,40 @@
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "psapi.lib")
 #include "app_internal.h"
+
+namespace {
+// Default-program changes (thumbnail "opens with" badges): one shell-level
+// registration for SHCNE_ASSOCCHANGED on the main window.
+ULONG g_assocNotify = 0;
+
+void RegisterAssocChangeNotify(HWND hwnd) {
+    if (g_assocNotify) return;
+    PIDLIST_ABSOLUTE desktop = nullptr;
+    if (FAILED(SHGetFolderLocation(nullptr, CSIDL_DESKTOP, nullptr, 0, &desktop))) return;
+    SHChangeNotifyEntry entry{desktop, TRUE};
+    g_assocNotify = SHChangeNotifyRegister(hwnd, SHCNRF_ShellLevel, SHCNE_ASSOCCHANGED,
+                                           pulse::WM_ASSOC_CHANGED, 1, &entry);
+    CoTaskMemFree(desktop);
+}
+
+void UnregisterAssocChangeNotify() {
+    if (g_assocNotify) SHChangeNotifyDeregister(g_assocNotify);
+    g_assocNotify = 0;
+}
+} // namespace
 #include "group_wheel_ui.h"
+#include "window_overview_ui.h"
+#include "window_switcher_ui.h"
 #include "duplicate_scan.h"
 #include "shell_tag_menu.h"
+#include "shell_tag_com.h"
+#include "shell_tag_audit.h"
 #include "hang_watch.h"
 #include "tray_reveal.h"
 #include "default_file_manager.h"
 #include "shell_window_sync.h"
+#include "host_window.h"
+#include "host_routing.h"
 #include <commctrl.h>
 #include <dbt.h> // WM_DEVICECHANGE / DEV_BROADCAST_HDR
 
@@ -193,6 +237,8 @@ void Render(AppState& s) {
     bool hc = s.shot_high_contrast || ui::IsHighContrast();
     ui::Theme theme = hc ? ui::MakeHighContrastTheme() : ui::MakeTheme(s.darkMode, s.accentColor);
 
+    if (s.scrollAnimating) UpdateSmoothScroll(s);
+    UpdateMarqueeFrame(s);
     UpdateProcessMetrics(s);
     ui::WindowViewModel vm = BuildVm(s);
     vm.backdrop_enabled = !hc && s.compositor.UsesTransparentComposition() && s.backdropActive;
@@ -218,6 +264,17 @@ void Render(AppState& s) {
     // An occluded flip chain advances to an unpainted buffer after Present.
     if (!hidden_capture) s.compositor.Present();
     const auto present_end = std::chrono::steady_clock::now();
+    // Test instances report each window's first presented frame to the
+    // debugger output on the QPC clock, so a harness can time Ctrl+N to the
+    // new window's first frame (multi-window M4f).
+    if (s.isolatedTest && !s.first_present_reported && !hidden_capture) {
+        s.first_present_reported = true;
+        LARGE_INTEGER qpc{};
+        QueryPerformanceCounter(&qpc);
+        wchar_t line[96]{};
+        swprintf_s(line, L"PulseFirstPresent hwnd=%p qpc=%lld\n", static_cast<void*>(s.hwnd), qpc.QuadPart);
+        OutputDebugStringW(line);
+    }
     s.timing.present_ms = std::chrono::duration<double, std::milli>(present_end - present_start).count();
 
     if (s.renameIndex >= 0) LayoutRenameOverlay(s);
@@ -254,30 +311,42 @@ void Render(AppState& s) {
     s.lastFrameTime = t1;
     // Motion started or still running: the next frames follow the display
     // clock instead of the 16 ms UI timer (see WM_FRAME_PUMP).
-    if (s.framePump.Running() && s.renderer.TickMotion(GetTickCount64())) s.framePump.Arm();
+    if (s.framePump.Running() &&
+        (s.scrollAnimating || s.marqueeAutoScroll || s.renderer.TickMotion(GetTickCount64())))
+        s.framePump.Arm();
 }
 
 // The session used to be written only in WM_DESTROY, so a Windows shutdown,
 // logoff, crash or forced exit lost every layout change of that run.
 static bool SessionWritable(const AppState& s) {
-    return !s.shot.active && !s.menushot && (!s.isolatedTest || s.isolatedTestPersist) &&
+    return s.startupComplete && !s.shot.active && !s.menushot && (!s.isolatedTest || s.isolatedTestPersist) &&
         !ShellTagHeadlessLaunch();
 }
-// Recent, starred and tag views list real files that live in folders nobody has open, so no
-// directory notification ever reaches them: a slow pass re-reads them instead, and coming back
-// to the window does it right away (that is when the user looks at the list again).
-constexpr ULONGLONG kVirtualViewRefreshMs = 10000;
-constexpr ULONGLONG kVirtualViewForegroundRefreshMs = 3000;
-static ULONGLONG virtual_view_refresh_tick = 0;
 
-static void MaybeRefreshVirtualViews(AppState& s, bool allow_network_paths, ULONGLONG min_gap_ms) {
-    const ULONGLONG now = GetTickCount64();
-    if (now - virtual_view_refresh_tick < min_gap_ms) return;
-    virtual_view_refresh_tick = now;
-    RefreshPathBackedViews(s, allow_network_paths);
+// One window of the session (v8, M4d).
+static app::WindowSessionSnapshot CaptureSessionWindow(AppState& w) {
+    app::WindowSessionSnapshot snap;
+    WINDOWPLACEMENT wp{ sizeof(wp) };
+    if (GetWindowPlacement(w.hwnd, &wp)) {
+        snap.window_rect = wp.rcNormalPosition;
+        snap.maximized = (wp.showCmd == SW_SHOWMAXIMIZED);
+    }
+    snap.layout = CaptureWindowLayout(w);
+    RememberLayoutFocus(w);
+    snap.active_layout_tab = static_cast<int>(w.window_tabs.active);
+    for (const auto& group : w.window_tabs.tab_groups)
+        snap.tab_groups.push_back({group.id, group.name, group.color_rgb, group.collapsed});
+    for (const auto& layout : w.window_tabs.items)
+        if (layout) snap.layout_tabs.push_back(app::CaptureLayoutTab(*layout));
+    snap.identity = w.identity;
+    return snap;
 }
 
-static app::SessionSnapshot CaptureWindowSession(AppState& s, HWND hwnd) {
+// The single-window fields describe the most recently used window, which is
+// also windows[0]: versions that read one window restore that one.
+static app::SessionSnapshot CaptureWindowSession(AppState& requested, HWND requested_hwnd) {
+    AppState& s = app::CurrentWindow(requested);
+    const HWND hwnd = &s == &requested || !s.hwnd ? requested_hwnd : s.hwnd;
     app::SessionSnapshot snap;
     WINDOWPLACEMENT wp{ sizeof(wp) };
     if (GetWindowPlacement(hwnd, &wp)) {
@@ -289,23 +358,8 @@ static app::SessionSnapshot CaptureWindowSession(AppState& s, HWND hwnd) {
     if (tab) snap.active_path = tab->current_path;
     RememberLayoutFocus(s);
     snap.active_layout_tab = static_cast<int>(s.window_tabs.active);
-    for (const auto& group : s.window_tabs.tab_groups) {
-        app::GroupSessionSnapshot group_snap{group.id, group.name, group.color_rgb,
-                                             group.collapsed};
-        // The live memory is a tab pointer; the session stores the position in
-        // the layout list, so the hover card can still mark "the tab you last
-        // used here" after a restart.
-        if (auto it = s.lastActiveInGroup.find(group.id);
-            it != s.lastActiveInGroup.end()) {
-            for (size_t i = 0; i < s.window_tabs.items.size(); ++i) {
-                if (s.window_tabs.items[i].get() == it->second) {
-                    group_snap.last_active = static_cast<int>(i);
-                    break;
-                }
-            }
-        }
-        snap.tab_groups.push_back(std::move(group_snap));
-    }
+    for (const auto& group : s.window_tabs.tab_groups)
+        snap.tab_groups.push_back({group.id, group.name, group.color_rgb, group.collapsed});
     for (const auto& layout : s.window_tabs.items)
         snap.layout_tabs.push_back(app::CaptureLayoutTab(*layout));
     snap.tray = s.tray;
@@ -319,13 +373,112 @@ static app::SessionSnapshot CaptureWindowSession(AppState& s, HWND hwnd) {
     snap.details_preview_only = s.detailsPreviewOnly;
     snap.details_preview = s.detailsPreviewEnabled;
     snap.details_panel_width = static_cast<int>(std::lround(s.detailsPanelWidth));
+    // Session v8 (M4d): every window, most recent first, then the windows of
+    // the last session that have not been opened yet (a launch into the tray).
+    snap.windows.push_back(CaptureSessionWindow(s));
+    snap.windows.front().window_rect = snap.window_rect;
+    snap.windows.front().maximized = snap.maximized;
+    app::ForEachWindowSharingCore(s, [&](AppState& window) {
+        if (&window != &s && window.hwnd && !window.window_tabs.items.empty())
+            snap.windows.push_back(CaptureSessionWindow(window));
+    });
+    for (const auto& pending : s.core.pending_session_windows) snap.windows.push_back(pending);
+    snap.focused_window = 0;
+    // M7f: closed windows survive a restart (the writer keeps the newest).
+    for (const auto& closed : s.core.closed_windows.Items())
+        snap.closed_windows.push_back(app::ClosedWindowToSession(closed));
     return snap;
+}
+
+// What reopening a closed window brings back (M4c): its tabs, groups and place
+// (M4d: and its sidebar and details pane).
+static app::ClosedWindow CaptureClosedWindow(AppState& s, HWND hwnd) {
+    app::ClosedWindow closed;
+    WINDOWPLACEMENT wp{ sizeof(wp) };
+    if (GetWindowPlacement(hwnd, &wp)) {
+        closed.rect = app::RestoredWindowRect(wp.rcNormalPosition);
+        closed.maximized = wp.showCmd == SW_SHOWMAXIMIZED || IsZoomed(hwnd);
+    }
+    RememberLayoutFocus(s);
+    closed.active_layout_tab = static_cast<int>(s.window_tabs.active);
+    for (const auto& group : s.window_tabs.tab_groups)
+        closed.tab_groups.push_back({group.id, group.name, group.color_rgb, group.collapsed});
+    for (const auto& layout : s.window_tabs.items)
+        if (layout) closed.layout_tabs.push_back(app::CaptureLayoutTab(*layout));
+    if (s.window_tabs.active < s.window_tabs.items.size() && s.window_tabs.items[s.window_tabs.active])
+        closed.name = app::LayoutTabTitle(*s.window_tabs.items[s.window_tabs.active]);
+    closed.layout = CaptureWindowLayout(s);
+    closed.identity = s.identity;
+    return closed;
+}
+
+// Rebuilds the window's tabs from snapshots: session restore, and a reopened
+// window (M4c).
+static void RestoreTabsFromSnapshots(AppState& s, const std::vector<app::LayoutTabSnapshot>& layout_tabs,
+                                     const std::vector<app::GroupSessionSnapshot>& groups, int active) {
+    s.pane = nullptr;
+    s.targetPane = nullptr;
+    AppState* const state = &s;
+    app::RestoreWindowTabs(
+        s.window_tabs, layout_tabs, groups, active,
+        [state](app::Tab& tab, const std::wstring& path) {
+            WarmupUnc(*state, path);
+            StartLoadingPath(*state, tab, path, PathLoadReason::RestoreSession);
+        });
+    for (size_t i = 0; i < s.window_tabs.items.size(); ++i) {
+        app::RebuildLayoutRoot(*s.window_tabs.items[i]);
+        if (i < layout_tabs.size() && s.window_tabs.items[i]->root && !layout_tabs[i].split_ratios.empty())
+            app::ApplySplitRatios(*s.window_tabs.items[i]->root, layout_tabs[i].split_ratios);
+    }
+    BindCurrentLayout(s);
+}
+
+// Ctrl+Shift+M (M4e, plan §8.4; M5c): the active tab itself moves to a new
+// window next to this one, keeping its panes, splits, pin, history, selection
+// and scroll position (it leaves its group); its folders show at once. A
+// window with one tab keeps it: moving it would only replace the window.
+static void MoveTabToNewWindow(AppState& s) {
+    auto& tabs = s.window_tabs;
+    const size_t index = tabs.active;
+    if (tabs.items.size() < 2 || index >= tabs.items.size() || !tabs.items[index]) return;
+    WindowInit init;  // no place: OpenPulseWindow cascades from `s`
+    if (const app::Tab* view = ActiveTab(s)) init.path = view->current_path;
+    init.adopt_from = &s;
+    init.adopt_index = index;
+    OpenPulseWindow(s, init);
+}
+
+// WM_CREATE of a window opened by MoveTabToNewWindow: the tab moves in and
+// replaces the placeholder tab, which has loaded nothing. False leaves the
+// window to open its start folder instead.
+static bool AdoptMovedTab(AppState& s) {
+    AppState* const from = s.window_adopt_from;
+    s.window_adopt_from = nullptr;
+    const app::LayoutTab* placeholder = s.window_tabs.Active();
+    if (!from || !placeholder || !MoveLayoutTab(*from, s.window_adopt_index, s, 0)) return false;
+    for (size_t i = 0; i < s.window_tabs.items.size(); ++i) {
+        if (s.window_tabs.items[i].get() != placeholder) continue;
+        s.window_tabs.CloseTab(i);
+        break;
+    }
+    BindCurrentLayout(s);
+    return true;
+}
+
+// Reopens the most recently closed window next to `from` (M4c).
+static void ReopenClosedWindow(AppState& from) {
+    auto closed = from.core.closed_windows.TakeLatest();
+    if (!closed) return;
+    DismissReopenToasts(from, WM_REOPEN_CLOSED_WINDOW);  // M7f: it came back
+    WindowInit init;
+    init.restore = std::move(closed);
+    OpenPulseWindow(from, init);
 }
 
 // Writes session.json and app.json when they differ from the last write (or always
 // when forced). Both writes are atomic, so a kill mid-save keeps the old file.
 static bool SaveWindowSession(AppState& s, HWND hwnd, bool force) {
-    if (!SessionWritable(s)) return false;
+    if (!SessionWritable(s) || s.appPrefs.load_failed) return false;
     auto json = app::SessionToJson(CaptureWindowSession(s, hwnd));
     const bool session_saved = app::SaveChangedSession(
         json, s.sessionSavedJson, force, app::WriteSessionJson);
@@ -341,6 +494,71 @@ bool pulse::PrepareSessionForUpdate(AppState& s) {
     return s.updateSessionPrepared;
 }
 
+// System broadcasts (host_routing.h, multi-window M3c), handled once for the
+// process: the shared part runs once, the window part for every window that
+// shares `s`'s core (only `s` when it is not registered).
+// Close button, Alt+F4, WM_CLOSE (plan §8.1). One of several windows is
+// destroyed and takes only its own state along; the last window hides to the
+// tray when Pulse keeps running in the background, otherwise it exits.
+static void CloseMainWindow(AppState& s) {
+    const HWND hwnd = s.hwnd;
+    if (!s.core.windows.IsLastWindow(hwnd)) {
+        DestroyWindow(hwnd);
+        return;
+    }
+    SuspendContentSearches(s);
+    s.globalSearchWindow.Hide();
+    if (s.appPrefs.KeepsRunningInBackground()) HideMainWindowToTray(s);
+    else DestroyWindow(hwnd);
+}
+
+// Tray "Exit" and the palette's "Exit Pulse": the session is saved while every
+// window is still open (v8, M4d), then every window closes, the most recent
+// one last so its WM_DESTROY stops the services (it skips the session write).
+// `s` may be gone once its window is destroyed; only the snapshot is used.
+static void ExitPulse(AppState& s) {
+    if (!s.updateSessionPrepared) SaveWindowSession(s, s.hwnd, true);
+    s.core.exiting = true;  // these closes are not undoable (closed_windows)
+    const HWND self = s.hwnd;
+    for (HWND window : s.core.windows.ExitOrder())
+        if (window != self && IsWindow(window)) DestroyWindow(window);
+    if (self && IsWindow(self)) DestroyWindow(self);
+}
+
+static LRESULT HandleSystemBroadcast(AppState& s, app::SystemBroadcast kind, WPARAM wParam) {
+    switch (kind) {
+    case app::SystemBroadcast::Theme:
+        if (s.themeOverride == ui::ThemeMode::Auto) s.darkMode = ui::ShouldUseDarkMode(s.themeOverride);
+        app::ForEachWindowSharingCore(s, [](AppState& window) {
+            if (window.appPrefs.accent_rgb.empty()) ApplyAccentFromPrefs(window, true);
+            ApplyAppWindowChrome(window);
+            InvalidateRect(window.hwnd, nullptr, FALSE);
+        });
+        return 0;
+    case app::SystemBroadcast::Volumes:
+        // The sidebar model is built once, so rebuild it here instead of
+        // waiting for a language switch or a restart.
+        RefreshSidebarModel(s);
+        app::ForEachWindowSharingCore(s, [](AppState& window) { InvalidateRect(window.hwnd, nullptr, FALSE); });
+        return 0;
+    case app::SystemBroadcast::QueryEndSession:
+        // Shutdown/logoff ends the process without WM_DESTROY; store the layout
+        // now. session.json holds every window (v8), so it is saved once.
+        SaveWindowSession(s, s.hwnd, true);
+        return TRUE;
+    case app::SystemBroadcast::EndSession:
+        if (s.startupComplete && wParam && !s.shot.active && !s.menushot && !s.isolatedTest) {
+            SaveWindowSession(s, s.hwnd, true);
+            s.places.Save();
+            s.ctxMenuPrefs.Save();
+        }
+        return 0;
+    case app::SystemBroadcast::None:
+        break;
+    }
+    return 0;
+}
+
 // Checked from the UI timer; skipped while a mouse drag (splitter, sidebar,
 // column, window move) is in progress so a half-finished resize is not stored.
 constexpr ULONGLONG kSessionAutosaveMs = 3000;
@@ -351,20 +569,16 @@ static void TickSessionAutosave(AppState& s, HWND hwnd, ULONGLONG now) {
     // GetKeyState is not used: its queued button state can stay "down" after a click
     // whose button-up a drag-detect loop consumed, which silently stopped autosave.
     if (GetCapture() != nullptr || s.sidebarResizing) return;
-    // A second window owns none of the persisted layout: the autosave must not
-    // replace the primary's session with its own.
-    if (s.secondaryInstance || s.mergedAway) return;
     SaveWindowSession(s, hwnd, false);
 }
 
-// kTimerUi drives animations and light polling. The pacer keeps the display
-// rate while anything changes and polls gently once the window is quiet,
-// minimized or hidden to the tray (see ui_timer_pacer.h).
-static app::UiTimerPacer g_uiTimerPacer;
-
-static void SyncUiTimerRate(HWND hwnd, bool visible) {
+// kTimerUi drives animations and light polling. Each window's pacer
+// (AppState::uiTimerPacer) keeps the display rate while anything changes and
+// polls gently once that window is quiet, minimized or hidden to the tray
+// (see ui_timer_pacer.h).
+static void SyncUiTimerRate(AppState& s, HWND hwnd, bool visible) {
     UINT period = 0;
-    if (g_uiTimerPacer.Update(visible, GetTickCount64(), period))
+    if (s.uiTimerPacer.Update(visible, GetTickCount64(), period))
         SetTimer(hwnd, kTimerUi, period, nullptr);
 }
 
@@ -380,20 +594,54 @@ static bool IsUiActivityMessage(UINT msg) {
            msg == WM_SIZE || msg == WM_CAPTURECHANGED || msg == WM_DPICHANGED;
 }
 
-static void NoteUiActivity(HWND hwnd, bool visible) {
-    g_uiTimerPacer.NoteActivity(GetTickCount64());
-    SyncUiTimerRate(hwnd, visible);
+static void NoteUiActivity(AppState& s, HWND hwnd, bool visible) {
+    s.uiTimerPacer.NoteActivity(GetTickCount64());
+    SyncUiTimerRate(s, hwnd, visible);
+}
+
+// A second launch or the Explorer tag verb reached the host window (the
+// single-instance endpoint, host_window.h); `s` is the window that handles it.
+static BOOL HandleInstanceCopyData(AppState& s, COPYDATASTRUCT* cds) {
+    if (app::ShellTagRequest tag_request; app::DecodeShellTagRequest(cds, tag_request)) {
+        // Explorer "Pulse tags" verb: tag in place, never raise the window.
+        QueueShellTagRequest(s, std::move(tag_request), false);
+        return TRUE;
+    }
+    if (cds && cds->dwData == app::SingleInstanceCoordinator::OpenRequestMessageId()) {
+        app::SingleInstanceCoordinator::OpenRequest request;
+        if (!app::SingleInstanceCoordinator::DecodeOpenRequest(cds, request)) return FALSE;
+        const auto accepted = s.single_instance.AcceptOpenRequest(request, GetTickCount64());
+        if (accepted == app::SingleInstanceCoordinator::OpenAcceptance::Invalid) return FALSE;
+        if (accepted == app::SingleInstanceCoordinator::OpenAcceptance::New)
+            OpenExternalFolder(s, request.path);  // plan §6: tab, window or the open one
+        return TRUE; // acceptance, not a claim that asynchronous enumeration succeeded
+    }
+    std::wstring path;
+    if (!app::SingleInstanceCoordinator::DecodeOpenPath(cds, path)) return FALSE;
+    OpenExternalFolder(s, path);
+    return TRUE;
 }
 
 LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     AppState* s = GetAppState(hwnd);
     if (s && msg != 0 && msg == app::UpdateShutdownMessage())
         return CloseForUpdate(*s);
-    if (s && IsUiActivityMessage(msg)) NoteUiActivity(hwnd, IsWindowVisible(hwnd) && !IsIconic(hwnd));
+    if (s && IsUiActivityMessage(msg)) NoteUiActivity(*s, hwnd, IsWindowVisible(hwnd) && !IsIconic(hwnd));
     if (s && s->notification_toast.HandleMessage(hwnd, msg, wParam, lParam)) return 0;
+    if (s && WindowSwitcherMessage(*s, hwnd, msg, wParam, lParam)) return 0;  // M7d
+    if (LRESULT overview_result = 0; s && WindowOverviewMessage(*s, hwnd, msg, wParam, lParam, overview_result))
+        return overview_result;  // M7e
     if (s && GroupWheelMessage(*s, hwnd, msg, wParam, lParam)) return 0;
-    if (s && msg == app::TrayController::TaskbarCreatedMessage() && msg != 0) {
-        s->tray_controller.HandleTaskbarCreated();   // Explorer restarted or came up late
+    // Explorer restarted or came up late. The broadcast reaches every
+    // top-level window; the host window handles it, unless there is none.
+    if (s && msg == app::TrayController::TaskbarCreatedMessage() && msg != 0 &&
+        ServiceWindow(*s) == hwnd) {
+        s->tray_controller.HandleTaskbarCreated();
+        return 0;
+    }
+    // M7c: this window's taskbar button exists (again); give it its dot.
+    if (s && msg != 0 && msg == TaskbarButtonCreatedMessage()) {
+        SyncWindowOverlay(*s);
         return 0;
     }
 
@@ -422,8 +670,14 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s = reinterpret_cast<AppState*>(cs->lpCreateParams);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
         s->hwnd = hwnd;
-        s->tray_controller.Attach(hwnd, cs->hInstance);
-        InstallTrayRevealHook(*s);
+        s->core.windows.Add(hwnd, s);
+        // Later windows (M4a) skip the process-level setup below: services,
+        // saved state and the tray already belong to the first window.
+        const bool init_core = !s->core.started;
+        if (init_core) {
+            s->tray_controller.Attach(hwnd, cs->hInstance, ServiceWindow(*s));
+            InstallTrayRevealHook(*s);
+        }
 
         s->scale = s->shot_scale_override > 0.0f
             ? s->shot_scale_override : (float)pulse::compat::WindowDpi(hwnd) / 96.0f;
@@ -431,12 +685,25 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->darkMode = ui::ShouldUseDarkMode(s->themeOverride);
         s->backdropActive = ui::ApplyWindowEffect(hwnd, ui::WindowEffect::MicaAlt, s->darkMode);
 
+#ifdef PULSE_WITH_SELFTEST
+        if (StartupRollbackFaultForTest(1)) return -1;
+#endif
+#ifdef PULSE_WITH_SELFTEST
+        // Fault injection is disabled unless all persistence is redirected.
+        wchar_t startup_fault[32]{};
+        const bool startup_fixture = GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", nullptr, 0) > 0;
+        if (startup_fixture) GetEnvironmentVariableW(L"PULSE_TEST_STARTUP_FAIL", startup_fault, ARRAYSIZE(startup_fault));
+        if (wcscmp(startup_fault, L"graphics") == 0) return -1;
+#endif
         if (!s->compositor.Init(hwnd)) {
             const std::wstring message = L"Failed to initialize D3D/D2D/DWrite\n\n" +
                 s->compositor.InitializationError() + L"\n\nLog: %LOCALAPPDATA%\\Pulse\\pulse_graphics.log";
             MessageBoxW(hwnd, message.c_str(), L"Pulse", MB_OK | MB_ICONERROR);
             return -1;
         }
+#ifdef PULSE_WITH_SELFTEST
+        if (wcscmp(startup_fault, L"after-graphics") == 0) return -1;
+#endif
         s->compositor.RecreateTextFormats(s->scale);
         if (s->shot.active) {
             wchar_t toast_test[2]{};
@@ -448,11 +715,18 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->renderer.SetCompositor(&s->compositor);
         s->renderer.SetScale(s->scale);
         s->renderer.SetIconNotifyWindow(hwnd);
-        s->quickPreview.Initialize(hwnd, WM_QUICK_PREVIEW_NAVIGATE,
-                                   WM_QUICK_PREVIEW_OPEN, WM_QUICK_PREVIEW_COMMAND);
+        if (init_core) RegisterAssocChangeNotify(ServiceWindow(*s));
+        // Later windows build Quick Look on first use (ToggleQuickPreview):
+        // each one is a hidden window that cost every Ctrl+N about 25 ms.
+        if (init_core)
+            s->quickPreview.Initialize(hwnd, WM_QUICK_PREVIEW_NAVIGATE,
+                                       WM_QUICK_PREVIEW_OPEN, WM_QUICK_PREVIEW_COMMAND);
 
         s->window_tabs.EnsureDefault();
         BindCurrentLayout(*s);
+#ifdef PULSE_WITH_SELFTEST
+        if (StartupRollbackFaultForTest(2)) return -1;
+#endif
         s->tabs.SetCallbacks({
             [s](app::Tab& tab) { StartLoadingPath(*s, tab, tab.current_path); },
             [hwnd] { InvalidateRect(hwnd, nullptr, FALSE); },
@@ -464,70 +738,94 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 return true;
             },
             [s] { return s->appPrefs.close_window_with_last_tab; },
-            // The tab menu closes the window through the same WM_CLOSE the title
-            // bar uses, so the tray settings decide hide-versus-exit.
             [hwnd] { PostMessageW(hwnd, WM_CLOSE, 0, 0); },
+            [s](const std::vector<size_t>& indices) { RememberClosingTabs(*s, indices); },
         });
-        if (s->isolatedTest) {
-            s->places.persist = false;
-            s->appPrefs.persist = s->isolatedTestPersist; // only into PULSE_TEST_DATA_DIR
-            s->ctxMenuPrefs.persist = s->isolatedTestPersist;
+        if (init_core) {
+            if (s->isolatedTest) {
+                s->places.persist = false;
+                s->appPrefs.persist = s->isolatedTestPersist; // only into PULSE_TEST_DATA_DIR
+                s->ctxMenuPrefs.persist = s->isolatedTestPersist;
+            }
+            s->savedSearches.Load();
+            SyncSavedSearchSidebar(*s);
+            s->places.Load();
+            ProbePinnedNetworks(*s);
+            s->ctxMenuPrefs.Load();
+            if (s->isolatedTest) {
+                // GUI verification of the menu settings with a given hidden mask
+                // (decimal), without touching the user's context_menu.json.
+                wchar_t mask[16]{};
+                if (GetEnvironmentVariableW(L"PULSE_TEST_BUILTIN_HIDDEN", mask, ARRAYSIZE(mask)) > 0) {
+                    s->ctxMenuPrefs.builtin_hidden = static_cast<uint32_t>(wcstoul(mask, nullptr, 10));
+                    s->ctxMenuPrefs.persist = false;
+                }
+                // PULSE_TEST_BUILTIN_ORDER0/1/2: comma-joined row keys per surface.
+                for (int surface = 0; surface < static_cast<int>(app::BuiltinMenuSurface::Count); ++surface) {
+                    wchar_t name[32]{};
+                    swprintf_s(name, L"PULSE_TEST_BUILTIN_ORDER%d", surface);
+                    wchar_t keys[512]{};
+                    if (GetEnvironmentVariableW(name, keys, ARRAYSIZE(keys)) == 0) continue;
+                    app::BuiltinMenuOrder order;
+                    wchar_t* next = nullptr;
+                    for (wchar_t* key = wcstok_s(keys, L",", &next); key; key = wcstok_s(nullptr, L",", &next))
+                        for (int i = 0; i < app::kBuiltinMenuItemCount; ++i)
+                            if (app::BuiltinMenuKey(static_cast<app::BuiltinMenuItem>(i)) == key)
+                                order.push_back(static_cast<app::BuiltinMenuItem>(i));
+                    s->ctxMenuPrefs.SetBuiltinOrder(static_cast<app::BuiltinMenuSurface>(surface), order);
+                    s->ctxMenuPrefs.persist = false;
+                }
+            }
+            s->appPrefs.Load();
+            NoteRunningVersion(*s);
+            if (!s->shot.active && s->appPrefs.theme_mode >= 0) {
+                s->themeOverride = s->appPrefs.theme_mode == 1 ? ui::ThemeMode::Light :
+                    s->appPrefs.theme_mode == 2 ? ui::ThemeMode::Dark : ui::ThemeMode::Auto;
+                s->darkMode = ui::ShouldUseDarkMode(s->themeOverride);
+            }
+            s->searchHistory.persist = !s->shot.active && !s->menushot && !s->isolatedTest;
+            if (s->searchHistory.persist) s->searchHistory.Load();
+            s->showFps = s->forceStatusPerformance || s->appPrefs.show_status_performance;
+            s->duplicateScan.scope = static_cast<app::DuplicateScanScope>(
+                std::clamp(s->appPrefs.duplicate_scan_scope, 0, 2));
+            s->duplicateScan.folder_path = s->appPrefs.duplicate_scan_folder;
+            s->duplicateScan.drive_root =
+                app::DuplicateScanSession::NormalizeDriveRoot(s->appPrefs.duplicate_scan_drive);
+            s->duplicateScan.minimum_file_bytes =
+                app::DuplicateScanSession::DefaultMinimumBytes(s->duplicateScan.scope);
+            if (s->shot.active && l10n::IsLanguageId(s->shot.language) &&
+                s->shot.language != L"system")
+                s->appPrefs.language = s->shot.language;
+            if (s->shot.active) {
+                // GUI verification of hidden / protected item styling (never persisted).
+                wchar_t show_hidden[2]{};
+                if (GetEnvironmentVariableW(L"PULSE_TEST_SHOW_HIDDEN", show_hidden, 2) == 1 &&
+                    show_hidden[0] == L'1') {
+                    s->appPrefs.show_hidden_files = true;
+                    s->appPrefs.show_protected_os_files = true;
+                }
+            }
+            l10n::Initialize(cs->hInstance, s->appPrefs.language);
+            if (s->shot.update_available) {
+                s->update_result_ready = true;
+                s->update_result.update_available = true;
+                s->update_result.version = L"9.8.7";
+                s->update_result.download_page = L"https://updates.example.test/pulse";
+                s->update_result.installer_sha256 =
+                    L"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            }
+            ui::typography::SetUiFontScale(s->appPrefs.ui_font_scale);
+            ui::typography::InvalidateCaches();
         }
-        s->savedSearches.Load();
-        SyncSavedSearchSidebar(*s);
-        s->places.Load();
-        ProbePinnedNetworks(*s);
-        s->ctxMenuPrefs.Load();
-        s->appPrefs.Load();
-        NoteRunningVersion(*s);
-        if (!s->shot.active && s->appPrefs.theme_mode >= 0) {
-            s->themeOverride = s->appPrefs.theme_mode == 1 ? ui::ThemeMode::Light :
-                s->appPrefs.theme_mode == 2 ? ui::ThemeMode::Dark : ui::ThemeMode::Auto;
-            s->darkMode = ui::ShouldUseDarkMode(s->themeOverride);
-        }
-        s->searchHistory.persist = !s->shot.active && !s->menushot && !s->isolatedTest;
-        if (s->searchHistory.persist) s->searchHistory.Load();
-        s->showFps = s->forceStatusPerformance || s->appPrefs.show_status_performance;
-        s->duplicateScan.scope = static_cast<app::DuplicateScanScope>(
-            std::clamp(s->appPrefs.duplicate_scan_scope, 0, 2));
-        s->duplicateScan.folder_path = s->appPrefs.duplicate_scan_folder;
-        s->duplicateScan.drive_root =
-            app::DuplicateScanSession::NormalizeDriveRoot(s->appPrefs.duplicate_scan_drive);
-        s->duplicateScan.minimum_file_bytes =
-            app::DuplicateScanSession::DefaultMinimumBytes(s->duplicateScan.scope);
-        if (s->shot.active && l10n::IsLanguageId(s->shot.language) &&
-            s->shot.language != L"system")
-            s->appPrefs.language = s->shot.language;
-        l10n::Initialize(cs->hInstance, s->appPrefs.language);
-        if (s->shot.update_available) {
-            s->update_result_ready = true;
-            s->update_result.update_available = true;
-            s->update_result.version = L"9.8.7";
-            s->update_result.download_page = L"https://updates.example.test/pulse";
-            s->update_result.installer_sha256 =
-                L"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        }
-        RefreshSidebarModel(*s);
-        ui::typography::SetUiFontScale(s->appPrefs.ui_font_scale);
-        // The taskbar jump list mirrors what is pinned to quick access. It needs
-        // the localized category and task names, so it runs after l10n::Initialize;
-        // only the primary window owns the taskbar identity.
-        if (!s->secondaryInstance)
-            app::RefreshJumpList(s->places.quick_access_paths,
-                                 s->appPrefs.multi_instance_mode);
-        // A window that was started as an extra one may be the only one left (a
-        // tab torn out to the desktop closes its window), and then the tray, the
-        // hotkey and the session belong to it. Retried in the background, so a
-        // window with a living owner simply gives up.
-        if (s->secondaryInstance) AdoptSingletonOwnership(*s);
-        ui::typography::InvalidateCaches();
         s->compositor.RecreateTextFormats(s->scale);
-        if (s->safeMode) {
-            s->appPrefs.window_effect = L"none";
-            s->appPrefs.background_image.clear();
-        } else {
-            SeedShellVerbCache(*s);
-            StartShellRegistryWatch(hwnd);
+        if (init_core) {
+            if (s->safeMode) {
+                s->appPrefs.window_effect = L"none";
+                s->appPrefs.background_image.clear();
+            } else {
+                SeedShellVerbCache(*s);
+                StartShellRegistryWatch(ServiceWindow(*s));
+            }
         }
         s->renderer.SetRowHeightDip(static_cast<float>(
             app::EffectiveRowHeightDip(s->appPrefs.row_height, s->appPrefs.ui_font_scale)));
@@ -535,7 +833,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                                  s->appPrefs.list_size_bar, s->appPrefs.list_tag_name_color,
                                  s->appPrefs.list_selection_outline);
         s->renderer.SetDetailsColumns(s->appPrefs.details_columns);
-        s->renderer.SetRowActions(app::RowActionMask(s->ctxMenuPrefs.builtin_hidden));
+        s->renderer.SetRowActions(app::RowActionMask(s->ctxMenuPrefs.builtin_hidden,
+            s->ctxMenuPrefs.BuiltinOrder(app::BuiltinMenuSurface::RowButtons)));
+        s->renderer.SetThumbnailBadges(s->appPrefs.list_thumbnail_badges);
         app::SetFolderSortMode(app::FolderSortModeFromInt(s->appPrefs.folder_sort_mode));
         ui::typography::SetTextRenderMode(static_cast<ui::typography::TextRenderMode>(s->appPrefs.text_render));
         s->compositor.UpdateTextRenderingParams(nullptr);
@@ -545,175 +845,141 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->renderer.SetTrayIconDip(static_cast<float>(s->appPrefs.tray_icon_size));
         ApplyAccentFromPrefs(*s, true);
         ApplyAppWindowChrome(*s);
-        s->index.Start(hwnd, WM_INDEX_NOTIFY, WM_INDEX_SEARCH);
-        StartChangeTracking(*s);
-        s->networkIndex.Start(hwnd, WM_NETWORK_INDEX_NOTIFY, WM_NETWORK_INDEX_SEARCH);
-        s->contentSearch.Start(hwnd, WM_CONTENT_SEARCH, s->contentIndexObserver ? index::ContentAgentMode::Observer : index::ContentAgentMode::Instant);
-        s->duplicateSearch.Start(hwnd, WM_DUPLICATE_SCAN, false);
-        s->settings.SetServiceInstalled(s->index.ServiceInstalled());
-        app::SettingsController::UiCallbacks settings_callbacks;
-        settings_callbacks.pick_image = [s](std::wstring& path) {
-            return PickImageFile(*s, path);
-        };
-        settings_callbacks.pick_folder = [s](std::wstring& path, std::wstring_view title) {
-            const std::wstring owned_title(title);
-            return PickFolder(*s, path, owned_title.c_str());
-        };
-        settings_callbacks.apply_effects = [s](app::SettingsEffect effects) {
-            ApplySettingsEffects(*s, effects);
-        };
-        settings_callbacks.integration_changing = [s] { StopShellWindows(*s); };
-        settings_callbacks.show_error = [s](const std::wstring& message) {
-            s->notification_toast.Show(s->hwnd, l10n::Get(l10n::StringId::SettingsGeneral), message);
-        };
-        if (s->appPrefs.load_failed) {
-            settings_callbacks.show_error(l10n::HantText(l10n::Pick(
-                L"原设置未能读取，已阻止覆盖。请关闭后重试打开 Pulse。",
-                L"The original settings could not be read. Saving is blocked to protect them. Restart Pulse to retry.")));
+        if (init_core) {
+            bool selection_fixture = false;
+#ifdef PULSE_WITH_SELFTEST
+            wchar_t fixture_scope[32]{};
+            selection_fixture = s->isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", nullptr, 0) &&
+                GetEnvironmentVariableW(L"PULSE_TEST_P1_SCOPE", fixture_scope, ARRAYSIZE(fixture_scope)) &&
+                (wcscmp(fixture_scope, L"selection") == 0 || wcscmp(fixture_scope, L"menu") == 0 ||
+                 wcscmp(fixture_scope, L"layout") == 0);
+#endif
+            if (!selection_fixture) {
+                const HWND service_window = ServiceWindow(*s);
+                s->index.Start(service_window, WM_INDEX_NOTIFY, WM_INDEX_SEARCH);
+                StartChangeTracking(*s);
+                s->networkIndex.Start(service_window, WM_NETWORK_INDEX_NOTIFY, WM_NETWORK_INDEX_SEARCH);
+                s->contentSearch.Start(service_window, WM_CONTENT_SEARCH, s->contentIndexObserver ? index::ContentAgentMode::Observer : index::ContentAgentMode::Instant);
+                s->duplicateSearch.Start(service_window, WM_DUPLICATE_SCAN, false);
+            }
+            s->settings.SetServiceInstalled(s->index.ServiceInstalled());
+            app::SettingsController::UiCallbacks settings_callbacks;
+            settings_callbacks.pick_image = [s](std::wstring& path) {
+                return PickImageFile(app::CurrentWindow(*s), path);
+            };
+            settings_callbacks.pick_folder = [s](std::wstring& path, std::wstring_view title) {
+                const std::wstring owned_title(title);
+                return PickFolder(app::CurrentWindow(*s), path, owned_title.c_str());
+            };
+            settings_callbacks.apply_effects = [s](app::SettingsEffect effects) {
+                // Every window shows the changed setting.
+                app::ForEachWindowSharingCore(app::CurrentWindow(*s), [&](AppState& window) {
+                    ApplySettingsEffects(window, effects);
+                });
+            };
+            settings_callbacks.integration_changing = [s] { StopShellWindows(*s); };
+            settings_callbacks.show_error = [s](const std::wstring& message) {
+                AppState& window = app::CurrentWindow(*s);
+                window.notification_toast.Show(window.hwnd, l10n::Get(l10n::StringId::SettingsGeneral), message);
+            };
+            if (s->appPrefs.load_failed) {
+                settings_callbacks.show_error(l10n::HantText(l10n::Pick(
+                    L"原设置未能读取，已阻止覆盖。请关闭后重试打开 Pulse。",
+                    L"The original settings could not be read. Saving is blocked to protect them. Restart Pulse to retry.")));
+            }
+            settings_callbacks.integration_changed = [s] { SyncShellWindows(app::CurrentWindow(*s)); };
+            settings_callbacks.task_completion = SettingsCompletion(ServiceWindow(*s));
+            settings_callbacks.open_path = [s](const std::wstring& path) {
+                ShellExecuteW(app::CurrentWindow(*s).hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            };
+            settings_callbacks.open_diagnostics = [s] {
+                const std::wstring path = app::GetPulseDataDir() + L"\\Diagnostics";
+                CreateDirectoryW((app::GetPulseDataDir() + L"\\Diagnostics").c_str(), nullptr);
+                CreateDirectoryW(path.c_str(), nullptr);
+                ShellExecuteW(app::CurrentWindow(*s).hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            };
+            settings_callbacks.clear_diagnostics = [s](std::wstring& error) {
+                if (!ConfirmClearDiagnostics(app::CurrentWindow(*s))) return true;
+                if (diagnostics::ClearCrashReports(app::GetPulseDataDir(), &error)) return true;
+                error = l10n::Get(l10n::StringId::DiagnosticsClearFailed);
+                return false;
+            };
+            settings_callbacks.prepare_diagnostics_export =
+                [s](std::wstring& destination, bool& include_service, bool& include_dumps) {
+                AppState& window = app::CurrentWindow(*s);
+                if (!ConfirmDiagnosticsExport(window, include_service, include_dumps)) return false;
+                return PickFolder(window, destination,
+                    l10n::Get(l10n::StringId::DiagnosticsExportLocation).c_str());
+            };
+            settings_callbacks.export_diagnostics = ExportAppDiagnostics;
+            s->settings.BindUi(s->appPrefs, s->ctxMenuPrefs, s->index,
+                               s->networkIndex, std::move(settings_callbacks));
+            ApplyGlobalSearchSettings(*s);
+
+            s->worker.Start([s](app::WorkResult res) { PostWorkerResult(*s, std::move(res)); });
+            RefreshSidebarModel(*s);
+            if (s->appPrefs.persist) QueueTagAds(*s, {});
+            RequestRecycleOccupancy(*s);
+            RequestNetworkLocations(*s);
+
+            // Ops layer: queue worker + shell host IPC; notify repaints the status bar.
+            const std::wstring data_dir = app::GetPulseDataDir();
+            if (!s->isolatedTest && !data_dir.empty())
+                s->ops.SetJournalPath(data_dir + L"\\operations.json");
+            s->ops.SetVerifyCopies(s->appPrefs.verify_copies);
+            // Shell dialogs (打开方式…/属性) must be owned by the Pulse window.
+            s->ops.SetUiWindow(hwnd);
+            s->ops.Start([notify = ServiceWindow(*s)] { PostMessageW(notify, WM_OPS_NOTIFY, 0, 0); });
+            // Drop stages of Pulse processes that are gone (#55).
+            app::SweepDropStages(app::DropStageRoot(), false);
+            const ops::RecoverySnapshot recovery = s->isolatedTest
+                ? ops::RecoverySnapshot{} : s->ops.PendingRecovery();
+            if (!recovery.entries.empty()) {
+                const bool duplicate_cleanup = std::any_of(recovery.entries.begin(), recovery.entries.end(),
+                    [](const ops::RecoveryEntry& entry) { return entry.request.duplicate_cleanup; });
+                if (AskRetryRecovery(*s, recovery.entries.size(), recovery.has_uncertain_destructive, duplicate_cleanup))
+                    s->ops.RetryRecovery();
+                else
+                    s->ops.DiscardRecovery();
+            }
+            s->context_menu.SetShellOperations({
+                [s](std::vector<std::wstring> paths, HWND owner, bool background, bool extended,
+                    std::vector<std::wstring> disabled) {
+                    if (s->safeMode) return uint32_t{0};
+                    return s->ops.QueryShellMenu(std::move(paths), owner, background, extended,
+                                                 std::move(disabled));
+                },
+                [s](uint32_t token) { s->ops.CloseShellMenu(token); },
+                [s](uint32_t token, uint32_t command, std::wstring verb, std::wstring text) {
+                    s->ops.InvokeShellMenu(token, command, std::move(verb), std::move(text));
+                },
+                [s](const std::wstring& path, const std::wstring& verb) {
+                    s->ops.ExecuteVerb(path, verb);
+                },
+                [s](const std::wstring& app_path, const std::wstring& path) {
+                    s->ops.OpenWithApp(app_path, path);
+                },
+                [s](const std::wstring& command, const std::wstring& path) {
+                    s->ops.ExecuteCommand(command, path);
+                },
+            });
+            // Explorer verbs arrive on the shell client's reader thread; hop to
+            // the UI thread with an owned payload (freed by the WM handler).
+            s->ops.SetShellMenuCallback([notify = ServiceWindow(*s)](uint32_t token,
+                                               std::vector<ops::ShellMenuItem> items,
+                                               bool partial,
+                                               std::vector<std::wstring> slow_clsids) {
+                auto* payload = new ShellCtxItemsPayload{
+                    std::move(items), partial, std::move(slow_clsids) };
+                if (!PostMessageW(notify, WM_SHELLCTX_ITEMS, token,
+                                  reinterpret_cast<LPARAM>(payload)))
+                    delete payload;
+            });
+            if (!s->pending_undo_json.empty()) s->ops.UndoFromJson(s->pending_undo_json);
         }
-        settings_callbacks.integration_changed = [s] { SyncShellWindows(*s); };
-        settings_callbacks.task_completion = SettingsCompletion(hwnd);
-        settings_callbacks.open_path = [hwnd](const std::wstring& path) {
-            ShellExecuteW(hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        };
-        settings_callbacks.open_diagnostics = [hwnd] {
-            const std::wstring path = app::GetPulseDataDir() + L"\\Diagnostics";
-            CreateDirectoryW((app::GetPulseDataDir() + L"\\Diagnostics").c_str(), nullptr);
-            CreateDirectoryW(path.c_str(), nullptr);
-            ShellExecuteW(hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        };
-        settings_callbacks.clear_diagnostics = [s](std::wstring& error) {
-            if (!ConfirmClearDiagnostics(*s)) return true;
-            if (diagnostics::ClearCrashReports(app::GetPulseDataDir(), &error)) return true;
-            error = l10n::Get(l10n::StringId::DiagnosticsClearFailed);
-            return false;
-        };
-        settings_callbacks.prepare_diagnostics_export =
-            [s](std::wstring& destination, bool& include_service) {
-            if (!ConfirmDiagnosticsExport(*s, include_service)) return false;
-            return PickFolder(*s, destination,
-                l10n::Get(l10n::StringId::DiagnosticsExportLocation).c_str());
-        };
-        settings_callbacks.export_diagnostics =
-            [](const std::wstring& destination, bool include_service,
-               std::wstring& error) {
-            WIN32_FIND_DATAW data{};
-            HANDLE find = FindFirstFileW((destination + L"\\*").c_str(), &data);
-            bool empty = true;
-            if (find != INVALID_HANDLE_VALUE) {
-                do {
-                    if (wcscmp(data.cFileName, L".") != 0 &&
-                        wcscmp(data.cFileName, L"..") != 0) {
-                        empty = false;
-                        break;
-                    }
-                } while (FindNextFileW(find, &data));
-                FindClose(find);
-            }
-            if (!empty) return false;
-
-            diagnostics::ExportOptions options;
-            options.source_root = app::GetPulseDataDir();
-            options.include_dumps = true;
-            options.require_empty_destination = true;
-            if (!include_service) {
-                options.destination = destination;
-                return diagnostics::Export(options, &error);
-            }
-
-            const std::wstring service_dir = destination + L"\\IndexService";
-            const bool service_exported = CreateDirectoryW(service_dir.c_str(), nullptr) &&
-                index::IndexClient::ExportDiagnosticsElevated(service_dir);
-            const std::wstring user_dir = destination + L"\\User";
-            if (!CreateDirectoryW(user_dir.c_str(), nullptr)) return false;
-            options.destination = user_dir;
-            const bool user_exported = diagnostics::Export(options, &error);
-            if (!service_exported && error.empty()) error = l10n::Pick(
-                L"用户日志已导出，但索引服务诊断未完整导出。请检查 IndexService 目录中的清单，或重新导出并允许管理员授权。",
-                L"User logs were exported, but index service diagnostics are incomplete. Check the manifest in IndexService, or export again and allow administrator access.");
-            return user_exported && service_exported;
-        };
-        s->settings.BindUi(s->appPrefs, s->ctxMenuPrefs, s->index,
-                           s->networkIndex, std::move(settings_callbacks));
-        ApplyGlobalSearchSettings(*s);
-
-        s->worker.Start([s](app::WorkResult res) { PostWorkerResult(*s, std::move(res)); });
-        if (s->appPrefs.persist) QueueTagAds(*s, {});
-        RequestRecycleOccupancy(*s);
-
-        // Ops layer: queue worker + shell host IPC; notify repaints the status bar.
-        const std::wstring data_dir = app::GetPulseDataDir();
-        if (!s->isolatedTest && !data_dir.empty())
-            s->ops.SetJournalPath(data_dir + L"\\operations.json");
-        s->ops.SetVerifyCopies(s->appPrefs.verify_copies);
-        // Shell dialogs (打开方式…/属性) must be owned by the Pulse window.
-        s->ops.SetUiWindow(hwnd);
-        s->ops.Start([hwnd] { PostMessageW(hwnd, WM_OPS_NOTIFY, 0, 0); });
-        // Drop stages of Pulse processes that are gone (#55).
-        app::SweepDropStages(app::DropStageRoot(), false);
-        const ops::RecoverySnapshot recovery = s->isolatedTest
-            ? ops::RecoverySnapshot{} : s->ops.PendingRecovery();
-        if (!recovery.entries.empty()) {
-            const bool duplicate_cleanup = std::any_of(recovery.entries.begin(), recovery.entries.end(),
-                [](const ops::RecoveryEntry& entry) { return entry.request.duplicate_cleanup; });
-            if (AskRetryRecovery(*s, recovery.entries.size(), recovery.has_uncertain_destructive, duplicate_cleanup))
-                s->ops.RetryRecovery();
-            else
-                s->ops.DiscardRecovery();
-        }
-        s->context_menu.SetShellOperations({
-            [s](std::vector<std::wstring> paths, HWND owner, bool background, bool extended,
-                std::vector<std::wstring> disabled) {
-                if (s->safeMode) return uint32_t{0};
-                return s->ops.QueryShellMenu(std::move(paths), owner, background, extended,
-                                             std::move(disabled));
-            },
-            [s](uint32_t token) { s->ops.CloseShellMenu(token); },
-            [s](uint32_t token, uint32_t command, std::wstring verb, std::wstring text) {
-                s->ops.InvokeShellMenu(token, command, std::move(verb), std::move(text));
-            },
-            [s](const std::wstring& path, const std::wstring& verb) {
-                s->ops.ExecuteVerb(path, verb);
-            },
-            [s](const std::wstring& app_path, const std::wstring& path) {
-                s->ops.OpenWithApp(app_path, path);
-            },
-            [s](const std::wstring& command, const std::wstring& path) {
-                s->ops.ExecuteCommand(command, path);
-            },
-        });
-        // Explorer verbs arrive on the shell client's reader thread; hop to
-        // the UI thread with an owned payload (freed by the WM handler).
-        s->ops.SetShellMenuCallback([hwnd](uint32_t token,
-                                           std::vector<ops::ShellMenuItem> items,
-                                           bool partial,
-                                           std::vector<std::wstring> slow_clsids) {
-            auto* payload = new ShellCtxItemsPayload{
-                std::move(items), partial, std::move(slow_clsids) };
-            if (!PostMessageW(hwnd, WM_SHELLCTX_ITEMS, token,
-                              reinterpret_cast<LPARAM>(payload)))
-                delete payload;
-        });
-        if (!s->pending_undo_json.empty()) s->ops.UndoFromJson(s->pending_undo_json);
-        s->operationWindow = std::make_unique<ui::FileOperationWindow>();
-        ui::FileOperationCallbacks operation_callbacks;
-        operation_callbacks.cancel = [hwnd] {
-            if (AppState* state = GetAppState(hwnd)) state->ops.CancelCurrent();
-        };
-        operation_callbacks.pause = [hwnd] {
-            if (AppState* state = GetAppState(hwnd)) state->ops.PauseCurrent();
-        };
-        operation_callbacks.resume = [hwnd] {
-            if (AppState* state = GetAppState(hwnd)) state->ops.ResumeCurrent();
-        };
-        operation_callbacks.dismiss = [hwnd] {
-            if (AppState* state = GetAppState(hwnd)) {
-                state->operationDismissedTaskId = state->ops.Status().task_id;
-                state->operationPinnedByUser = false;
-            }
-        };
-        s->operationWindow->Create(hwnd, std::move(operation_callbacks));
-        s->operationWindow->SetTheme(s->darkMode, s->accentColor);
+        // Later windows build the operations window when they first show it
+        // (EnsureOperationWindow); the first window owns operations at launch.
+        if (init_core) EnsureOperationWindow(*s);
 
         // OLE drop target: list rows, pane headers, breadcrumbs, sidebar, tray.
         {
@@ -737,116 +1003,103 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             RegisterDragDrop(hwnd, s->dropTarget);
         }
 
-        // "Open the default location" drops only the saved tabs; the rest of the
-        // session (sidebar, details pane, window state) still applies.
-        const bool open_default_location =
-            !s->shot.active && !app::RestoresLastTabs(s->appPrefs, s->restoreUpdateSession);
-        if (open_default_location) {
-            s->session_layout_tabs.clear();
-            s->session_tab_groups.clear();
-            s->session_active_layout_tab = 0;
-            s->session_path.clear();
-        }
-        if (!s->shot.active && !s->session_layout_tabs.empty()) {
-            s->pane = nullptr;
-            s->targetPane = nullptr;
-            app::RestoreWindowTabs(
-                s->window_tabs, s->session_layout_tabs, s->session_tab_groups,
-                s->session_active_layout_tab,
-                [s](app::Tab& tab, const std::wstring& path) {
-                    WarmupUnc(*s, path);
-                    StartLoadingPath(*s, tab, path, PathLoadReason::RestoreSession);
-                });
-            // Rebuild the group activation memory: the session kept each group's
-            // last-used tab as a position in the restored layout list.
-            s->lastActiveInGroup.clear();
-            for (const auto& group : s->session_tab_groups) {
-                if (group.last_active < 0 ||
-                    static_cast<size_t>(group.last_active) >= s->window_tabs.items.size())
-                    continue;
-                const app::LayoutTab* tab =
-                    s->window_tabs.items[static_cast<size_t>(group.last_active)].get();
-                // A tab that changed groups since the save must not be claimed.
-                if (tab->tab_group == group.id) s->lastActiveInGroup[group.id] = tab;
+        if (init_core) {
+            // "Open the default location" drops only the saved tabs; the rest of the
+            // session (sidebar, details pane, window state) still applies.
+            const bool open_default_location =
+                !s->shot.active && !app::RestoresLastTabs(s->appPrefs, s->restoreUpdateSession);
+            if (open_default_location) {
+                s->session_layout_tabs.clear();
+                s->session_tab_groups.clear();
+                s->session_active_layout_tab = 0;
+                s->session_path.clear();
             }
-            for (size_t i = 0; i < s->window_tabs.items.size(); ++i) {
-                app::RebuildLayoutRoot(*s->window_tabs.items[i]);
-                if (i < s->session_layout_tabs.size() &&
-                    s->window_tabs.items[i]->root &&
-                    !s->session_layout_tabs[i].split_ratios.empty()) {
-                    app::ApplySplitRatios(*s->window_tabs.items[i]->root,
-                                          s->session_layout_tabs[i].split_ratios);
-                }
-            }
-            BindCurrentLayout(*s);
-            if (!s->session_path.empty())
-                RememberPath(*s, s->session_path);
-            else if (app::Tab* t = ActiveTab(*s))
-                RememberPath(*s, t->current_path);
-        } else {
-        // A shell namespace (the taskbar's Explorer button, the desktop's Recycle Bin)
-        // is translated to its Pulse view, or to nothing when Pulse has no view for it:
-        // the window still opens, it just has nothing of its own to show. This PC is the
-        // empty path; an unrecognized namespace keeps the default instead of a CLSID tab.
-        std::wstring startPath = L"C:\\";
-        if (s->shot.active) {
-            // Shots accept the This PC arguments too (GUI checks of the drive view).
-            startPath = app::IsThisPcArgument(s->shot.path) ? std::wstring()
-                : ResolveIncomingPath(s->shot.path);
-            if (startPath.empty() && !app::IsThisPcArgument(s->shot.path)) startPath = L"C:\\";
-        } else if (!s->session_path.empty()) {
-            startPath = s->session_path;
-        } else if (!s->open_path.empty()) {
-            if (app::IsThisPcArgument(s->open_path)) {
-                startPath.clear();
+            // The session's other windows (M4d) come back only with its tabs.
+            if (open_default_location || s->session_layout_tabs.empty() || s->menushot ||
+                s->colorpickshot || s->colorpickdialog)
+                s->core.pending_session_windows.clear();
+            if (!s->shot.active && !s->session_layout_tabs.empty()) {
+                RestoreTabsFromSnapshots(*s, s->session_layout_tabs, s->session_tab_groups,
+                                         s->session_active_layout_tab);
+                if (!s->session_path.empty())
+                    RememberPath(*s, s->session_path);
+                else if (app::Tab* t = ActiveTab(*s))
+                    RememberPath(*s, t->current_path);
             } else {
-                const std::wstring incoming = ResolveIncomingPath(s->open_path);
-                if (!incoming.empty()) startPath = incoming;
+            // A shell namespace (the taskbar's Explorer button, the desktop's Recycle Bin)
+            // is translated to its Pulse view, or to nothing when Pulse has no view for
+            // it: the window still opens, it just has nothing of its own to show. This PC
+            // is the empty path; an unrecognized namespace keeps the default instead of a
+            // CLSID tab.
+            std::wstring startPath = L"C:\\";
+            if (s->shot.active) {
+                // Shots accept the This PC arguments too (GUI checks of the drive view).
+                startPath = app::IsThisPcArgument(s->shot.path) ? std::wstring()
+                    : ResolveIncomingPath(s->shot.path);
+                if (startPath.empty() && !app::IsThisPcArgument(s->shot.path)) startPath = L"C:\\";
+            } else if (!s->session_path.empty()) {
+                startPath = s->session_path;
+            } else if (!s->open_path.empty()) {
+                if (app::IsThisPcArgument(s->open_path)) {
+                    startPath.clear();
+                } else {
+                    const std::wstring incoming = ResolveIncomingPath(s->open_path);
+                    if (!incoming.empty()) startPath = incoming;
+                }
+            } else if (open_default_location) {
+                startPath = app::DefaultLocation(s->appPrefs); // empty = This PC
             }
-        }
-        // A new window nobody aimed anywhere: the recent view, not whatever the
-        // window that spawned it happened to be showing.
-        else if (s->secondaryInstance) startPath = app::MakeRecentPath();
-        else if (open_default_location)
-            startPath = app::DefaultLocation(s->appPrefs); // empty = This PC
-        s->pane->NewTab(startPath);
-        if (s->shot.active) s->pane->ActiveTab()->view_mode = s->shot.view_mode;
-        StartLoadingPath(*s, *s->pane->ActiveTab(), startPath,
-            !s->shot.active && !s->session_path.empty()
-                ? PathLoadReason::RestoreSession : PathLoadReason::Navigate);
-        // After StartLoadingPath: it clears the pending rows of a fresh load, so the
-        // hand-off has to be armed behind it. A window started by tearing a tab out of
-        // another one then puts the rows that tab had selected back under the cursor
-        // (and its details preview follows the same file).
-        if (app::Tab* opened = s->pane->ActiveTab()) {
-            opened->pending_selected_names = std::move(s->pending_handoff_names);
-            opened->pending_selected_name = std::move(s->pending_handoff_focus);
-        }
-        RememberPath(*s, startPath);
-        if (!s->shot.active && s->session_path.empty() && !s->open_path.empty())
-            SelectLaunchedFile(*s, s->open_path);
+            s->pane->NewTab(startPath);
+            if (s->shot.active) s->pane->ActiveTab()->view_mode = s->shot.view_mode;
+            StartLoadingPath(*s, *s->pane->ActiveTab(), startPath,
+                !s->shot.active && !s->session_path.empty()
+                    ? PathLoadReason::RestoreSession : PathLoadReason::Navigate);
+            RememberPath(*s, startPath);
+            if (!s->shot.active && s->session_path.empty() && !s->open_path.empty())
+                SelectLaunchedFile(*s, s->open_path);
+            }
+
+            if (!s->shot.active && !s->open_path.empty() &&
+                (!s->session_layout_tabs.empty() || !s->session_path.empty())) {
+                const bool this_pc = app::IsThisPcArgument(s->open_path);
+                const std::wstring open_path = this_pc ? std::wstring() : ResolveIncomingPath(s->open_path);
+                if (this_pc) OpenTabAt(*s, open_path);  // NewTab would open C: for ""
+                else if (!open_path.empty() && !ActivateExistingFolderTab(*s, open_path))
+                    NewTab(*s, open_path);
+                if (!open_path.empty()) SelectLaunchedFile(*s, s->open_path);
+            }
+        } else if (s->window_restore && !s->window_restore->layout_tabs.empty()) {
+            // A reopened window (M4c) gets its tabs back, as session restore does.
+            const app::ClosedWindow restore = std::move(*s->window_restore);
+            s->window_restore.reset();
+            RestoreTabsFromSnapshots(*s, restore.layout_tabs, restore.tab_groups, restore.active_layout_tab);
+            if (app::Tab* t = ActiveTab(*s)) RememberPath(*s, t->current_path);
+        } else if (s->window_adopt_from && AdoptMovedTab(*s)) {
+            // Ctrl+Shift+M (M5c): the moved tab arrived alive; nothing to load.
+        } else {
+            // A later window opens one tab at its start folder (OpenPulseWindow).
+            const std::wstring start = s->window_start_path;
+            s->pane->NewTab(start);
+            StartLoadingPath(*s, *s->pane->ActiveTab(), start, PathLoadReason::Navigate);
+            RememberPath(*s, start);
         }
 
-        // The restored-primary case: the requested folder joins the restored tabs.
-        // A new window has exactly one tab, so it never lands here.
-        if (!s->shot.active && !s->secondaryInstance && !s->open_path.empty() &&
-            (!s->session_layout_tabs.empty() || !s->session_path.empty())) {
-            const bool this_pc = app::IsThisPcArgument(s->open_path);
-            const std::wstring open_path = this_pc ? std::wstring() : ResolveIncomingPath(s->open_path);
-            if (this_pc) OpenTabAt(*s, open_path);  // NewTab would open C: for ""
-            else if (!open_path.empty() && !ActivateExistingFolderTab(*s, open_path))
-                NewTab(*s, open_path);
-            if (!open_path.empty()) SelectLaunchedFile(*s, s->open_path);
-        }
-
+        // Settings have been loaded (or their own load_failed guard is set),
+        // and the saved layouts/undo are now represented by live models.
+        if (init_core && !s->isolatedTest && !s->shot.active && !s->menushot)
+            app::CleanupAbandonedUpdateStagesAsync();
+        s->startupComplete = true;
         s->lastFrameTime = std::chrono::steady_clock::now();
         s->renderer.SetDetailsPanelVisible(s->showDetailsPanel);
         s->renderer.SetDetailsPanelWidth(s->detailsPanelWidth);
-        SetTimer(hwnd, kTimerUi, g_uiTimerPacer.Current(), nullptr);
+        SetTimer(hwnd, kTimerUi, s->uiTimerPacer.Current(), nullptr);
         s->framePump.Start(hwnd, WM_FRAME_PUMP);
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
             SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        s->core.started = true;
+        // M7c: a color for it; with a second window every window shows its name.
+        SyncWindowIdentities(*s);
         return 0;
     }
 
@@ -938,7 +1191,6 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->hoverSubIndex = -1;
             s->hoverSince = 0;
             s->tooltipText.clear();
-            HideTabGroupCard(*s);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -955,120 +1207,51 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         if (wParam == HTCLOSE) {
-            SuspendContentSearches(*s);
-            s->globalSearchWindow.Hide();
-            // A second window has no tray icon to hide behind.
-            if (!s->secondaryInstance &&
-                (s->appPrefs.keep_running_on_close || s->appPrefs.global_search_enabled))
-                HideMainWindowToTray(*s);
-            else DestroyWindow(hwnd);
+            CloseMainWindow(*s);
             return 0;
         }
         break;
     }
 
-    case WM_CLOSE: {
-        if (s) { SuspendContentSearches(*s); s->globalSearchWindow.Hide(); }
-        // A window whose last tab went to a sibling has nothing to hide: it is
-        // closing for good, whether or not it used to keep the tray icon.
-        if (s && !s->mergedAway && !s->secondaryInstance &&
-            (s->appPrefs.keep_running_on_close || s->appPrefs.global_search_enabled)) {
-            HideMainWindowToTray(*s);
-            return 0;
-        }
-        break;
-    }
-
-    case WM_COPYDATA: {
-        auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lParam);
-        if (app::ShellTagRequest tag_request; s && app::DecodeShellTagRequest(cds, tag_request)) {
-            // Explorer "Pulse tags" verb: tag in place, never raise the window.
-            QueueShellTagRequest(*s, std::move(tag_request), false);
-            return TRUE;
-        }
-        if (cds && cds->dwData == app::SingleInstanceCoordinator::OpenRequestMessageId()) {
-            app::SingleInstanceCoordinator::OpenRequest request;
-            if (!s || !app::SingleInstanceCoordinator::DecodeOpenRequest(cds, request)) return FALSE;
-            const auto accepted = s->single_instance.AcceptOpenRequest(request, GetTickCount64());
-            if (accepted == app::SingleInstanceCoordinator::OpenAcceptance::Invalid) return FALSE;
-            if (accepted == app::SingleInstanceCoordinator::OpenAcceptance::New)
-                OpenFolderInNewTab(*s, request.path);
-            return TRUE; // acceptance, not a claim that asynchronous enumeration succeeded
-        }
-        std::wstring path;
-        app::SingleInstanceCoordinator::TabTransfer transfer;
-        if (s && app::SingleInstanceCoordinator::DecodeTabTransfer(cds, transfer)) {
-            // The window that sent this is closing: the tab it could not keep is
-            // ours now, and so are the resources it used to own. Always a new
-            // tab - the tab the user dragged has to show up here, even when this
-            // window already has that folder open (the forwarded path below
-            // activates the existing tab instead).
-            // A virtual location ("pulse:recent", a tag, a search) is opened as
-            // it is; only a real path is resolved to its folder.
-            const std::wstring resolved = ResolveIncomingPath(transfer.path);
-            if (!resolved.empty()) {
-                NewTab(*s, resolved);
-                if (app::Tab* opened = s->pane ? s->pane->ActiveTab() : nullptr) {
-                    // The rows the user had selected travel too, so this window shows
-                    // the same file under the cursor (and previews it) once its listing
-                    // arrives.
-                    opened->pending_selected_names = std::move(transfer.selected_names);
-                    opened->pending_selected_name = std::move(transfer.focus_name);
-                }
-            }
-            AdoptSingletonOwnership(*s);
-            return TRUE;
-        }
-        if (s && app::SingleInstanceCoordinator::DecodeTabTransfer(cds, path)) {
-            // A window of an older build hands the folder over without its selection.
-            const std::wstring resolved = ResolveIncomingPath(path);
-            if (!resolved.empty()) NewTab(*s, resolved);
-            AdoptSingletonOwnership(*s);
-            return TRUE;
-        }
-        HWND drain_sink = nullptr;
-        if (s && app::SingleInstanceCoordinator::DecodeDrainRequest(cds, drain_sink)) {
-            // The multi-window mode was turned off in the window that asked: this
-            // one hands every tab over in order and closes. A tab that cannot
-            // travel keeps the window alive rather than being lost.
-            bool all_sent = true;
-            for (const auto& layout : s->window_tabs.items) {
-                const app::Tab* folder = layout->ActiveFolder();
-                app::SingleInstanceCoordinator::TabTransfer transfer;
-                transfer.path = folder ? folder->current_path : std::wstring{};
-                if (transfer.path.empty() ||
-                    !app::SingleInstanceCoordinator::SendTabTransfer(drain_sink, transfer)) {
-                    all_sent = false;
-                    break;
-                }
-            }
-            if (all_sent) {
-                s->mergedAway = true; // closing now: this window must not be persisted
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
-            }
-            return TRUE;
-        }
-        if (!s || !app::SingleInstanceCoordinator::DecodeOpenPath(cds, path)) return FALSE;
-        OpenFolderInNewTab(*s, path);
-        return TRUE;
-    }
+    case WM_CLOSE:
+        if (!s) break;
+        CloseMainWindow(*s);
+        return 0;
 
     case app::TrayController::kCallbackMessage: {
         if (!s) return 0;
+        // The host hands tray clicks to the most recent window; "Show Pulse"
+        // brings that one back (M4c), not whichever window the tray had.
+        if (s->tray_controller.Window() != hwnd) {
+            s->tray_controller.Retarget(hwnd);
+            InstallTrayRevealHook(*s);
+        }
         const auto result = s->tray_controller.HandleCallback(lParam);
         if (result == app::TrayController::CallbackResult::ExitRequested)
-            DestroyWindow(hwnd);
+            ExitPulse(*s);
         return 0;
     }
 
     case WM_EXIT_PULSE:
         // Palette "Exit Pulse" (#57): the tray menu's full exit, reachable
         // when the icon is hidden. Posted so the palette unwinds first.
-        DestroyWindow(hwnd);
+        if (s) ExitPulse(*s);
+        else DestroyWindow(hwnd);
         return 0;
 
     case WM_DPICHANGED: {
+        const float old_scale = s->scale;
         s->scale = (float)HIWORD(wParam) / 96.0f;
+        if (old_scale > 0.0f && s->scale != old_scale) {
+            // Moved to a monitor at another DPI (M6f): pixel scroll positions
+            // follow, so every tab keeps the same rows in view.
+            const float ratio = s->scale / old_scale;
+            for (auto& item : s->window_tabs.items)
+                if (item) RescaleLayoutTabScroll(*item, ratio);
+            s->scrollTargetX *= ratio;
+            s->scrollTargetY *= ratio;
+            s->detailsScroll *= ratio;
+        }
         RECT* rc = reinterpret_cast<RECT*>(lParam);
         SetWindowPos(hwnd, nullptr, rc->left, rc->top,
             rc->right - rc->left, rc->bottom - rc->top,
@@ -1090,38 +1273,41 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_SETTINGCHANGE:
-        if (s && (lParam == 0 ||
-                  wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"ImmersiveColorSet") == 0 ||
-                  wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"HighContrast") == 0)) {
-            if (s->themeOverride == ui::ThemeMode::Auto)
-                s->darkMode = ui::ShouldUseDarkMode(s->themeOverride);
-            if (s->appPrefs.accent_rgb.empty())
-                ApplyAccentFromPrefs(*s, true);
-            ApplyAppWindowChrome(*s);
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        return 0;
-
     case WM_DEVICECHANGE:
-        // A USB stick, a mounted image, or any new volume changes the drive
-        // list. The sidebar model is built once, so rebuild it here instead of
-        // waiting for a language switch or a restart.
-        if (s && (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE)) {
-            const auto* header = reinterpret_cast<const DEV_BROADCAST_HDR*>(lParam);
-            if (!header || header->dbch_devicetype == DBT_DEVTYP_VOLUME) {
-                RefreshSidebarModel(*s);
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-        }
-        return 0;
+    case WM_QUERYENDSESSION:
+    case WM_ENDSESSION: {
+        // Every top-level window receives these; the host handles them once
+        // for all windows (HandleSystemBroadcast). Only without a host (tests,
+        // probes) does the window handle them itself.
+        const auto kind = app::ClassifySystemBroadcast(msg, wParam, lParam);
+        if (s && kind != app::SystemBroadcast::None && ServiceWindow(*s) == hwnd)
+            return HandleSystemBroadcast(*s, kind, wParam);
+        return msg == WM_QUERYENDSESSION ? TRUE : 0;
+    }
 
     case WM_SHOWWINDOW:
         // Sent before the window becomes visible; restore full rate right away.
-        if (s && wParam && !IsIconic(hwnd)) NoteUiActivity(hwnd, true);
+        if (s && wParam && !IsIconic(hwnd)) NoteUiActivity(*s, hwnd, true);
         break;
 
     case WM_ACTIVATE:
+        if (s && LOWORD(wParam) != WA_INACTIVE) {
+            s->core.windows.Touch(hwnd);
+            // The session's other windows open once the first one is on screen
+            // (M4d): at launch, or when a launch into the tray is revealed.
+            if (!s->core.pending_session_windows.empty() && s->startupComplete)
+                PostMessageW(hwnd, WM_OPEN_SESSION_WINDOWS, 0, 0);
+            // File operation progress follows the window used last (M4c).
+            if (AppState* ui = GetAppState(s->ops.UiWindow()); ui && ui != s) MoveOperationUi(*ui, *s);
+        }
         if (s) s->renderer.NotifyPreviewActivate(LOWORD(wParam) != WA_INACTIVE);
+        if (s && LOWORD(wParam) != WA_INACTIVE) {
+            std::wstring kind, page;
+            const auto* tab = ActiveTab(*s);
+            if (tab && app::ParsePulsePath(tab->current_path, &kind, &page) && kind == L"settings" &&
+                app::SettingsController::PageFromName(page) == 5)
+                ui::DetectPreviewCodecs(true, hwnd);
+        }
         break;
 
     case WM_ACTIVATEAPP:
@@ -1130,9 +1316,6 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->renderer.EndDetailsPreviewPan();
             if (GetCapture() == hwnd) ReleaseCapture();
         }
-        // The user is looking at the window again: a list of files that live elsewhere should
-        // be current by the time they read it (network paths included - they may be back).
-        if (s && wParam) MaybeRefreshVirtualViews(*s, true, kVirtualViewForegroundRefreshMs);
         if (s) s->renderer.NotifyPreviewActivate(wParam != 0);
         return 0;
 
@@ -1149,9 +1332,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s) {
             s->compositor.Resize(LOWORD(lParam), HIWORD(lParam));
             s->maximized = (wParam == SIZE_MAXIMIZED);
-            if (wParam != SIZE_MINIMIZED && IsWindowVisible(hwnd)) NoteUiActivity(hwnd, true);
-            // The card is anchored to the chip; a resize invalidates that.
-            HideTabGroupCard(*s);
+            if (wParam != SIZE_MINIMIZED && IsWindowVisible(hwnd)) NoteUiActivity(*s, hwnd, true);
             if (s->addressEditing) LayoutAddressEditor(*s);
             if (s->filterEditing && !s->filterFocusPending) LayoutFilterEditor(*s);
             if (!s->tagRenameId.empty()) LayoutTagRenameOverlay(*s);
@@ -1189,6 +1370,57 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
+    case WM_REOPEN_CLOSED_WINDOW:
+        if (s) ReopenClosedWindow(*s);
+        return 0;
+
+    case WM_REOPEN_CLOSED_TABS:
+        if (s) ReopenClosedTabs(*s);
+        return 0;
+
+    case WM_OPEN_SESSION_WINDOWS:
+        if (s) OpenSessionWindows(*s);
+        return 0;
+
+    case WM_MOVE_TAB_TO_NEW_WINDOW:
+        if (s) MoveTabToNewWindow(*s);
+        return 0;
+
+    case WM_ENTERSIZEMOVE:
+        if (s) BeginWindowMove(*s);  // a title-bar drag may end on another window's strip (M6c)
+        break;
+
+    case WM_MOVING:
+        if (s) TrackTabDrop(*s);  // a dragged window over another window's strip (M6b, M6c)
+        break;
+
+    case WM_EXITSIZEMOVE:
+        if (s) EndWindowMove(*s);
+        break;
+
+    case WM_MERGE_WINDOW:
+        // Destroys this window when the merge happens: touch nothing after.
+        if (s) FinishWindowMerge(*s, reinterpret_cast<HWND>(wParam), static_cast<size_t>(lParam));
+        return 0;
+
+    case WM_UNDO_WINDOW_MERGE:
+        if (s) UndoWindowMerge(*s);
+        return 0;
+
+    case WM_CONVERT_EXTERNAL_OPEN:
+        // May destroy this window ("make it a tab"): touch nothing after.
+        if (s) ConvertExternalOpen(*s);
+        return 0;
+
+    case WM_ADOPT_OPEN_POLICY:
+        if (s) AdoptSuggestedOpenPolicy(*s);
+        return 0;
+
+    case WM_BEGIN_TAB_DETACH:
+        // May destroy this window (Esc puts the tab back): touch nothing after.
+        if (s) RunDetachedTabMove(*s, reinterpret_cast<HWND>(wParam), static_cast<size_t>(lParam));
+        return 0;
+
     case WM_SHELL_SELECT: {
         std::unique_ptr<app::ShellSelectRequest> request(reinterpret_cast<app::ShellSelectRequest*>(lParam));
         if (s && request) HandleShellSelect(*s, *request);
@@ -1199,7 +1431,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (!s) return 0;
         s->framePump.FrameConsumed();
         if (!IsWindowVisible(hwnd) || IsIconic(hwnd) ||
-            !s->renderer.TickMotion(GetTickCount64())) {
+            (!s->scrollAnimating && !s->marqueeAutoScroll && !s->renderer.TickMotion(GetTickCount64()))) {
             s->framePump.Disarm();  // WM_PAINT re-arms once shown again
             return 0;
         }
@@ -1216,23 +1448,41 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_TIMER: {
+        if (s && wParam == kTimerMarqueeScroll) {
+            TickMarqueeAutoScroll(*s);
+            return 0;
+        }
+        if (s && wParam == kTimerUncProbeRetry) {
+            KillTimer(hwnd, kTimerUncProbeRetry);
+            PumpUncProbe(*s);
+            return 0;
+        }
         if (s && wParam == kTimerUi) {
-            SyncUiTimerRate(hwnd, IsWindowVisible(hwnd) && !IsIconic(hwnd));
+            SyncUiTimerRate(*s, hwnd, IsWindowVisible(hwnd) && !IsIconic(hwnd));
             bool dirty = false;
             if (TickChangeTracking(*s)) dirty = true;
             static bool folderSizeResortWaiting = false;
             if (s->folderSizes.TakeChanged()) {
                 dirty = true;
                 folderSizeResortWaiting = true;
+                if (s->hoverRegion == static_cast<int>(ui::HitTestResult::RowFolderSize) && !s->tooltipText.empty())
+                    s->tooltipText = TooltipForHover(*s);
             }
             // New totals re-sort Size-ordered listings, paced (#58).
             if (folderSizeResortWaiting) folderSizeResortWaiting = ResortForFolderSizes(*s);
             DrainDirNotifies(*s);
             const ULONGLONG now = GetTickCount64();
             TickUpdates(*s, now);
+            TickQuickPreviewSelection(*s, now);
+            if (TickSidebarRefresh(*s, now)) {
+                // The sidebar model is shared: whichever window's timer picks
+                // up the new drives, every window shows them.
+                dirty = true;
+                app::ForEachWindowSharingCore(*s, [s](AppState& window) {
+                    if (&window != s) InvalidateRect(window.hwnd, nullptr, FALSE);
+                });
+            }
             TickSessionAutosave(*s, hwnd, now);
-            // Path-backed virtual views (Recent, starred, a tag) get re-read on a slow pass.
-            MaybeRefreshVirtualViews(*s, false, kVirtualViewRefreshMs);
             if (s->renderer.TickDetailsPreview(now)) dirty = true;
             if (s->renderer.TickMotion(now)) {
                 // Paced by the frame pump when it runs; the timer only
@@ -1261,13 +1511,6 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (PumpRecycleRefresh(*s, now)) dirty = true;
             MaybePrefetchHoverCtxMenu(*s);
             s->places.FlushPendingSave(false);
-            // A window that took a closing sibling's last tab becomes the window
-            // that owns the tray, the hotkey and the session. The mutex may still
-            // be held for a moment, so the takeover is retried from here.
-            if (s->adoptPending && now - s->adoptLastTry >= 150) {
-                s->adoptLastTry = now;
-                AdoptSingletonOwnership(*s);
-            }
             if (s->renameClickCandidate && s->renameClickDue != 0 &&
                 now >= s->renameClickDue) {
                 app::Tab* tab = ActiveTab(*s);
@@ -1327,11 +1570,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->sidebarScrollbarFade.SetHot(s->sidebarScrollbarHot ||
                 (s->scrollbarDragging && s->scrollbarSidebar), now);
             if (s->sidebarScrollbarFade.Tick(now)) dirty = true;
-            if (s->sidebarScrollbarFade.Moving(now)) g_uiTimerPacer.NoteActivity(now);
-            // Smooth scroll.
+            if (s->sidebarScrollbarFade.Moving(now)) s->uiTimerPacer.NoteActivity(now);
+            // Scroll positions advance at paint time, once per displayed frame.
             if (s->scrollAnimating) {
-                UpdateSmoothScroll(*s);
-                dirty = true;
+                if (s->framePump.Running()) s->framePump.Arm();
+                else dirty = true;
             }
             // Tag slide animation.
             if (!s->tagTracks.empty() || s->tagGapFrom != s->tagGapTo) {
@@ -1360,48 +1603,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     if (page == 4 && s->duplicateScan.scanning) dirty = true;
                 }
             }
-            // Edge-style group hover card: 150 ms dwell on a chip opens it.
-            // Leaving both the chip and the card, or starting a tab drag,
-            // closes it.
-            const bool group_dragging = s->tabDragging || s->tabDragPending;
-            const bool on_chip =
-                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroup);
-            const bool on_card =
-                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroupCardRow) ||
-                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroupCard);
-            if (s->groupCardGroupId != 0 &&
-                (group_dragging || (!on_chip && !on_card))) {
-                HideTabGroupCard(*s);
-                dirty = true;
-            }
-            if (!group_dragging && on_chip && s->groupCardSince != 0 &&
-                now - s->groupCardSince >= 150 && s->hoverControlIndex >= 0 &&
-                s->hoverControlIndex <
-                    static_cast<int>(s->window_tabs.tab_groups.size())) {
-                const int group_id = s->window_tabs.tab_groups[
-                    static_cast<size_t>(s->hoverControlIndex)].id;
-                if (s->groupCardGroupId != group_id) {
-                    s->groupCardGroupId = group_id;
-                    s->groupCardChipIndex = s->hoverControlIndex;
-                    s->groupCardHoverRow = -1;
-                    // The card replaces any hint the chip would have shown.
-                    s->tooltipText.clear();
-                    dirty = true;
-                }
-            }
-            const int card_row =
-                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroupCardRow)
-                    ? s->hoverControlIndex : -1;
-            if (s->groupCardGroupId != 0 && card_row != s->groupCardHoverRow) {
-                s->groupCardHoverRow = card_row;
-                dirty = true;
-            }
             // 150 ms: the icon rail relies on the hint to name each row, and the
-            // old 400 ms delay read as "no tooltip at all". The group hover card
-            // owns that spot while it is open.
+            // old 400 ms delay read as "no tooltip at all".
             // No hover tooltip under an open popup menu (it would sit beneath it).
-            if (s->groupCardGroupId == 0 && s->hoverRegion != 0 &&
-                s->tooltipText.empty() && s->hoverSince != 0 &&
+            if (s->hoverRegion != 0 && s->tooltipText.empty() && s->hoverSince != 0 &&
                 !(s->menu && s->menu->IsOpen()) &&
                 GetTickCount64() - s->hoverSince >= 150) {
                 s->tooltipText = TooltipForHover(*s);
@@ -1416,7 +1621,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             QueueVisibleTagDiscovery(*s);
             UpdateOperationWindow(*s, false);
             if (dirty) {
-                g_uiTimerPacer.NoteActivity(GetTickCount64());
+                s->uiTimerPacer.NoteActivity(GetTickCount64());
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
         }
@@ -1460,6 +1665,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             return TRUE;
         }
         const bool splitter = s->splitterDragging || hit.region == ui::HitTestResult::Splitter;
+        if (splitter && !s->splitterDragging && hit.index >= ui::kSplitterSwapIndex) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
         if (splitter) {
             const bool vertical = s->splitterDragging
                 ? (s->splitterOrientation == app::SplitOrientation::Vertical)
@@ -1501,11 +1710,22 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
+        if (s->settings.menu_drag_live()) {
+            // Rows only slide along one axis: up/down, or left/right for 行按钮.
+            SetCursor(LoadCursorW(nullptr, s->settings.ContextTab() == 2 ? IDC_SIZEWE : IDC_SIZENS));
+            return TRUE;
+        }
+        if (hit.region == ui::HitTestResult::SettingsToggle && hit.index >= ui::kSettingsMenuRowHit) {
+            // Hand, not IDC_SIZEALL: some pointer themes draw "move" like "no".
+            SetCursor(LoadCursorW(nullptr, IDC_HAND)); // movable Pulse menu preview row
+            return TRUE;
+        }
         break;
     }
 
     case WM_CANCELMODE:
         HandleSidebarResize(s, hwnd, msg, lParam);
+        if (s) s->settings.EndMenuDrag();
         if (s) { s->detailsPreviewPanning = false; s->renderer.EndDetailsPreviewPan(); }
         if (GetCapture() == hwnd) ReleaseCapture();
         break;
@@ -1576,10 +1796,19 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // Properties shortcut (alt && VK_RETURN) was unreachable.
         if (s && wParam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000))
             return HandleKeyDown(s, hwnd, msg, wParam, lParam);
+        // Same for Alt+Left/Right/Up (back, forward, up) and F10 (Shift+F10 is
+        // the context menu); unhandled keys still reach DefWindowProc there.
+        if (s && (wParam == VK_F10 || ((GetKeyState(VK_MENU) & 0x8000) &&
+                  (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP))))
+            return HandleKeyDown(s, hwnd, msg, wParam, lParam);
         break;
 
     case WM_SYSCHAR:
         if (wParam == L'\r') return 0; // Alt+Enter handled above; no default beep
+        break;
+
+    case WM_CHAR:
+        if (s && HandleListCharacter(*s, static_cast<wchar_t>(wParam))) return 0;
         break;
 
     case WM_KEYDOWN:
@@ -1621,6 +1850,21 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
+    case WM_NETWORK_LOCATIONS:
+        if (s) ApplyNetworkLocations(*s);
+        return 0;
+
+    case WM_BITLOCKER_UNLOCK: {
+        std::unique_ptr<app::BitLockerUnlockResult> result(
+            reinterpret_cast<app::BitLockerUnlockResult*>(lParam));
+        // Every window showing the drive reloads or updates its banner.
+        if (s && result)
+            app::ForEachWindowSharingCore(*s, [&](AppState& window) {
+                ApplyBitLockerUnlock(window, result->root, result->unlocked);
+            });
+        return 0;
+    }
+
     case WM_RECYCLE_INFO: {
         auto* info = reinterpret_cast<fs::RecycleBinInfo*>(lParam);
         if (s && info && ApplyQueriedRecycleInfo(*s, *info))
@@ -1639,10 +1883,16 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 ScheduleRecycleRefresh(*s);
                 RefreshRecycleViews(*s, false);
             }
-            if (st.completed_ops != s->opsCompleted) {
+            // Take terminal IDs first: a success queued between these drains
+            // must still be applied before its matching intent is released.
+            const auto finished_tasks = s->ops.DrainFinishedTasks();
+            const auto completions = s->ops.DrainCompletions();
+            if (st.completed_ops != s->opsCompleted || !completions.empty() || !finished_tasks.empty()) {
+                const bool refresh = st.completed_ops != s->opsCompleted || !completions.empty();
                 s->opsCompleted = st.completed_ops;
+                if (refresh) RequestSidebarRefresh(*s);
                 std::vector<std::wstring> tag_metadata_paths;
-                for (const auto& completed : s->ops.DrainCompletions()) {
+                for (const auto& completed : completions) {
                     // Ask for confirmed index changes on the next tick. Keep any
                     // in-flight request and never invent a deletion before capture.
                     s->changes.last_query = 0;
@@ -1658,6 +1908,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         const std::wstring parent = fs::ParentPath(destination);
                         if (!parent.empty()) s->store.MarkDirty(parent);
                     }
+                    for (const auto& directory : completed.refresh_directories)
+                        s->store.MarkDirty(directory);
+                    if (completed.refresh_only) continue;
+                    ApplyOperationIntentCompletion(*s, completed);
                     if (completed.type == ops::OpType::Copy) {
                         for (size_t i = 0; i < completed.sources.size() &&
                                            i < completed.destinations.size(); ++i) {
@@ -1672,6 +1926,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                                            i < completed.destinations.size(); ++i) {
                             s->places.RemapPaths(completed.sources[i],
                                                  completed.destinations[i]);
+                            FollowMovedFolder(*s, completed.sources[i], completed.destinations[i]);
+                            // Only the items that really moved / were renamed:
+                            // every rename entry (list, tray) leaves the tray
+                            // to this, so failed or cancelled items keep their names.
+                            s->tray.ReplacePath(completed.sources[i], completed.destinations[i]);
                             tag_metadata_paths.push_back(completed.destinations[i]);
                         }
                         if (completed.type == ops::OpType::Move &&
@@ -1729,9 +1988,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 }
                 if (!tag_metadata_paths.empty())
                     QueueTagAds(*s, BuildTagAdsUpdates(s->places, tag_metadata_paths, true));
+                for (const auto& finished : finished_tasks) FinishOperationIntents(*s, finished);
                 // An op finished: refresh the view (watcher also fires, this is immediate).
                 app::Tab* tab = ActiveTab(*s);
-                if (tab) {
+                if (tab && refresh) {
                     s->store.MarkDirty(tab->current_path);
                     RefreshActiveTab(*s, RefreshReason::OperationCompleted);
                 }
@@ -1749,14 +2009,17 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 token, std::move(payload->items), GetTickCount64(), payload->partial);
             if (completed.accepted) {
                 bool prefs_changed = false;
-                if (!completed.partial &&
-                    s->ctxMenuPrefs.RecordComTiming(completed.cache_key,
-                                                    completed.elapsed_ms))
-                    prefs_changed = true;
                 if (!completed.partial) {
+                    // The host names only a handler provably hung on its own
+                    // at its stuck limit (collect_hung); three such hangs
+                    // disable it. Slow-but-finished handlers are not reported:
+                    // the menu streams rows as they arrive and never waits.
                     for (const auto& clsid : payload->slow_clsids) {
+                        // SendTo is exempt from the auto-disable (#77): it
+                        // serializes the whole default menu.
+                        if (ipc::IsSendToHandlerClsid(clsid)) continue;
                         if (s->ctxMenuPrefs.RecordComTiming(
-                                ipc::HandlerCatalogKey(clsid), 1000))
+                                ipc::HandlerCatalogKey(clsid), 5000))
                             prefs_changed = true;
                     }
                 }
@@ -1793,9 +2056,21 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s) {
             s->context_menu.InvalidateCaches();
             SeedShellVerbCache(*s);
+            // Broad Classes registry changes also include unrelated shell verbs.
+            // Application badges refresh on SHCNE_ASSOCCHANGED instead.
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     }
+
+    case WM_ASSOC_CHANGED:
+        // Another program (or Settings > Default apps) took over a file type:
+        // resolve the thumbnail badges again. Bursts only bump an epoch.
+        if (s) {
+            s->renderer.InvalidateOpenWithIcons();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
 
     case WM_DETAILS_META: {
         auto* result = reinterpret_cast<DetailsMetaResult*>(lParam);
@@ -1880,7 +2155,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         const uint32_t id = static_cast<uint32_t>(wParam);
         index::SearchResult result;
         if (!s->index.TakeResult(id, result)) return 0;
-        AcceptIndexProviderResult(*s, id, std::move(result), false);
+        AcceptIndexProviderResult(SearchResultWindow(*s, id), id, std::move(result), false);
         return 0;
     }
 
@@ -1889,13 +2164,14 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         const uint32_t id = static_cast<uint32_t>(wParam);
         index::SearchResult result;
         if (!s->networkIndex.TakeResult(id, result)) return 0;
-        AcceptIndexProviderResult(*s, id, std::move(result), true);
+        AcceptIndexProviderResult(SearchResultWindow(*s, id), id, std::move(result), true);
         return 0;
     }
 
     case WM_NETWORK_LIVE_SEARCH: {
         auto* live = reinterpret_cast<std::shared_ptr<LiveNetworkSearch>*>(lParam);
-        if (s && live) AcceptLiveNetworkProgress(*s, *live);
+        if (s && live && *live)
+            AcceptLiveNetworkProgress(SearchResultWindow(*s, (*live)->latest_id.load()), *live);
         delete live;
         return 0;
     }
@@ -1922,10 +2198,16 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     case WM_CONTENT_SEARCH: {
         if (!s) return 0;
+        // Each update goes to the window whose tab runs that search (M5a).
+        std::vector<AppState*> updated{s};
         index::ContentSearchUpdate update;
-        while (s->contentSearch.TakeUpdate(update))
-            ApplyContentSearchUpdate(*s, std::move(update));
-        RefreshContentResults(*s);
+        while (s->contentSearch.TakeUpdate(update)) {
+            AppState& owner = ContentSearchWindow(*s, update.progress.generation);
+            ApplyContentSearchUpdate(owner, std::move(update));
+            if (std::find(updated.begin(), updated.end(), &owner) == updated.end())
+                updated.push_back(&owner);
+        }
+        for (AppState* window : updated) RefreshContentResults(*window);
         return 0;
     }
 
@@ -1959,59 +2241,65 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_QUICK_PREVIEW_COMMAND:
-        if (s) HandleQuickPreviewCommand(*s, static_cast<ui::QuickPreviewAction>(wParam),
-                                         (lParam & 1) != 0);
+        if (s) {
+            ui::QuickPreviewCommand command;
+            if (s->quickPreview.TakeCommand(static_cast<UINT_PTR>(lParam), command))
+                HandleQuickPreviewCommand(*s, command);
+        }
         return 0;
 
     case WM_NET_PROBE: {
         auto* result = reinterpret_cast<fs::UncProbeResult*>(lParam);
         if (s && result) {
+            if (!s->probe_scheduler.AcceptResult(result->unc, result->probe_id, result->final)) {
+                delete result;
+                return 0;
+            }
             const bool completed_current_probe = s->probe_scheduler.Finish(result->probe_id);
             if (completed_current_probe) s->probeUnc.clear();
+            if (!s->probe_scheduler.Accept(result->unc, result->probe_id, result->completed)) {
+                PumpUncProbe(*s);
+                delete result;
+                return 0;
+            }
             s->places.SetNetworkStatus(result->unc, result->status, result->rtt_ms);
-            if (result->status == fs::NetStatus::Offline) {
-                ForEachPane(*s, [&](app::Pane& pane) {
+            // The status is shared; every window showing the share updates.
+            const bool offline = result->status == fs::NetStatus::Offline;
+            app::ForEachWindowSharingCore(*s, [&](AppState& window) {
+                ForEachPane(window, [&](app::Pane& pane) {
                     app::Tab* tab = pane.ActiveTab();
                     if (!tab || tab->current_path != result->unc) return;
-                    if (tab->snapshot) {
-                        tab->net_readonly = true;
-                        tab->banner_title = l10n::Get(l10n::StringId::Offline);
-                        tab->banner_message = l10n::Get(l10n::StringId::OfflineSnapshot);
+                    if (offline) {
+                        if (tab->snapshot) {
+                            tab->net_readonly = true;
+                            tab->banner_title = l10n::Get(l10n::StringId::Offline);
+                            tab->banner_message = l10n::Get(l10n::StringId::OfflineSnapshot);
+                        }
+                        return;
                     }
-                });
-            } else {
-                ForEachPane(*s, [&](app::Pane& pane) {
-                    app::Tab* tab = pane.ActiveTab();
-                    if (!tab || tab->current_path != result->unc) return;
                     tab->net_readonly = false;
                     if (tab->banner_title == l10n::Get(l10n::StringId::Offline)) {
                         tab->banner_title.clear();
                         tab->banner_message.clear();
                     }
                 });
-            }
-            if (completed_current_probe) PumpUncProbe(*s);
-            InvalidateRect(hwnd, nullptr, FALSE);
+                InvalidateRect(window.hwnd, nullptr, FALSE);
+            });
+            PumpUncProbe(*s);
         }
         delete result;
         return 0;
     }
 
     case WM_TAG_ADS_WARNING: {
-        std::unique_ptr<std::vector<std::wstring>> volumes(
-            reinterpret_cast<std::vector<std::wstring>*>(lParam));
-        if (s && volumes) {
-            for (const auto& volume : *volumes) {
-                const std::wstring shown = ClipboardPath(volume);
-                if (!s->tagFallbackVolumes.insert(shown).second) continue;
-                if (app::Tab* tab = ActiveTab(*s)) {
-                    tab->banner_title = l10n::Get(l10n::StringId::TagsSavedLocally);
-                    tab->banner_message = l10n::Get(l10n::StringId::TagMetadataUnsupported);
-                    const size_t path_marker = tab->banner_message.find(L"{path}");
-                    if (path_marker != std::wstring::npos)
-                        tab->banner_message.replace(path_marker, 6, shown);
-                }
-            }
+        std::unique_ptr<app::TagAdsResult> result(reinterpret_cast<app::TagAdsResult*>(lParam));
+        if (s && result && app::AcceptTagAdsResult(s->tagAdsResultRevision, result->revision)) {
+            for (auto& failure : result->failures) failure.path = ClipboardPath(failure.path);
+            ForEachPane(*s, [&](app::Pane& pane) {
+                if (auto* tab = pane.ActiveTab())
+                    app::ApplyTagAdsNotice(tab->tag_ads_notice, result->failures,
+                        tab->banner_title, tab->banner_message, tab == ActiveTab(*s));
+            });
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -2020,51 +2308,80 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_TAG_ADS_DISCOVERED: {
         std::unique_ptr<std::vector<TagAdsDiscovery>> discoveries(
             reinterpret_cast<std::vector<TagAdsDiscovery>*>(lParam));
-        if (s && discoveries) {
-            const uint64_t before = s->places.TagRevision();
-            for (const auto& discovery : *discoveries) {
-                const std::wstring key = TagDiscoveryKey(discovery.path);
-                s->tagAdsDiscoveryQueued.erase(key);
-                s->tagAdsDiscoveryChecked.insert(key);
-                s->places.MergeAdsRecords(discovery.path, discovery.records,
-                                          discovery.legacy_names);
-            }
-            if (s->places.TagRevision() != before)
-                InvalidateRect(hwnd, nullptr, FALSE);
-        }
+        if (s && discoveries) ApplyTagAdsDiscoveries(*s, *discoveries);
         return 0;
     }
 
-    case WM_QUERYENDSESSION:
-        // Shutdown/logoff ends the process without WM_DESTROY; store the layout now.
-        if (s) SaveWindowSession(*s, hwnd, true);
-        return TRUE;
-    case WM_ENDSESSION:
-        if (s && wParam && !s->shot.active && !s->menushot && !s->isolatedTest) {
-            SaveWindowSession(*s, hwnd, true);
-            s->places.Save();
-            s->ctxMenuPrefs.Save();
+    case WM_NEW_WINDOW:
+        // Another window at this window's current folder (M4a; Ctrl+N in M4b).
+        if (s && s->startupComplete && !s->shot.active && !s->menushot) {
+            const app::Tab* tab = ActiveTab(*s);
+            OpenPulseWindow(*s, WindowInit{tab ? tab->current_path : std::wstring()});
         }
         return 0;
 
+    case WM_NCDESTROY:
+        // A window opened by OpenPulseWindow owns its state: retired here and
+        // freed on the host's next message, after this window is gone.
+        if (s && RetireWindowState(*s)) SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        break;
+
     case WM_DESTROY: {
+        // Closing one of several windows (M3f) tears down what the window
+        // owns; services, saved state and the shared caches go with the last.
+        const bool last_window = !s || s->core.windows.IsLastWindow(hwnd);
+        if (last_window) app::shell_tags::RevokeCommandServer();
         if (s) {
             s->framePump.Stop();
-            StopShellWindows(*s);
-            ShutdownGlobalSearch(*s);
-            StopShellRegistryWatch();
-            s->watches.Stop();
-            s->folderSizes.Stop();
-            s->settings.ResetUi();
-            s->settings.Stop();
-            s->update_checker.Stop();
-            s->update_installer.Stop();
-            s->contentSearch.Stop();
-            s->duplicateSearch.Stop();
-            s->networkIndex.Stop();
-            s->changes.client.Stop();
-            s->index.Stop();
-            s->worker.Stop();
+            if (last_window) {
+                s->probe_scheduler.Clear();
+                s->probeQueue.clear();
+                s->probeUnc.clear();
+#ifdef PULSE_WITH_SELFTEST
+                extern void RecordP1StartupRollback(const AppState&);
+                RecordP1StartupRollback(*s);
+#endif
+                StopShellWindows(*s);
+                ShutdownGlobalSearch(*s);
+                StopShellRegistryWatch();
+                s->watches.Stop();
+                s->folderSizes.Stop();
+                s->settings.ResetUi();
+                s->settings.Stop();
+                s->update_checker.Stop();
+                s->update_installer.Stop();
+                s->contentSearch.Stop();
+                s->duplicateSearch.Stop();
+                s->networkIndex.Stop();
+                s->changes.client.Stop();
+                s->index.Stop();
+                CancelNetworkLocations(*s);
+                CancelSidebarRefresh(*s);
+                s->worker.Stop();
+            } else if (AppState* next = s->core.windows.MostRecentExcept(hwnd)) {
+                // Hand the process bindings this window held to the next one
+                // (M4a): tray hide/restore and the owner of shell dialogs.
+                if (s->tray_controller.Window() == hwnd) {
+                    s->tray_controller.Retarget(next->hwnd);
+                    InstallTrayRevealHook(*next);
+                }
+                // File operation progress moves along (M4c).
+                if (s->ops.UiWindow() == hwnd) MoveOperationUi(*s, *next);
+                // Closing is undoable (plan §8.1): keep the tabs and offer
+                // them back in the window used next.
+                if (!s->core.exiting) {
+                    app::ClosedWindow closed = CaptureClosedWindow(*s, hwnd);
+                    if (!closed.layout_tabs.empty()) {
+                        std::wstring name = closed.name;
+                        closed.closed_seq = ++s->core.close_seq;  // M7f: one timeline with closed tabs
+                        s->core.closed_windows.Push(std::move(closed));
+                        next->notification_toast.ShowSnack(
+                            next->hwnd, ui::SnackIcon::Undo, l10n::Get(l10n::StringId::WindowClosedTitle),
+                            std::move(name), {{l10n::Get(l10n::StringId::SnackRestore), WM_REOPEN_CLOSED_WINDOW}},
+                            L"Ctrl+Shift+T");
+                    }
+                }
+            }
             ShutdownDetailsSizeWalk(*s);
 
             if (s->dropTarget) {
@@ -2098,31 +2415,49 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 DeleteObject(s->editBrush);
                 s->editBrush = nullptr;
             }
-            // Visual-regression runs must never overwrite the user's real
-            // window, path, tray, or undo session.
-            if (!s->shot.active && !s->menushot && !s->isolatedTest) {
-                // A hidden tag-only launch must not overwrite the real
-                // window/tab session (SessionWritable); tags and places still save below.
-                // A second window owns none of that either: saving its own tabs,
-                // tray deck and undo stack would replace the primary's.
-                if (!s->secondaryInstance && !s->mergedAway && !s->updateSessionPrepared)
-                    SaveWindowSession(*s, hwnd, true);
-                s->places.Save();
-                s->ctxMenuPrefs.Save();
-                if (!s->updateSessionPrepared) s->appPrefs.Save();
+            if (last_window) {
+                // Visual-regression runs must never overwrite the user's real
+                // window, path, tray, or undo session.
+                if (s->startupComplete && !s->shot.active && !s->menushot && !s->isolatedTest) {
+                    // A hidden tag-only launch must not overwrite the real
+                    // window/tab session (SessionWritable); tags and places still save below.
+                    // ExitPulse saved every window before closing them (M4d);
+                    // by now this is the only one left.
+                    if (!s->updateSessionPrepared && !s->core.exiting) SaveWindowSession(*s, hwnd, true);
+                    s->places.Save();
+                    s->ctxMenuPrefs.Save();
+                    if (!s->updateSessionPrepared) s->appPrefs.Save();
+                }
+
+                s->tray_controller.Detach();
+                s->ops.Stop();
+                ops::ShutdownElevatedTransferHelper();
+                app::SweepDropStages(app::DropStageRoot(), true);
+                s->single_instance.Release();
+
+                UnregisterAssocChangeNotify();
             }
-
-            s->tray_controller.Detach();
-            s->ops.Stop();
-            app::SweepDropStages(app::DropStageRoot(), true);
-            s->single_instance.Release();
-
             s->renderer.SetIconNotifyWindow(nullptr);
             s->renderer.SetCompositor(nullptr);
+            if (last_window) ui::ResetRenderCaches(s->core.render_caches);
             s->compositor.Shutdown();
+            ReleaseWindowOverlay(*s);
+            s->core.windows.Remove(hwnd);
             s->hwnd = nullptr;
+            if (!last_window) {
+                // Withdraw this window's panes from the shell's window list
+                // (M4b) and free select requests it will no longer dispatch.
+                MSG pending{};
+                while (PeekMessageW(&pending, hwnd, WM_SHELL_SELECT, WM_SHELL_SELECT, PM_REMOVE))
+                    delete reinterpret_cast<app::ShellSelectRequest*>(pending.lParam);
+                if (AppState* next = s->core.windows.MostRecent()) {
+                    SyncShellWindows(*next);
+                    SyncVisibleWatches(*next);  // stop watching what only this window showed
+                    SyncWindowIdentities(*next);  // M7c: down to one, names and dots go
+                }
+            }
         }
-        PostQuitMessage(0);
+        if (last_window) PostQuitMessage(0);
         return 0;
     }
     }
@@ -2151,6 +2486,22 @@ bool WaitForShotReady(AppState& s) {
         ProcessPendingResults(s);
         app::Tab* tab = ActiveTab(s);
         if (tab && !tab->loading && tab->snapshot) {
+            // PULSE_TEST_SHOT_SETTLE_MS: keep pumping after the folder loaded so
+            // asynchronous results (thumbnails from the preview host) land in the shot.
+            wchar_t settle[16]{};
+            if (GetEnvironmentVariableW(L"PULSE_TEST_SHOT_SETTLE_MS", settle, 16)) {
+                const auto until = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds((std::min)(_wtoi(settle), 15000));
+                while (std::chrono::steady_clock::now() < until) {
+                    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    ProcessPendingResults(s);
+                    if (s.hwnd) RedrawWindow(s.hwnd, nullptr, nullptr, RDW_UPDATENOW | RDW_INTERNALPAINT);
+                    Sleep(20);
+                }
+            }
             return true;
         }
         if (s.hwnd) {
@@ -2252,6 +2603,42 @@ static void ApplyShotTrayAction(AppState& state) {
     }
 }
 
+// GUI verification for two-pane layouts: PULSE_SHOT_SPLIT_PATH opens that
+// folder in a second pane (PULSE_SHOT_SPLIT_STACKED=1: top/bottom instead of
+// left/right; PULSE_SHOT_SPLIT_FOCUS=1 focuses the second pane).
+static void StageSplitShot(AppState& state) {
+    wchar_t second[MAX_PATH]{}, flag[4]{};
+    if (!state.isolatedTest ||
+        !GetEnvironmentVariableW(L"PULSE_SHOT_SPLIT_PATH", second, ARRAYSIZE(second))) return;
+    const bool stacked = GetEnvironmentVariableW(L"PULSE_SHOT_SPLIT_STACKED", flag, ARRAYSIZE(flag)) > 0;
+    ApplyLayoutPreset(state, stacked ? app::LayoutPreset::TwoHorizontal : app::LayoutPreset::TwoVertical);
+    std::vector<app::Pane*> visible;
+    if (Root(state)) Root(state)->CollectPanes(visible);
+    if (visible.size() != 2 || !visible[1]->ActiveTab()) return;
+    app::Tab* tab = visible[1]->ActiveTab();
+    StartLoadingPath(state, *tab, second);
+    if (GetEnvironmentVariableW(L"PULSE_SHOT_SPLIT_FOCUS", flag, ARRAYSIZE(flag)) > 0)
+        FocusPane(state, visible[1]);
+    // PULSE_SHOT_SPLIT_SWAP=1 swaps the panes; PULSE_SHOT_SPLIT_HOVER=1|2 shows the
+    // divider hover (1) or the swap button hover (2).
+    if (GetEnvironmentVariableW(L"PULSE_SHOT_SPLIT_SWAP", flag, ARRAYSIZE(flag)) > 0)
+        SwapSplitPanes(state);
+    if (GetEnvironmentVariableW(L"PULSE_SHOT_SPLIT_HOVER", flag, ARRAYSIZE(flag)) > 0) {
+        state.hoverRegion = static_cast<int>(ui::HitTestResult::Splitter);
+        state.hoverControlIndex = flag[0] == L'2' ? ui::kSplitterSwapIndex : 0;
+    }
+    MSG msg{};
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < until && (tab->loading || !tab->snapshot)) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        ProcessPendingResults(state);
+        Sleep(20);
+    }
+}
+
 static void StageLinkPillShot(AppState& state) {
     wchar_t mode[24]{}, index[16]{};
     if (!state.isolatedTest || !GetEnvironmentVariableW(L"PULSE_TEST_LINK_PILL_SHOT", mode, ARRAYSIZE(mode)) ||
@@ -2288,6 +2675,7 @@ int ShotModeMain(AppState& state, HWND hwnd) {
     __try {
         WaitForShotReady(state);
         StageTagShotStates(state);
+        StageSplitShot(state);
         if (state.shot_details && state.pane && state.pane->ActiveTab() &&
             state.pane->ActiveTab()->snapshot &&
             !state.pane->ActiveTab()->snapshot->empty()) {
@@ -2350,15 +2738,64 @@ int ShotModeMain(AppState& state, HWND hwnd) {
     return ok ? 0 : 1;
 }
 
+// Hidden: pulse.exe --picker-live file|folder|image [--dark] [--init <path>]
+// [--out <file>] opens Pulse's open dialog on its own, the way an app's
+// IFileOpenDialog would, and writes "picked:<path>..." or "cancel" (UTF-8).
+int RunPickerLive(int first) {
+    std::wstring kind = first < __argc && __wargv[first][0] != L'-' ? __wargv[first] : L"file";
+    bool dark = false;
+    std::wstring init, out;
+    for (int i = first; i < __argc; ++i) {
+        if (wcscmp(__wargv[i], L"--dark") == 0) dark = true;
+        else if (wcscmp(__wargv[i], L"--init") == 0 && i + 1 < __argc) init = __wargv[++i];
+        else if (wcscmp(__wargv[i], L"--out") == 0 && i + 1 < __argc) out = __wargv[++i];
+    }
+    ui::FolderPickerSpec spec;
+    spec.mode = kind == L"folder" ? ui::PickerMode::Folder
+              : kind == L"image" ? ui::PickerMode::Image : ui::PickerMode::File;
+    spec.initial_path = init;
+    if (spec.mode == ui::PickerMode::File) {
+        spec.allow_multiselect = true;
+        spec.filters = {{l10n::Pick(L"所有文件 (*.*)", L"All files (*.*)"), L"*.*"},
+                        {l10n::Pick(L"文本文档 (*.txt; *.md)", L"Text documents (*.txt; *.md)"), L"*.txt;*.md"},
+                        {l10n::Pick(L"图片", L"Pictures"), L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"}};
+    }
+    const D2D1_COLOR_F accent = ui::HexColor(0x0078D4);
+    ui::FilePickerResult result;
+    const bool picked = ui::ShowFilePicker(nullptr, spec, dark, accent, result);
+    std::wstring text = picked ? L"picked:" : L"cancel";
+    for (size_t i = 0; i < result.paths.size(); ++i) {
+        if (i) text += L"\n";
+        text += result.paths[i];
+    }
+    if (!out.empty()) {
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        std::string utf8(static_cast<size_t>(bytes > 1 ? bytes - 1 : 0), '\0');
+        if (bytes > 1) WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, utf8.data(), bytes, nullptr, nullptr);
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, out.c_str(), L"wb") == 0 && f) {
+            fwrite(utf8.data(), 1, utf8.size(), f);
+            fclose(f);
+        }
+    }
+    return picked ? 0 : 1;
+}
+
 bool SkipSingletonFromArgv() {
+#ifdef PULSE_WITH_SELFTEST
+    // Exercise the normal persistence branch without forwarding a fault test
+    // to a real running instance. GetPulseDataDir redirects every fixture.
+    if (GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", nullptr, 0) > 0 &&
+        GetEnvironmentVariableW(L"PULSE_TEST_STARTUP_FAIL", nullptr, 0) > 0) return true;
+#endif
     for (int i = 1; i < __argc; ++i) {
         if (wcscmp(__wargv[i], L"--selftest") == 0 ||
+            wcscmp(__wargv[i], L"--picker-live") == 0 ||
             wcscmp(__wargv[i], L"--material-selftest") == 0 ||
             wcscmp(__wargv[i], L"--seed-shell-verbs") == 0 ||
             wcscmp(__wargv[i], L"--shot") == 0 ||
             wcscmp(__wargv[i], L"--menushot") == 0 ||
             wcscmp(__wargv[i], L"--test-instance") == 0 ||
-            wcscmp(__wargv[i], L"--new-window") == 0 ||
             wcscmp(__wargv[i], L"--colorpickshot") == 0 ||
             wcscmp(__wargv[i], L"--colorpickdialog") == 0)
             return true;
@@ -2366,17 +2803,43 @@ bool SkipSingletonFromArgv() {
     return false;
 }
 
+int RunFilePickerDialogTest(int argc, wchar_t** argv);
+int RunFilePickerOperationsTest();
+#ifdef PULSE_WITH_SELFTEST
+int RunUiModuleAuditTest();
+int RunQuickPreviewAuditTest();
+#endif
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
+#ifdef PULSE_WITH_SELFTEST
+    std::optional<CLSID> tag_com_audit_class;
+    if (!app::shell_tags::PrepareCommandAudit(__argc, __wargv, tag_com_audit_class)) return 2;
+#endif
+#ifdef PULSE_WITH_SELFTEST
+    if (__argc == 2 && wcscmp(__wargv[1], L"--quick-preview-audit") == 0)
+        return RunQuickPreviewAuditTest();
+    if (__argc == 2 && wcscmp(__wargv[1], L"--ui-module-audit") == 0)
+        return RunUiModuleAuditTest();
+    if (__argc == 2 && wcscmp(__wargv[1], L"--startup-rollback-test") == 0)
+        return RunStartupRollbackTest(hInstance, WndProc);
+#endif
+    if (__argc == 2 && wcscmp(__wargv[1], L"--picker-operations-test") == 0)
+        return RunFilePickerOperationsTest();
+    if (__argc >= 3 && wcscmp(__wargv[1], L"--picker-dialog-test") == 0)
+        return RunFilePickerDialogTest(__argc - 1, __wargv + 1);
     pulse::crash::Initialize({pulse::crash::ProcessRole::App, false, {}});
-    // One taskbar identity for every Pulse window; the installer puts the same
-    // one on the shortcuts so a pinned button and a running window agree.
-    SetCurrentProcessExplicitAppUserModelID(app::kAppUserModelId);
     pulse::compat::EnableDpiAwareness();
     // OLE init (drag & drop + clipboard); implies STA COM init.
     OleInitialize(nullptr);
     for (int i = 1; i < __argc; ++i) {
         if (wcscmp(__wargv[i], L"--material-selftest") == 0) {
             const int rc = ui::RunMaterialSelfTest();
+            OleUninitialize();
+            return rc;
+        }
+        if (wcscmp(__wargv[i], L"--picker-live") == 0) {
+            l10n::Initialize(hInstance, L"system");
+            const int rc = RunPickerLive(i + 1);
             OleUninitialize();
             return rc;
         }
@@ -2400,17 +2863,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", nullptr, 0) > 0 &&
         GetEnvironmentVariableW(L"PULSE_TEST_PERSIST", nullptr, 0) > 0)
         state.isolatedTestPersist = true;
+    if (tag_com_audit_class) state.isolatedTestPersist = false;
 #endif
-    for (int i = 1; i < __argc; ++i) {
-        if (wcscmp(__wargv[i], L"--new-window") != 0) continue;
-        // A shortcut or jump-list entry built while the mode was on can outlive
-        // it: the launch is then an ordinary one and the running window takes the
-        // folder as a tab. Read the preference here; the full app is not built yet.
-        app::AppPrefs launch_prefs;
-        launch_prefs.persist = false;
-        launch_prefs.Load();
-        if (launch_prefs.multi_instance_mode) state.secondaryInstance = true;
-    }
     for (int i = 1; i < __argc; ++i)
         if (state.isolatedTest && wcscmp(__wargv[i], L"--content-index-observer") == 0) state.contentIndexObserver = true;
 
@@ -2429,38 +2883,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     // Load previous session before parsing overrides.
     app::SessionSnapshot session;
     if ((!state.isolatedTest || state.isolatedTestPersist) && app::LoadSession(session)) {
-        // A second window starts where the primary was, but owns its own tabs:
-        // the persisted layout, tray deck and undo stack stay with the primary.
-        if (state.secondaryInstance) {
-            session.layout_tabs.clear();
-            session.tab_groups.clear();
-            session.tray.Clear();
-            session.undo_json.clear();
-            // The window opens what it was asked for - or the recent view - as its
-            // only tab. Starting from the primary's location would hand it a tab
-            // the user never asked for, on top of the one they dropped it on.
-            session.active_path.clear();
-            // Cascade past the Pulse windows that are already open, so the new
-            // one does not land exactly on the window that asked for it.
-            int open_windows = 0;
-            HWND other = nullptr;
-            while (open_windows < 8) {
-                other = FindWindowExW(nullptr, other,
-                                      app::SingleInstanceCoordinator::WindowClassName(),
-                                      nullptr);
-                if (!other) break;
-                ++open_windows;
-            }
-            const LONG step = 32 * static_cast<LONG>(open_windows);
-            session.window_rect.left += step;
-            session.window_rect.top += step;
-            session.window_rect.right += step;
-            session.window_rect.bottom += step;
-        }
         state.session_path = session.active_path;
         state.session_layout_tabs = std::move(session.layout_tabs);
         state.session_tab_groups = std::move(session.tab_groups);
         state.session_active_layout_tab = session.active_layout_tab;
+        // Session v8 (M4d): the single-window fields above are the focused
+        // window; the others open after the first window is shown.
+        if (session.focused_window >= 0 && session.focused_window < static_cast<int>(session.windows.size()))
+            state.identity = session.windows[static_cast<size_t>(session.focused_window)].identity;  // M7c
+        for (size_t i = 0; i < session.windows.size(); ++i)
+            if (static_cast<int>(i) != session.focused_window)
+                state.core.pending_session_windows.push_back(std::move(session.windows[i]));
+        // M7f: Ctrl+Shift+T and the overview can still bring these back.
+        for (const auto& closed : session.closed_windows)
+            state.core.closed_windows.Push(app::ClosedWindowFromSession(closed, ++state.core.close_seq));
         state.tray = session.tray;
         state.darkMode = session.dark;
         state.sidebarCollapsedMask = static_cast<uint32_t>(session.sidebar_collapsed);
@@ -2525,15 +2961,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
             state.tooltipText = state.hoverLabel;
         } else if (wcscmp(__wargv[i], L"--shot-details") == 0) {
             state.shot_details = true;
+        } else if (wcscmp(__wargv[i], L"--shot-group") == 0 && i + 1 < __argc) {
+            state.shot_group = std::clamp(_wtoi(__wargv[++i]), 0, 6);
         } else if (wcscmp(__wargv[i], L"--shot-details-multi") == 0) {
             state.shot_details = true;
             state.shot_details_multi = true;
-        } else if (wcscmp(__wargv[i], L"--entry") == 0 && i + 1 < __argc) {
-            // A torn-off tab's selection, one flag per entry (mirrors the transfer
-            // message another window sends).
-            state.pending_handoff_names.emplace_back(__wargv[++i]);
-        } else if (wcscmp(__wargv[i], L"--focus") == 0 && i + 1 < __argc) {
-            state.pending_handoff_focus = __wargv[++i];
         } else if (wcscmp(__wargv[i], L"--shot-scale") == 0 && i + 1 < __argc) {
             state.shot_scale_override = std::clamp(
                 static_cast<float>(_wtof(__wargv[++i])), 1.0f, 2.5f);
@@ -2557,6 +2989,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         } else if (wcscmp(__wargv[i], L"--test-instance") == 0 || wcscmp(__wargv[i], L"--content-index-observer") == 0 ||
                    wcscmp(__wargv[i], L"--hang-watch") == 0 || wcscmp(__wargv[i], app::kStartupArgument) == 0) {
             continue;
+#ifdef PULSE_WITH_SELFTEST
+        } else if ((wcscmp(__wargv[i], L"--tag-com-audit-class") == 0 ||
+                    wcscmp(__wargv[i], L"--tag-com-audit-dir") == 0) && i + 1 < __argc) {
+            ++i;
+#endif
+        } else if (wcscmp(__wargv[i], L"--tag") == 0 ||
+                   wcscmp(__wargv[i], L"--tag-add") == 0 ||
+                   wcscmp(__wargv[i], L"--tag-remove") == 0) {
+            if (i + 2 >= __argc) return 1;
+            i += 2;
         } else if (wcscmp(__wargv[i], L"--fps") == 0) {
             state.forceStatusPerformance = true;
             state.showFps = true;
@@ -2569,9 +3011,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
                 state.shot.width = std::max(320, requestedWidth);
                 state.shot.height = std::max(240, requestedHeight);
             }
-        } else if (i == __argc - 1 && __wargv[i][0] != L'-') {
-            // A trailing switch is not a path: `--new-window` with no folder used
-            // to open a tab titled after the flag itself.
+        } else if (i == __argc - 1) {
             state.shot.path = __wargv[i];
         } else if (__wargv[i][0] != L'-' && state.shot.path.empty()) {
             state.shot.path = __wargv[i]; // tolerate path not being the last argument
@@ -2587,17 +3027,40 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
     state.shot.start = std::chrono::steady_clock::now();
 
-    const std::optional<app::ShellTagRequest> shell_tag = app::ParseShellTagArgs(__argc, __wargv);
-    if (shell_tag) state.open_path.clear();
+    std::optional<app::ShellTagRequest> shell_tag = app::ParseShellTagArgs(__argc, __wargv);
+    for (int i = 1; i < __argc; ++i) {
+        const std::wstring_view arg(__wargv[i]);
+        if ((arg == L"--tag" || arg == L"--tag-add" || arg == L"--tag-remove") && !shell_tag)
+            return 1;
+    }
+    bool shell_tag_com = false;
+    for (int i = 1; i < __argc; ++i) if (wcscmp(__wargv[i], L"--shell-tag-com") == 0) shell_tag_com = true;
+    if (shell_tag || shell_tag_com) state.open_path.clear();
+    std::wstring normalized_launch;
+    if (!app::SingleInstanceCoordinator::NormalizeLaunchPath(state.open_path, normalized_launch)) {
+        MessageBoxW(nullptr, L"Invalid launch path.", L"Pulse", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    state.open_path = std::move(normalized_launch);
+    if (shell_tag) {
+        if (!app::SingleInstanceCoordinator::NormalizeLaunchPath(shell_tag->path, normalized_launch) ||
+            normalized_launch.empty() || normalized_launch.starts_with(L"pulse:") ||
+            app::IsThisPcArgument(normalized_launch)) return 1;
+        shell_tag->path = std::move(normalized_launch);
+    }
     // Launched by the HKCU Run value (app_prefs.cpp), not by the user.
     const bool startup_launch = app::HasStartupArgument(__argc, __wargv);
     if (!SkipSingletonFromArgv()) {
         const auto result = state.single_instance.Acquire();
+        if (result == app::SingleInstanceCoordinator::AcquireResult::Failed) {
+            MessageBoxW(nullptr, L"Could not establish the Pulse instance endpoint.", L"Pulse", MB_OK | MB_ICONERROR);
+            return 1;
+        }
         if (result == app::SingleInstanceCoordinator::AcquireResult::Existing) {
             bool forwarded = true;
             if (shell_tag) forwarded = app::ForwardShellTagRequest(*shell_tag);
             // A sign-in launch must not pop up the window that is already running.
-            else if (!startup_launch) forwarded = state.single_instance.ForwardOpenPath(state.open_path, 5000);
+            else if (!startup_launch && !shell_tag_com) forwarded = state.single_instance.ForwardOpenPath(state.open_path, 5000);
             if (!forwarded) {
                 // This process exits before WM_CREATE initializes localization.
                 // Read the preference without repairing startup registration.
@@ -2616,6 +3079,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         }
     }
 
+    if (!state.isolatedTest && !state.shot.active) app::StartUpdateDownloadCleanup();
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
@@ -2632,21 +3097,59 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT, w = (int)(1600 * state.scale), h = (int)(960 * state.scale);
     if (session.window_rect.right > session.window_rect.left) {
-        x = session.window_rect.left;
-        y = session.window_rect.top;
-        w = session.window_rect.right - session.window_rect.left;
-        h = session.window_rect.bottom - session.window_rect.top;
+        // Saved from rcNormalPosition: workspace coordinates (window_placement.h).
+        RECT restored = app::RestoredWindowRect(session.window_rect);
+        // Its monitor is gone (M4d): the primary monitor's work area.
+        if (!MonitorFromRect(&restored, MONITOR_DEFAULTTONULL)) {
+            MONITORINFO primary{sizeof(primary)};
+            if (GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &primary))
+                restored = app::PlaceSessionWindow(restored, false, primary.rcWork, {}, 0);
+        }
+        x = restored.left;
+        y = restored.top;
+        w = restored.right - restored.left;
+        h = restored.bottom - restored.top;
     }
     if (state.shot.active && state.shot.width > 0 && state.shot.height > 0) {
         w = state.shot.width;
         h = state.shot.height;
     }
 
-    constexpr DWORD kMainWindowStyle =
-        WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+    // kMainWindowStyle (window_factory.h) is shared with later windows.
     static_assert((kMainWindowStyle & WS_CAPTION) == WS_CAPTION &&
                   (kMainWindowStyle & WS_SYSMENU) == 0,
                   "keep the system animations without DWM's duplicate caption buttons");
+    // Hidden process window (host_window.h), created before the main window
+    // so WM_CREATE can point services at it. It owns the single-instance
+    // endpoint (Pulse windows do not accept WM_COPYDATA) and forwards the
+    // process-level notifications in host_routing.h to the most recently
+    // active window (WindowRegistry).
+    const bool host_created = state.core.host.Create(hInstance,
+        [&state](HWND host, UINT message, WPARAM wParam, LPARAM lParam) -> std::optional<LRESULT> {
+            AppState* const target = state.core.windows.MostRecent();
+            if (app::IsHostRoutedMessage(message))
+                return target ? SendMessageW(target->hwnd, message, wParam, lParam) : 0;
+            if (const auto kind = app::ClassifySystemBroadcast(message, wParam, lParam);
+                kind != app::SystemBroadcast::None) {
+                if (target) return HandleSystemBroadcast(*target, kind, wParam);
+                return message == WM_QUERYENDSESSION ? TRUE : 0;
+            }
+            if (message != 0 && message == app::TrayController::TaskbarCreatedMessage()) {
+                state.tray_controller.HandleTaskbarCreated();  // the icon lives on the host
+                return 0;
+            }
+            if (message == WM_RELEASE_WINDOW_STATES) {
+                ReleaseRetiredWindowStates();
+                return 0;
+            }
+            if (message != WM_COPYDATA) return std::nullopt;
+            // A --test-instance publishes no endpoint (a second launch would
+            // reach the user's own Pulse), so test scripts send the open
+            // message straight to its host window (M7a end-to-end checks).
+            if (!target || (!state.single_instance.OwnsEndpoint(host) && !state.isolatedTest)) return FALSE;
+            return HandleInstanceCopyData(*target, reinterpret_cast<COPYDATASTRUCT*>(lParam));
+        });
+    if (!host_created) return 1;
     HWND hwnd = CreateWindowExW(
         WS_EX_NOREDIRECTIONBITMAP,
         wc.lpszClassName,
@@ -2664,6 +3167,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         nullptr, nullptr, hInstance, &state);
 
     if (!hwnd) return 1;
+    if (!SkipSingletonFromArgv() && !state.single_instance.PublishEndpoint(state.core.host.Hwnd())) {
+        DestroyWindow(hwnd);
+        return 1;
+    }
     // Diagnostics: sample thread stacks while the UI thread is stalled.
     for (int i = 1; i < __argc; ++i) {
         if (wcscmp(__wargv[i], L"--hang-watch") != 0) continue;
@@ -2685,14 +3192,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     // Started by the Explorer tag verb while Pulse was closed: stay hidden,
     // apply the tag batch, then exit (shell_tag_menu.cpp).
     if (shell_tag) QueueShellTagRequest(state, *shell_tag, true);
+    if (shell_tag_com) BeginShellTagComLaunch();
+    const CLSID* tag_com_class = nullptr;
+    bool tag_com_allowed = !state.isolatedTest;
+#ifdef PULSE_WITH_SELFTEST
+    if (tag_com_audit_class) { tag_com_class = &*tag_com_audit_class; tag_com_allowed = true; }
+#endif
+    if (tag_com_allowed && state.appPrefs.shell_tag_menu) {
+        const HRESULT registered = app::shell_tags::RegisterCommandServer(tag_com_class);
+        if (shell_tag_com && FAILED(registered)) { DestroyWindow(hwnd); OleUninitialize(); return 1; }
+    } else if (shell_tag_com) { DestroyWindow(hwnd); OleUninitialize(); return 1; }
     // Sign-in launch with 开机自启时隐藏到托盘: only the tray icon shows; a
     // click restores the window (maximized if the session was).
-    const bool start_in_tray = !test_hidden && !shell_tag && !state.shot.active && !state.menushot &&
+    const bool start_in_tray = !test_hidden && !shell_tag && !shell_tag_com && !state.shot.active && !state.menushot &&
         !state.colorpickshot && !state.colorpickdialog &&
         app::StartsHiddenInTray(startup_launch, state.appPrefs.start_in_tray) &&
         state.tray_controller.StartHidden(nCmdShow == SW_SHOWMAXIMIZED, state.appPrefs.notify_icon_mode != 2);
     if (!start_in_tray)
-        ShowWindow(hwnd, test_hidden || shell_tag ? SW_HIDE
+        ShowWindow(hwnd, test_hidden || shell_tag || shell_tag_com ? SW_HIDE
                                                   : state.shot.active ? SW_SHOWNORMAL : nCmdShow);
     UpdateWindow(hwnd);
 
@@ -2737,6 +3254,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
             if (verb_len > 0 && verb_len < ARRAYSIZE(long_verb))
                 shell_rows.push_back({ app::CmdShellStaticBase + 1, long_verb, true });
             app::AppendShellSection(debug_items, shell_rows);
+            if (GetEnvironmentVariableW(L"PULSE_TEST_SPLIT_MENU", quick_menu, ARRAYSIZE(quick_menu)) == 1) {
+                debug_items = app::BuildSplitMenu(static_cast<int>(app::LayoutPreset::TwoVertical));
+                debug_items.back().separator_after = true;
+                ui::FluentMenuItem compare;
+                compare.command = app::CmdCompareToggle;
+                compare.text = l10n::Get(l10n::StringId::CompareMenu);
+                compare.glyph = L"\xE89F";
+                debug_items.push_back(std::move(compare));
+            }
             ok = m.SaveDebugSnapshot(state.menushot_out.c_str(), std::move(debug_items));
         }
         DestroyWindow(hwnd);
@@ -2767,7 +3293,40 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         return 0;
     }
 
+#ifdef PULSE_WITH_SELFTEST
+    wchar_t p1_probe[32768]{};
+    if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", nullptr, 0) > 0 &&
+        GetEnvironmentVariableW(L"PULSE_TEST_P1_FLOW", p1_probe, ARRAYSIZE(p1_probe))) {
+        extern int RunP1RegressionProbe(AppState&, const wchar_t*);
+        const int result = WaitForShotReady(state) ? RunP1RegressionProbe(state, p1_probe) : 4;
+        DestroyWindow(hwnd);
+        OleUninitialize();
+        return result;
+    }
+#endif
     if (state.shot.active) {
+        wchar_t experience_probe[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_FOLDER_SIZE_EXPERIENCE", experience_probe, ARRAYSIZE(experience_probe))) {
+            extern int RunFolderSizeExperienceProbe(AppState&, const wchar_t*);
+            const int result = WaitForShotReady(state) ? RunFolderSizeExperienceProbe(state, experience_probe) : 4;
+            DestroyWindow(hwnd); OleUninitialize(); return result;
+        }
+        wchar_t folder_probe[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_FOLDER_THUMB_FLOW", folder_probe, ARRAYSIZE(folder_probe))) {
+            extern int RunFolderThumbnailProbe(AppState&, const wchar_t*);
+            const int result = WaitForShotReady(state) ? RunFolderThumbnailProbe(state, folder_probe) : 4;
+            DestroyWindow(hwnd);
+            OleUninitialize();
+            return result;
+        }
+        wchar_t selection_probe[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SELECTION_FLOW", selection_probe, ARRAYSIZE(selection_probe))) {
+            extern int RunSelectionInputProbe(AppState&, const wchar_t*);
+            const int result = WaitForShotReady(state) ? RunSelectionInputProbe(state, selection_probe) : 4;
+            DestroyWindow(hwnd);
+            OleUninitialize();
+            return result;
+        }
         wchar_t settings_fixture[32]{};
         if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SETTINGS_EXPANDED",settings_fixture,ARRAYSIZE(settings_fixture)))
             state.settingsExpanded=static_cast<unsigned>(wcstoul(settings_fixture,nullptr,10)) & 0x3f0fu;
@@ -2789,6 +3348,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         }
 #ifdef PULSE_WITH_SELFTEST
         wchar_t settings_interactions[32768]{};
+        wchar_t quicklook_settings[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_QUICKLOOK_SETTINGS", quicklook_settings, ARRAYSIZE(quicklook_settings))) {
+            extern int RunQuickLookSettingsTest(AppState&, const wchar_t*);
+            const int result = RunQuickLookSettingsTest(state, quicklook_settings);
+            DestroyWindow(hwnd); OleUninitialize(); return result;
+        }
         if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SETTINGS_INTERACTIONS",settings_interactions,ARRAYSIZE(settings_interactions))) {
             extern int RunSettingsInteractionTest(AppState&,const wchar_t*);
             const int result=RunSettingsInteractionTest(state,settings_interactions);
@@ -2850,6 +3415,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
             state.window_tabs.items[state.window_tabs.active]->title = L"工作";
             state.window_tabs.items[state.window_tabs.active]->marker_rgb = 0x0078D4;
         }
+        if (state.shot_group > 0)
+            if (app::Tab* grouped = ActiveTab(state)) grouped->group_by = state.shot_group;
         if (state.shot_details) {
             state.showDetailsPanel = true;
             state.renderer.SetDetailsPanelVisible(true);
@@ -2863,9 +3430,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     BOOL ret;
     while ((ret = GetMessageW(&msg, nullptr, 0, 0)) != 0) {
         if (ret == -1) break;
+        NoteUserInput(state, msg);
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    // Later windows' states hold references into the core `state` owns.
+    ReleaseWindowStatesAtExit();
     pulse::app::hang::Stop();
     OleUninitialize();
     return (int)msg.wParam;

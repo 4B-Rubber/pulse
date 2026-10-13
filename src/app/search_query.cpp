@@ -1,4 +1,5 @@
 #include "search_query.h"
+#include "search_query_rewrite.h"
 #include "../common/path_utils.h"
 
 #include <algorithm>
@@ -153,7 +154,7 @@ bool ParseSmartSize(const std::wstring& tok, AdvancedSearchSpec& spec) {
 } // namespace
 
 std::wstring QuoteQueryValue(std::wstring_view value) {
-    bool need = false;
+    bool need = !value.empty() && value.front() == L'!';
     for (wchar_t c : value) {
         if (c == L' ' || c == L'\t' || c == L'|' || c == L'"' || c == L':' || c == L'：') {
             need = true;
@@ -170,6 +171,19 @@ std::wstring QuoteQueryValue(std::wstring_view value) {
 }
 
 std::wstring CompileSearchQuery(const AdvancedSearchSpec& spec) {
+    if (spec.name_is_query) {
+        // The name holds native input typed by the user: keep its syntax and
+        // add the structured fields to every OR branch.
+        auto fields = spec;
+        fields.name.clear();
+        fields.name_is_query = false;
+        fields.origin.reset();
+        std::wstring raw = spec.name;
+        Trim(raw);
+        const auto filters = CompileSearchQuery(fields);
+        return filters.empty() ? raw : CombineNativeQuery(raw, filters);
+    }
+    if (spec.origin) return RewriteSearchQuery(spec);
     std::wstring q;
     auto append = [&](std::wstring_view token) {
         if (token.empty()) return;
@@ -187,7 +201,7 @@ std::wstring CompileSearchQuery(const AdvancedSearchSpec& spec) {
         } else {
             const auto words = SplitWords(name);
             if (words.size() > 1) {
-                for (const auto& word : words) append(word);
+                for (const auto& word : words) append(QuoteQueryValue(word));
             } else {
                 append(QuoteQueryValue(name));
             }
@@ -358,6 +372,7 @@ AdvancedSearchSpec ParseSearchQuery(std::wstring_view raw, std::wstring_view cur
     if (saw_ge_1mb && saw_le_10mb) spec.size = SizePreset::From1To10MB;
     if (spec.size == SizePreset::Custom) spec.size_custom = CollectSizeTokens(raw);
     spec.date = DetectDatePreset(raw);
+    RememberSearchQuery(spec, raw);
     return spec;
 }
 

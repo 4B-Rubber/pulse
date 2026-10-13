@@ -139,8 +139,9 @@ bool RunFolderSizesTest() {
         file(fixture / L"nested" / L"child" / L"b.bin", 1000);
         service.Invalidate((fixture / L"nested" / L"child" / L"b.bin").wstring());
         const auto stale = service.Get(nested);
-        check(stale.has_value && stale.bytes == 6912 && stale.state == FolderSizeState::Updating,
-              "old value remains visible while invalidated data updates");
+        check(stale.has_value && stale.bytes == 6912 && stale.state == FolderSizeState::Cached &&
+            stale.source == FolderSizeSource::Scan && !stale.verified,
+              "invalidation retains the published scan as unverified cache, separate from work progress");
         check(wait([&] { const auto v = service.Get(nested); return v.state == FolderSizeState::Ready && v.bytes == 2234; }),
               "changed descendant refreshes its parent total");
         for (int i = 0; i < 30; ++i) service.Sync({{i % 2 ? nested : empty}}, {});

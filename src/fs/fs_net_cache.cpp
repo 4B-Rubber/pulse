@@ -6,12 +6,67 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <atomic>
+#include <cstdio>
+#include <fcntl.h>
+#include <io.h>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
 
 namespace pulse::fs {
+#if defined(PULSE_TEST_NET_CACHE)
+std::wstring NetCacheDirectoryForTest();
+BOOL ProbeAttributesForTest(const std::wstring& path);
+DWORD ProbeTimeoutForTest();
+void BeforeNetSnapshotCommitForTest(uint64_t generation);
+#endif
+
+struct NetSnapshotWriteState {
+    std::wstring path;
+    std::atomic<uint64_t> latest{0};
+    std::mutex commit_mutex;
+    uint64_t committed = 0;
+};
 
 namespace {
 
+std::mutex write_registry_mutex;
+std::unordered_map<std::wstring, std::weak_ptr<NetSnapshotWriteState>> write_registry;
+
+struct SnapshotTempFile {
+    std::wstring path;
+    FILE* stream = nullptr;
+    ~SnapshotTempFile() {
+        if (stream) fclose(stream);
+        if (!path.empty()) DeleteFileW(path.c_str());
+    }
+    bool Open(const std::wstring& destination) {
+        static std::atomic<uint64_t> serial{0};
+        for (int attempt = 0; attempt < 16; ++attempt) {
+            const std::wstring candidate = destination + L"." + std::to_wstring(GetCurrentProcessId()) +
+                L"." + std::to_wstring(GetTickCount64()) + L"." + std::to_wstring(++serial) + L".tmp";
+            HANDLE handle = CreateFileW(candidate.c_str(), GENERIC_WRITE, 0, nullptr,
+                                        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (handle == INVALID_HANDLE_VALUE) {
+                if (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS) continue;
+                return false;
+            }
+            path = candidate;
+            const int descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | _O_WRONLY);
+            if (descriptor < 0) { CloseHandle(handle); return false; }
+            stream = _fdopen(descriptor, "wb");
+            if (!stream) { _close(descriptor); return false; }
+            return true;
+        }
+        return false;
+    }
+};
+
 std::wstring CacheDir() {
+#if defined(PULSE_TEST_NET_CACHE)
+    return NetCacheDirectoryForTest();
+#endif
     wchar_t path[MAX_PATH] = {};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, path))) return L"";
     std::wstring dir = std::wstring(path) + L"\\Pulse";
@@ -31,10 +86,12 @@ uint64_t HashPath(const std::wstring& p) {
 }
 
 std::wstring CacheFile(const std::wstring& path) {
+    const std::wstring normalized = NormalizePath(path);
+    if (normalized.empty()) return {};
     std::wstring dir = CacheDir();
     if (dir.empty()) return L"";
     wchar_t name[32];
-    swprintf_s(name, L"%016llX.bin", HashPath(NormalizePath(path)));
+    swprintf_s(name, L"%016llX.bin", HashPath(normalized));
     return dir + L"\\" + name;
 }
 
@@ -45,36 +102,74 @@ uint64_t NowUnix() {
 
 } // namespace
 
-bool SaveNetSnapshot(const std::wstring& path, const SnapshotPtr& snapshot) {
-    if (!snapshot || !IsUncPath(path)) return false;
-    const std::wstring file = CacheFile(path);
+NetSnapshotWrite BeginNetSnapshotWrite(const std::wstring& path) {
+    NetSnapshotWrite request;
+    if (!IsUncPath(path)) return request;
+    const auto normalized = NormalizePath(path);
+    if (normalized.empty()) return request;
+    std::lock_guard lock(write_registry_mutex);
+    // Retain ordering while any queued/running request owns the state, without
+    // retaining every UNC directory ever visited for the process lifetime.
+    for (auto it = write_registry.begin(); it != write_registry.end(); ) {
+        if (it->second.expired()) it = write_registry.erase(it);
+        else ++it;
+    }
+    auto& weak = write_registry[normalized];
+    request.state_ = weak.lock();
+    if (!request.state_) {
+        request.state_ = std::make_shared<NetSnapshotWriteState>();
+        request.state_->path = normalized;
+        weak = request.state_;
+    }
+    request.generation_ = ++request.state_->latest;
+    return request;
+}
+
+bool SaveNetSnapshot(const NetSnapshotWrite& request, const SnapshotPtr& snapshot) {
+    const auto& state = request.state_;
+    if (!snapshot || !state || state->latest.load() != request.generation_ || snapshot->size() > 500000) return false;
+    for (const auto& entry : *snapshot) if (entry.name.size() > 1024) return false;
+    const std::wstring file = CacheFile(state->path);
     if (file.empty()) return false;
-    const std::wstring tmp = file + L".tmp";
-    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-    if (!f) return false;
-    f.write("PNCH", 4);
+    SnapshotTempFile tmp;
+    if (!tmp.Open(file)) return false;
+    bool complete = true;
+    const auto write = [&](const void* data, size_t bytes) {
+        if (complete && fwrite(data, 1, bytes, tmp.stream) != bytes) complete = false;
+    };
+    write("PNCH", 4);
     uint32_t ver = 2;
     uint64_t ts = NowUnix();
     uint32_t count = static_cast<uint32_t>(snapshot->size());
-    f.write(reinterpret_cast<const char*>(&ver), 4);
-    f.write(reinterpret_cast<const char*>(&ts), 8);
-    f.write(reinterpret_cast<const char*>(&count), 4);
+    write(&ver, 4);
+    write(&ts, 8);
+    write(&count, 4);
     for (const auto& e : *snapshot) {
         uint8_t flags = (e.is_dir ? 1 : 0) | (e.is_reparse ? 2 : 0);
         uint64_t mtime = (static_cast<uint64_t>(e.mtime.dwHighDateTime) << 32) | e.mtime.dwLowDateTime;
         uint32_t nlen = static_cast<uint32_t>(e.name.size());
-        f.write(reinterpret_cast<const char*>(&flags), 1);
-        f.write(reinterpret_cast<const char*>(&e.attrs), 4);
-        f.write(reinterpret_cast<const char*>(&e.reparse_tag), 4);
-        f.write(reinterpret_cast<const char*>(&e.size), 8);
-        f.write(reinterpret_cast<const char*>(&mtime), 8);
-        f.write(reinterpret_cast<const char*>(&nlen), 4);
-        f.write(reinterpret_cast<const char*>(e.name.data()), nlen * sizeof(wchar_t));
+        write(&flags, 1);
+        write(&e.attrs, 4);
+        write(&e.reparse_tag, 4);
+        write(&e.size, 8);
+        write(&mtime, 8);
+        write(&nlen, 4);
+        write(e.name.data(), nlen * sizeof(wchar_t));
+        if (!complete) return false;
     }
-    f.close();
-    if (!f) { DeleteFileW(tmp.c_str()); return false; }
-    return MoveFileExW(tmp.c_str(), file.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (fflush(tmp.stream) != 0 || !FlushFileBuffers(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(tmp.stream))))) return false;
+    if (fclose(std::exchange(tmp.stream, nullptr)) != 0 || !complete) return false;
+    // Only background publishers take this lock. Request registration never
+    // waits on disk I/O. A newer publisher cannot be overtaken by an old one.
+#if defined(PULSE_TEST_NET_CACHE)
+    BeforeNetSnapshotCommitForTest(request.generation_);
+#endif
+    std::lock_guard lock(state->commit_mutex);
+    if (state->latest.load() != request.generation_ || state->committed >= request.generation_) return false;
+    if (!MoveFileExW(tmp.path.c_str(), file.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return false;
+    state->committed = request.generation_;
+    return true;
 }
 
 SnapshotPtr LoadNetSnapshot(const std::wstring& path, uint64_t* unix_sec) {
@@ -136,74 +231,107 @@ std::wstring FormatCacheAge(uint64_t unix_sec) {
 
 namespace {
 
+std::atomic<unsigned> active_probes{0};
+constexpr unsigned kMaxActiveProbes = 8;
 struct ProbeJob {
     std::wstring unc;
     UncProbeId probe_id = 0;
     HWND hwnd = nullptr;
     UINT msg = 0;
     HANDLE done = nullptr;
+    HANDLE thread = nullptr;
     BOOL ok = FALSE;
     DWORD rtt_ms = 0;
+    bool owns_permit = true;
+    void ReleasePermit() {
+        if (owns_permit) { --active_probes; owns_permit = false; }
+    }
+    ~ProbeJob() {
+        if (thread) {
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
+        }
+        if (done) CloseHandle(done);
+        ReleasePermit();
+    }
 };
 
 DWORD WINAPI ProbeInner(LPVOID param) {
     auto* j = static_cast<ProbeJob*>(param);
     const ULONGLONG t0 = GetTickCount64();
+#if defined(PULSE_TEST_NET_CACHE)
+    j->ok = ProbeAttributesForTest(j->unc);
+#else
     WIN32_FILE_ATTRIBUTE_DATA fad{};
     j->ok = GetFileAttributesExW(j->unc.c_str(), GetFileExInfoStandard, &fad);
+#endif
     j->rtt_ms = static_cast<DWORD>(GetTickCount64() - t0);
     SetEvent(j->done);
     return 0;
 }
 
+void PostProbe(const ProbeJob& job, bool completed, DWORD elapsed) noexcept {
+    try {
+        auto result = std::make_unique<UncProbeResult>();
+        result->probe_id = job.probe_id;
+        result->unc = job.unc;
+        result->completed = completed;
+        result->final = completed;
+        // The timeout path MUST NOT inspect worker-owned fields: only a successful
+        // event/thread wait publishes ok/rtt_ms to this thread.
+        result->rtt_ms = completed ? job.rtt_ms : elapsed;
+        result->status = !completed || !job.ok ? NetStatus::Offline :
+            (job.rtt_ms > 800 ? NetStatus::Slow : NetStatus::Online);
+        if (PostMessageW(job.hwnd, job.msg, 0, reinterpret_cast<LPARAM>(result.get())))
+            result.release();
+    } catch (...) {
+        // Allocation failure must not tear down a job still owned by its I/O thread.
+    }
+}
+
 } // namespace
+
+#if defined(PULSE_TEST_NET_CACHE)
+unsigned ActiveUncProbesForTest() { return active_probes.load(); }
+#endif
 
 bool StartUncProbe(HWND hwnd, UINT msg, std::wstring unc, UncProbeId probe_id) {
     if (!hwnd || unc.empty() || probe_id == 0) return false;
-    auto* job = new ProbeJob{};
+    if (active_probes.fetch_add(1) >= kMaxActiveProbes) { --active_probes; return false; }
+    std::unique_ptr<ProbeJob> job;
+    try { job = std::make_unique<ProbeJob>(); }
+    catch (...) { --active_probes; return false; }
     job->unc = std::move(unc);
     job->probe_id = probe_id;
     job->hwnd = hwnd;
     job->msg = msg;
     job->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!job->done) {
-        delete job;
-        return false;
-    }
-    HANDLE thread = CreateThread(nullptr, 0, ProbeInner, job, 0, nullptr);
-    if (!thread) {
-        CloseHandle(job->done);
-        delete job;
-        return false;
-    }
-    std::thread([job, thread]() {
-        const DWORD wait = WaitForSingleObject(job->done, 1500);
-        auto* result = new UncProbeResult{};
-        result->probe_id = job->probe_id;
-        result->unc = job->unc;
-        result->rtt_ms = job->rtt_ms;
-        if (wait != WAIT_OBJECT_0) result->status = NetStatus::Offline;
-        else if (!job->ok) result->status = NetStatus::Offline;
-        else result->status = job->rtt_ms > 800 ? NetStatus::Slow : NetStatus::Online;
-        const bool timed_out = wait != WAIT_OBJECT_0;
-        if (!PostMessageW(job->hwnd, job->msg, 0, reinterpret_cast<LPARAM>(result)))
-            delete result;
-        WaitForSingleObject(thread, INFINITE);
-        if (timed_out) {
-            auto* final_result = new UncProbeResult{};
-            final_result->probe_id = job->probe_id;
-            final_result->unc = job->unc;
-            final_result->rtt_ms = job->rtt_ms;
-            final_result->status = job->ok ?
-                (job->rtt_ms > 800 ? NetStatus::Slow : NetStatus::Online) : NetStatus::Offline;
-            if (!PostMessageW(job->hwnd, job->msg, 0, reinterpret_cast<LPARAM>(final_result)))
-                delete final_result;
-        }
-        CloseHandle(thread);
-        CloseHandle(job->done);
-        delete job;
-    }).detach();
+    if (!job->done) return false;
+    try {
+        std::thread([job = std::move(job)] {
+            job->thread = CreateThread(nullptr, 0, ProbeInner, job.get(), 0, nullptr);
+            if (!job->thread) { job->ReleasePermit(); PostProbe(*job, true, 0); return; }
+#if defined(PULSE_TEST_NET_CACHE)
+            const DWORD timeout = ProbeTimeoutForTest();
+#else
+            constexpr DWORD timeout = 1500;
+#endif
+            const ULONGLONG started = GetTickCount64();
+            const bool completed = WaitForSingleObject(job->done, timeout) == WAIT_OBJECT_0;
+            if (!completed) PostProbe(*job, false, static_cast<DWORD>(GetTickCount64() - started));
+            WaitForSingleObject(job->thread, INFINITE);
+            // Capacity must be reusable before the final message wakes the UI.
+            job->ReleasePermit();
+            PostProbe(*job, true, 0);
+        }).detach();
+    } catch (...) { return false; }
     return true;
 }
 
 } // namespace pulse::fs
+
+namespace pulse::fs {
+bool SaveNetSnapshot(const std::wstring& path, const SnapshotPtr& snapshot, const NetSnapshotWrite& request) {
+    return request.state_ && request.state_->path == NormalizePath(path) && SaveNetSnapshot(request, snapshot);
+}
+}

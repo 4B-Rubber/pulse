@@ -1,5 +1,7 @@
 #include "update_installer.h"
+#include "update_download_cleanup.h"
 #include "update_transport.h"
+#include "update_stage.h"
 #include "../common/runtime_log.h"
 #include <bcrypt.h>
 #include <shellapi.h>
@@ -87,33 +89,27 @@ struct UpdateInstaller::State {
     DWORD install_error = ERROR_SUCCESS;
     DWORD error = ERROR_SUCCESS;
     std::wstring directory, file;
+    UpdateDownloadPackage package;
     FileHandle guard;
     ~State() {
         if (guard.value != INVALID_HANDLE_VALUE) {
             CloseHandle(guard.value);
             guard.value = INVALID_HANDLE_VALUE;
         }
-        if (!file.empty()) DeleteFileW(file.c_str());
-        if (!directory.empty()) RemoveDirectoryW(directory.c_str());
+        RemoveUpdateDownloadPackage(package);
     }
 
     DWORD Download(const UpdateResult& update) {
         wchar_t local[MAX_PATH]{};
         if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, local)))
             return ERROR_PATH_NOT_FOUND;
-        std::array<uint8_t, 16> random{};
-        if (BCryptGenRandom(nullptr, random.data(), static_cast<ULONG>(random.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0)
-            return ERROR_GEN_FAILURE;
-        std::wstring candidate = std::wstring(local) + L"\\PulseUpdate-";
-        constexpr wchar_t hex[] = L"0123456789abcdef";
-        for (const auto value : random) { candidate += hex[value >> 4]; candidate += hex[value & 15]; }
-        if (!CreateDirectoryW(candidate.c_str(), nullptr)) return GetLastError();
-        directory = std::move(candidate);
-        file = directory + L"\\PulseSetup.exe";
+        if (!CreateUpdateDownloadPackage(std::wstring(local) + L"\\PulseUpdateDownloads", package))
+            return ERROR_ACCESS_DENIED;
+        directory = package.directory;
+        file = package.file;
         {
-            FileHandle output{CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr,
-                CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
-            if (output.value == INVALID_HANDLE_VALUE) return GetLastError();
+            FileHandle output{OpenUpdateDownloadPackage(package, GENERIC_WRITE, 0)};
+            if (output.value == INVALID_HANDLE_VALUE) { const DWORD open_error = GetLastError(); return open_error ? open_error : ERROR_INVALID_DATA; }
             DWORD failure = ERROR_SUCCESS;
             UpdateError category = UpdateError::None;
             if (!ReadUpdateWithFallback(update.download_page, kMaximumInstallerBytes, cancelled,
@@ -147,9 +143,8 @@ struct UpdateInstaller::State {
         }
         if (cancelled) return ERROR_CANCELLED;
         // Deny writes and deletion from verification until the installer has started.
-        guard.value = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-        if (guard.value == INVALID_HANDLE_VALUE) return GetLastError();
+        guard.value = OpenUpdateDownloadPackage(package, GENERIC_READ, FILE_SHARE_READ);
+        if (guard.value == INVALID_HANDLE_VALUE) { const DWORD open_error = GetLastError(); return open_error ? open_error : ERROR_INVALID_DATA; }
         FILE_ATTRIBUTE_TAG_INFO attributes{};
         if (!GetFileInformationByHandleEx(guard.value, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
             (attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
@@ -238,7 +233,7 @@ bool UpdateInstaller::Launch(HWND owner, DWORD& error) {
     SHELLEXECUTEINFOW execute{sizeof(execute)};
     execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
     execute.hwnd = owner;
-    // Let Inno Setup elevate its worker while retaining the original user's
+    // Let the setup elevate its worker while retaining the original user's
     // token for post-install launch. Explicit runas makes Pulse elevated too.
     execute.lpVerb = L"open";
     execute.lpFile = state_->file.c_str();

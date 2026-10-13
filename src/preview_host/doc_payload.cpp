@@ -1,12 +1,24 @@
 // doc_payload.cpp — see doc_payload.h.
 #include "doc_payload.h"
+#include "doc_payload_race_test_hook.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cwctype>
 #include <filesystem>
 #include <system_error>
+#include <fcntl.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#include <share.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace pulse::preview {
 
@@ -15,6 +27,41 @@ namespace {
 constexpr size_t kMaxImageBytes = 24u * 1024u * 1024u;   // one picture
 constexpr size_t kMaxStoredBytes = 96u * 1024u * 1024u;  // one document
 constexpr size_t kMaxStoredCount = 400;
+
+FILE* OpenImagePartial(const std::filesystem::path& file, std::filesystem::path& partial) {
+    static std::atomic<uint64_t> sequence{0};
+#ifdef _WIN32
+    const auto process = _getpid();
+#else
+    const auto process = getpid();
+#endif
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+        partial = file;
+        partial += L"." + std::to_wstring(process) + L"." +
+            std::to_wstring(sequence.fetch_add(1, std::memory_order_relaxed)) + L".part";
+        int descriptor = -1;
+#ifdef _WIN32
+        const int error = _wsopen_s(&descriptor, partial.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+            _SH_DENYRW, _S_IREAD | _S_IWRITE);
+        if (error) { if (error == EEXIST) continue; return nullptr; }
+        FILE* stream = _fdopen(descriptor, "wb");
+#else
+        descriptor = open(partial.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+        if (descriptor < 0) { if (errno == EEXIST) continue; return nullptr; }
+        FILE* stream = fdopen(descriptor, "wb");
+#endif
+        if (stream) return stream;
+#ifdef _WIN32
+        _close(descriptor);
+#else
+        close(descriptor);
+#endif
+        std::error_code ignored;
+        std::filesystem::remove(partial, ignored);
+        return nullptr;
+    }
+    return nullptr;
+}
 
 void AppendTarget(std::wstring& out, const std::wstring& target) {
     std::wstring encoded;
@@ -204,17 +251,20 @@ std::wstring PreviewImageCache::Store(const std::vector<unsigned char>& bytes, s
     const std::filesystem::path file = std::filesystem::path(dir_) / (std::wstring(name) + ext);
     std::error_code ec;
     if (!std::filesystem::exists(file, ec)) {
-        const std::filesystem::path partial = std::filesystem::path(dir_) / (std::wstring(name) + ext + L".part");
-        FILE* f = nullptr;
-#ifdef _WIN32
-        if (_wfopen_s(&f, partial.c_str(), L"wb") != 0) f = nullptr;
-#else
-        f = fopen(partial.c_str(), "wb");
-#endif
+        // Each writer owns its temporary file; another host can publish the
+        // same content without truncating or removing this writer's bytes.
+        std::filesystem::path partial;
+        FILE* f = OpenImagePartial(file, partial);
         if (!f) return {};
+#ifdef PULSE_PREVIEW_IMAGE_CACHE_RACE_TEST
+        PreviewImageCacheTestStage(1);
+#endif
         const bool ok = fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
-        fclose(f);
-        if (!ok) { std::filesystem::remove(partial, ec); return {}; }
+        const bool closed = fclose(f) == 0;
+        if (!ok || !closed) { std::filesystem::remove(partial, ec); return {}; }
+#ifdef PULSE_PREVIEW_IMAGE_CACHE_RACE_TEST
+        PreviewImageCacheTestStage(2);
+#endif
         std::filesystem::rename(partial, file, ec);
         if (ec) {
             std::filesystem::remove(partial, ec);

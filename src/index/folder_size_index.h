@@ -13,6 +13,10 @@ public:
     void Reset() { valid_ = false; totals_.clear(); }
     bool Valid() const { return valid_; }
     uint64_t Builds() const { return builds_; }
+    // Background builds fill a private copy that is published under the engine's
+    // write lock; both outcomes count as one aggregation attempt.
+    void Adopt(FolderSizeIndex&& built) { totals_ = std::move(built.totals_); valid_ = built.valid_; ++builds_; }
+    void NoteFailedBuild() { Reset(); ++builds_; }
     std::optional<uint64_t> Get(int32_t id) const {
         const auto it = totals_.find(id);
         return valid_ && it != totals_.end() ? std::optional(it->second) : std::nullopt;

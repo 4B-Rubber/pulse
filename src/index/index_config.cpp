@@ -1,7 +1,10 @@
 #include "index_config.h"
+#include "index_directory_security.h"
+#include "../common/config_json.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
 #include <algorithm>
+#include <iterator>
 #include <aclapi.h>
 #include <cwctype>
 #include <sddl.h>
@@ -43,12 +46,12 @@ bool EnsureMachineDirectory(const std::wstring& path, bool user_readable = true)
     }
 
     HANDLE directory = CreateFileW(
-        path.c_str(), READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+        path.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC | WRITE_OWNER,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (directory == INVALID_HANDLE_VALUE) {
         directory = CreateFileW(
-            path.c_str(), READ_CONTROL,
+            path.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (directory == INVALID_HANDLE_VALUE) {
@@ -119,46 +122,6 @@ std::wstring Win32Error(const wchar_t* operation) {
     return out;
 }
 
-std::vector<std::wstring> ExtractStringArray(const std::wstring& json,
-                                             const std::wstring& key) {
-    std::vector<std::wstring> out;
-    const std::wstring marker = L"\"" + key + L"\"";
-    size_t p = json.find(marker);
-    if (p == std::wstring::npos) return out;
-    p = json.find(L'[', p + marker.size());
-    if (p == std::wstring::npos) return out;
-    ++p;
-    while (p < json.size()) {
-        while (p < json.size() && iswspace(json[p])) ++p;
-        if (p >= json.size() || json[p] == L']') break;
-        if (json[p] != L'\"') return {};
-        ++p;
-        std::wstring value;
-        while (p < json.size() && json[p] != L'\"') {
-            if (json[p] != L'\\') {
-                value.push_back(json[p++]);
-                continue;
-            }
-            if (++p >= json.size()) return {};
-            switch (json[p]) {
-            case L'\"': value.push_back(L'\"'); break;
-            case L'\\': value.push_back(L'\\'); break;
-            case L'n': value.push_back(L'\n'); break;
-            case L'r': value.push_back(L'\r'); break;
-            case L't': value.push_back(L'\t'); break;
-            default: value.push_back(json[p]); break;
-            }
-            ++p;
-        }
-        if (p >= json.size()) return {};
-        ++p;
-        out.push_back(std::move(value));
-        while (p < json.size() && iswspace(json[p])) ++p;
-        if (p < json.size() && json[p] == L',') ++p;
-    }
-    return out;
-}
-
 std::wstring ConfigJson(const IndexConfig& config) {
     std::wstring escaped_path;
     pulse::json::Escape(config.index_path, escaped_path);
@@ -192,8 +155,42 @@ std::wstring ConfigJson(const IndexConfig& config) {
         out += L"\n    \"" + escaped + L"\"";
     }
     if (!excluded_paths.empty()) out += L"\n  ";
+    out += L"],\n  \"exclude_system\":";
+    out += config.exclude_system ? L"true" : L"false";
+    out += L",\n  \"system_exclusion_groups\":[";
+    for (size_t i = 0; i < config.system_groups.size(); ++i) {
+        if (i) out += L",";
+        out += L"\"" + config.system_groups[i] + L"\"";
+    }
+    // Groups this release offered; later groups start at their default.
+    out += L"],\n  \"system_exclusion_known\":[";
+    for (size_t i = 0; i < std::size(kSystemExclusionGroups); ++i) {
+        if (i) out += L",";
+        out += L"\"" + std::wstring(kSystemExclusionGroups[i]) + L"\"";
+    }
     out += L"]\n}\n";
     return out;
+}
+
+void AddProfileFolders(const std::wstring& suffix, std::vector<std::wstring>& out) {
+    HKEY list = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", 0,
+            KEY_READ | KEY_WOW64_64KEY, &list) != ERROR_SUCCESS) return;
+    wchar_t sid[256]{};
+    for (DWORD i = 0;; ++i) {
+        DWORD sid_len = ARRAYSIZE(sid);
+        if (RegEnumKeyExW(list, i, sid, &sid_len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        wchar_t raw[MAX_PATH]{};
+        DWORD bytes = sizeof(raw) - sizeof(wchar_t);
+        if (RegGetValueW(list, sid, L"ProfileImagePath", RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+                nullptr, raw, &bytes) != ERROR_SUCCESS) continue;
+        wchar_t expanded[MAX_PATH]{};
+        const DWORD n = ExpandEnvironmentStringsW(raw, expanded, ARRAYSIZE(expanded));
+        if (!n || n > ARRAYSIZE(expanded) || expanded[0] == 0 || expanded[1] != L':') continue;
+        out.push_back(std::wstring(expanded) + suffix);
+    }
+    RegCloseKey(list);
 }
 
 bool IsNtfs(const std::wstring& fs) {
@@ -216,6 +213,47 @@ bool IndexConfig::IsPathExcluded(std::wstring_view path) const {
             path[excluded.size()] == L'/') return true;
     }
     return false;
+}
+
+bool IsSystemExclusionGroup(std::wstring_view group) {
+    return std::any_of(std::begin(kSystemExclusionGroups), std::end(kSystemExclusionGroups),
+                       [&](const wchar_t* known) { return group == known; });
+}
+
+bool HidesNodeModules(const IndexConfig& config) {
+    return config.exclude_system &&
+        std::find(config.system_groups.begin(), config.system_groups.end(), L"node_modules") !=
+            config.system_groups.end();
+}
+
+std::vector<std::wstring> SystemExclusionPaths(const IndexConfig& config) {
+    std::vector<std::wstring> out;
+    if (!config.exclude_system) return out;
+    wchar_t windows[MAX_PATH]{};
+    const UINT n = GetSystemWindowsDirectoryW(windows, ARRAYSIZE(windows));
+    if (!n || n >= ARRAYSIZE(windows) || windows[1] != L':') return out;
+    const std::wstring windir = windows;
+    const std::wstring drive = windir.substr(0, 2);
+    auto enabled = [&](const wchar_t* group) {
+        return std::find(config.system_groups.begin(), config.system_groups.end(), group) !=
+            config.system_groups.end();
+    };
+    if (enabled(L"windows")) out.push_back(windir);
+    if (enabled(L"temp")) {
+        out.push_back(windir + L"\\Temp");
+        AddProfileFolders(L"\\AppData\\Local\\Temp", out);
+        AddProfileFolders(L"\\AppData\\Local\\Microsoft\\Windows\\INetCache", out);
+        AddProfileFolders(L"\\AppData\\Local\\CrashDumps", out);
+    }
+    if (enabled(L"old")) {
+        for (const wchar_t* name : {L"\\Windows.old", L"\\$WINDOWS.~BT", L"\\$Windows.~WS", L"\\$WinREAgent"})
+            out.push_back(drive + name);
+    }
+    if (enabled(L"programdata")) {
+        const std::wstring data = KnownFolder(CSIDL_COMMON_APPDATA);
+        if (data.size() > 3) out.push_back(data);
+    }
+    return out;
 }
 
 std::wstring NormalizeVolumeId(std::wstring id) {
@@ -244,25 +282,7 @@ std::wstring MachineIndexRoot() {
 }
 
 bool ProtectIndexDirectory(const std::wstring& path) {
-    // A chosen folder that already holds other files keeps its ACL: a new
-    // protected DACL would propagate to everything inside it.
-    if (path.size() <= 3) return false;
-    const DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
-        (attributes & FILE_ATTRIBUTE_REPARSE_POINT))
-        return false;
-    WIN32_FIND_DATAW entry{};
-    HANDLE find = FindFirstFileExW((path + L"\\*").c_str(), FindExInfoBasic, &entry,
-                                   FindExSearchNameMatch, nullptr, 0);
-    if (find != INVALID_HANDLE_VALUE) {
-        bool empty = true;
-        do {
-            if (wcscmp(entry.cFileName, L".") != 0 && wcscmp(entry.cFileName, L"..") != 0) empty = false;
-        } while (empty && FindNextFileW(find, &entry));
-        FindClose(find);
-        if (!empty) return false;
-    }
-    return EnsureMachineDirectory(path, false);
+    return PreparePrivateIndexDirectory(std::filesystem::path(path));
 }
 
 std::wstring UserIndexRoot() {
@@ -278,56 +298,97 @@ std::wstring MachineConfigPath() {
     return root.empty() ? L"" : root + L"\\index-config.json";
 }
 
+bool LoadIndexConfigFrom(const std::wstring& path, const std::wstring& default_index_path,
+                         IndexConfig& config, std::wstring* error) {
+    IndexConfig loaded;
+    loaded.index_path = default_index_path;
+    std::wstring json;
+    if (!pulse::ReadUtf8File(path, json)) {
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            const DWORD code = GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+                config = std::move(loaded);
+                return true;
+            }
+        }
+        config.load_failed = true;
+        SetError(error, L"无法读取索引配置");
+        return false;
+    }
+    if (!pulse::json::ValidConfigObject(json)) {
+        config.load_failed = true;
+        SetError(error, L"索引配置为空或损坏");
+        return false;
+    }
+    loaded.version = static_cast<uint32_t>((std::max)(1, pulse::json::ExtractInt(json, L"version", 1)));
+    loaded.generation = static_cast<uint64_t>((std::max)(1, pulse::json::ExtractInt(json, L"generation", 1)));
+    loaded.include_fixed_ntfs = pulse::json::ExtractBool(json, L"include_fixed_ntfs", true);
+    loaded.include_removable_ntfs = pulse::json::ExtractBool(json, L"include_removable_ntfs", true);
+    loaded.index_path = pulse::json::ExtractString(json, L"index_path", default_index_path);
+    if (loaded.index_path.empty()) loaded.index_path = default_index_path;
+    for (auto& id : pulse::json::ExtractStringArray(json, L"excluded_volume_ids"))
+        loaded.excluded_volume_ids.insert(NormalizeVolumeId(std::move(id)));
+    for (auto& path_value : pulse::json::ExtractStringArray(json, L"excluded_paths")) {
+        std::replace(path_value.begin(), path_value.end(), L'/', L'\\');
+        while (path_value.size() > 3 && path_value.back() == L'\\') path_value.pop_back();
+        if (!path_value.empty()) loaded.excluded_paths.push_back(std::move(path_value));
+    }
+    std::sort(loaded.excluded_paths.begin(), loaded.excluded_paths.end(),
+              [](const auto& a, const auto& b) {
+                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+              });
+    loaded.excluded_paths.erase(std::unique(loaded.excluded_paths.begin(), loaded.excluded_paths.end(),
+              [](const auto& a, const auto& b) {
+                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+              }), loaded.excluded_paths.end());
+    loaded.exclude_system = pulse::json::ExtractBool(json, L"exclude_system", true);
+    loaded.system_groups_saved = json.find(L"\"system_exclusion_groups\"") != std::wstring::npos;
+    if (loaded.system_groups_saved) {
+        loaded.system_groups.clear();
+        for (auto& group : pulse::json::ExtractStringArray(json, L"system_exclusion_groups"))
+            if (IsSystemExclusionGroup(group) &&
+                std::find(loaded.system_groups.begin(), loaded.system_groups.end(), group) ==
+                    loaded.system_groups.end())
+                loaded.system_groups.push_back(std::move(group));
+        // A group introduced after this file was written was never offered to
+        // the user, so it keeps its default. Before "system_exclusion_known"
+        // existed, node_modules was always hidden.
+        std::vector<std::wstring> known;
+        if (json.find(L"\"system_exclusion_known\"") != std::wstring::npos)
+            known = pulse::json::ExtractStringArray(json, L"system_exclusion_known");
+        else
+            known = {L"windows", L"temp", L"old", L"programdata"};
+        const IndexConfig defaults;
+        for (const auto& group : defaults.system_groups) {
+            if (std::find(known.begin(), known.end(), group) == known.end() &&
+                std::find(loaded.system_groups.begin(), loaded.system_groups.end(), group) ==
+                    loaded.system_groups.end())
+                loaded.system_groups.push_back(group);
+        }
+    }
+    config = std::move(loaded);
+    return true;
+}
+
 bool LoadMachineConfig(IndexConfig& config, std::wstring* error) {
-    config = {};
     const std::wstring root = MachineDataRoot();
-    config.index_path = root.empty() ? L"" : root + L"\\Index";
     std::wstring path = MachineConfigPath();
     if (path.empty()) {
+        config.load_failed = true;
         SetError(error, L"无法定位 ProgramData 索引目录");
         return false;
     }
     // Older releases kept machine configuration inside the default data directory.
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND)
         path = root + L"\\Index\\config.json";
-    std::wstring json;
-    if (!pulse::ReadUtf8File(path, json)) {
-        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            const DWORD code = GetLastError();
-            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return true;
-        }
-        SetError(error, L"无法读取索引配置");
-        return false;
-    }
-    if (json.empty() || json.find(L'{') == std::wstring::npos) {
-        SetError(error, L"索引配置为空或损坏");
-        return false;
-    }
-    config.version = static_cast<uint32_t>((std::max)(1, pulse::json::ExtractInt(json, L"version", 1)));
-    config.generation = static_cast<uint64_t>((std::max)(1, pulse::json::ExtractInt(json, L"generation", 1)));
-    config.include_fixed_ntfs = pulse::json::ExtractBool(json, L"include_fixed_ntfs", true);
-    config.include_removable_ntfs = pulse::json::ExtractBool(json, L"include_removable_ntfs", true);
-    config.index_path = pulse::json::ExtractString(json, L"index_path", root + L"\\Index");
-    if (config.index_path.empty()) config.index_path = root + L"\\Index";
-    for (auto& id : ExtractStringArray(json, L"excluded_volume_ids"))
-        config.excluded_volume_ids.insert(NormalizeVolumeId(std::move(id)));
-    for (auto& path_value : ExtractStringArray(json, L"excluded_paths")) {
-        std::replace(path_value.begin(), path_value.end(), L'/', L'\\');
-        while (path_value.size() > 3 && path_value.back() == L'\\') path_value.pop_back();
-        if (!path_value.empty()) config.excluded_paths.push_back(std::move(path_value));
-    }
-    std::sort(config.excluded_paths.begin(), config.excluded_paths.end(),
-              [](const auto& a, const auto& b) {
-                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_LESS_THAN;
-              });
-    config.excluded_paths.erase(std::unique(config.excluded_paths.begin(), config.excluded_paths.end(),
-              [](const auto& a, const auto& b) {
-                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
-              }), config.excluded_paths.end());
-    return true;
+    return LoadIndexConfigFrom(path, root + L"\\Index", config, error);
 }
 
 bool SaveMachineConfig(const IndexConfig& config, std::wstring* error) {
+    if (config.load_failed) {
+        SetError(error, L"索引配置读取失败，禁止覆盖");
+        return false;
+    }
     const std::wstring path = MachineConfigPath();
     if (path.empty()) {
         SetError(error, L"无法定位 ProgramData 索引目录");
@@ -371,7 +432,11 @@ bool ConfigureIndexPath(const std::wstring& path, std::wstring* error) {
         SetError(error, Win32Error(L"无法创建索引目录"));
         return false;
     }
-    (void)ProtectIndexDirectory(path);  // new or empty folders only
+    PrivateIndexDirectoryLock destination_lock;
+    if (!destination_lock.Acquire(std::filesystem::path(path)) || !ProtectIndexDirectory(path)) {
+        SetError(error, L"索引目录权限不安全，请使用空的独立目录。原索引配置已保留。");
+        return false;
+    }
     IndexConfig config;
     if (!LoadMachineConfig(config, error)) return false;
     config.index_path = path;
@@ -398,6 +463,24 @@ bool ConfigureExcludePath(const std::wstring& path, bool enabled, std::wstring* 
         if (it == config.excluded_paths.end()) config.excluded_paths.push_back(normalized);
     } else if (it != config.excluded_paths.end()) {
         config.excluded_paths.erase(it);
+    }
+    ++config.generation;
+    return SaveMachineConfig(config, error);
+}
+
+bool ConfigureSystemExclusion(const std::wstring& group, bool enabled, std::wstring* error) {
+    if (group != L"all" && !IsSystemExclusionGroup(group)) {
+        SetError(error, L"未知的系统文件夹分组");
+        return false;
+    }
+    IndexConfig config;
+    if (!LoadMachineConfig(config, error)) return false;
+    if (group == L"all") {
+        config.exclude_system = enabled;
+    } else {
+        auto it = std::find(config.system_groups.begin(), config.system_groups.end(), group);
+        if (enabled && it == config.system_groups.end()) config.system_groups.push_back(group);
+        else if (!enabled && it != config.system_groups.end()) config.system_groups.erase(it);
     }
     ++config.generation;
     return SaveMachineConfig(config, error);

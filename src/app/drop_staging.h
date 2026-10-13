@@ -1,4 +1,5 @@
 #pragma once
+#include <windows.h>
 #include <string>
 #include <vector>
 
@@ -22,9 +23,35 @@ bool IsTemporaryDropSource(const std::wstring& path, const std::wstring& temp_di
 // links (copies for read-only files or when linking fails), under a folder
 // named like their original parent so dialogs still show it. `staged` gets
 // `sources` with each staged entry replaced; entries that are not temporary
-// or fail to stage pass through. Returns true when anything was staged.
-bool StageDropSources(const std::vector<std::wstring>& sources, const std::wstring& temp_dir,
+// pass through. Failure leaves the entire source list unchanged.
+struct DropStageResult {
+    bool any = false;
+    unsigned long error = 0;
+    std::wstring source;
+    operator bool() const { return any; }
+};
+DropStageResult StageDropSources(const std::vector<std::wstring>& sources, const std::wstring& temp_dir,
                       const std::wstring& stage_root, std::vector<std::wstring>& staged);
+
+struct DropStageError { DWORD code = ERROR_SUCCESS; std::wstring source; };
+struct DropEnumerationApi {
+    decltype(&FindFirstFileExW) first = ::FindFirstFileExW;
+    decltype(&FindNextFileW) next = ::FindNextFileW;
+};
+bool StageDropSources(const std::vector<std::wstring>& sources, const std::wstring& temp_dir,
+    const std::wstring& stage_root, std::vector<std::wstring>& staged,
+    DropStageError* error, const DropEnumerationApi& api = {});
+
+// The Drop submission boundary: callbacks only receive a fully prepared list.
+template<class Submit>
+DropStageResult SubmitStagedDrop(const std::vector<std::wstring>& sources,
+                                const std::wstring& temp_dir, const std::wstring& stage_root,
+                                Submit&& submit) {
+    std::vector<std::wstring> staged;
+    auto result = StageDropSources(sources, temp_dir, stage_root, staged);
+    if (!result.error) submit(staged);
+    return result;
+}
 
 // Removes stage folders whose process has exited, and this process's own
 // folders as well when `include_own` (at exit).

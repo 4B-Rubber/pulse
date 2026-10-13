@@ -1,6 +1,7 @@
 // app_runtime.h — Shared layout accessors and window-model helpers.
 #pragma once
 #include "app_state.h"
+#include "split_tree_shape.h"
 
 namespace pulse {
 
@@ -32,6 +33,13 @@ inline const std::unique_ptr<app::SplitContainer>& Root(const AppState& s) {
 
 inline app::LayoutPreset& LayoutOf(AppState& s) {
     return LiveLayout(s).layout;
+}
+
+// The preset a pinned workspace keeps for the active tab, which knows no
+// free split tree: a custom one (M7k) as the preset with as many panes.
+inline app::LayoutPreset WorkspaceLayoutOf(AppState& s) {
+    const app::LayoutTab& tab = LiveLayout(s);
+    return tab.layout == app::LayoutPreset::Custom ? app::PresetForPaneCount(tab.VisiblePanes().size()) : tab.layout;
 }
 
 template<typename Fn>
@@ -74,12 +82,6 @@ std::wstring ResolveIncomingPath(const std::wstring& raw);
 // in the active tab, which ResolveOpenFolderPath opened on its folder.
 void SelectLaunchedFile(AppState& s, const std::wstring& raw);
 void OpenFolderInNewTab(AppState& s, const std::wstring& raw);
-// No window is "the primary": the singleton mutex, the tray icon, the global
-// hotkey and the session file belong to whoever is left. A window that started
-// as an extra one calls this when the window that owned them is closing (it took
-// its last tab); the mutex may still be held for a moment, so it retries from
-// the UI tick and gives up if somebody else claimed it in the meantime.
-void AdoptSingletonOwnership(AppState& s);
 void PostWorkerResult(AppState& s, app::WorkResult res);
 D2D1_RECT_F FocusedPaneRect(const AppState& s);
 app::Pane* PaneAtSlot(AppState& s, int index);
@@ -133,12 +135,11 @@ std::wstring TooltipForHover(AppState& s);
 // Records what the pointer is over. Both mouse-move paths (client and frame)
 // must call this, or a hover field silently stops updating.
 void ApplyHoverTarget(AppState& s, const ui::HitTestResult& hit);
-// Hides the group-chip hover card. Safe to call when it is already hidden.
-void HideTabGroupCard(AppState& s);
 std::wstring EntryFullPath(const app::Tab& tab, int index);
 std::vector<std::wstring> SelectedFullPaths(const app::Tab& tab);
 std::wstring TagDiscoveryKey(std::wstring path);
 void QueueVisibleTagDiscovery(AppState& s);
+void ApplyTagAdsDiscoveries(AppState& s, const std::vector<TagAdsDiscovery>& discoveries);
 std::wstring SelectedFullPath(AppState& s);
 void SyncSavedSearchSidebar(AppState& s);
 } // namespace pulse

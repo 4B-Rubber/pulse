@@ -15,6 +15,35 @@ inline bool ContentPathUnder(std::wstring_view path, std::wstring_view root) {
     return path == root || (path.size() > root.size() && path.starts_with(root) &&
         (root.ends_with(L'\\') || path[root.size()] == L'\\'));
 }
+// Intersect configured coverage with the request before opening any directory.
+inline std::vector<std::wstring> ContentTaskRoots(const ContentIndexConfig& config,
+                                                 const ContentSearchRequest& request) {
+    std::vector<std::wstring> requested = request.roots;
+    if (requested.empty() && !request.root.empty()) requested.push_back(request.root);
+    if (requested.empty()) for (const auto& root : config.roots) requested.push_back(root.path);
+    std::vector<std::wstring> roots;
+    for (auto path : requested) {
+        path = ContentScopeKey(std::move(path));
+        if (!request.root.empty()) {
+            const auto single = ContentScopeKey(request.root);
+            if (path != single && !request.recursive) continue;
+            if (ContentPathUnder(single, path)) path = single;
+            else if (!ContentPathUnder(path, single)) continue;
+        }
+        for (const auto& configured : config.roots) {
+            const auto scope = ContentScopeKey(configured.path);
+            std::wstring effective;
+            if (ContentPathUnder(path, scope)) effective = path;
+            else if (request.recursive && ContentPathUnder(scope, path)) effective = scope;
+            else continue;
+            if (std::any_of(roots.begin(), roots.end(), [&](const auto& old) {
+                    return effective == old || (request.recursive && ContentPathUnder(effective, old)); })) continue;
+            if (request.recursive) std::erase_if(roots, [&](const auto& old) { return ContentPathUnder(old, effective); });
+            roots.push_back(std::move(effective));
+        }
+    }
+    return roots;
+}
 inline bool ContentPathExcluded(const ContentIndexConfig& config, const std::wstring& path) {
     const auto key = ContentScopeKey(path);
     for (const auto& name : config.excluded_directories) {

@@ -1,11 +1,11 @@
 #pragma once
 
 #include "../ipc/protocol.h"
+#include "network_agent_security.h"
 
 namespace pulse::index::agent {
 
 inline constexpr uint32_t kMagic = 0x544E5050; // 'PPNT'
-inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\PulseNetworkIndex";
 inline constexpr size_t kMaxPayload = 16 * 1024 * 1024;
 
 enum Message : uint32_t {

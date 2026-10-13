@@ -374,9 +374,9 @@ bool RunRenameEditorTest() {
         }
         SendMessageW(state->hwndRenameEdit, EM_SETSEL, 0, 6);
         if (state->compositor.LumaTextEnabled()) {
-            const auto draws = state->compositor.GetLumaTextStats()->draw_calls;
+            const auto draws = state->compositor.GetLumaTextStats()->edit_directwrite_draws;
             SendMessageW(state->hwndRenameEdit, EM_SETSEL, 0, 6);
-            check(state->compositor.GetLumaTextStats()->draw_calls > draws,
+            check(state->compositor.GetLumaTextStats()->edit_directwrite_draws > draws,
                 "setting the initial selection immediately repaints the LumaText surface");
         }
         SetWindowTextW(state->hwndRenameEdit, L"after.txt");
