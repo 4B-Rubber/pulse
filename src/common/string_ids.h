@@ -1499,3 +1499,5 @@
 #define IDS_HELP_WINDOW_OVERVIEW 2652
 // Recent/starred item menu: reveal the row in its containing folder.
 #define IDS_OPEN_ITEM_LOCATION 2653
+// Tab-group hover card: the trailing "Edit group" action row.
+#define IDS_TAB_GROUP_EDIT 2654

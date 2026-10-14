@@ -10,7 +10,8 @@ namespace {
 
 constexpr UINT kFirstString = IDS_SETTINGS;
 // Must stay on the highest allocated string id, otherwise Get() returns empty.
-constexpr UINT kLastString = IDS_OPEN_ITEM_LOCATION;
+constexpr UINT kLastString = IDS_TAB_GROUP_EDIT;
+static_assert(static_cast<UINT>(StringId::TabGroupEdit) <= kLastString);
 static_assert(static_cast<UINT>(StringId::OpenItemLocation) <= kLastString);
 static_assert(static_cast<UINT>(StringId::SettingsRecycleBinDesc) <= kLastString);
 static_assert(static_cast<UINT>(StringId::HelpContextMenu) <= kLastString);
