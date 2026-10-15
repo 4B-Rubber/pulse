@@ -6,14 +6,16 @@ namespace pulse::fs {
 bool IsVirtualPath(const std::wstring& p) { return p.starts_with(L"pulse:"); }
 bool IsUncPath(const std::wstring& p) { return p.starts_with(L"\\\\"); }
 DWORD ReadReparseTag(const std::wstring&) { return 0; }
-void EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>&, const std::atomic_bool*) {
+void EnumerateDirectory(const std::wstring&, std::vector<DirEntry>&, const std::atomic_bool*) {}
+bool EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>&, const EnumerateProgress&) {
     if (path.find(L"blocked") != std::wstring::npos) {
         ++block_count;
         SetEvent(blocked);
         WaitForSingleObject(release_io, INFINITE);
     }
+    return true;
 }
-void EnumerateRecycleBin(std::vector<DirEntry>&, RecycleBinInfo*) {}
+bool EnumerateRecycleBin(std::vector<DirEntry>&, RecycleBinInfo*, const RecycleProgress&) { return true; }
 bool QueryDirectoryIdentity(const std::wstring&, DirectoryIdentity&) { return true; }
 NetSnapshotWrite BeginNetSnapshotWrite(const std::wstring&) { return {}; }
 bool SaveNetSnapshot(const NetSnapshotWrite&, const SnapshotPtr&) { return true; }

@@ -345,6 +345,51 @@ std::wstring ResolveOpenFolderPath(std::wstring path) {
     return fs::NormalizePath(path);
 }
 
+namespace {
+// The shell namespaces Pulse has an answer for, and the view that answers them. Home
+// (~Quick access) is what "open the file manager" means when nothing in particular is
+// aimed at; Recent is this app's own answer to that. The Recycle Bin has a view of its
+// own. The rest (This PC, Control Panel, Network) have no Pulse view, so they must not
+// turn into a tab showing a CLSID.
+struct NamespaceView {
+    const wchar_t* id;   // the GUID inside "::{...}", without braces
+    const wchar_t* view;
+};
+constexpr NamespaceView kNamespaceViews[] = {
+    { L"f874310e-b6b7-47dc-bc84-b9e6b38f5903", L"pulse:recent" },   // Home (Windows 11)
+    { L"679f85cb-0220-4080-b29b-5540cc05aab6", L"pulse:recent" },   // Quick access
+    { L"645ff040-5081-101b-9f08-00aa002f954e", L"pulse:recycle" },  // Recycle Bin
+};
+
+// The GUID a "::{...}" path carries, or "" when it carries none. A namespace can nest
+// ("::{GUID}\sub") and the shell spells the id in either case, so only the first group
+// is read and it is compared without case.
+std::wstring NamespaceGuid(const std::wstring& raw) {
+    const size_t open = raw.find(L'{');
+    if (open == std::wstring::npos) return {};
+    const size_t close = raw.find(L'}', open + 1);
+    if (close == std::wstring::npos || close == open + 1) return {};
+    return raw.substr(open + 1, close - open - 1);
+}
+
+std::wstring ShellNamespaceView(const std::wstring& raw) {
+    const std::wstring guid = NamespaceGuid(raw);
+    if (guid.empty()) return {};
+    for (const auto& entry : kNamespaceViews) {
+        if (_wcsicmp(guid.c_str(), entry.id) == 0) return entry.view;
+    }
+    return {};
+}
+} // namespace
+
+std::wstring ResolveIncomingPath(const std::wstring& raw) {
+    // A namespace has no view when Pulse does not recognise it: open nothing rather
+    // than turning the CLSID into a tab.
+    if (fs::IsShellNamespacePath(raw)) return ShellNamespaceView(raw);
+    if (fs::IsVirtualPath(raw)) return raw;
+    return ResolveOpenFolderPath(raw);
+}
+
 void SelectLaunchedFile(AppState& s, const std::wstring& raw) {
     std::wstring path = raw;
     while (!path.empty() && (path.front() == L'"' || path.back() == L'"')) {
@@ -369,7 +414,10 @@ void OpenFolderInNewTab(AppState& s, const std::wstring& raw) {
         RevealWindow(s);
         return;
     }
-    const std::wstring path = ResolveOpenFolderPath(raw);
+    // Handed over tabs and shell forwards can name a virtual view ("pulse:recent",
+    // a tag, a saved search), a shell namespace (the desktop's Recycle Bin) or a real
+    // folder. A namespace Pulse has no view for opens no tab instead of the CLSID.
+    const std::wstring path = ResolveIncomingPath(raw);
     // Back from the tray with "open the default location" at startup: an
     // explicit folder starts over on its own, as launching with it would.
     if (!path.empty() && !IsWindowVisible(s.hwnd) && TakeFreshStart(s)) StartFreshAt(s, path);
@@ -2042,6 +2090,22 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         s.sidebarHiddenMask, s.starredExpanded, &s.sidebarOrder,
         s.sidebarQuickAccessHiddenMask);
     app::FillWindowTabStrip(vm, s.window_tabs);
+    if (s.groupCardGroupId != 0) {
+        // The tab controller can close tabs without going through the AppState
+        // wrappers, so re-check the remembered tabs before reading them.
+        PruneGroupActivations(s);
+        const app::LayoutTab* last_active = nullptr;
+        if (auto it = s.lastActiveInGroup.find(s.groupCardGroupId);
+            it != s.lastActiveInGroup.end()) {
+            last_active = it->second;
+        }
+        vm.tab_group_card.group_id = s.groupCardGroupId;
+        vm.tab_group_card.chip_index = s.groupCardChipIndex;
+        vm.tab_group_card.hover_row = s.groupCardHoverRow;
+        vm.tab_group_card.rows =
+            app::TabGroupCardRows(s.window_tabs, s.groupCardGroupId, last_active);
+        vm.tab_group_card.visible = !vm.tab_group_card.rows.empty();
+    }
     if (WindowIdentityShown(s) && app::ValidWindowColor(s.identity.color)) {  // M7c
         vm.window_identity = true;
         vm.window_identity_name = WindowDisplayName(s);
@@ -2637,13 +2701,32 @@ bool SidebarRailActive(const AppState& s) {
 }
 
 void ApplyHoverTarget(AppState& s, const ui::HitTestResult& hit) {
+    const int previous_index = s.hoverControlIndex;
+    const bool was_chip = s.hoverRegion == static_cast<int>(ui::HitTestResult::TabGroup);
     s.hoverRegion = static_cast<int>(hit.region);
     s.hoverControlIndex = hit.index;
     s.hoverSubIndex = hit.sub_index;
+    // The group card dwells on one chip: moving to a sibling chip restarts the
+    // clock (that chip's card opens), leaving the strip cancels it. Arriving
+    // from anywhere but the same chip always restarts it, even when the new
+    // index happens to equal the old non-chip index.
+    if (hit.region == ui::HitTestResult::TabGroup) {
+        if (!was_chip || previous_index != hit.index) s.groupCardSince = GetTickCount64();
+    } else if (hit.region != ui::HitTestResult::TabGroupCard &&
+               hit.region != ui::HitTestResult::TabGroupCardRow) {
+        s.groupCardSince = 0;
+    }
     s.hoverPath = hit.path;
     s.hoverLabel = hit.label;
     s.hoverSince = GetTickCount64();
     s.tooltipText.clear();
+}
+
+void HideTabGroupCard(AppState& s) {
+    s.groupCardGroupId = 0;
+    s.groupCardChipIndex = -1;
+    s.groupCardHoverRow = -1;
+    s.groupCardSince = 0;
 }
 
 std::wstring TooltipForHover(AppState& s) {

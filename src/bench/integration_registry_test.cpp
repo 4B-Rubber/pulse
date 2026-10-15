@@ -305,6 +305,28 @@ int wmain() {
     Check(ApplyShellIntegration(ShellIntegrationKind::Directory, exe, false) &&
           Read(command) == rollback_command && Read(command, L"DelegateExecute") == rollback_delegate,
           "retry after failed enable compensation restores original command and delegate");
+
+    // A build retired long ago registered the folder association under
+    // Folder\shell; nothing manages that group any more, so switching the
+    // settings off left it stealing folder opens (the settings only knew the
+    // Directory/Drive groups).
+    {
+        const std::wstring folder_shell = L"Software\\Classes\\Folder\\shell";
+        Clear();
+        Set(folder_shell, L"", L"");
+        Set(folder_shell + L"\\open", L"", L"");
+        Set(folder_shell + L"\\open", L"DelegateExecute", L"");
+        Set(folder_shell + L"\\open\\command", L"", L"\"" + exe + L"\" \"%1\"");
+        Set(folder_shell + L"\\open\\command", L"DelegateExecute", L"");
+        Check(ReleaseStaleFolderAssociation(exe) && !KeyExists(folder_shell),
+            "the retired Folder association is released when it points at this executable");
+        Check(!ReleaseStaleFolderAssociation(exe),
+            "releasing the retired Folder association twice makes no changes");
+        Clear();
+        Set(folder_shell + L"\\open\\command", L"", L"\"C:\\Other\\manager.exe\" \"%1\"");
+        Check(!ReleaseStaleFolderAssociation(exe) && Read(folder_shell + L"\\open\\command", L"").exists,
+            "the retired Folder cleanup leaves a foreign association alone");
+    }
 #endif
     // Another copy of Pulse (an older install folder, a portable or development
     // build) registered: this copy's switches and its uninstaller give back

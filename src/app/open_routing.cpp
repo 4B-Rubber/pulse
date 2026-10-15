@@ -68,7 +68,11 @@ void ForgetOpenToast(AppCore& core) {
 
 AppState& OpenExternalFolder(AppState& mru, const std::wstring& raw) {
     const bool this_pc = app::IsThisPcArgument(raw);
-    const std::wstring path = this_pc ? std::wstring() : ResolveOpenFolderPath(raw);
+    // A shell namespace (the taskbar's Explorer button, the desktop's Recycle Bin) is
+    // translated to the Pulse view that answers it, or to nothing when Pulse has no
+    // view for it: no tab and no window should ever be named after the CLSID.
+    const std::wstring path = this_pc ? std::wstring() : ResolveIncomingPath(raw);
+    if (!this_pc && path.empty() && fs::IsShellNamespacePath(raw)) return mru;  // nothing to open
     // Screenshot runs stay one window (plan §8.7); nothing to open stays as before.
     if (mru.shot.active || (!this_pc && path.empty())) {
         OpenFolderInNewTab(mru, raw);

@@ -1118,6 +1118,23 @@ void ApplyDriveVerbResult(AppState& s, const app::DriveVerbResult& result) {
         app::StartDriveDisconnect(s.hwnd, WM_DRIVE_VERB, result.root, false);
     }
 }
+// Reveal a path in the folder that holds it: the parent becomes the location and the
+// row itself is selected once the listing arrives. The pending selection has to be
+// armed after the load starts - StartLoadingPath clears it.
+void RevealInParent(AppState& s, const std::wstring& full) {
+    app::Tab* tab = ActiveTab(s);
+    if (!tab || full.empty()) return;
+    const std::wstring parent = fs::ParentPath(full);
+    const size_t slash = full.find_last_of(L"\\/");
+    const std::wstring leaf =
+        slash == std::wstring::npos ? full : full.substr(slash + 1);
+    if (parent.empty() || leaf.empty()) return;
+    NavigateTo(s, parent);
+    tab->pending_selected_name = leaf;
+    tab->pending_selected_names = { leaf };
+    tab->pending_selection_revision = tab->selection_revision;
+    tab->pending_ensure_selection_visible = true;
+}
 
 void DispatchMenuCommand(AppState& s, int cmd) {
     const bool needs_files=cmd==app::CmdProperties || cmd==app::CmdOpenPath || cmd==app::CmdOpenInNewTab || cmd==app::CmdRename ||
@@ -1210,34 +1227,10 @@ void DispatchMenuCommand(AppState& s, int cmd) {
         }
         break;
     }
-    case app::CmdOpenPath: {
-        // Reveal the hit in its containing folder (search results).
-        app::Tab* tab = ActiveTab(s);
-        const std::wstring full = tab ? SelectedFullPath(s) : L"";
-        if (!full.empty()) {
-            const std::wstring parent = fs::ParentPath(full);
-            const size_t slash = full.find_last_of(L"\\/");
-            const std::wstring leaf =
-                slash == std::wstring::npos ? full : full.substr(slash + 1);
-            if (!parent.empty() && !leaf.empty()) {
-                NavigateTo(s, parent);
-                tab->pending_selected_name = leaf;
-                tab->pending_selected_names = { leaf };
-                tab->pending_selection_revision = tab->selection_revision;
-                tab->pending_ensure_selection_visible = true;
-                if (tab->snapshot) {
-                    for (size_t i = 0; i < tab->snapshot->size(); ++i) {
-                        if (_wcsicmp((*tab->snapshot)[i].name.c_str(), leaf.c_str()) != 0) continue;
-                        tab->SelectOnly(static_cast<int>(i));
-                        tab->pending_selection_revision = tab->selection_revision;
-                        EnsureRowVisible(s, *tab, static_cast<int>(i));
-                        break;
-                    }
-                }
-            }
-        }
+    case app::CmdOpenPath:
+        // Reveal the hit in its containing folder (search results, recent items).
+        RevealInParent(s, SelectedFullPath(s));
         break;
-    }
     case app::CmdCut: CollectToTray(s, true); break;
     case app::CmdCopy: CollectToTray(s, false); break;
     case app::CmdPaste: PasteIntoCurrent(s); break;
@@ -2440,6 +2433,17 @@ void ShowCuratedItemMenu(AppState& s, const std::wstring& path,
     open.text = l10n::Get(l10n::StringId::Open);
     open.glyph = L"\xE8A0";
     items.push_back(std::move(open));
+    // Only a row whose target is still there can be revealed; a stale one (a recent item
+    // that moved away, a pinned folder that is gone) keeps just the commands that act on
+    // the list it lives in. Starred and pinned rows get this too: the same gesture means
+    // the same thing wherever the row is shown.
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        ui::FluentMenuItem location;
+        location.command = app::CmdOpenPath;
+        location.text = l10n::Get(l10n::StringId::OpenItemLocation);
+        location.glyph = L"\xE8B7";
+        items.push_back(std::move(location));
+    }
     if (recent) {
         ui::FluentMenuItem remove;
         remove.command = app::CmdRemoveRecent;
@@ -2502,6 +2506,8 @@ void ShowCuratedItemMenu(AppState& s, const std::wstring& path,
             s.ops.OpenWith(path);
             RecordRecentOpen(s, path, app::PlaceItemKind::File);
         }
+    } else if (cmd == app::CmdOpenPath) {
+        RevealInParent(s, path);
     } else if (cmd == app::CmdEditStarBadge) {
         ShowStarredBadgeEditor(s, path, screen_pt);
     } else if (cmd >= app::CmdTabColorBase &&

@@ -1436,6 +1436,28 @@ void ApplyWorkerResult(AppState& s, app::WorkResult& res) {
     bool has_panes = false;
     app::ForEachWindowSharingCore(s, [&](AppState& window) { has_panes = has_panes || !Panes(window).empty(); });
     if (!has_panes) return;
+    // Progressive rows from a still-running scan (a big folder or bin): show what has
+    // been gathered so far in every window that waits for this listing. Selection,
+    // generations, the snapshot store and the banners belong to the final result;
+    // loading stays set so the status bar keeps reporting the growing count and the
+    // final result still lands normally.
+    if (res.partial) {
+        if (!res.snapshot) return;
+        app::ForEachWindowSharingCore(s, [&](AppState& window) {
+            ForEachPane(window, [&](app::Pane& pane) {
+                app::Tab* tab = pane.ActiveTab();
+                if (!tab || tab->current_path != res.path) return;
+                if (tab->pending_generation != res.generation) return;
+                if (tab->applied_generation != 0 && res.generation < tab->applied_generation) return;
+                // A refresh that merges into the shown order keeps its rows where they
+                // are until the final result; progressive batches would shuffle them.
+                if (tab->refresh_keeps_order) return;
+                tab->SetSnapshot(res.snapshot);
+            });
+            InvalidateRect(window.hwnd, nullptr, FALSE);
+        });
+        return;
+    }
     const bool again = ApplyWorkerResultData(s.core, res);
     AppState* awaiting = nullptr;
     app::ForEachWindowSharingCore(s, [&](AppState& window) {
@@ -2592,9 +2614,32 @@ void OpenTabAt(AppState& s, const std::wstring& path) {
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
+void RememberGroupActivation(AppState& s, const app::LayoutTab* outgoing) {
+    if (!outgoing) return;
+    const int group_id = outgoing->tab_group;
+    if (group_id == 0) return;
+    s.lastActiveInGroup[group_id] = outgoing;
+}
+
+void PruneGroupActivations(AppState& s) {
+    auto& memory = s.lastActiveInGroup;
+    for (auto it = memory.begin(); it != memory.end();) {
+        bool still_member = false;
+        for (const auto& item : s.window_tabs.items) {
+            if (item.get() == it->second && item->tab_group == it->first) {
+                still_member = true;
+                break;
+            }
+        }
+        if (still_member) ++it;
+        else it = memory.erase(it);
+    }
+}
+
 void NewTab(AppState& s, const std::wstring& path) {
     if (OpenSystemNetworkShortcut(s, path)) return;
     RememberLayoutFocus(s);
+    RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.NewTab(path.empty() ? L"C:\\" : path);
     BindCurrentLayout(s);
     if (app::Tab* tab = ActiveTab(s)) {
@@ -2763,12 +2808,15 @@ void CloseLayoutTab(AppState& s, size_t idx) {
         return;
     }
     RememberLayoutFocus(s);
+    RememberGroupActivation(s, s.window_tabs.Active());
     if (s.window_tabs.items.size() > 1 && !s.window_tabs.items[idx]->pinned) {
         RememberClosingTabs(s, {idx});  // Ctrl+Shift+T brings it back (M7f)
         for (const auto& pane : s.window_tabs.items[idx]->panes)
             DropLiveNetworkSearch(s, pane->view.search_session_id);
     }
     s.window_tabs.CloseTab(idx);
+    // The closed tab is gone; drop any memory that still points at it.
+    PruneGroupActivations(s);
     BindCurrentLayout(s);
     RevalidateVisibleFolders(s);
     InvalidateRect(s.hwnd, nullptr, FALSE);
@@ -2782,6 +2830,7 @@ void SwitchTab(AppState& s, size_t idx) {
     if (idx >= s.window_tabs.items.size()) return;
     if (s.addressSearching) HideAddressEditor(s, false);
     RememberLayoutFocus(s);
+    RememberGroupActivation(s, s.window_tabs.Active());
     s.window_tabs.SwitchTab(idx);
     BindCurrentLayout(s);
     RevalidateVisibleFolders(s);

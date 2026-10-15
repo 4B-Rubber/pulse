@@ -54,6 +54,9 @@ struct DirEntry {
 
 // pulse:tag: / pulse:search: / pulse:workspace: — not filesystem paths.
 bool IsVirtualPath(const std::wstring& path);
+// ::{GUID} parsing names and shell: links (the desktop's Recycle Bin, a pinned
+// Explorer button) are shell namespaces, not folders; never normalize them.
+bool IsShellNamespacePath(const std::wstring& path);
 bool IsUncPath(const std::wstring& path);
 
 enum class NetStatus { Unknown = 0, Online, Slow, Offline };
@@ -67,6 +70,12 @@ std::wstring StripLnkSuffix(const std::wstring& name);
 
 // Enumerate a directory into out. Throws std::runtime_error on failure.
 void EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out, const std::atomic_bool* cancelled = nullptr);
+// Progress hook for a long enumeration: called between batches with everything
+// gathered so far (the vector being filled; do not modify it). Returning false stops
+// the scan, and the call then reports false as well. Failures still throw.
+using EnumerateProgress = std::function<bool(const std::vector<DirEntry>&)>;
+// Enumerate with a progress hook. Returns false when the hook asked to stop.
+bool EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out, const EnumerateProgress& progress);
 struct EnumerationOptions {
     std::function<bool()> cancelled;
     DWORD timeout_ms = 15000;

@@ -1544,3 +1544,7 @@
 // Network view warning when Windows Firewall's Network Discovery group is off.
 #define IDS_NETWORK_DISCOVERY_OFF_TITLE 2731
 #define IDS_NETWORK_DISCOVERY_OFF_DESC 2732
+// Recent/starred item menu: reveal the row in its containing folder.
+#define IDS_OPEN_ITEM_LOCATION 2733
+// Tab-group hover card: the trailing "Edit group" action row.
+#define IDS_TAB_GROUP_EDIT 2734
