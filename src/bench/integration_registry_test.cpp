@@ -326,6 +326,28 @@ int wmain() {
         Set(folder_shell + L"\\open\\command", L"", L"\"C:\\Other\\manager.exe\" \"%1\"");
         Check(!ReleaseStaleFolderAssociation(exe) && Read(folder_shell + L"\\open\\command", L"").exists,
             "the retired Folder cleanup leaves a foreign association alone");
+        // 2026-10-16: the same build also wrote "explore" (Open in a new
+        // window). On a machine where the cleanup already ran only the first
+        // verb is gone, so every verb has to be visited, not just the first.
+        Clear();
+        Set(folder_shell, L"", L"explore");
+        Set(folder_shell + L"\\explore", L"", L"");
+        Set(folder_shell + L"\\explore", L"DelegateExecute", L"");
+        Set(folder_shell + L"\\explore\\command", L"", L"\"" + exe + L"\" \"%1\"");
+        Set(folder_shell + L"\\explore\\command", L"DelegateExecute", L"");
+        Check(ReleaseStaleFolderAssociation(exe) && !KeyExists(folder_shell),
+            "a lone explore verb is released along with the class default naming it");
+        Clear();
+        Set(folder_shell + L"\\open\\command", L"", L"\"" + exe + L"\" \"%1\"");
+        Set(folder_shell + L"\\explore\\command", L"", L"\"C:\\Other\\manager.exe\" \"%1\"");
+        Check(ReleaseStaleFolderAssociation(exe) && !Read(folder_shell + L"\\open\\command", L"").exists &&
+              Read(folder_shell + L"\\explore\\command", L"").exists,
+            "a foreign verb survives while the owned verb is released");
+        Clear();
+        Set(folder_shell, L"", L"somebody elses verb");
+        Set(folder_shell + L"\\open\\command", L"", L"\"" + exe + L"\" \"%1\"");
+        Check(ReleaseStaleFolderAssociation(exe) && Read(folder_shell, L"").exists,
+            "a class default somebody else set is left alone");
     }
 #endif
     // Another copy of Pulse (an older install folder, a portable or development

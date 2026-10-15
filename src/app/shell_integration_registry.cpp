@@ -233,6 +233,23 @@ void DropEmptyKeys(std::wstring key) {
     }
 }
 
+// Verb subkeys under a shell key, in registry order. A missing key reads as an
+// empty list.
+std::vector<std::wstring> SubKeyNames(const std::wstring& key) {
+    std::vector<std::wstring> names;
+    HKEY handle = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_ENUMERATE_SUB_KEYS, &handle) != ERROR_SUCCESS)
+        return names;
+    for (DWORD index = 0;; ++index) {
+        wchar_t name[512]{};
+        DWORD size = static_cast<DWORD>(ARRAYSIZE(name));
+        if (RegEnumKeyExW(handle, index, name, &size, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        names.emplace_back(name);
+    }
+    RegCloseKey(handle);
+    return names;
+}
+
 bool Flush(const std::wstring& key, bool missing_ok = false) {
     HKEY handle = nullptr;
     const LONG opened = RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &handle);
@@ -720,25 +737,44 @@ bool ReleaseStaleFolderAssociation(const std::wstring& exe) {
     const std::wstring target = exe.empty() ? CurrentModulePath() : exe;
     if (target.empty()) return false;
     const std::wstring shell = L"Software\\Classes\\Folder\\shell";
-    const std::wstring verb = shell + L"\\open";
-    const std::wstring command = verb + L"\\command";
-    Value value;
-    if (!Read(command, L"", value) || !value.exists ||
-        (value.type != REG_SZ && value.type != REG_EXPAND_SZ)) return false;
-    if (!ShellCommandTargetsExecutable(Text(value), target)) return false;
-    // The stale shape mirrors a group write: the command plus the empty
-    // DelegateExecute on the command and on the verb (which suppresses the
-    // inherited Explorer handler), and the empty defaults that build left on
-    // the shell and verb keys.
-    bool ok = Write(command, L"", Value{});
-    ok = Write(command, L"DelegateExecute", Value{}) && ok;
-    ok = Write(verb, L"", Value{}) && ok;
-    ok = Write(verb, L"DelegateExecute", Value{}) && ok;
-    ok = Write(shell, L"", Value{}) && ok;
-    DropEmptyKeys(command);
-    DropEmptyKeys(verb);
+    // That build took over every folder verb it knew ("open" for a double
+    // click, "explore" for "Open in a new window"), and a machine that already
+    // ran an earlier cleanup has only the second one left - so visit every verb
+    // instead of assuming the first.
+    bool released = false;
+    std::vector<std::wstring> released_verbs;
+    for (const std::wstring& name : SubKeyNames(shell)) {
+        const std::wstring verb = shell + L"\\" + name;
+        const std::wstring command = verb + L"\\command";
+        Value value;
+        if (!Read(command, L"", value) || !value.exists ||
+            (value.type != REG_SZ && value.type != REG_EXPAND_SZ)) continue;
+        if (!ShellCommandTargetsExecutable(Text(value), target)) continue;
+        // The stale shape mirrors a group write: the command plus the empty
+        // DelegateExecute on the command and on the verb (which suppresses the
+        // inherited Explorer handler), and the empty defaults that build left
+        // on the verb and on the shell key.
+        bool ok = Write(command, L"", Value{});
+        ok = Write(command, L"DelegateExecute", Value{}) && ok;
+        ok = Write(verb, L"", Value{}) && ok;
+        ok = Write(verb, L"DelegateExecute", Value{}) && ok;
+        DropEmptyKeys(command);
+        DropEmptyKeys(verb);
+        released_verbs.push_back(name);
+        released = released || ok;
+    }
+    if (!released) return false;
+    // The old build left the class default either empty or naming one of the
+    // verbs it wrote; clear it then, so a default somebody else set stays
+    // where it is.
+    Value current;
+    if (Read(shell, L"", current) && current.exists) {
+        const std::wstring text = Text(current);
+        if (text.empty() || std::find(released_verbs.begin(), released_verbs.end(), text) != released_verbs.end())
+            Write(shell, L"", Value{});
+    }
     DropEmptyKeys(shell);
-    return ok;
+    return true;
 }
 
 bool RepairLegacyShellIntegrationResidue() {

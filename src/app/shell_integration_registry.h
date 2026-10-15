@@ -24,8 +24,8 @@ bool HasLegacyShellIntegrationResidue();
 bool RepairLegacyShellIntegrationResidue();
 // Historical builds registered the folder association under Folder\shell, a
 // group nothing here manages any more. A machine that ran one of them keeps
-// opening folders in Pulse whatever the settings say, so release those values
-// while the command still points at `exe` (empty means this process's module).
+// opening folders in Pulse whatever the settings say, so release every verb
+// whose command still points at `exe` (empty means this process's module).
 // Returns true when something was released (the caller refreshes the shell;
 // a missing or foreign key is a no-op).
 bool ReleaseStaleFolderAssociation(const std::wstring& exe);
