@@ -41,10 +41,13 @@ In-app updates launch an installer; download a new portable ZIP to continue usin
 "@ | Set-Content -LiteralPath (Join-Path $payload 'README.txt') -Encoding utf8
 $archive = Join-Path $dist "Pulse-$version-dev-portable-win-x64.zip"
 Compress-Archive -LiteralPath $payload -DestinationPath $archive -Force
+# The archive root is the staged folder itself, so read its name from the stage: a renamed
+# folder cannot silently turn this check into a no-op.
+$root = Split-Path -Leaf $payload
 $zip = [IO.Compression.ZipFile]::OpenRead($archive)
 try {
     foreach ($file in $files) {
-        $entry = $zip.GetEntry("Pulse-$version-portable/$file")
+        $entry = $zip.GetEntry("$root/$file")
         if (-not $entry -or $entry.Length -ne (Get-Item -LiteralPath (Join-Path $build $file)).Length) {
             throw "Final portable archive is missing or truncates: $file"
         }
