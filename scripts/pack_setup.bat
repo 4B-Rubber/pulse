@@ -11,8 +11,10 @@ if not defined PULSE_BUILD_DIR set "PULSE_BUILD_DIR=build"
 if not defined PULSE_CHANNEL set "PULSE_CHANNEL=windows"
 rem Accept a relative (to the repository) or absolute build directory.
 for %%I in ("%PULSE_BUILD_DIR%") do set "PULSE_BUILD_DIR=%%~fI"
-set "PULSE_SUFFIX="
-if /i "%PULSE_CHANNEL%"=="win81" set "PULSE_SUFFIX=-win81"
+rem Builds from this repository are the -dev channel: the asset names carry the label while
+rem version.txt (and the update manifest) stay numeric.
+set "PULSE_SUFFIX=-dev"
+if /i "%PULSE_CHANNEL%"=="win81" set "PULSE_SUFFIX=-dev-win81"
 
 set /p PULSE_VERSION=<version.txt
 if not defined PULSE_VERSION (
