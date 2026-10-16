@@ -2166,6 +2166,22 @@ int wmain(int argc, wchar_t** argv) {
     parsed_prefs.start_in_tray = true;
     parsed_prefs.ResetToDefaults();
     passed &= Report("reset turns start in tray off", !parsed_prefs.start_in_tray);
+    passed &= Report("staging tray setting has localized text",
+        !pulse::l10n::Get(pulse::l10n::StringId::SettingsShowStagingTray).empty() &&
+        !pulse::l10n::Get(pulse::l10n::StringId::SettingsShowStagingTrayDesc).empty());
+    passed &= Report("the staging tray is shown by default", prefs.show_staging_tray);
+    settings_ui.ToggleUi(37);
+    passed &= Report("hiding the staging tray persists",
+        !prefs.show_staging_tray && parsed_prefs.FromJson(prefs.ToJson()) && !parsed_prefs.show_staging_tray);
+    settings_ui.ToggleUi(37);
+    passed &= Report("showing it again persists",
+        prefs.show_staging_tray && parsed_prefs.FromJson(prefs.ToJson()) && parsed_prefs.show_staging_tray);
+    parsed_prefs.show_staging_tray = false;
+    passed &= Report("a file without the key keeps the staging tray",
+        parsed_prefs.FromJson(L"{}") && parsed_prefs.show_staging_tray);
+    parsed_prefs.show_staging_tray = false;
+    parsed_prefs.ResetToDefaults();
+    passed &= Report("reset shows the staging tray again", parsed_prefs.show_staging_tray);
     {
         const std::wstring exe = L"C:\\Program Files\\Pulse\\pulse.exe";
         passed &= Report("startup Run command quotes the exe and adds --startup",

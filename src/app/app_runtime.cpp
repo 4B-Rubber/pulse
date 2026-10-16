@@ -2121,6 +2121,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.settings_list_selection_outline = s.appPrefs.list_selection_outline;
     vm.settings_list_thumbnail_badges = s.appPrefs.list_thumbnail_badges;
     vm.settings_vertical_tabs = s.appPrefs.vertical_tabs;
+    vm.settings_show_staging_tray = s.appPrefs.show_staging_tray;
     vm.settings_show_hints = s.appPrefs.show_hints;
     vm.settings_tips_seen = s.appPrefs.tips_seen != 0;
     vm.settings_folder_sort = s.appPrefs.folder_sort_mode;
@@ -2335,6 +2336,9 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(TrayStackTop(s)),
                                              static_cast<size_t>(TrayDeckCap(s)));
         ui::TrayDeckView& deck = vm.tray_deck;
+        // Settings > Appearance can take the whole panel away; the file picker
+        // host sets hidden on its own view model when it has no tray.
+        deck.hidden = !s.appPrefs.show_staging_tray;
         deck.open = s.trayOpen;
         deck.spread = s.traySpread;
         deck.thumb_dip = static_cast<float>(s.appPrefs.tray_icon_size);

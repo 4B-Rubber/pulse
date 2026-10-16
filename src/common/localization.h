@@ -66,6 +66,8 @@ enum class StringId : UINT {
     WorkspacePanes = IDS_WORKSPACE_PANES,
     SettingsVerticalTabs = IDS_SETTINGS_VERTICAL_TABS,
     SettingsVerticalTabsDesc = IDS_SETTINGS_VERTICAL_TABS_DESC,
+    SettingsShowStagingTray = IDS_SETTINGS_SHOW_STAGING_TRAY,
+    SettingsShowStagingTrayDesc = IDS_SETTINGS_SHOW_STAGING_TRAY_DESC,
     SidebarTabs = IDS_SIDEBAR_TABS,
     ToggleSidebar = IDS_TOGGLE_SIDEBAR,
     ArcFiles = IDS_ARC_FILES,

@@ -1548,3 +1548,6 @@
 #define IDS_OPEN_ITEM_LOCATION 2733
 // Tab-group hover card: the trailing "Edit group" action row.
 #define IDS_TAB_GROUP_EDIT 2734
+// Settings > Appearance: show or hide the sidebar staging tray panel.
+#define IDS_SETTINGS_SHOW_STAGING_TRAY 2735
+#define IDS_SETTINGS_SHOW_STAGING_TRAY_DESC 2736

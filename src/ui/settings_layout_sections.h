@@ -234,6 +234,7 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
         y+=8*scale; l.protected_files_row=row(64);
         y+=8*scale; l.pinned_names_row=row(64);
         y+=8*scale; l.vertical_tabs_row=row(64);
+        y+=8*scale; l.show_staging_tray_row=row(64);
         y+=8*scale; l.hints_row=row(64);
         y+=8*scale; l.hints_reset_row=row(64);
         {

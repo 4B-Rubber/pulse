@@ -878,6 +878,7 @@ struct WindowViewModel {
     float settings_scroll = 0.0f;
     bool settings_launch_on_startup = false;
     bool settings_start_in_tray = false;
+    bool settings_show_staging_tray = true;     // sidebar staging tray panel
     bool settings_keep_running = false;
     bool settings_show_hidden_files = false;
     bool settings_show_protected_os_files = false;

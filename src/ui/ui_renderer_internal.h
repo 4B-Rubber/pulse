@@ -2118,6 +2118,7 @@ struct SettingsLayout {
     D2D1_RECT_F close_tab_double_click_row{};
     D2D1_RECT_F confirm_delete_row{};
     D2D1_RECT_F start_in_tray_row{};
+    D2D1_RECT_F show_staging_tray_row{};
     D2D1_RECT_F text_render_card{};
     D2D1_RECT_F text_render_row[3]{};
     D2D1_RECT_F ui_font_size_card{};

@@ -79,6 +79,7 @@ void AppPrefs::ResetToDefaults() {
     close_tab_on_double_click = false;
     confirm_recycle_delete = false;
     start_in_tray = false;
+    show_staging_tray = true;
     home_folder.clear();
     text_render = 0;
     ui_font_scale = 100;
@@ -177,6 +178,8 @@ std::wstring AppPrefs::ToJson() const {
     out += vertical_tabs ? L"true" : L"false";
     out += L",\n  \"sidebar_collapsed\":";
     out += sidebar_collapsed ? L"true" : L"false";
+    out += L",\n  \"show_staging_tray\":";
+    out += show_staging_tray ? L"true" : L"false";
     out += L",\n  \"folder_sort_mode\":";
     out += std::to_wstring(folder_sort_mode >= 0 && folder_sort_mode <= 2 ? folder_sort_mode : 0);
     out += L",\n  \"details_columns\":";
@@ -344,6 +347,8 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     list_thumbnail_badges = pulse::json::ExtractBool(json, L"list_thumbnail_badges", true);
     vertical_tabs = pulse::json::ExtractBool(json, L"vertical_tabs", false);
     sidebar_collapsed = pulse::json::ExtractBool(json, L"sidebar_collapsed", false);
+    // Missing key = preferences saved before the setting existed: keep their tray.
+    show_staging_tray = pulse::json::ExtractBool(json, L"show_staging_tray", true);
     folder_sort_mode = pulse::json::ExtractInt(json, L"folder_sort_mode", 0);
     if (folder_sort_mode < 0 || folder_sort_mode > 2) folder_sort_mode = 0;
     details_columns = ui::NormalizeDetailsColumns(static_cast<uint32_t>(pulse::json::ExtractInt(
