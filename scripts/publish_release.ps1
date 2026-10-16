@@ -4,11 +4,13 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $version = (Get-Content version.txt -Raw).Trim()
 if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid release version' }
 $tag = "v$version"
-$repository = 'jimmgreen/pulse'
+$repository = '4B-Rubber/pulse'
 $base = "https://github.com/$repository/releases/download/$tag"
-$normal = "PulseSetup-$version.exe"
-$win81 = "PulseSetup-$version-win81.exe"
-$portable = "Pulse-$version-portable-win-x64.zip"
+# This repository publishes the -dev channel, so the installers carry the label while the version
+# (and the update manifest clients read) stays numeric.
+$normal = "PulseSetup-$version-dev.exe"
+$win81 = "PulseSetup-$version-dev-win81.exe"
+$portable = "Pulse-$version-dev-portable-win-x64.zip"
 foreach ($file in @($normal, $win81)) {
     if (-not (Test-Path -LiteralPath "dist/$file")) { throw "Missing installer: $file" }
 }
@@ -34,7 +36,7 @@ $changesPath = "docs/releases/$version.md"
 $changes = if (Test-Path $changesPath) { Get-Content $changesPath -Raw } else { '修复问题并改进使用体验。' }
 $notesPath = 'dist/release-notes.md'
 @"
-# Pulse $version
+# Pulse $version (dev)
 
 ## 下载安装
 
@@ -65,17 +67,22 @@ Assets 中的 update-manifest*.json 是客户端使用的更新清单，无需�
 $existing = & gh release view $tag --repo $repository --json isDraft 2>$null
 if ($LASTEXITCODE -eq 0) {
     if (-not ($existing | ConvertFrom-Json).isDraft) { throw 'This version is already published; increment version.txt' }
-    & gh release edit $tag --repo $repository --title "Pulse $version" --notes-file $notesPath
+    & gh release edit $tag --repo $repository --title "Pulse $version (dev)" --notes-file $notesPath
 } else {
-    & gh release create $tag --repo $repository --verify-tag --draft --title "Pulse $version" --notes-file $notesPath
+    & gh release create $tag --repo $repository --verify-tag --draft --title "Pulse $version (dev)" --notes-file $notesPath
 }
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the release draft' }
 & gh release upload $tag --repo $repository "dist/$normal" "dist/$win81" "dist/$portable" `
     dist/update-manifest.json dist/update-manifest-win81.json --clobber
 if ($LASTEXITCODE -ne 0) { throw 'Could not upload release assets; release remains a draft' }
-$packArgs = @('--tag', $tag, '--repository', $repository, '--asset-directory', 'dist/preview-packs')
-if ($env:PULSE_PREVIEW_PACK_SOURCE_TAG) { $packArgs += @('--source-tag', $env:PULSE_PREVIEW_PACK_SOURCE_TAG) }
-& python "$PSScriptRoot/ensure_release_packs.py" @packArgs
-if ($LASTEXITCODE -ne 0) { throw 'Preview pack verification failed; release remains a draft' }
+# Preview pack bundles: the compiled catalog still points at the release they were published
+# with, so the client keeps downloading them from there. Mirroring copies into this repository's
+# release (the upstream flow) needs the pack payloads staged, so it is opt-in here.
+if ($env:PULSE_PUBLISH_PREVIEW_PACKS) {
+    $packArgs = @('--tag', $tag, '--repository', $repository, '--asset-directory', 'dist/preview-packs')
+    if ($env:PULSE_PREVIEW_PACK_SOURCE_TAG) { $packArgs += @('--source-tag', $env:PULSE_PREVIEW_PACK_SOURCE_TAG) }
+    & python "$PSScriptRoot/ensure_release_packs.py" @packArgs
+    if ($LASTEXITCODE -ne 0) { throw 'Preview pack verification failed; release remains a draft' }
+}
 & gh release edit $tag --repo $repository --draft=false --latest
 if ($LASTEXITCODE -ne 0) { throw 'Could not publish the release' }

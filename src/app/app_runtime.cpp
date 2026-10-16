@@ -680,7 +680,7 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
                 : s.appPrefs.language == L"en-US" ? 3 : 0;
             wchar_t version_text[128]{};
             swprintf_s(version_text,
-                l10n::Get(l10n::StringId::VersionFormat).c_str(), PULSE_VERSION_STRING);
+                l10n::Get(l10n::StringId::VersionFormat).c_str(), PULSE_VERSION_LABEL);
             vm.settings_version = version_text;
             wchar_t build_text[256]{};
             swprintf_s(build_text,

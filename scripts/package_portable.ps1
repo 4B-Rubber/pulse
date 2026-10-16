@@ -13,7 +13,7 @@ foreach ($file in $files) {
 }
 $dist = if ($OutputDir) { [IO.Path]::GetFullPath($OutputDir) } else { Join-Path $repo 'dist' }
 $stage = Join-Path $dist ("portable-stage-" + [guid]::NewGuid().ToString('N'))
-$payload = Join-Path $stage "Pulse-$version-portable"
+$payload = Join-Path $stage "Pulse-$version-dev-portable"
 New-Item -ItemType Directory -Path $payload -Force | Out-Null
 foreach ($file in $files) { Copy-Item -LiteralPath (Join-Path $build $file) -Destination $payload }
 foreach ($license in @('PDFium', 'LumaText')) {
@@ -39,7 +39,7 @@ Settings, caches and logs remain in the current user's application-data director
 Extraction does not register the PulseIndex service. Use the installer for the system indexing service.
 In-app updates launch an installer; download a new portable ZIP to continue using the unpacked edition.
 "@ | Set-Content -LiteralPath (Join-Path $payload 'README.txt') -Encoding utf8
-$archive = Join-Path $dist "Pulse-$version-portable-win-x64.zip"
+$archive = Join-Path $dist "Pulse-$version-dev-portable-win-x64.zip"
 Compress-Archive -LiteralPath $payload -DestinationPath $archive -Force
 $zip = [IO.Compression.ZipFile]::OpenRead($archive)
 try {
