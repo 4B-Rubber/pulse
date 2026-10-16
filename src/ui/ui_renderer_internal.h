@@ -2788,6 +2788,7 @@ struct SettingsLayout {
     D2D1_RECT_F operation_progress_row{};
     D2D1_RECT_F compact_title_bar_row{};
     D2D1_RECT_F start_in_tray_row{};
+    D2D1_RECT_F show_staging_tray_row{};
     D2D1_RECT_F text_render_card{};
     D2D1_RECT_F text_render_row[3]{};
     D2D1_RECT_F ui_font_size_card{};

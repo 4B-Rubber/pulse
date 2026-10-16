@@ -1416,6 +1416,9 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 37) {
         prefs_->tray_hide_when_empty = !prefs_->tray_hide_when_empty;
         SaveAndApply(SettingsEffect::None);
+    } else if (index == 83) {
+        prefs_->show_staging_tray = !prefs_->show_staging_tray;
+        SaveAndApply(SettingsEffect::None);
     } else if (index == 24) {
         prefs_->show_hints = !prefs_->show_hints;
         SaveAndApply(SettingsEffect::None);
@@ -1431,10 +1434,10 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 32) {
         prefs_->confirm_recycle_delete = !prefs_->confirm_recycle_delete;
         SaveAndApply(SettingsEffect::None);
-    } else if (index == 38) {
+    } else if (index == 84) {
         prefs_->operation_progress_window = !prefs_->operation_progress_window;
         SaveAndApply(SettingsEffect::None);
-    } else if (index == 39) {
+    } else if (index == 85) {
         prefs_->compact_title_bar = !prefs_->compact_title_bar;
         SaveAndApply(SettingsEffect::TitleBarChrome);
     } else if (index == 27) {

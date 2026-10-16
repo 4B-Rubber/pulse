@@ -2869,6 +2869,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.settings_vertical_tabs = s.appPrefs.vertical_tabs;
     vm.tab_layout = s.appPrefs.tab_layout;
     vm.tab_max_rows = s.appPrefs.tab_max_rows;
+    vm.settings_show_staging_tray = s.appPrefs.show_staging_tray;
     vm.settings_tray_hide_empty = s.appPrefs.tray_hide_when_empty;
     vm.settings_lan_discovery = s.appPrefs.lan_discovery;
     vm.settings_network_recent = s.appPrefs.network_recent_enabled;
@@ -3217,6 +3218,9 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         const auto entries = TrayDeckEntries(s.tray, static_cast<size_t>(TrayStackTop(s)),
                                              static_cast<size_t>(TrayDeckCap(s)));
         ui::TrayDeckView& deck = vm.tray_deck;
+        // Settings > Appearance can take the whole panel away; the file picker
+        // host sets hidden on its own view model when it has no tray.
+        deck.hidden = !s.appPrefs.show_staging_tray;
         deck.open = s.trayOpen;
         deck.spread = s.traySpread;
         deck.thumb_dip = static_cast<float>(s.appPrefs.tray_icon_size);

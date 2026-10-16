@@ -1497,6 +1497,7 @@ float MainRenderer::SettingsDestinationOffset(const WindowViewModel& vm, int set
     case I::ThumbCache: target=l.thumb_cache_row;break;
     case I::SettingsVerticalTabs: target=l.vertical_tabs_row;break;
     case I::TrayHideWhenEmpty: target=l.tray_hide_row;break;
+    case I::SettingsShowStagingTray: target=l.show_staging_tray_row;break;
     case I::SettingsLanDiscovery: target=l.lan_discovery_row;break;
     case I::SettingsLanCache: target=l.lan_cache_card;break;
     case I::SettingsNetworkRecent: target=l.network_recent_row;break;

@@ -103,6 +103,7 @@ void AppPrefs::ResetToDefaults() {
     network_recent_enabled = true;
     show_hidden_shares = false;
     lan_cache_mode = 0;
+    show_staging_tray = true;
     home_folder.clear();
     text_render = 0;
     ui_font_scale = 100;
@@ -261,6 +262,8 @@ std::wstring AppPrefs::ToJson() const {
     out += tray_hide_when_empty ? L"true" : L"false";
     out += L",\n  \"sidebar_collapsed\":";
     out += sidebar_collapsed ? L"true" : L"false";
+    out += L",\n  \"show_staging_tray\":";
+    out += show_staging_tray ? L"true" : L"false";
     out += L",\n  \"folder_sort_mode\":";
     out += std::to_wstring(folder_sort_mode >= 0 && folder_sort_mode <= 2 ? folder_sort_mode : 0);
     out += L",\n  \"details_columns\":";
@@ -575,6 +578,8 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     favorites_bar_icon_only = pulse::json::ExtractBool(json, L"favorites_bar_icon_only", false);
     tray_hide_when_empty = pulse::json::ExtractBool(json, L"tray_hide_when_empty", false);
     sidebar_collapsed = pulse::json::ExtractBool(json, L"sidebar_collapsed", false);
+    // Missing key = preferences saved before the setting existed: keep their tray.
+    show_staging_tray = pulse::json::ExtractBool(json, L"show_staging_tray", true);
     folder_sort_mode = pulse::json::ExtractInt(json, L"folder_sort_mode", 0);
     if (folder_sort_mode < 0 || folder_sort_mode > 2) folder_sort_mode = 0;
     details_columns = ui::NormalizeDetailsColumns(static_cast<uint32_t>(pulse::json::ExtractInt(

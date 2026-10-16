@@ -98,6 +98,7 @@ struct AppPrefs {
     bool sidebar_collapsed = false;   // sidebar folded to its icon rail (Ctrl+B)
     bool favorites_bar = false;       // 收藏栏 under the command row (Ctrl+Shift+B)
     bool favorites_bar_icon_only = false;
+    bool show_staging_tray = true;    // the staging tray panel at the bottom of the sidebar
     // 0 folders first, 1 folders last, 2 mixed with files
     int folder_sort_mode = 0;
     // Optional Details columns for every folder (ui/details_column_set.h bits).
