@@ -1721,7 +1721,9 @@ StatusBarMetrics MakeStatusBarMetrics(const WindowViewModel& vm, const D2D1_RECT
             m.bar.top + 2.0f * scale, rect.right - m.pad, m.bar.bottom - 2.0f * scale);
         m.right_reserved += width + 8.0f * scale;
     }
-    const bool has_task = vm.status.query_active || !vm.status.task_text.empty() || vm.status.task_progress >= 0.0f;
+    // A hidden pill leaves no room for the task: the progress window owns it.
+    const bool has_task = centered_progress ||
+        (!vm.status.task_hidden && (!vm.status.task_text.empty() || vm.status.task_progress >= 0.0f));
     if (has_task) {
         m.task = D2D1::RectF(rect.right * (vm.status.query_cancellable ? 0.40f : 0.48f), m.bar.top,
                              rect.right - m.right_reserved, m.bar.bottom);

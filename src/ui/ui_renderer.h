@@ -561,6 +561,8 @@ struct StatusBarView {
     bool task_is_update = false;   // Noninteractive, centered progress; never opens file operations.
     bool task_active = false;      // file operation running (drives the progress pill)
     bool task_failed = false;      // last operation ended with an error: no success check
+    // The progress window shows file operations instead of the pill (setting).
+    bool task_hidden = false;
     std::wstring performance_text; // development diagnostics; empty hides it
     std::wstring performance_compact_text;
 };

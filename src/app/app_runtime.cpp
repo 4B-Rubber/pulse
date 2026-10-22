@@ -2158,6 +2158,12 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
             (bytes ? pulse::format::ByteSize(*bytes, true) : l10n::Get(l10n::StringId::LoadingEllipsis));
     }
     ops::OpStatus st = s.ops.Status();
+    // With the progress window setting on, the pill stays out of the way: the
+    // two would otherwise show the same operation at the same time. Closing
+    // that window for this task hands the progress back to the pill, so the
+    // operation is still visible and one click away.
+    vm.status.task_hidden = s.appPrefs.operation_progress_window &&
+        !(st.active && st.task_id != 0 && st.task_id == s.operationDismissedTaskId);
     if (st.active || !st.last_error.empty() || !st.summary.empty()) {
         vm.status.task_text = st.last_error.empty() ? st.summary
             : st.summary + L" — " + st.last_error;

@@ -1573,7 +1573,8 @@ void MainRenderer::DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& r
     DrawTextEndEllipsis(dc, factory, small_fmt, brTextSecondary_.get(), status_text,
         sb.pad, y, statusWidth, status_height_);
     const float selectionLeft = sb.pad + statusWidth + gap;
-    const bool hasTask = vm.status.query_active || !vm.status.task_text.empty() || vm.status.task_progress >= 0.0f;
+    const bool hasTask = centered_progress ||
+        (!vm.status.task_hidden && (!vm.status.task_text.empty() || vm.status.task_progress >= 0.0f));
     const float selectionRight = hasTask ? sb.task.left - gap : rect.right - sb.right_reserved - gap;
     DrawTextEndEllipsis(dc, factory, small_fmt, brTextSecondary_.get(), vm.status.selection_text,
         selectionLeft, y, std::max(0.0f, selectionRight - selectionLeft), status_height_);
@@ -1640,8 +1641,9 @@ void MainRenderer::DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& r
         progress.indeterminate=progress_value<0.0f;
         progress.animation_progress=static_cast<float>(GetTickCount64()%1952)/1952.0f;
         painter_.DrawProgressBar(progress);
-    } else if (!vm.status.task_text.empty() || vm.status.task_progress >= 0.0f ||
-               vm.status.task_active) {
+    } else if (!vm.status.task_hidden &&
+               (!vm.status.task_text.empty() || vm.status.task_progress >= 0.0f ||
+                vm.status.task_active)) {
         DrawTaskPill(vm, D2D1::RectF(taskX, y, taskRight, y + status_height_), theme);
     } else {
         task_pill_was_active_ = false;
