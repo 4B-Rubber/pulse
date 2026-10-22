@@ -171,6 +171,29 @@ void CheckSelectionSync(pulse::ui::Compositor& compositor, HWND edit) {
     Check(std::wstring(content) == L"a.txt" && selection() == std::pair<DWORD, DWORD>{1, 1},
         "IME composition at a caret leaves the text alone");
     SendMessageW(edit, WM_IME_ENDCOMPOSITION, 0, 0);
+    // A TSF input method commits by rewriting the whole text and then puts the insertion point
+    // back itself; an EDIT resets the caret to 0 on every WM_SETTEXT.
+    set_text(L"demo");
+    SendMessageW(edit, EM_SETSEL, 4, 4);
+    set_text(L"demo1");
+    Check(selection() == std::pair<DWORD, DWORD>{5, 5},
+        "a rewritten text keeps the caret past the committed span");
+    SendMessageW(edit, EM_SETSEL, 2, 2);
+    set_text(L"demo1");
+    Check(selection() == std::pair<DWORD, DWORD>{2, 2},
+        "a redundant rewrite keeps the caret where the user left it");
+    SetFocus(edit);
+    SendMessageW(edit, EM_SETSEL, 4, 4);
+    SendMessageW(edit, WM_CHAR, L'1', 0);
+    Check(selection() == std::pair<DWORD, DWORD>{5, 5},
+        "a committed character leaves the caret at its end");
+    SendMessageW(edit, EM_SETSEL, 0, 0);
+    Check(selection() == std::pair<DWORD, DWORD>{5, 5},
+        "a caret reset right after a commit is dropped");
+    SendMessageW(edit, WM_KEYDOWN, VK_HOME, 0);
+    SendMessageW(edit, EM_SETSEL, 2, 2);
+    Check(selection() == std::pair<DWORD, DWORD>{2, 2},
+        "a navigation key ends the guard so the caret can move back");
     set_text(text);
     SendMessageW(edit, EM_SETSEL, 8, 3);
     click(5, true);
