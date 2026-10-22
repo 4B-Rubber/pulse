@@ -604,8 +604,14 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
     }
 
     if (status.active) {
-        // Progress lives in the status-bar pill; the details window opens only
-        // when the pill is clicked (conflicts and failures still surface).
+        // Progress lives in the status-bar pill and the details window opens
+        // when the pill is clicked. Asking for the window opens it by itself
+        // once the operation has run long enough to be worth watching, so a
+        // quick copy does not flash a dialog.
+        if (s.appPrefs.operation_progress_window && !OperationWindowVisible(s) &&
+            now - s.operationStartedAt >= std::chrono::milliseconds(400)) {
+            ShowOperationWindow(s, status, false);
+        }
         return;
     }
 

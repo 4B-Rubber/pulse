@@ -39,6 +39,7 @@ enum class SettingsEffect : uint32_t {
     TextRendering = 1u << 12,
     UiFontSize = 1u << 13,
     MenuMaterial = 1u << 14,
+    TitleBarChrome = 1u << 15,
 };
 
 constexpr SettingsEffect operator|(SettingsEffect left, SettingsEffect right) noexcept {

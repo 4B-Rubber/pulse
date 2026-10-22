@@ -301,6 +301,10 @@ D2D1_RECT_F MainRenderer::SidebarToggleRect(float w) const {
     if (w / scale_ < kSidebarRailWindowDip) return {};
     const float size = 32.0f * scale_;
     const float top = (title_bar_height_ - size) * 0.5f;
+    // Compact title bar: the toggle moves to the window edge, where the brand
+    // used to be. Collapsing the sidebar stays one click away.
+    if (compact_title_bar_)
+        return D2D1::RectF(4.0f * scale_, top, 4.0f * scale_ + size, top + size);
     if (sidebar_collapsed_) {
         const float left = (kSidebarRailWidthDip * scale_ - size) * 0.5f;
         return D2D1::RectF(left, top, left + size, top + size);
@@ -320,9 +324,16 @@ MainRenderer::WindowIdentityGeometry MainRenderer::WindowIdentityLayout(const Wi
     const D2D1_RECT_F toggle = SidebarToggleRect(w);
     const bool has_toggle = toggle.right > toggle.left;
     if (!(has_toggle && sidebar_collapsed_)) {
-        const float left = (12.0f + 24.0f + 4.0f) * scale_;
-        float limit = EffectiveSidebarWidth(w) - 8.0f * scale_;
-        if (has_toggle) limit = (std::min)(limit, toggle.left - 4.0f * scale_);
+        // Compact title bar: no mark in front of the name, and the name may use
+        // the room the brand used to take (the tab strip starts after it).
+        const float left = compact_title_bar_
+            ? (has_toggle ? toggle.right + 6.0f * scale_ : 8.0f * scale_)
+            : (12.0f + 24.0f + 4.0f) * scale_;
+        float limit = compact_title_bar_
+            ? (std::min)(w - 320.0f * scale_, left + 240.0f * scale_)
+            : EffectiveSidebarWidth(w) - 8.0f * scale_;
+        if (has_toggle && !compact_title_bar_)
+            limit = (std::min)(limit, toggle.left - 4.0f * scale_);
         const float text = MeasureLayoutText(compositor_, compositor_->DwriteFactory(), compositor_->HeaderFormat(),
                                              vm.window_identity_name);
         const float width = (std::min)(limit - left, 28.0f * scale_ + text);
@@ -337,10 +348,15 @@ MainRenderer::WindowIdentityGeometry MainRenderer::WindowIdentityLayout(const Wi
     }
     g.compact = true;
     g.dot_radius = 4.0f * scale_;
-    if (has_toggle && sidebar_collapsed_) {
+    if (has_toggle && (sidebar_collapsed_ || compact_title_bar_)) {
+        // The toggle carries the dot (rail, or the compact bar where the mark
+        // is gone). In the compact bar the dot shares the toggle's corner, so
+        // it must not take clicks away from the toggle.
         g.dot = D2D1::Point2F(toggle.right - 3.0f * scale_, toggle.bottom - 3.0f * scale_);
-        const float reach = g.dot_radius + 3.0f * scale_;
-        g.hit = D2D1::RectF(g.dot.x - reach, g.dot.y - reach, g.dot.x + reach, g.dot.y + reach);
+        if (!compact_title_bar_) {
+            const float reach = g.dot_radius + 3.0f * scale_;
+            g.hit = D2D1::RectF(g.dot.x - reach, g.dot.y - reach, g.dot.x + reach, g.dot.y + reach);
+        }
     } else {
         const float mark = 24.0f * scale_;
         const float left = 12.0f * scale_;
@@ -1062,27 +1078,29 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
                                 brTextSecondary_.get());
         }
     }
-    if (hasToggle && sidebar_collapsed_) {
-        // Rail: the toggle stands in for the brand mark.
-    } else if (ID2D1Bitmap* logo = LogoBitmap()) {
-        dc->DrawBitmap(logo, D2D1::RectF(x, markY, x + mark, markY + mark), 1.0f,
-                       D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
-    } else {
-        MakeBrush(dc, theme.accent, brAccent_);
-        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + mark * 0.5f, markY + mark * 0.5f),
-                                      mark * 0.5f, mark * 0.5f), brAccent_.get());
-        ComPtr<IDWriteTextFormat> markFmt;
-        typography::CreateTextFormat(compositor_->DwriteFactory(),
-            {typography::FontRole::Display, 11.0f * scale_, DWRITE_FONT_WEIGHT_SEMI_BOLD},
-            &markFmt);
-        if (markFmt.get()) {
-            markFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            markFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            MakeBrush(dc, theme.accent_text, brAccentText_);
-            DrawTextRect(dc, markFmt.get(), brAccentText_.get(), L"P", x, markY, mark, mark);
+    if (!compact_title_bar_) {
+        if (hasToggle && sidebar_collapsed_) {
+            // Rail: the toggle stands in for the brand mark.
+        } else if (ID2D1Bitmap* logo = LogoBitmap()) {
+            dc->DrawBitmap(logo, D2D1::RectF(x, markY, x + mark, markY + mark), 1.0f,
+                           D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
+        } else {
+            MakeBrush(dc, theme.accent, brAccent_);
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + mark * 0.5f, markY + mark * 0.5f),
+                                          mark * 0.5f, mark * 0.5f), brAccent_.get());
+            ComPtr<IDWriteTextFormat> markFmt;
+            typography::CreateTextFormat(compositor_->DwriteFactory(),
+                {typography::FontRole::Display, 11.0f * scale_, DWRITE_FONT_WEIGHT_SEMI_BOLD},
+                &markFmt);
+            if (markFmt.get()) {
+                markFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                markFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                MakeBrush(dc, theme.accent_text, brAccentText_);
+                DrawTextRect(dc, markFmt.get(), brAccentText_.get(), L"P", x, markY, mark, mark);
+            }
         }
+        x += mark + 8.0f * scale_;
     }
-    x += mark + 8.0f * scale_;
     const float brandRight = EffectiveSidebarWidth(right) - 12.0f * scale_;
     const float nameWidth = MeasureLayoutText(compositor_, compositor_->DwriteFactory(),
         compositor_->HeaderFormat(), L"Pulse");
@@ -1100,7 +1118,7 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
         MakeBrush(dc, theme.text, brText_);
         DrawTextEndEllipsis(dc, compositor_->DwriteFactory(), compositor_->HeaderFormat(), brText_.get(),
                             vm.window_identity_name, text_x, 0.0f, identity.hit.right - 6.0f * scale_ - text_x, h);
-    } else if (x + nameWidth <= brandRight) {
+    } else if (!compact_title_bar_ && x + nameWidth <= brandRight) {
         MakeBrush(dc, theme.text, brText_);
         DrawTextRect(dc, compositor_->HeaderFormat(), brText_.get(), L"Pulse",
             x, 0.0f, nameWidth + 1.0f * scale_, h);
@@ -1115,7 +1133,8 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
         }
     }
 
-    if (identity.compact && identity.hit.right > identity.hit.left) {
+    if (identity.compact && identity.dot_radius > 0.0f &&
+        (identity.hit.right > identity.hit.left || compact_title_bar_)) {
         // M7c on the rail: the window's dot on the corner of the mark (or of
         // the toggle), ringed in the title bar's color so it stands apart.
         MakeBrush(dc, theme.surface_title, brAccent_);
@@ -1451,16 +1470,12 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
     const D2D1_RECT_F themeRc = D2D1::RectF(chrome.theme_left, buttonTop,
         chrome.theme_left + chrome.theme_w, buttonBottom);
     {
-        // The solid half shows the current theme: right in light, left in dark.
-        D2D1_MATRIX_3X2_F previous{};
-        dc->GetTransform(&previous);
-        if (vm.dark) {
-            dc->SetTransform(D2D1::Matrix3x2F::Rotation(180.0f, D2D1::Point2F(
-                (themeRc.left + themeRc.right) * 0.5f, (themeRc.top + themeRc.bottom) * 0.5f)) * previous);
-        }
+        // The glyph names the state: sun for light, moon for dark, half circle
+        // for following the system (the button cycles through all three).
+        const wchar_t* theme_glyph = vm.theme_mode == 1 ? kIconThemeLight
+            : vm.theme_mode == 2 ? kIconThemeDark : kIconTheme;
         DrawButton(themeRc, theme, IsHovered(vm, HitTestResult::ThemeToggle) ? theme.fill_hover : kTransparent,
-            kIconTheme, L"T", theme.text, true, true);
-        dc->SetTransform(previous);
+            theme_glyph, L"T", theme.text, true, true);
     }
 
     // Window controls, right-aligned in Win11 order: min, max/restore, close.
@@ -1766,7 +1781,16 @@ MainRenderer::TabStripMetrics MainRenderer::ComputeTabStrip(
     TabStripMetrics m;
 
     const TitleChrome chrome = MakeTitleChrome(window_w, scale_, title_bar_height_);
-    m.x0 = EffectiveSidebarWidth(window_w) + margin_;
+    if (compact_title_bar_) {
+        // Tabs start after the sidebar toggle (which moved to the window edge)
+        // and after a window identity name when this window has one.
+        const WindowIdentityGeometry identity = WindowIdentityLayout(vm, window_w);
+        const D2D1_RECT_F toggle = SidebarToggleRect(window_w);
+        m.x0 = identity.hit.right > identity.hit.left ? identity.hit.right + 8.0f * scale_
+            : toggle.right > toggle.left ? toggle.right + margin_ : margin_;
+    } else {
+        m.x0 = EffectiveSidebarWidth(window_w) + margin_;
+    }
     const float tabsRight = chrome.settings_left - 8.0f * scale_;
 
     // Group chips: one at the start of each consecutive same-group run. Their

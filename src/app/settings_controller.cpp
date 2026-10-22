@@ -1196,6 +1196,12 @@ void SettingsController::ToggleUi(int index) {
     } else if (index == 32) {
         prefs_->confirm_recycle_delete = !prefs_->confirm_recycle_delete;
         SaveAndApply(SettingsEffect::None);
+    } else if (index == 38) {
+        prefs_->operation_progress_window = !prefs_->operation_progress_window;
+        SaveAndApply(SettingsEffect::None);
+    } else if (index == 39) {
+        prefs_->compact_title_bar = !prefs_->compact_title_bar;
+        SaveAndApply(SettingsEffect::TitleBarChrome);
     } else if (index == 27) {
         prefs_->start_in_tray = !prefs_->start_in_tray;
         SaveAndApply(SettingsEffect::None);

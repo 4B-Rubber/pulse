@@ -24,6 +24,10 @@ bool HoverPreviewMessage(AppState& s, HWND hwnd, UINT msg, WPARAM wparam, LPARAM
 // Space while the card shows: its file is selected and opens in quick look.
 // False when no card is shown (Space then previews the selection as before).
 bool OpenHoverPreviewInQuickLook(AppState& s);
+// Space with nothing selected: the row under the pointer is the target, so
+// hovering a file and pressing Space previews it without clicking first
+// (space-preview mode). False when a row is selected (that one wins).
+bool OpenHoveredRowInQuickLook(AppState& s);
 // This frame's card for the renderer; a card whose row is gone or scrolled
 // away is dropped.
 // GUI verification (--shot-hover-preview N): shows the card over the Nth file

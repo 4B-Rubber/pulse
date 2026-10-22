@@ -1080,6 +1080,7 @@ float MainRenderer::SettingsDestinationOffset(const WindowViewModel& vm, int set
     case I::SettingsCloseLastTab: target=l.close_last_tab_row;break;
     case I::SettingsCloseTabDoubleClick: target=l.close_tab_double_click_row;break;
     case I::SettingsConfirmDelete: target=l.confirm_delete_row;break;
+    case I::SettingsOperationProgress: target=l.operation_progress_row;break;
     case I::SettingsOpenFolders: target=l.integration_cover[0];break;
     case I::SettingsRowHeight: target=l.density_card;break;
     case I::SettingsShowPerformance: target=l.performance_row;break;
@@ -1092,6 +1093,7 @@ float MainRenderer::SettingsDestinationOffset(const WindowViewModel& vm, int set
     case I::SettingsFolderSort: target=l.folder_sort_card;break;
     case I::SettingsTextRender: target=l.text_render_card;break;
     case I::SettingsUiFontSize: target=l.ui_font_size_card;break;
+    case I::SettingsCompactTitleBar: target=l.compact_title_bar_row;break;
     case I::SettingsWallpaper: target=l.wallpaper_card;break;
     case I::SettingsWallpaperLook: target=l.wallpaper_look_card;break;
     case I::SettingsWallpaperBlur: target=l.wallpaper_blur_card;break;

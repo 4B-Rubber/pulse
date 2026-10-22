@@ -282,6 +282,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             }
             if(ContainsPt(lay.performance_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=4;return r;}
             if(ContainsPt(lay.menu_acrylic_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=36;return r;}
+            if(ContainsPt(lay.compact_title_bar_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=39;return r;}
             for(int list_row=0;list_row<6;++list_row)
                 if(ContainsPt(lay.list_style_row[list_row],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=list_row<3 ? 17+list_row : (list_row==3 ? 22 : list_row==4 ? 33 : 34);return r;}
             const D2D1_RECT_F actions[]={lay.content_pause,lay.content_options,lay.content_rebuild};
@@ -472,6 +473,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 }
                 if (ContainsPt(lay.confirm_delete_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 32; return r;
+                }
+                if (ContainsPt(lay.operation_progress_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 38; return r;
                 }
                 if (ContainsPt(lay.start_in_tray_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 27; return r;

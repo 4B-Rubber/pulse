@@ -4252,8 +4252,10 @@ LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             s->appPrefs.Save();
             InvalidateRect(hwnd, nullptr, FALSE);
         } else if (wParam == VK_SPACE) {
-            // A hover card up: Space opens its file, not the selection.
-            if (!OpenHoverPreviewInQuickLook(*s)) ToggleQuickPreview(*s);
+            // A hover card up: Space opens its file, not the selection. With
+            // nothing selected the row under the pointer is the target.
+            if (!OpenHoverPreviewInQuickLook(*s) && !OpenHoveredRowInQuickLook(*s))
+                ToggleQuickPreview(*s);
         } else if (ctrl && shift && wParam == L'A') {
             DispatchMenuCommand(*s, app::CmdSelectWildcard);
         } else if (ctrl && wParam == L'A') {

@@ -193,7 +193,9 @@ void ClearTextWidthCache() {
     constexpr const wchar_t* kIconSearch = L"\xE721";
     constexpr const wchar_t* kIconInfo = L"\xE946";
     constexpr const wchar_t* kIconFilter = L"\xE71C";
-    constexpr const wchar_t* kIconTheme = L"\xE793";
+    constexpr const wchar_t* kIconTheme = L"\xE793";       // half circle: follow the system
+    constexpr const wchar_t* kIconThemeLight = L"\xE706";  // sun
+    constexpr const wchar_t* kIconThemeDark = L"\xE708";   // moon
     constexpr const wchar_t* kIconSettings = L"\xE713";
     constexpr const wchar_t* kIconMinimize = L"\xE921";
     constexpr const wchar_t* kIconMaximize = L"\xE922";
@@ -2117,6 +2119,8 @@ struct SettingsLayout {
     D2D1_RECT_F close_last_tab_row{};
     D2D1_RECT_F close_tab_double_click_row{};
     D2D1_RECT_F confirm_delete_row{};
+    D2D1_RECT_F operation_progress_row{};
+    D2D1_RECT_F compact_title_bar_row{};
     D2D1_RECT_F start_in_tray_row{};
     D2D1_RECT_F show_staging_tray_row{};
     D2D1_RECT_F text_render_card{};

@@ -803,6 +803,7 @@ struct WindowViewModel {
     bool focused = true;
     bool maximized = false;
     bool dark = false;
+    int theme_mode = 0; // 0 follows the system, 1 light, 2 dark (title-bar theme button)
     bool backdrop_enabled = false;
     WindowEffect window_effect = WindowEffect::MicaAlt;
     std::wstring background_image;
@@ -901,6 +902,8 @@ struct WindowViewModel {
     bool settings_close_last_tab = false;
     bool settings_close_tab_double_click = false;
     bool settings_confirm_delete = false;
+    bool settings_operation_progress_window = false;
+    bool settings_compact_title_bar = false;
     std::wstring settings_home_folder; // default location; empty = This PC
     int settings_text_render = 0; // 0 auto, 1 sharp, 2 smooth
     int settings_ui_font_scale = 100; // interface font size: 90 / 100 / 112 / 125
@@ -1262,6 +1265,10 @@ public:
         vertical_tabs_ = on && !embedded_;
         toolbar_height_ = (vertical_tabs_ || embedded_ ? 44.0f : 88.0f) * scale_;
     }
+    // Title bar without the product mark/name and the sidebar toggle: the tab
+    // strip then starts at the window edge (see ComputeTabStrip).
+    void SetCompactTitleBar(bool on) { compact_title_bar_ = on && !embedded_; }
+    bool CompactTitleBar() const { return compact_title_bar_; }
     // Hosted inside another window (the file picker): no title bar, tabs,
     // command row, status bar or details panel; only the address row, the
     // sidebar and the pane. `top_dip` is the host's own strip above the
@@ -1872,6 +1879,7 @@ private:
     float sidebar_width_ = 224.0f;
     float sidebar_width_dip_ = 224.0f;
     bool vertical_tabs_ = false;
+    bool compact_title_bar_ = false;
     float search_min_dip_ = 0.0f;
     int toolbar_group_ = -1;
     int new_primary_ = 0;

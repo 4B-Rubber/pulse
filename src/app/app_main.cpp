@@ -910,6 +910,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->compositor.UpdateTextRenderingParams(nullptr);
         s->renderer.SetSidebarWidthDip(static_cast<float>(s->appPrefs.sidebar_width));
         s->renderer.SetVerticalTabs(s->appPrefs.vertical_tabs);
+        s->renderer.SetCompactTitleBar(s->appPrefs.compact_title_bar);
         s->renderer.SetSidebarCollapsed(s->appPrefs.sidebar_collapsed);
         s->renderer.SetTrayIconDip(static_cast<float>(s->appPrefs.tray_icon_size));
         ApplyAccentFromPrefs(*s, true);

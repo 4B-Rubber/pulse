@@ -1551,3 +1551,9 @@
 // Settings > Appearance: show or hide the sidebar staging tray panel.
 #define IDS_SETTINGS_SHOW_STAGING_TRAY 2735
 #define IDS_SETTINGS_SHOW_STAGING_TRAY_DESC 2736
+// Settings > General: file-operation progress in a popup window instead of the status bar.
+#define IDS_SETTINGS_OPERATION_PROGRESS 2737
+#define IDS_SETTINGS_OPERATION_PROGRESS_DESC 2738
+// Settings > Appearance: hide the title-bar brand and the sidebar toggle.
+#define IDS_SETTINGS_COMPACT_TITLE_BAR 2739
+#define IDS_SETTINGS_COMPACT_TITLE_BAR_DESC 2740

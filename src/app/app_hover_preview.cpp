@@ -321,6 +321,25 @@ bool OpenHoverPreviewInQuickLook(AppState& s) {
     return true;
 }
 
+bool OpenHoveredRowInQuickLook(AppState& s) {
+    if (s.hoverRow < 0 || s.renameIndex >= 0) return false;
+    const int row = s.hoverRow;
+    const int slot = s.hoverPaneIndex;
+    app::Pane* pane = slot >= 0 ? PaneAtSlot(s, slot) : s.pane;
+    app::Tab* tab = pane ? pane->ActiveTab() : nullptr;
+    if (!tab || !tab->snapshot || row >= static_cast<int>(tab->EntryCount())) return false;
+    // A selection is the explicit target; the pointer only speaks for the list
+    // when nothing was picked yet.
+    if (tab->selected_index >= 0) return false;
+    if (pane != s.pane) FocusPane(s, pane);
+    if (s.quickPreview.visible()) s.quickPreview.Close();
+    tab->SelectOnly(row);
+    EnsureRowVisible(s, *tab, row);
+    ToggleQuickPreview(s);
+    InvalidateRect(s.hwnd, nullptr, FALSE);
+    return true;
+}
+
 bool StageHoverDwellShot(AppState& s, int nth_file) {
     if (!StageHoverPreviewShot(s, nth_file)) return false;
     auto& card = s.hoverPreview;

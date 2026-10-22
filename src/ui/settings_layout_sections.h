@@ -93,6 +93,7 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
     l.language_card=row(narrow ? 98.0f : 64.0f); l.language_choice=choice(l.language_card,176);
     l.text_render_card=row(narrow ? 98.0f : 64.0f); segments(l.text_render_card,l.text_render_row,3,282);
     l.ui_font_size_card=row(narrow ? 98.0f : 64.0f); segments(l.ui_font_size_card,l.ui_font_size_row,4,340);
+    l.compact_title_bar_row=row(64);
     l.group[0]=D2D1::RectF(left,l.theme_row.top,right,y);
     // Default file manager: a titled card of its own, independent of startup and background running.
     // The switch says what it does; the tiles below show what actually opens in Pulse.
@@ -215,6 +216,7 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
     for(auto& list_row : l.list_style_row) list_row=row(64);
     l.folder_sort_card=row(narrow ? 98.0f : 64.0f); segments(l.folder_sort_card,l.folder_sort_row,3,282);
     l.confirm_delete_row=row(64);
+    l.operation_progress_row=row(64);
     l.group[2]=D2D1::RectF(left,l.density_card.top,right,y);
     y+=18*scale;
     l.disclosure[0]=row(64);
@@ -283,12 +285,13 @@ inline const wchar_t* TriggerSection() { return l10n::Pick(L"预览方式", L"Pr
 inline const wchar_t* TriggerTitle() { return l10n::Pick(L"打开预览", L"Open previews"); }
 inline const wchar_t* TriggerDesc(int trigger) {
     return trigger == 1
-        ? l10n::Pick(L"选中文件后按空格键预览", L"Select a file and press Space")
+        ? l10n::Pick(L"悬停时不弹卡片；选中文件，或把指针停在文件上，按空格键预览",
+                     L"No card on hover; select a file, or rest the pointer on it, and press Space")
         : l10n::Pick(L"指针停在文件上时显示预览卡片，空格键仍可展开完整预览",
                      L"Rest the pointer on a file for a preview card; Space still opens the full preview");
 }
 inline const wchar_t* TriggerChoice(int i) {
-    return i == 0 ? l10n::Pick(L"悬停预览", L"Hover") : l10n::Pick(L"空格预览", L"Space");
+    return i == 0 ? l10n::Pick(L"悬停预览", L"Hover") : l10n::Pick(L"仅空格预览", L"Space only");
 }
 inline const wchar_t* DelayTitle() { return l10n::Pick(L"悬停延迟", L"Hover delay"); }
 inline const wchar_t* DelayDesc() { return l10n::Pick(L"指针停留多久后显示预览卡片",

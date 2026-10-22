@@ -2090,6 +2090,8 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         s.pane->focused, s.maximized, s.darkMode, &s.places, s.sidebarCollapsedMask,
         s.sidebarHiddenMask, s.starredExpanded, &s.sidebarOrder,
         s.sidebarQuickAccessHiddenMask);
+    vm.theme_mode = s.themeOverride == ui::ThemeMode::Light ? 1
+        : s.themeOverride == ui::ThemeMode::Dark ? 2 : 0;
     app::FillWindowTabStrip(vm, s.window_tabs);
     if (s.groupCardGroupId != 0) {
         // The tab controller can close tabs without going through the AppState
@@ -2132,6 +2134,8 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.settings_close_last_tab = s.appPrefs.close_window_with_last_tab;
     vm.settings_close_tab_double_click = s.appPrefs.close_tab_on_double_click;
     vm.settings_confirm_delete = s.appPrefs.confirm_recycle_delete;
+    vm.settings_operation_progress_window = s.appPrefs.operation_progress_window;
+    vm.settings_compact_title_bar = s.appPrefs.compact_title_bar;
     vm.settings_home_folder = s.appPrefs.home_folder;
     vm.settings_text_render = s.appPrefs.text_render;
     vm.settings_ui_font_scale = s.appPrefs.ui_font_scale;
@@ -2785,7 +2789,13 @@ std::wstring TooltipForHover(AppState& s) {
         return label;
     }
     case R::TabNew: return text(s.appPrefs.show_hints ? I::TipxNewTab : I::TooltipNewTab);
-    case R::ThemeToggle: return text(I::TooltipToggleTheme);
+    case R::ThemeToggle: {
+        // The button cycles follow-the-system, light, dark; the hint names the
+        // state it is in now.
+        static constexpr I modes[] = {I::SettingsThemeSystem, I::SettingsThemeLight, I::SettingsThemeDark};
+        return l10n::Pick(L"主题：", L"Theme: ") +
+            text(modes[std::clamp(s.appPrefs.theme_mode, 0, 2)]);
+    }
     case R::SettingsButton: return text(I::Settings);
     case R::SettingsFind: return text(I::SettingsFind);
     case R::SettingsNav: {

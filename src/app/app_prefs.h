@@ -68,6 +68,13 @@ struct AppPrefs {
     // Double-clicking a tab closes it, like its close button (app/last_tab_close.h).
     bool close_tab_on_double_click = false;
     bool confirm_recycle_delete = false; // ask before Delete moves items to the Recycle Bin
+    // File-operation progress: false keeps it in the status-bar pill (click the
+    // pill for the details window); true opens that window by itself, the way
+    // Windows shows its copy dialog.
+    bool operation_progress_window = false;
+    // Title bar: drop the product mark/name and the sidebar toggle so the tab
+    // strip starts at the window edge (Ctrl+B still collapses the sidebar).
+    bool compact_title_bar = false;
     // Sign-in launches (Run value with --startup) stay hidden behind the tray icon.
     bool start_in_tray = false;
     std::wstring home_folder;

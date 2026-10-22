@@ -3622,6 +3622,8 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
         ApplyGlobalSearchSettings(s);
     if (app::HasEffect(effects, app::SettingsEffect::StatusBarPerformance))
         s.showFps = s.forceStatusPerformance || s.appPrefs.show_status_performance;
+    if (app::HasEffect(effects, app::SettingsEffect::TitleBarChrome))
+        s.renderer.SetCompactTitleBar(s.appPrefs.compact_title_bar);
     if (app::HasEffect(effects, app::SettingsEffect::Language)) {
         l10n::SetLanguage(s.appPrefs.language);
         RefreshSidebarModel(s);
@@ -3647,7 +3649,16 @@ app::SettingsTaskCompletion SettingsCompletion(HWND hwnd) {
     };
 }
 void ToggleTheme(AppState& s) {
-    SetThemeMode(s, s.darkMode ? 1 : 2);
+    // Three states on one button: follow the system, light, dark. Leaving
+    // "follow the system" always flips the appearance, so the first click on a
+    // default install (which starts there) never looks like nothing happened;
+    // the ring then walks the two explicit modes and comes back.
+    const int mode = std::clamp(s.appPrefs.theme_mode, 0, 2);
+    const bool system_dark = ui::ShouldUseDarkMode(ui::ThemeMode::Auto);
+    const int next = mode == 0 ? (system_dark ? 1 : 2)
+        : mode == 1 ? (system_dark ? 2 : 0)
+                    : (system_dark ? 0 : 1);
+    SetThemeMode(s, next);
 }
 void SetThemeMode(AppState& s, int mode) {
     s.appPrefs.theme_mode = std::clamp(mode, 0, 2);
