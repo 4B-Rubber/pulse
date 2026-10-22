@@ -851,6 +851,8 @@ struct StatusBarView {
     bool task_is_update = false;   // Noninteractive, centered progress; never opens file operations.
     bool task_active = false;      // file operation running (drives the progress pill)
     bool task_failed = false;      // last operation ended with an error: no success check
+    // The progress window shows file operations instead of the pill (setting).
+    bool task_hidden = false;
     uint64_t task_id = 0;          // resets completion age when another operation becomes current
     bool task_paused = false;      // paused or pausing: amber pill
     uint32_t task_queued = 0;      // operations waiting behind the running one ("+N")

@@ -2998,8 +2998,9 @@ void MainRenderer::DrawStatusBar(const WindowViewModel& vm, const D2D1_RECT_F& f
         progress.indeterminate=progress_value<0.0f;
         progress.animation_progress=static_cast<float>(GetTickCount64()%1952)/1952.0f;
         painter_.DrawProgressBar(progress);
-    } else if (!vm.status.task_text.empty() || vm.status.task_progress >= 0.0f ||
-               vm.status.task_active) {
+    } else if (!vm.status.task_hidden &&
+               (!vm.status.task_text.empty() || vm.status.task_progress >= 0.0f ||
+                vm.status.task_active)) {
         DrawTaskPill(vm, D2D1::RectF(taskX, y, taskRight, y + status_height_), theme);
     } else {
         task_pill_was_active_ = false;
