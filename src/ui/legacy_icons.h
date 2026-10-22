@@ -94,6 +94,8 @@ inline bool DrawLegacyIcon(ID2D1DeviceContext* dc, IDWriteFactory2* factory,
     case 0xE8A9: case 0xECA5: case 0xEA37: box(2,2,10,10); box(14,2,22,10); box(2,14,10,22); box(14,14,22,22); break;
     case 0xE713: circle(12,12,8); circle(12,12,3); for(int i=0;i<8;++i){float a=static_cast<float>(i)*0.785398f;line(12+8*std::cos(a),12+8*std::sin(a),12+11*std::cos(a),12+11*std::sin(a));} break;
     case 0xE706: circle(12,12,5); for(int i=0;i<8;++i){float a=static_cast<float>(i)*0.785398f;line(12+8*std::cos(a),12+8*std::sin(a),12+11*std::cos(a),12+11*std::sin(a));} break;
+    case 0xE793: circle(12,12,9); line(12,3,12,21); break;  // half light, half dark
+    case 0xE708: dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(12,12),7.5f,8.5f), brush); break;  // moon
     default: dc->SetTransform(previous); return false;
     }
     dc->SetTransform(previous);

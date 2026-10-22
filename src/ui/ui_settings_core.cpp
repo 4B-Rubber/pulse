@@ -389,6 +389,7 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
         segmented(lay.text_render_card,lay.text_render_row,text_render,text_render_values,vm.settings_text_render,H::SettingsTextRender,I::SettingsTextRender,I::SettingsTextRenderDesc,3,L"\xE8D2");
         const I ui_font_size[]={I::UiFontSmall,I::UiFontDefault,I::UiFontLarge,I::UiFontLarger};const int ui_font_size_values[]={90,100,112,125};
         segmented(lay.ui_font_size_card,lay.ui_font_size_row,ui_font_size,ui_font_size_values,vm.settings_ui_font_scale,H::SettingsUiFontSize,I::SettingsUiFontSize,I::SettingsUiFontSizeDesc,4,L"\xE8E9");
+        toggle(lay.compact_title_bar_row,I::SettingsCompactTitleBar,I::SettingsCompactTitleBarDesc,L"\xE890",vm.settings_compact_title_bar,85);
         if(lay.wallpaper_card.bottom>lay.wallpaper_card.top) {
         const auto& preview = lay.wallpaper_preview;
         MakeBrush(dc, theme.fill_hover, brFillHover_);
@@ -868,6 +869,7 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
         }
         if(page==12) {
         toggle(lay.confirm_delete_row,I::SettingsConfirmDelete,I::SettingsConfirmDeleteDesc,L"\xE897",vm.settings_confirm_delete,32);
+        toggle(lay.operation_progress_row,I::SettingsOperationProgress,I::SettingsOperationProgressDesc,L"\xE8A7",vm.settings_operation_progress_window,84);
         {
             const I sizes[]={I::SettingsTraySmall,I::SettingsTrayStandard,I::SettingsTrayLarge};const int icons[]={40,48,56};
             segmented(lay.tray_icon_card,lay.tray_icon_row,sizes,icons,vm.settings_tray_icon,H::SettingsTrayIcon,I::SettingsTrayIcon,I::SettingsTrayIconDesc,3,L"\xED1E");

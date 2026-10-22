@@ -96,6 +96,8 @@ void AppPrefs::ResetToDefaults() {
     close_window_with_last_tab = true;
     close_tab_on_double_click = false;
     confirm_recycle_delete = false;
+    operation_progress_window = false;
+    compact_title_bar = false;
     start_in_tray = false;
     lan_discovery = true;
     network_recent_enabled = true;
@@ -286,6 +288,10 @@ std::wstring AppPrefs::ToJson() const {
     out += close_tab_on_double_click ? L"true" : L"false";
     out += L",\n  \"confirm_recycle_delete\":";
     out += confirm_recycle_delete ? L"true" : L"false";
+    out += L",\n  \"operation_progress_window\":";
+    out += operation_progress_window ? L"true" : L"false";
+    out += L",\n  \"compact_title_bar\":";
+    out += compact_title_bar ? L"true" : L"false";
     out += L",\n  \"start_in_tray\":";
     out += start_in_tray ? L"true" : L"false";
     out += L",\n  \"lan_discovery\":";
@@ -599,6 +605,8 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     close_window_with_last_tab = pulse::json::ExtractBool(json, L"close_window_with_last_tab", false);
     close_tab_on_double_click = pulse::json::ExtractBool(json, L"close_tab_on_double_click", false);
     confirm_recycle_delete = pulse::json::ExtractBool(json, L"confirm_recycle_delete", false);
+    operation_progress_window = pulse::json::ExtractBool(json, L"operation_progress_window", false);
+    compact_title_bar = pulse::json::ExtractBool(json, L"compact_title_bar", false);
     start_in_tray = pulse::json::ExtractBool(json, L"start_in_tray", false);
     lan_discovery = pulse::json::ExtractBool(json, L"lan_discovery", true);
     network_recent_enabled = pulse::json::ExtractBool(json, L"network_recent_enabled", true);

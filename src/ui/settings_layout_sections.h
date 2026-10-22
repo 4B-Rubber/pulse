@@ -188,6 +188,7 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
         l.language_card=row(seg_h); l.language_choice=choice(l.language_card,176);
         l.text_render_card=row(seg_h); fitted_segments(l.text_render_card,l.text_render_row,{I::TextRenderAuto,I::TextRenderSharp,I::TextRenderSmooth});
         l.ui_font_size_card=row(seg_h); fitted_segments(l.ui_font_size_card,l.ui_font_size_row,{I::UiFontSmall,I::UiFontDefault,I::UiFontLarge,I::UiFontLarger});
+        l.compact_title_bar_row=row(64);
     } else if (page == 9) {
         section(I::SettingsSecOpenSelect);
         l.click_open_card=row(seg_h); fitted_segments(l.click_open_card,l.click_open_row,{I::ClickOpenDouble,I::ClickOpenSingle});
@@ -475,6 +476,7 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
     } else {
         section(I::SettingsSecDelete);
         l.confirm_delete_row=row(64);
+        l.operation_progress_row=row(64);
 
         section(I::SettingsSecStaging);
         l.tray_icon_card=row(seg_h); fitted_segments(l.tray_icon_card,l.tray_icon_row,{I::SettingsTraySmall,I::SettingsTrayStandard,I::SettingsTrayLarge});

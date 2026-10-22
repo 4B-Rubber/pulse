@@ -5117,3 +5117,13 @@ NativeExtensionSettingsChoose	IDS_NATIVE_EXTENSION_SETTINGS_CHOOSE	6387	选择�
 ArchivePluginRequired	IDS_ARCHIVE_PLUGIN_REQUIRED	6388	需要压缩包插件。请安装并启用支持此格式的原生增强包。	An archive plugin is required. Install and enable a native extension supporting this format.	需要壓縮檔外掛程式。請安裝並啟用支援此格式的原生增強套件。
 ArchivePluginMigrationTitle	IDS_ARCHIVE_PLUGIN_MIGRATION_TITLE	6389	压缩包增强功能已迁移	Archive features have moved to plugins	壓縮檔增強功能已移轉
 ArchivePluginMigrationBody	IDS_ARCHIVE_PLUGIN_MIGRATION_BODY	6390	旧的 7-Zip 下载包已停用。请安装并启用压缩包原生增强包以预览和解压 7z、RAR；内置 ZIP 功能不受影响。	The old 7-Zip download pack is retired. Install and enable the native archive extension to preview and extract 7z and RAR files. Built-in ZIP features remain available.	舊的 7-Zip 下載套件已停用。請安裝並啟用壓縮檔原生增強套件以預覽及解壓縮 7z、RAR；內建 ZIP 功能不受影響。
+OpenItemLocation	IDS_OPEN_ITEM_LOCATION	6391	打开文件所在位置	Open file location	開啟檔案所在位置
+TabGroupEdit	IDS_TAB_GROUP_EDIT	6392	编辑组	Edit group	編輯組
+SettingsShowStagingTray	IDS_SETTINGS_SHOW_STAGING_TRAY	6393	显示临时暂存托盘	Show the staging tray	顯示臨時暫存托盤
+SettingsShowStagingTrayDesc	IDS_SETTINGS_SHOW_STAGING_TRAY_DESC	6394	侧栏底部集中存放待复制/移动文件的面板；关掉后侧栏不再显示它	The panel at the bottom of the sidebar that collects files for a copy or move. Turn it off to keep the sidebar clear	側欄底部集中暫存待複製/移動檔案的面板；關閉後側欄不再顯示它
+SettingsOperationProgress	IDS_SETTINGS_OPERATION_PROGRESS	6395	进度显示在弹窗中	Show operation progress in a window	在視窗中顯示進度
+SettingsOperationProgressDesc	IDS_SETTINGS_OPERATION_PROGRESS_DESC	6396	复制、移动、删除等操作像 Windows 一样弹出进度窗口；关闭时进度显示在状态栏	Copy, move and delete open a progress window like Windows; off keeps the progress in the status bar.	複製、移動、刪除等操作像 Windows 一樣彈出進度視窗；關閉時進度顯示在狀態列
+SettingsCompactTitleBar	IDS_SETTINGS_COMPACT_TITLE_BAR	6397	紧凑标题栏	Compact title bar	精簡標題列
+SettingsCompactTitleBarDesc	IDS_SETTINGS_COMPACT_TITLE_BAR_DESC	6398	隐藏标题栏左侧的 Pulse 品牌标识，把空间留给标签页；侧边栏折叠按钮会移到最左边	Hide the Pulse brand on the left so tabs get the room; the sidebar toggle moves to the window edge.	隱藏標題列左側的 Pulse 品牌標識，把空間留給分頁；側邊欄摺疊按鈕會移到最左邊
+AiAsstModelContext	IDS_AI_ASST_MODEL_CONTEXT	6399	上下文 {n}	Context {n}	上下文 {n}
+AiAsstModelCost	IDS_AI_ASST_MODEL_COST	6400	消耗 {x}×	Uses {x}×	消耗 {x}×

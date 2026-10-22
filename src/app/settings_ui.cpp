@@ -64,6 +64,7 @@ struct SettingDestination { I title;int page;unsigned expanded; };
 constexpr SettingDestination destinations[]={
     // 0 外观
     {I::SettingsTheme,0,0},{I::SettingsThemeColor,0,0},{I::AccentCustomTitle,0,32},{I::SettingsWindowEffect,0,0},{I::SettingsFrameLook,0,0},{I::MenuAcrylic,0,0},
+    {I::SettingsCompactTitleBar,0,0},{I::SettingsShowStagingTray,0,0},
     {I::SettingsWallpaper,0,0},{I::SettingsWallpaperLook,0,0},{I::SettingsWallpaperBlur,0,0},
     {I::SettingsLanguage,0,0},{I::SettingsTextRender,0,0},{I::SettingsUiFontSize,0,0},
     {I::NativeExtensionSettingsTitle,ui::kSettingsPageNativeExtensions,0},
@@ -86,7 +87,7 @@ constexpr SettingDestination destinations[]={
     {I::SettingsRecycleBin,11,0},{I::SettingsExplorerWindows,11,0},
     {I::SettingsLaunch,11,0},{I::SettingsStartInTray,11,0},{I::SettingsKeepRunning,11,0},{I::SettingsNotifyIcon,11,0},{I::SettingsShellTags,11,0},
     // 12 文件操作
-    {I::SettingsConfirmDelete,12,0},{I::SettingsTrayIcon,12,0},{I::TrayHideWhenEmpty,12,0},
+    {I::SettingsConfirmDelete,12,0},{I::SettingsTrayIcon,12,0},{I::TrayHideWhenEmpty,12,0},{I::SettingsOperationProgress,12,0},
     {I::SettingsLanDiscovery,12,0},{I::SettingsLanCache,12,0},{I::SettingsNetworkRecent,12,0},{I::NetworkShowHiddenShares,12,0},
     {I::SettingsClearNetwork,12,0},{I::SettingsChangeTracking,12,0},
     {I::GlobalSearch,1,0},{I::GlobalSearchHotkey,1,0},{I::GlobalSearchDoubleCtrl,1,0},{I::GlobalSearchDoubleCtrlGap,1,0},{I::GlobalSearchApps,1,0},{I::DialogJumpBar,11,0},{I::DialogJumpAuto,11,0},{I::SearchPinyin,1,0},{I::JumpHistory,1,0},{I::ContentIndexManage,1,0},{I::IndexLocation,1,2},{I::LocalDrives,1,2},

@@ -1750,6 +1750,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->compositor.UpdateTextRenderingParams(nullptr);
         s->renderer.SetSidebarWidthDip(static_cast<float>(s->appPrefs.sidebar_width));
         s->renderer.SetVerticalTabs(s->appPrefs.vertical_tabs);
+        s->renderer.SetCompactTitleBar(s->appPrefs.compact_title_bar);
         s->renderer.SetSidebarCollapsed(s->appPrefs.sidebar_collapsed);
         s->renderer.SetTrayIconDip(static_cast<float>(s->appPrefs.tray_icon_size));
         ApplyAccentFromPrefs(*s, true);
@@ -2855,6 +2856,42 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     if (page == 0 && s->bloom_accent.Tick(0.016f)) dirty = true;
                     if (page == 4 && s->duplicateScan.scanning) dirty = true;
                 }
+            }
+            // Edge-style group hover card: 150 ms dwell on a chip opens it.
+            // Leaving both the chip and the card, or starting a tab drag,
+            // closes it.
+            const bool group_dragging = s->tabDragging || s->tabDragPending;
+            const bool on_chip =
+                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroup);
+            const bool on_card =
+                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroupCardRow) ||
+                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroupCard);
+            if (s->groupCardGroupId != 0 &&
+                (group_dragging || (!on_chip && !on_card))) {
+                HideTabGroupCard(*s);
+                dirty = true;
+            }
+            if (!group_dragging && on_chip && s->groupCardSince != 0 &&
+                GetTickCount64() - s->groupCardSince >= 150 && s->hoverControlIndex >= 0 &&
+                s->hoverControlIndex <
+                    static_cast<int>(s->window_tabs.tab_groups.size())) {
+                const int group_id = s->window_tabs.tab_groups[
+                    static_cast<size_t>(s->hoverControlIndex)].id;
+                if (s->groupCardGroupId != group_id) {
+                    s->groupCardGroupId = group_id;
+                    s->groupCardChipIndex = s->hoverControlIndex;
+                    s->groupCardHoverRow = -1;
+                    // The card replaces any hint the chip would have shown.
+                    s->tooltipText.clear();
+                    dirty = true;
+                }
+            }
+            const int card_row =
+                s->hoverRegion == static_cast<int>(ui::HitTestResult::TabGroupCardRow)
+                    ? s->hoverControlIndex : -1;
+            if (s->groupCardGroupId != 0 && card_row != s->groupCardHoverRow) {
+                s->groupCardHoverRow = card_row;
+                dirty = true;
             }
             // 150 ms: the icon rail relies on the hint to name each row, and the
             // old 400 ms delay read as "no tooltip at all".

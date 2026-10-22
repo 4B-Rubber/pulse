@@ -5102,6 +5102,16 @@ enum class StringId : UINT {
     ArchivePluginRequired = IDS_ARCHIVE_PLUGIN_REQUIRED,
     ArchivePluginMigrationTitle = IDS_ARCHIVE_PLUGIN_MIGRATION_TITLE,
     ArchivePluginMigrationBody = IDS_ARCHIVE_PLUGIN_MIGRATION_BODY,
+    OpenItemLocation = IDS_OPEN_ITEM_LOCATION,
+    TabGroupEdit = IDS_TAB_GROUP_EDIT,
+    SettingsShowStagingTray = IDS_SETTINGS_SHOW_STAGING_TRAY,
+    SettingsShowStagingTrayDesc = IDS_SETTINGS_SHOW_STAGING_TRAY_DESC,
+    SettingsOperationProgress = IDS_SETTINGS_OPERATION_PROGRESS,
+    SettingsOperationProgressDesc = IDS_SETTINGS_OPERATION_PROGRESS_DESC,
+    SettingsCompactTitleBar = IDS_SETTINGS_COMPACT_TITLE_BAR,
+    SettingsCompactTitleBarDesc = IDS_SETTINGS_COMPACT_TITLE_BAR_DESC,
+    AiAsstModelContext = IDS_AI_ASST_MODEL_CONTEXT,
+    AiAsstModelCost = IDS_AI_ASST_MODEL_COST,
 };
 
 bool IsLanguageId(std::wstring_view id) noexcept;

@@ -41,6 +41,8 @@ enum class SettingsEffect : uint32_t {
     UiFontSize = 1u << 13,
     MenuMaterial = 1u << 14,
     SearchSwitch = 1u << 15,
+    // Compact title bar: the in-window caption and its buttons change.
+    TitleBarChrome = 1u << 16,
 };
 
 constexpr SettingsEffect operator|(SettingsEffect left, SettingsEffect right) noexcept {

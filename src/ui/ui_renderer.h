@@ -145,6 +145,10 @@ public:
     float ToolbarHeightDip() const {
         return (vertical_tabs_ || embedded_ ? 44.0f : 88.0f) + (favorites_bar_ ? kFavoritesBarHeightDip : 0.0f);
     }
+    // Title bar without the product mark/name and the sidebar toggle: the tab
+    // strip then starts at the window edge (see ComputeTabStrip).
+    void SetCompactTitleBar(bool on) { compact_title_bar_ = on && !embedded_; }
+    bool CompactTitleBar() const { return compact_title_bar_; }
     // Hosted inside another window (the file picker): no title bar, tabs,
     // command row, status bar or details panel; only the address row, the
     // sidebar and the pane. `top_dip` is the host's own strip above the
@@ -1113,6 +1117,7 @@ private:
     float sidebar_width_ = 224.0f;
     float sidebar_width_dip_ = 224.0f;
     bool vertical_tabs_ = false;
+    bool compact_title_bar_ = false;
     float search_min_dip_ = 0.0f;
     bool navigation_can_forward_ = false;
     mutable float title_brand_width_ = 0.0f;

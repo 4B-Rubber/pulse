@@ -140,6 +140,8 @@ bool TrayEffectiveMove(const AppState& s);
 // Hashes of every staged path ("已暂存" row pills), cached per tray state.
 std::shared_ptr<const std::unordered_set<uint64_t>> StagedHashes(AppState& s);
 ui::WindowViewModel BuildVm(AppState& s, bool probe_details = true);
+// Closes the tab-group hover card; its state belongs to the window, not the vm.
+void HideTabGroupCard(AppState& s);
 std::wstring TooltipForHover(AppState& s);
 // Records what the pointer is over. Both mouse-move paths (client and frame)
 // must call this, or a hover field silently stops updating.

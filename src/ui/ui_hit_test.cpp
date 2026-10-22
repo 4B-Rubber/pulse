@@ -107,6 +107,31 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
     // Embedded hosts own the title strip and footer controls.
     if (embedded_ && (y < title_bar_height_ || y >= rect.bottom - status_height_)) return r;
 
+    // The group hover card floats over the strip and the content area, so it
+    // must win every hit before the title-bar/settings/pane branches.
+    if (vm.tab_group_card.visible && !vm.tab_group_card.rows.empty()) {
+        D2D1_RECT_F chip_rc{};
+        if (vm.tab_group_card.chip_index >= 0 &&
+            TabGroupChipRect(vm, rect.right, vm.tab_group_card.chip_index, &chip_rc)) {
+            int visible = 0;
+            const D2D1_RECT_F card =
+                TabGroupCardRect(vm.tab_group_card, chip_rc, rect, scale_, &visible);
+            if (ContainsPt(card, x, y)) {
+                const int display = TabGroupCardRowAt(card, x, y, scale_);
+                if (display >= 0 && display < visible) {
+                    r.region = HitTestResult::TabGroupCardRow;
+                    // Rows are reported by their index in tab_group_card.rows,
+                    // not by the position they are drawn at: a capped card skips
+                    // the member rows it had to drop.
+                    r.index = TabGroupCardRowIndex(vm.tab_group_card, display, visible);
+                } else {
+                    r.region = HitTestResult::TabGroupCard;
+                }
+                return r;
+            }
+        }
+    }
+
     const auto layout_hit = PaneLayoutHit(vm, rect, x, y, scale_, compositor_->DwriteFactory(), compositor_->SmallFormat());
     if (layout_hit.region != HitTestResult::None) return layout_hit;
     if (vm.status.history_open) {
@@ -355,6 +380,7 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             }
             if(ContainsPt(lay.performance_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=4;return r;}
             if(ContainsPt(lay.menu_acrylic_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=36;return r;}
+            if(ContainsPt(lay.compact_title_bar_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=85;return r;}
             for(int list_row=0;list_row<7;++list_row)
                 if(ContainsPt(lay.list_style_row[list_row],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=list_row<3 ? 17+list_row : (list_row==3 ? 22 : list_row==4 ? 33 : list_row==5 ? 34 : 80);return r;}
             // 鼠标与选择 (the rows hidden without single-click are empty rects).
@@ -629,6 +655,9 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 }
                 if (ContainsPt(lay.confirm_delete_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 32; return r;
+                }
+                if (ContainsPt(lay.operation_progress_row, x, y)) {
+                    r.region = HitTestResult::SettingsToggle; r.index = 84; return r;
                 }
                 // 文件操作 → 网络位置 (zero rects on the other pages).
                 if (ContainsPt(lay.lan_discovery_row, x, y)) {

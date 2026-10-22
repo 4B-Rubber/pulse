@@ -467,8 +467,13 @@ float MainRenderer::TitleBrandWidth(const WindowViewModel& vm, float w) const {
 }
 
 D2D1_RECT_F MainRenderer::SidebarToggleRect(float w) const {
+    if (w / scale_ < kSidebarRailWindowDip) return {};
     const float size = (!vertical_tabs_ && !embedded_ && w < 360.0f*scale_ ? 24.0f : 32.0f) * scale_;
     const float top = (TitleControlsHeight() - size) * 0.5f;
+    // Compact title bar: the toggle moves to the window edge, where the brand
+    // used to be. Collapsing the sidebar stays one click away.
+    if (compact_title_bar_)
+        return D2D1::RectF(4.0f * scale_, top, 4.0f * scale_ + size, top + size);
     if (!vertical_tabs_ && !embedded_ && title_brand_width_ > 0) {
         const float right = title_brand_width_ - 4 * scale_;
         return D2D1::RectF(right - size, top, right, top + size);
@@ -489,7 +494,9 @@ D2D1_RECT_F MainRenderer::SidebarToggleRect(float w) const {
 MainRenderer::WindowIdentityGeometry MainRenderer::WindowIdentityLayout(const WindowViewModel& vm, float w) const {
     const float brand = TitleBrandWidth(vm, w);
     WindowIdentityGeometry g;
-    if (!vm.window_identity || vm.window_identity_name.empty() || !compositor_) return g;
+    // The compact title bar shows neither: its room goes to the tab strip, and
+    // the taskbar still carries the name and the color.
+    if (compact_title_bar_ || !vm.window_identity || vm.window_identity_name.empty() || !compositor_) return g;
     const D2D1_RECT_F toggle = SidebarToggleRect(w);
     const bool has_toggle = toggle.right > toggle.left;
     const bool title_rail = user_sidebar_collapsed_ || SidebarAutoCollapsed(w);
@@ -511,10 +518,12 @@ MainRenderer::WindowIdentityGeometry MainRenderer::WindowIdentityLayout(const Wi
     }
     g.compact = true;
     g.dot_radius = 4.0f * scale_;
-    if (has_toggle && title_rail && (vertical_tabs_ || embedded_)) {
+    if (has_toggle && title_rail && (vertical_tabs_ || embedded_ || user_sidebar_collapsed_)) {
         g.dot = D2D1::Point2F(toggle.right - 3.0f * scale_, toggle.bottom - 3.0f * scale_);
-        const float reach = g.dot_radius + 3.0f * scale_;
-        g.hit = D2D1::RectF(g.dot.x - reach, g.dot.y - reach, g.dot.x + reach, g.dot.y + reach);
+        if (!compact_title_bar_) {
+            const float reach = g.dot_radius + 3.0f * scale_;
+            g.hit = D2D1::RectF(g.dot.x - reach, g.dot.y - reach, g.dot.x + reach, g.dot.y + reach);
+        }
     } else {
         const float mark = 24.0f * scale_;
         const float left = 12.0f * scale_;
@@ -1943,7 +1952,57 @@ void MainRenderer::Render(const WindowViewModel& vm, const D2D1_RECT_F& rect,
         MakeBrush(dc, theme.fill_selected, brFillSelected_);
     }
     if (vm.teach.visible && vm.drag_badge.empty()) DrawTeachBubble(vm, rect, theme);
-    if (!vm.status.history_open && !vm.change_popover.visible && vm.drag_badge.empty() && !vm.tooltip_text.empty() &&
+
+    // Edge-style group hover card: member rows plus the two action rows. Drawn
+    // last so it floats over the pane content and suppresses the tooltip.
+    if (vm.tab_group_card.visible && !vm.tab_group_card.rows.empty()) {
+        D2D1_RECT_F chip_rc{};
+        if (vm.tab_group_card.chip_index >= 0 &&
+            TabGroupChipRect(vm, rect.right, vm.tab_group_card.chip_index, &chip_rc)) {
+            int visible = 0;
+            const D2D1_RECT_F card =
+                TabGroupCardRect(vm.tab_group_card, chip_rc, rect, scale_, &visible);
+            painter_.DrawMenuSurface(card);
+            for (int display = 0; display < visible; ++display) {
+                const int index = TabGroupCardRowIndex(vm.tab_group_card, display, visible);
+                const TabGroupCardRow& row =
+                    vm.tab_group_card.rows[static_cast<size_t>(index)];
+                fluent::MenuItemSpec spec;
+                spec.bounds = TabGroupCardRowRect(card, display, scale_);
+                spec.text = row.text;
+                // MenuItemSpec has no bold/emphasis flag ("checked" only renders
+                // for swatch or toggle rows), so the active member is called out
+                // with a check mark in the icon column, and the tab last used in
+                // this group with the same mark drawn faint below. The glyph is
+                // assigned per branch so the view never binds to a temporary.
+                if (row.active) spec.glyph = L"\xE73E";
+                else if (!row.was_active) spec.glyph = row.glyph;
+                // A capped card can drop the last member row, which is the one
+                // carrying the divider: keep it right above the action rows.
+                spec.separator_after = row.separator_after ||
+                    (row.tab_index >= 0 && display + 3 == visible);
+                spec.state.hovered = index == vm.tab_group_card.hover_row;
+                painter_.DrawMenuItem(spec);
+                if (row.was_active) {
+                    // "You were here": dimmed so it cannot be mistaken for the
+                    // tab the window is on. Giving MenuItemSpec a foreground
+                    // override would touch every menu row, so the check is drawn
+                    // here in the icon column instead; the rect mirrors the
+                    // icon bounds Painter::DrawMenuItem computes.
+                    D2D1_COLOR_F dim = theme.text_secondary;
+                    dim.a *= 0.7f;
+                    const float icon_left = spec.bounds.left + 16.0f * scale_;
+                    painter_.DrawGlyph(L"\xE73E",
+                        D2D1::RectF(icon_left, spec.bounds.top + 2.0f * scale_,
+                                    icon_left + 20.0f * scale_,
+                                    spec.bounds.bottom - 2.0f * scale_),
+                        dim);
+                }
+            }
+        }
+    }
+    if (!vm.status.history_open && !vm.change_popover.visible && !vm.tab_group_card.visible &&
+        vm.drag_badge.empty() && !vm.tooltip_text.empty() &&
         !group_wheel_.Visible() && !window_switcher_.IsOpen() && !window_overview_.IsOpen()) {
         IDWriteTextFormat* fmt = compositor_->SmallFormat();
         // Multi-line tooltips ("\n"): one row per line, widest line sets the width.
@@ -2073,7 +2132,9 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
                                 brTextSecondary_.get());
         }
     }
-    if (hasToggle && (user_sidebar_collapsed_ || SidebarAutoCollapsed(right)) && (vertical_tabs_ || embedded_)) {
+    if (compact_title_bar_) {
+        // Compact bar: no product mark in front of the tab strip.
+    } else if (hasToggle && (user_sidebar_collapsed_ || SidebarAutoCollapsed(right)) && (vertical_tabs_ || embedded_)) {
         // Rail: the toggle stands in for the brand mark.
     } else if (ID2D1Bitmap* logo = LogoBitmap()) {
         // 1:1 on whole pixels so the pixel-fitted frame stays sharp.
@@ -2744,16 +2805,12 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
     const D2D1_RECT_F themeRc = D2D1::RectF(chrome.theme_left, buttonTop,
         chrome.theme_left + chrome.theme_w, buttonBottom);
     {
-        // The solid half shows the current theme: right in light, left in dark.
-        D2D1_MATRIX_3X2_F previous{};
-        dc->GetTransform(&previous);
-        if (vm.dark) {
-            dc->SetTransform(D2D1::Matrix3x2F::Rotation(180.0f, D2D1::Point2F(
-                (themeRc.left + themeRc.right) * 0.5f, (themeRc.top + themeRc.bottom) * 0.5f)) * previous);
-        }
+        // The glyph names the state: sun for light, moon for dark, half circle
+        // for following the system (the button cycles through all three).
+        const wchar_t* theme_glyph = vm.theme_mode == 1 ? kIconThemeLight
+            : vm.theme_mode == 2 ? kIconThemeDark : kIconTheme;
         DrawButton(themeRc, theme, IsHovered(vm, HitTestResult::ThemeToggle) ? theme.fill_hover : kTransparent,
-            kIconTheme, L"T", theme.text, true, true);
-        dc->SetTransform(previous);
+            theme_glyph, L"T", theme.text, true, true);
     }
 
     }

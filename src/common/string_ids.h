@@ -5110,5 +5110,15 @@
 #define IDS_ARCHIVE_PLUGIN_REQUIRED                                                      6388
 #define IDS_ARCHIVE_PLUGIN_MIGRATION_TITLE                                               6389
 #define IDS_ARCHIVE_PLUGIN_MIGRATION_BODY                                                6390
+#define IDS_OPEN_ITEM_LOCATION                                                           6391
+#define IDS_TAB_GROUP_EDIT                                                               6392
+#define IDS_SETTINGS_SHOW_STAGING_TRAY                                                   6393
+#define IDS_SETTINGS_SHOW_STAGING_TRAY_DESC                                              6394
+#define IDS_SETTINGS_OPERATION_PROGRESS                                                  6395
+#define IDS_SETTINGS_OPERATION_PROGRESS_DESC                                             6396
+#define IDS_SETTINGS_COMPACT_TITLE_BAR                                                   6397
+#define IDS_SETTINGS_COMPACT_TITLE_BAR_DESC                                              6398
+#define IDS_AI_ASST_MODEL_CONTEXT                                                        6399
+#define IDS_AI_ASST_MODEL_COST                                                           6400
 
 #endif  // PULSE_STRING_IDS_H

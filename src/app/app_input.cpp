@@ -2955,6 +2955,7 @@ LRESULT HandleMouseLeave(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             s->hoverLabel.clear();
             s->hoverSince = 0;
             s->tooltipText.clear();
+            HideTabGroupCard(*s);
             s->bloom_accent.SetPointer(0.0f, 0.0f, false);
             if (GetCapture() != hwnd) s->listSelection.EndFile();
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -3194,6 +3195,39 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
+        }
+        if (hit.region == ui::HitTestResult::TabGroupCardRow ||
+            hit.region == ui::HitTestResult::TabGroupCard) {
+            // Group hover card. Member rows switch to that tab and leave the
+            // group folded - the card is how a folded group is read, and
+            // unfolding on every pick would shuffle the strip for a tab the user
+            // chose out of a list. The trailing rows run the two group actions.
+            // Both cases dismiss the card. Handled ahead of the region chain
+            // below: one more else-if there is over the MSVC nested-block limit.
+            const int group_id = vm.tab_group_card.group_id;
+            const ui::TabGroupCardRow* row =
+                hit.region == ui::HitTestResult::TabGroupCardRow && hit.index >= 0 &&
+                hit.index < static_cast<int>(vm.tab_group_card.rows.size())
+                    ? &vm.tab_group_card.rows[static_cast<size_t>(hit.index)] : nullptr;
+            HideTabGroupCard(*s);
+            if (row && group_id != 0) {
+                if (row->tab_index >= 0) {
+                    if (row->tab_index < static_cast<int>(s->window_tabs.items.size()))
+                        SwitchTab(*s, static_cast<size_t>(row->tab_index));
+                } else if (row->new_tab) {
+                    RememberGroupActivation(*s, s->window_tabs.Active());
+                    s->tabs.NewTabInGroup(s->window_tabs, group_id);
+                    BindCurrentLayout(*s);
+                } else if (row->edit) {
+                    POINT sp{ mx, my };
+                    ClientToScreen(hwnd, &sp);
+                    if (s->pane && EnsureMenu(*s)) {
+                        RememberGroupActivation(*s, s->window_tabs.Active());
+                        s->tabs.ShowGroupMenu(s->window_tabs, group_id, sp, *s->menu);
+                        BindCurrentLayout(*s);
+                    }
+                }
+            }
         }
         if (hit.region == ui::HitTestResult::DetailsPreviewToggle) {
             s->detailsPreviewOnly = !s->detailsPreviewOnly;
@@ -5506,8 +5540,10 @@ LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 EnsureRowVisible(*s, *tab, focus);
             }
         } else if (wParam == VK_SPACE) {
-            // A hover card up: Space opens its file, not the selection.
-            if (!OpenHoverPreviewInQuickLook(*s)) ToggleQuickPreview(*s);
+            // A hover card up: Space opens its file, not the selection. With
+            // nothing selected the row under the pointer is the target.
+            if (!OpenHoverPreviewInQuickLook(*s) && !OpenHoveredRowInQuickLook(*s))
+                ToggleQuickPreview(*s);
         } else if (ctrl && shift && wParam == L'A') {
             DispatchMenuCommand(*s, app::CmdSelectWildcard);
         } else if (ctrl && wParam == L'A') {

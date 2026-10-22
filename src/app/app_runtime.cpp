@@ -2804,6 +2804,8 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
         s.pane->focused, s.maximized, s.darkMode, &s.places, s.sidebarCollapsedMask,
         SidebarHiddenMaskWithBar(s), s.starredExpanded, &s.sidebarOrder,
         s.sidebarQuickAccessHiddenMask);
+    vm.theme_mode = s.themeOverride == ui::ThemeMode::Light ? 1
+        : s.themeOverride == ui::ThemeMode::Dark ? 2 : 0;
     FillWorkspaceSidebarState(s, vm);
     if (const app::Tab* tab = ActiveTab(s)) {
         FillWallHint(*tab, vm.pane);  // photo wall suggestion
@@ -2813,6 +2815,22 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
             vm.pane.can_create_folder = true;
     }
     app::FillWindowTabStrip(vm, s.window_tabs);
+    if (s.groupCardGroupId != 0) {
+        // The tab controller can close tabs without going through the AppState
+        // wrappers, so re-check the remembered tabs before reading them.
+        PruneGroupActivations(s);
+        const app::LayoutTab* last_active = nullptr;
+        if (auto it = s.lastActiveInGroup.find(s.groupCardGroupId);
+            it != s.lastActiveInGroup.end()) {
+            last_active = it->second;
+        }
+        vm.tab_group_card.group_id = s.groupCardGroupId;
+        vm.tab_group_card.chip_index = s.groupCardChipIndex;
+        vm.tab_group_card.hover_row = s.groupCardHoverRow;
+        vm.tab_group_card.rows =
+            app::TabGroupCardRows(s.window_tabs, s.groupCardGroupId, last_active);
+        vm.tab_group_card.visible = !vm.tab_group_card.rows.empty();
+    }
     if(s.window_tabs.active<vm.tabs.size()) {
         const auto* layout=s.window_tabs.Active();
         if(layout&&ZoomedPane(*layout)) vm.tabs[s.window_tabs.active].title += L" · "+l10n::Get(l10n::StringId::AiCtlExpand);
@@ -2872,6 +2890,8 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.settings_close_last_tab = s.appPrefs.close_window_with_last_tab;
     vm.settings_close_tab_double_click = s.appPrefs.close_tab_on_double_click;
     vm.settings_confirm_delete = s.appPrefs.confirm_recycle_delete;
+    vm.settings_operation_progress_window = s.appPrefs.operation_progress_window;
+    vm.settings_compact_title_bar = s.appPrefs.compact_title_bar;
     vm.settings_home_folder = s.appPrefs.home_folder;
     vm.settings_text_render = s.appPrefs.text_render;
     vm.settings_ui_font_scale = s.appPrefs.ui_font_scale;
@@ -3643,13 +3663,32 @@ bool SidebarRailActive(const AppState& s) {
 }
 
 void ApplyHoverTarget(AppState& s, const ui::HitTestResult& hit) {
+    const int previous_index = s.hoverControlIndex;
+    const bool was_chip = s.hoverRegion == static_cast<int>(ui::HitTestResult::TabGroup);
     s.hoverRegion = static_cast<int>(hit.region);
     s.hoverControlIndex = hit.index;
     s.hoverSubIndex = hit.sub_index;
+    // The group card dwells on one chip: moving to a sibling chip restarts the
+    // clock (that chip's card opens), leaving the strip cancels it. Arriving
+    // from anywhere but the same chip always restarts it, even when the new
+    // index happens to equal the old non-chip index.
+    if (hit.region == ui::HitTestResult::TabGroup) {
+        if (!was_chip || previous_index != hit.index) s.groupCardSince = GetTickCount64();
+    } else if (hit.region != ui::HitTestResult::TabGroupCard &&
+               hit.region != ui::HitTestResult::TabGroupCardRow) {
+        s.groupCardSince = 0;
+    }
     s.hoverPath = hit.path;
     s.hoverLabel = hit.label;
     s.hoverSince = GetTickCount64();
     s.tooltipText.clear();
+}
+
+void HideTabGroupCard(AppState& s) {
+    s.groupCardGroupId = 0;
+    s.groupCardChipIndex = -1;
+    s.groupCardHoverRow = -1;
+    s.groupCardSince = 0;
 }
 
 std::wstring TooltipForHover(AppState& s) {
@@ -3704,7 +3743,13 @@ std::wstring TooltipForHover(AppState& s) {
         return label;
     }
     case R::TabNew: return text(s.appPrefs.show_hints ? I::TipxNewTab : I::TooltipNewTab);
-    case R::ThemeToggle: return text(I::TooltipToggleTheme);
+    case R::ThemeToggle: {
+        // The button cycles follow-the-system, light, dark; the hint names the
+        // state it is in now.
+        static constexpr I modes[] = {I::SettingsThemeSystem, I::SettingsThemeLight, I::SettingsThemeDark};
+        return text(I::SettingsTheme) + L" \u00B7 " +
+            text(modes[std::clamp(s.appPrefs.theme_mode, 0, 2)]);
+    }
     case R::StatusUndo: return s.ops.CanUndo() ? s.ops.UndoLabel() + L"  Ctrl+Z" : text(I::HistoryLocked);
     case R::StatusRedo: return text(I::HistoryRedo) + L"  Ctrl+Y";
     case R::StatusUndoHistory: return text(I::OpHistory);

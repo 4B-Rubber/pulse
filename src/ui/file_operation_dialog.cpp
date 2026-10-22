@@ -2664,6 +2664,11 @@ void FileOperationWindow::Update(const ops::OpStatus& incoming) {
                                        (status_.authorization != ops::AuthorizationState::None);
     status_ = ops::PresentOperationStatus(status);
     if (new_task) {
+        speed_history_.clear();
+        speed_sample_tick_ = 0;
+        last_progress_tick_ = now;
+        last_progress_bytes_ = status_.transferred_bytes;
+        last_progress_items_ = status_.completed_items;
         graph_.Reset();
         SyncGraph();   // a card built late starts with the run so far
         task_start_tick_ = now;
@@ -2673,6 +2678,11 @@ void FileOperationWindow::Update(const ops::OpStatus& incoming) {
         keep_open_requested_ = false;
         locate_after_ = false;
         pending_locate_task_ = 0;
+    } else if (status_.transferred_bytes != last_progress_bytes_ ||
+               status_.completed_items != last_progress_items_) {
+        last_progress_tick_ = now;
+        last_progress_bytes_ = status_.transferred_bytes;
+        last_progress_items_ = status_.completed_items;
     }
     const bool finished = !status_.active &&
         (status_.phase == ops::OpPhase::Completed || status_.phase == ops::OpPhase::Failed);
@@ -2694,16 +2704,6 @@ void FileOperationWindow::Update(const ops::OpStatus& incoming) {
         hwnd_ && !Shown() && callbacks_.locate_results) {
         if (closing_) pending_locate_task_ = status_.task_id;
         else callbacks_.locate_results(status_.task_id);
-        speed_history_.clear();
-        speed_sample_tick_ = 0;
-        last_progress_tick_ = now;
-        last_progress_bytes_ = status_.transferred_bytes;
-        last_progress_items_ = status_.completed_items;
-    } else if (status_.transferred_bytes != last_progress_bytes_ ||
-               status_.completed_items != last_progress_items_) {
-        last_progress_tick_ = now;
-        last_progress_bytes_ = status_.transferred_bytes;
-        last_progress_items_ = status_.completed_items;
     }
     if (!hwnd_) return;
     if (authorization_changed || new_task || was_active != status_.active || layout_changed)
@@ -2718,7 +2718,6 @@ bool FileOperationWindow::FlightAnimationsEnabled() const {
     return flight_animations_override_.value_or(motion::SystemAnimationsEnabled());
 }
 
-void FileOperationWindow::Show(bool activate, bool from_status) {
 bool FileOperationWindow::Stalled(ULONGLONG now) const {
     // Only a running task that already moved can stall: before the first byte the
     // readout is "estimating", not zero.
@@ -2733,7 +2732,7 @@ double FileOperationWindow::LiveSpeed(ULONGLONG now) const {
         ? status_.items_per_second : status_.bytes_per_second;
 }
 
-void FileOperationWindow::Show(bool activate) {
+void FileOperationWindow::Show(bool activate, bool from_status) {
     if (!hwnd_) return;
     const bool interrupted = closing_ || opening_;
     const RECT initial = flight_.Bounds();
@@ -3622,67 +3621,6 @@ void FileOperationWindow::Render() {
             painter_.FillRoundedRect(Rect(s, kPadX + content_w - 6.0f, at, 2.0f, thumb), ScaleDip(s, 1.0f),
                                      WithAlpha(theme.text, 0.25f));
         }
-    const auto stats = Rect(scale_, kPadX, 118, dip_w - kPadX * 2.0f, authorization ? 86.0f : 52.0f);
-    painter_.FillRoundedRect(stats, ScaleDip(scale_, 12.0f),
-        dark_ ? HexColor(0xFFFFFF, 0.05f) : HexColor(0x000000, 0.05f));
-    if (authorization) {
-        const std::wstring explanation = requesting
-            ? l10n::Get(l10n::StringId::OpAuthorizationPrompt)
-            : status_.last_error.empty() ? l10n::Get(l10n::StringId::OpAuthorizationNotGranted)
-                                        : l10n::ServiceErrorText(status_.last_error);
-        painter_.DrawGlyph(L"\xEA18", Rect(scale_, 30, 150, 22, 22), theme.accent);
-        DrawEllipsizedText(compositor_, compositor_.SmallFormat(),
-            Rect(scale_, 62, 124, dip_w - 94, 72), explanation, theme.text, true);
-    } else {
-        const bool byte_basis = status_.speed_basis == ops::OpSpeedBasis::Bytes;
-        const std::wstring time_text = failed ? l10n::Get(l10n::StringId::OpIncomplete).c_str()
-            : completed ? l10n::Get(l10n::StringId::OpCompleted).c_str()
-            : paused ? l10n::Get(l10n::StringId::OpPaused).c_str()
-            : waiting ? l10n::Get(l10n::StringId::OpWaiting).c_str()
-            : emptying ? l10n::Get(l10n::StringId::OpEmptying)
-            : status_.speed_basis == ops::OpSpeedBasis::None ? l10n::Get(l10n::StringId::OpNoEstimate).c_str()
-            : status_.eta_seconds == 0 ? l10n::Get(l10n::StringId::OpEstimating).c_str()
-            : l10n::Get(l10n::StringId::OpApprox).c_str() + FormatDuration(status_.eta_seconds);
-        const uint64_t remain_items = status_.total_items > status_.completed_items
-            ? status_.total_items - status_.completed_items : 0;
-        const uint64_t remain_bytes = status_.total_bytes > status_.transferred_bytes
-            ? status_.total_bytes - status_.transferred_bytes : 0;
-        std::wstring items_text;
-        if (completed) items_text = l10n::Get(l10n::StringId::OpZeroItems).c_str();
-        else if (failed && status_.total_items == 0) items_text = L"—";
-        else if (status_.total_items == 0) items_text = l10n::Get(l10n::StringId::OpCalculating).c_str();
-        else if (byte_basis && status_.total_bytes > 0)
-            items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountBytes).c_str()
-                + pulse::format::ByteSize(remain_bytes) + L")";
-        else items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountSuffix).c_str();
-        const ULONGLONG now = GetTickCount64();
-        const double live_speed = LiveSpeed(now);
-        std::wstring speed_text;
-        if (status_.speed_basis == ops::OpSpeedBasis::None)
-            speed_text = l10n::Get(l10n::StringId::OpNoEstimate).c_str();
-        else if (completed || failed || paused || waiting)
-            speed_text = FormatSpeedText(status_.speed_basis, 0.0);
-        else if (live_speed > 0.0)
-            speed_text = FormatSpeedText(status_.speed_basis, live_speed);
-        else if (Stalled(now))
-            // Progress stopped but the task still runs: "estimating" would read as
-            // if it were still moving, so say zero instead.
-            speed_text = FormatSpeedText(status_.speed_basis, 0.0);
-        else
-            speed_text = l10n::Get(l10n::StringId::OpEstimating).c_str();
-        const D2D1_COLOR_F time_color = failed ? theme.danger : theme.text;
-        painter_.DrawText(l10n::Get(l10n::StringId::OpRemainingTime).c_str(), Rect(scale_, 32, 124, 120, 14),
-                          compositor_.SmallFormat(), theme.text_secondary);
-        painter_.DrawText(l10n::Get(l10n::StringId::OpRemainingItems).c_str(), Rect(scale_, 176, 124, 140, 14),
-                          compositor_.SmallFormat(), theme.text_secondary);
-        painter_.DrawText(l10n::Get(l10n::StringId::OpCurrentSpeed).c_str(), Rect(scale_, 328, 124, 110, 14),
-                          compositor_.SmallFormat(), theme.text_secondary);
-        painter_.DrawText(time_text, Rect(scale_, 32, 140, 136, 22),
-                          compositor_.SmallFormat(), time_color);
-        painter_.DrawText(items_text, Rect(scale_, 176, 140, 148, 22),
-                          compositor_.SmallFormat(), theme.text);
-        painter_.DrawText(speed_text, Rect(scale_, 328, 140, 112, 22),
-                          compositor_.SmallFormat(), sky);
     }
 
     // --- Details: a two-column label / value list ------------------------------
@@ -3905,7 +3843,6 @@ LRESULT FileOperationWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM l
                 return 0;
             }
             SampleGraph(now);
-            const ULONGLONG now = GetTickCount64();
             if (speed_sample_tick_ == 0 || now - speed_sample_tick_ >= 250) {
                 speed_sample_tick_ = now;
                 const bool running = status_.phase == ops::OpPhase::Running;
