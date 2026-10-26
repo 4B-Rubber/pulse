@@ -1504,6 +1504,13 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
         s.operationFinishedAt = {};
     }
 
+    // A transfer blocked on a conflict decision makes no progress, so its window
+    // stays closed: the prompt is the only thing to answer, and the window opens
+    // once the choice sets the transfer running again.
+    const auto pending_conflict = s.ops.PendingConflict();
+    const bool awaiting_conflict = pending_conflict.has_value() ||
+        status.phase == ops::OpPhase::WaitingForConflict;
+
     // Creation stays in the list (including inline rename after completion).
     // UAC already owns consent; do not turn it into a transfer progress window.
     const bool inline_create = status.type == ops::OpType::CreateFolder ||
@@ -1514,14 +1521,16 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
     }
     if (s.operationWindow) s.operationWindow->Update(status);
 
-    if (allow_conflict_dialog) {
-        if (const auto conflict = s.ops.PendingConflict();
-            conflict && conflict->token != s.conflictUiToken) {
-            s.conflictUiToken = conflict->token;
-            const ui::ConflictDialogResult result = ui::ShowFileConflictDialog(
-                s.hwnd, *conflict, s.darkMode, s.accentColor);
-            s.ops.ResolveConflict(conflict->token, result.choice, result.apply_to_all);
-        }
+    if (allow_conflict_dialog && pending_conflict &&
+        pending_conflict->token != s.conflictUiToken) {
+        s.conflictUiToken = pending_conflict->token;
+        const ui::ConflictDialogResult result = ui::ShowFileConflictDialog(
+            s.hwnd, *pending_conflict, s.darkMode, s.accentColor);
+        s.ops.ResolveConflict(pending_conflict->token, result.choice, result.apply_to_all);
+        // Time spent on the prompt is not time the transfer ran: the resumed
+        // transfer gets its own wait before the window may open, so answering
+        // a prompt for a file that copies at once shows no window at all.
+        s.operationStartedAt = std::chrono::steady_clock::now();
     }
 
     // A failure inside the assistant's task: the panel asks instead.
@@ -1561,12 +1570,12 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
     }
 
     if (status.active) {
-        // Progress starts in the status-bar pill; a task still running after
-        // kOperationAutoShowDelay opens the details window once (without
-        // taking focus), unless it is nearly done. Closing that window keeps
-        // it closed for this task (operationDismissedTaskId above).
-        // Emptying the Recycle Bin starts from a menu with no row to watch, so
-        // its window opens sooner.
+        // The window is the setting's job: off keeps progress in the status-bar
+        // pill only. When on, a task still running after the delay opens the
+        // details window once (without taking focus), unless it is nearly done.
+        // Closing that window keeps it closed for this task
+        // (operationDismissedTaskId above). Emptying the Recycle Bin starts from
+        // a menu with no row to watch, so its window opens sooner.
         constexpr auto kOperationAutoShowDelay = std::chrono::milliseconds(2000);
         const bool quick_type = status.type == ops::OpType::Rename ||
                                 status.type == ops::OpType::CreateFolder ||
@@ -1574,8 +1583,8 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
         const bool emptying = status.type == ops::OpType::EmptyRecycle;
         const auto delay = emptying ? std::chrono::milliseconds(400) : kOperationAutoShowDelay;
         const bool nearly_done = !emptying && status.percent >= 90.0f;
-        if (!quick_type && !s.operationAutoShown && !nearly_done &&
-            status.phase != ops::OpPhase::WaitingForConflict &&
+        if (s.appPrefs.operation_progress_window && !quick_type && !s.operationAutoShown &&
+            !nearly_done && !awaiting_conflict &&
             now - s.operationStartedAt >= delay) {
             s.operationAutoShown = true;
             if (!OperationWindowVisible(s)) ShowOperationWindow(s, status, false);
