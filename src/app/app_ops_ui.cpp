@@ -568,14 +568,23 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
         s.operationFinishedAt = {};
     }
 
-    if (allow_conflict_dialog) {
-        if (const auto conflict = s.ops.PendingConflict();
-            conflict && conflict->token != s.conflictUiToken) {
-            s.conflictUiToken = conflict->token;
-            const ui::ConflictDialogResult result = ui::ShowFileConflictDialog(
-                s.hwnd, *conflict, s.darkMode, s.accentColor);
-            s.ops.ResolveConflict(conflict->token, result.choice, result.apply_to_all);
-        }
+    // A transfer blocked on a conflict decision makes no progress, so its window
+    // stays closed: the prompt is the only thing to answer, and the window opens
+    // once the choice sets the transfer running again.
+    const auto pending_conflict = s.ops.PendingConflict();
+    const bool awaiting_conflict = pending_conflict.has_value() ||
+        status.phase == ops::OpPhase::WaitingForConflict;
+
+    if (allow_conflict_dialog && pending_conflict &&
+        pending_conflict->token != s.conflictUiToken) {
+        s.conflictUiToken = pending_conflict->token;
+        const ui::ConflictDialogResult result = ui::ShowFileConflictDialog(
+            s.hwnd, *pending_conflict, s.darkMode, s.accentColor);
+        s.ops.ResolveConflict(pending_conflict->token, result.choice, result.apply_to_all);
+        // Time spent on the prompt is not time the transfer ran: the resumed
+        // transfer gets its own 400 ms before the window may open, so answering
+        // a prompt for a file that copies at once shows no window at all.
+        s.operationStartedAt = std::chrono::steady_clock::now();
     }
 
     // Failed on an item other processes hold: name them and offer the retry
@@ -608,7 +617,8 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
         // when the pill is clicked. Asking for the window opens it by itself
         // once the operation has run long enough to be worth watching, so a
         // quick copy does not flash a dialog.
-        if (s.appPrefs.operation_progress_window && !OperationWindowVisible(s) &&
+        if (s.appPrefs.operation_progress_window && !awaiting_conflict &&
+            !OperationWindowVisible(s) &&
             now - s.operationStartedAt >= std::chrono::milliseconds(400)) {
             ShowOperationWindow(s, status, false);
         }

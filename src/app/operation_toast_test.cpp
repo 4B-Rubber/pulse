@@ -184,6 +184,48 @@ bool RunOperationToastTest() {
         }
         check(!state->notification_toast.IsVisible() && GetTickCount64() - snack_start >= 1400,
               "a capsule goes by itself after its time");
+        // A copy stopped on a conflict has nothing to watch until the user
+        // answers: the prompt is the only thing on screen, and the progress
+        // window may only open once the choice lets the transfer run.
+        {
+            const auto incoming = fixture / L"conflict-source.txt";
+            const auto target_dir = fixture / L"conflict-target";
+            const auto target_file = target_dir / L"conflict-source.txt";
+            std::filesystem::create_directories(target_dir);
+            std::ofstream(incoming) << "incoming";
+            std::ofstream(target_file) << "existing";
+            state->appPrefs.operation_progress_window = true;
+            ops::OpRequest request;
+            request.type = ops::OpType::Copy;
+            request.dest_dir = target_dir.wstring();
+            request.sources = {incoming.wstring()};
+            const uint64_t conflict_task = state->ops.Submit(std::move(request));
+            uint64_t conflict_token = 0;
+            const auto conflict_start = GetTickCount64();
+            while (conflict_task != 0 && GetTickCount64() - conflict_start < 5000) {
+                UpdateOperationWindow(*state, false);  // what the UI timer does
+                if (const auto conflict = state->ops.PendingConflict()) {
+                    conflict_token = conflict->token;
+                    break;
+                }
+                Sleep(10);
+            }
+            check(conflict_token != 0, "copy stops on an existing target and asks");
+            Sleep(500);  // past the 400 ms after which the window opens by itself
+            UpdateOperationWindow(*state, false);
+            check(!state->operationWindow || !state->operationWindow->IsVisible(),
+                "no progress window while the conflict prompt waits for an answer");
+            if (conflict_token != 0)
+                state->ops.ResolveConflict(conflict_token, ops::ConflictChoice::Skip, false);
+            const auto skip_start = GetTickCount64();
+            while (state->ops.Status().active && GetTickCount64() - skip_start < 5000) Sleep(10);
+            if (state->ops.Status().active) state->ops.CancelCurrent();
+            check(!state->ops.Status().active, "answering the prompt lets the copy finish");
+            state->appPrefs.operation_progress_window = false;
+            std::filesystem::remove(target_file);
+            std::filesystem::remove(incoming);
+            check(std::filesystem::remove(target_dir), "conflict fixture cleaned");
+        }
         check(!state->operationWindow, "status updates alone never build the operations window");
         PinAndShowOperationWindow(*state);
         const ui::FileOperationWindow* built = state->operationWindow.get();
