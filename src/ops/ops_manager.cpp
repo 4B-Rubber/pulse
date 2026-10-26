@@ -2919,8 +2919,11 @@ void OpsManager::ConfigureShellCallbacks() {
     // it resets whenever the task id changes.
     auto shell_item_rate = std::make_shared<TransferRateEstimator>();
     // Deleting a folder tree runs well under one item per second and still deserves a
-    // countdown, so this estimator drops the byte-transfer floor.
+    // countdown, so this estimator drops the byte-transfer floor. Item counts arrive
+    // in far fewer steps than byte progress: the readout averages two seconds and
+    // stays empty until a handful of items moved.
     shell_item_rate->SetEtaFloor(0.0);
+    shell_item_rate->SetDisplayWindow(2000, 5);
     auto shell_rate_task = std::make_shared<uint64_t>(0);
     // A phone transfer (RunShellTransfer) reports a percent of its bytes.
     auto shell_byte_rate = std::make_shared<TransferRateEstimator>();
@@ -2943,10 +2946,10 @@ void OpsManager::ConfigureShellCallbacks() {
                     shell_item_rate->Reset(now, st.completed_items);
                 }
                 shell_item_rate->Observe(now, st.completed_items, st.total_items);
-                st.items_per_second = shell_item_rate->speed();
+                st.items_per_second = shell_item_rate->speed(now);
                 st.peak_items_per_second = (std::max)(st.peak_items_per_second,
                                                       st.items_per_second);
-                st.eta_seconds = shell_item_rate->eta_seconds();
+                st.eta_seconds = shell_item_rate->eta_seconds(now);
             } else if (st.speed_basis == OpSpeedBasis::Bytes && st.total_bytes > 0 && pct >= 0.0f) {
                 const double share = (std::min)(100.0, static_cast<double>(pct)) / 100.0;
                 st.transferred_bytes = static_cast<uint64_t>(static_cast<double>(st.total_bytes) * share);
@@ -2956,9 +2959,9 @@ void OpsManager::ConfigureShellCallbacks() {
                     shell_byte_rate->Reset(now, st.transferred_bytes);
                 }
                 shell_byte_rate->Observe(now, st.transferred_bytes, st.total_bytes);
-                st.bytes_per_second = shell_byte_rate->speed();
+                st.bytes_per_second = shell_byte_rate->speed(now);
                 st.peak_bytes_per_second = (std::max)(st.peak_bytes_per_second, st.bytes_per_second);
-                st.eta_seconds = shell_byte_rate->eta_seconds();
+                st.eta_seconds = shell_byte_rate->eta_seconds(now);
             }
             if (!item.empty()) {
                 std::wstring base = st.summary;
@@ -4484,10 +4487,23 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
 
     uint64_t total_bytes = 0;
     for (const auto& entry : entries) total_bytes += entry.bytes;
+    // A move that renamed every item on one volume never wrote data: its byte rate
+    // would only be the file sizes divided by the elapsed time. Count items there.
+    // A move that had to copy (another volume, an existing target, a lock) keeps
+    // bytes, and so does every other operation.
+    OpSpeedBasis basis = SpeedBasisFor(req.type);
+    if (req.type == OpType::Move && !entries.empty() &&
+        std::all_of(entries.begin(), entries.end(),
+            [](const TransferEntry& entry) { return entry.directory || entry.renamed; }))
+        basis = OpSpeedBasis::Items;
+    const bool item_basis = basis == OpSpeedBasis::Items;
+    const uint64_t item_total = entries.size();
     SetStatus([&](OpStatus& st) {
         st.total_bytes = total_bytes;
         st.total_items = entries.size();
         st.enumeration_complete = enumeration_complete;
+        st.total_items = item_total;
+        st.speed_basis = basis;
         if (failure.empty() && !cancelled) {
             st.phase = OpPhase::Running;
             st.percent = 0.0f;
@@ -4508,6 +4524,10 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
     uint64_t processed_items = 0;
     TransferRateEstimator rate;
     rate.Reset(rate_now(), 0);
+    // Item counts arrive in far fewer steps than byte progress: a longer window,
+    // and no readout until a handful of items have moved.
+    rate.SetDisplayWindow(item_basis ? 2000 : 1500, item_basis ? 5 : 0);
+    rate.Reset(GetTickCount64(), 0);
 
     auto publish_progress = [&](const TransferEntry& entry, uint64_t file_done,
                                 uint64_t file_total, uint64_t completed_items) {
@@ -4522,20 +4542,52 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
         overall = (std::max)(published_bytes, overall);
         if (total_bytes > 0) overall = (std::min)(overall, total_bytes);
         published_bytes = overall;
-        rate.Observe(rate_now(), overall, total_bytes);
-        SetProgressStatus([&](OpStatus& st) {
-            st.current_item = FileName(st.current_item_token && active_serial_entry ? active_serial_entry->source : entry.source);
+        const ULONGLONG now = rate_now();
+        if (item_basis) {
+            rate.Observe(now, completed_items, item_total);
+            const double live = rate.speed(now);
+            const uint64_t eta = rate.eta_seconds(now);
+            SetProgressStatus([&, live, eta](OpStatus& st) {
+                st.current_item = FileName(st.current_item_token && active_serial_entry
+                    ? active_serial_entry->source : entry.source);
+                st.transferred_bytes = overall;
+                st.completed_items = completed_items;
+                st.items_per_second = live;
+                st.peak_items_per_second = (std::max)(st.peak_items_per_second, live);
+                st.eta_seconds = eta;
+                if (item_total > 0) {
+                    st.percent = static_cast<float>((std::min)(100.0,
+                        static_cast<double>(completed_items) * 100.0 / item_total));
+                }
+            });
+            return;
+        }
+        rate.Observe(now, overall, total_bytes);
+        const double live = rate.speed(now);
+        const uint64_t eta = rate.eta_seconds(now);
+        SetProgressStatus([&, live, eta](OpStatus& st) {
+            st.current_item = FileName(st.current_item_token && active_serial_entry
+                ? active_serial_entry->source : entry.source);
             st.transferred_bytes = overall;
             st.completed_items = completed_items;
-            st.bytes_per_second = rate.speed();
-            st.peak_bytes_per_second = (std::max)(st.peak_bytes_per_second, rate.speed());
+            st.bytes_per_second = live;
+            st.peak_bytes_per_second = (std::max)(st.peak_bytes_per_second, live);
             if (st.total_bytes > 0) {
                 st.percent = static_cast<float>((std::min)(verify_copies_.load() ? 99.0 : 100.0,
                     static_cast<double>(overall) * 100.0 / st.total_bytes));
-                st.eta_seconds = rate.eta_seconds();
+                st.eta_seconds = eta;
             } else if (st.total_items > 0) {
                 st.percent = static_cast<float>(completed_items * 100.0 / st.total_items);
             }
+        });
+    };
+
+    auto reset_rate = [&] {
+        rate.Reset(GetTickCount64(), item_basis ? processed_items : published_bytes);
+        SetStatus([&](OpStatus& st) {
+            st.bytes_per_second = 0.0;
+            st.items_per_second = 0.0;
+            st.eta_seconds = 0;
         });
     };
 
@@ -4543,14 +4595,27 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
         skipped_sources.push_back(entry.source);
         total_bytes -= (std::min)(total_bytes, entry.bytes);
         ++processed_items;
-        rate.Observe(rate_now(), published_bytes, total_bytes);
-        SetProgressStatus([&](OpStatus& st) {
+        const ULONGLONG now = rate_now();
+        rate.Observe(now, item_basis ? processed_items : published_bytes,
+                     item_basis ? item_total : total_bytes);
+        const double live = rate.speed(now);
+        const uint64_t eta = rate.eta_seconds(now);
+        SetProgressStatus([&, live, eta](OpStatus& st) {
             st.total_bytes = total_bytes;
             st.transferred_bytes = published_bytes;
             st.completed_items = processed_items;
             st.current_item = FileName(entry.source);
-            st.eta_seconds = rate.eta_seconds();
-            if (st.total_bytes > 0) {
+            st.eta_seconds = eta;
+            if (item_basis) {
+                st.items_per_second = live;
+                st.peak_items_per_second = (std::max)(st.peak_items_per_second, live);
+                if (item_total > 0) {
+                    st.percent = static_cast<float>((std::min)(100.0,
+                        static_cast<double>(processed_items) * 100.0 / item_total));
+                }
+            } else if (st.total_bytes > 0) {
+                st.bytes_per_second = live;
+                st.peak_bytes_per_second = (std::max)(st.peak_bytes_per_second, live);
                 st.percent = static_cast<float>((std::min)(100.0,
                     static_cast<double>(published_bytes) * 100.0 / st.total_bytes));
             } else if (st.total_items > 0) {
@@ -5187,8 +5252,9 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
             SetStatus([&](OpStatus& st) {
                 st.phase = OpPhase::Running;
                 st.summary = ProgressSummary(req.type, entries.size());
-                st.bytes_per_second = rate.speed();
-                st.eta_seconds = rate.eta_seconds();
+                const ULONGLONG now = GetTickCount64();
+                st.bytes_per_second = rate.speed(now);
+                st.eta_seconds = rate.eta_seconds(now);
             });
         }
 
@@ -5589,8 +5655,9 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
             SetStatus([&](OpStatus& st) {
                 st.phase = OpPhase::Running;
                 st.summary = ProgressSummary(req.type, entries.size());
-                st.bytes_per_second = rate.speed();
-                st.eta_seconds = rate.eta_seconds();
+                const ULONGLONG now = GetTickCount64();
+                st.bytes_per_second = rate.speed(now);
+                st.eta_seconds = rate.eta_seconds(now);
             });
         }
         const bool item_skipped = item_control_.Finish(current_item);
@@ -6100,6 +6167,7 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
             st.percent = -1.0f;
         });
         TransferRateEstimator recycle_rate;
+        recycle_rate.SetDisplayWindow(1500, 0);
         recycle_rate.Reset(GetTickCount64(), 0);
         const ULONGLONG started = GetTickCount64();
         const auto cancelled = [this] { return stopping_.load() || shell_cancel_requested_.load(); };
@@ -6113,10 +6181,11 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
                 st.percent = st.total_bytes ? 100.0f * static_cast<float>(st.transferred_bytes) / static_cast<float>(st.total_bytes)
                     : p.total_items ? 100.0f * static_cast<float>(p.removed_items) / static_cast<float>(p.total_items) : -1.0f;
                 st.current_item = p.current.empty() ? OpVerb(OpType::EmptyRecycle) : p.current;
-                recycle_rate.Observe(GetTickCount64(), st.transferred_bytes, st.total_bytes);
-                st.bytes_per_second = recycle_rate.speed();
+                const ULONGLONG now_tick = GetTickCount64();
+                recycle_rate.Observe(now_tick, st.transferred_bytes, st.total_bytes);
+                st.bytes_per_second = recycle_rate.speed(now_tick);
                 st.peak_bytes_per_second = (std::max)(st.peak_bytes_per_second, st.bytes_per_second);
-                st.eta_seconds = recycle_rate.eta_seconds();
+                st.eta_seconds = recycle_rate.eta_seconds(now_tick);
             });
         };
         const auto bin_folders = recycle_empty::CurrentUserBinFolders();

@@ -109,6 +109,12 @@ private:
     ops::OpStatus BoardStatus() const;
     void RetryFailureRows(const std::vector<size_t>& rows);
     void FinishRetry(const ops::OpStatus& status);
+    void RequestClose();
+    // Speed for the readout and the graph. The worker only publishes status when
+    // something changes, so a stalled transfer keeps repeating its last value;
+    // here that value stops counting once no progress arrived for a while.
+    bool Stalled(ULONGLONG now) const;
+    double LiveSpeed(ULONGLONG now) const;
 
     bool preparation_only_ = false;
     HWND hwnd_ = nullptr;
@@ -153,6 +159,14 @@ private:
     ComPtr<IDWriteTextFormat> chip_format_;
     ComPtr<IDWriteTextFormat> glyph_format_;
     ComPtr<IDWriteTextFormat> tile_glyph_format_;
+    std::deque<double> speed_history_;
+    ULONGLONG speed_sample_tick_ = 0;
+    // Last moment the transfer made progress, for the stall cutoff above. The
+    // worker does not tick while nothing moves, so this has to live here.
+    ULONGLONG last_progress_tick_ = 0;
+    uint64_t last_progress_bytes_ = 0;
+    uint64_t last_progress_items_ = 0;
+    static constexpr ULONGLONG kStallMs = 1200;
     bool dark_ = false;
     bool backdrop_enabled_ = false;
     bool detailed_ = false;
