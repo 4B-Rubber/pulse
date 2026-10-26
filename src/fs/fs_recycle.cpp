@@ -121,8 +121,7 @@ bool ReadRecycleIndex(const std::wstring& index_path, RecycleItem& out) {
 }
 
 bool EnumerateRecycleBinAtRoot(const std::wstring& recycle_root, std::vector<DirEntry>& out,
-    const std::function<bool()>& cancelled) {
-    if (cancelled && cancelled()) return false;
+                               const RecycleProgress& progress) {
     const std::wstring sid = CurrentUserSidString();
     if (sid.empty()) return false; // Never fall back to scanning other users.
     const std::wstring normalized = NormalizePath(recycle_root);
@@ -134,56 +133,80 @@ bool EnumerateRecycleBinAtRoot(const std::wstring& recycle_root, std::vector<Dir
         const DWORD error = GetLastError();
         return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
     }
+    size_t since_progress = 0;
     do {
-        if (cancelled && cancelled()) { FindClose(find); return false; }
         if (index.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         RecycleItem item;
-        if (ReadRecycleIndexCancellable(sid_dir + L"\\" + index.cFileName, item, cancelled))
+        if (ReadRecycleIndexCancellable(sid_dir + L"\\" + index.cFileName, item, {})) {
             out.push_back(ToDirEntry(item));
+            // Reading $I records one by one is the slow part of a big bin; publish at
+            // a steady item count so a caller can stream rows while the scan runs.
+            if (++since_progress >= 256) {
+                since_progress = 0;
+                if (progress && !progress(out)) {
+                    FindClose(find);
+                    return false;
+                }
+            }
+        }
     } while (FindNextFileW(find, &index));
     const DWORD error = GetLastError();
     FindClose(find);
     return error == ERROR_NO_MORE_FILES;
 }
 
-bool EnumerateRecycleBinAtRoot(const std::wstring& recycle_root, std::vector<DirEntry>& out) {
-    return EnumerateRecycleBinAtRoot(recycle_root, out, {});
-}
-
-void EnumerateRecycleBin(std::vector<DirEntry>& out, RecycleBinInfo* info,
-    const std::function<bool()>& cancelled) {
+bool EnumerateRecycleBin(std::vector<DirEntry>& out, RecycleBinInfo* info,
+                         const RecycleProgress& progress) {
     out.clear();
-    if (cancelled && cancelled()) { if (info) *info = {}; return; }
-    if (info) QueryRecycleBinInfo(*info);
+    // The listing never blocks on SHQueryRecycleBinW: occupancy has its own query,
+    // and a big bin must show rows while it is still being read.
+    bool stopped = false;
+    const auto gate = [&](const std::vector<DirEntry>& gathered) {
+        if (!progress) return true;
+        if (progress(gathered)) return true;
+        stopped = true;
+        return false;
+    };
     const DWORD drives = GetLogicalDrives();
     bool complete = drives != 0;
     for (int i = 0; i < 26; ++i) {
-        if (cancelled && cancelled()) { out.clear(); if (info) *info = {}; return; }
         if ((drives & (1u << i)) == 0) continue;
         wchar_t root[4] = { static_cast<wchar_t>(L'A' + i), L':', L'\\', 0 };
         const UINT type = GetDriveTypeW(root);
         if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE) continue;
         if (IsRemoteLikeDrive(root)) continue;  // cloud mount: no local bin to scan
         const std::wstring bin = NormalizePath(std::wstring(root) + L"$Recycle.Bin");
-        if (!EnumerateRecycleBinAtRoot(bin, out, cancelled)) complete = false;
+        if (!EnumerateRecycleBinAtRoot(bin, out, gate)) {
+            // A stop request is not a read failure: hand the partial rows back now.
+            if (stopped) return false;
+            complete = false;
+        }
     }
-    if (cancelled && cancelled()) { out.clear(); if (info) *info = {}; return; }
-    if (!info) return;
-    uint64_t enum_bytes = 0;
-    for (const auto& entry : out) enum_bytes += entry.size;
-    const uint64_t enum_items = out.size();
-    // Use the same live, current-user items as the list, including after clear.
-    // If a volume could not be read, retain Shell's occupancy instead.
-    if (complete) {
-        info->valid = true;
-        info->items = enum_items;
-        info->bytes = enum_bytes;
-        return;
+    if (info) {
+        uint64_t enum_bytes = 0;
+        for (const auto& entry : out) enum_bytes += entry.size;
+        const uint64_t enum_items = out.size();
+        // Use the same live, current-user items as the list, including after clear.
+        // If a volume could not be read, leave Shell's occupancy in place instead.
+        if (complete) {
+            info->valid = true;
+            info->items = enum_items;
+            info->bytes = enum_bytes;
+        }
     }
+    return true;
 }
 
-void EnumerateRecycleBin(std::vector<DirEntry>& out, RecycleBinInfo* info) {
-    EnumerateRecycleBin(out, info, {});
+bool EnumerateRecycleBinAtRoot(const std::wstring& recycle_root, std::vector<DirEntry>& out,
+                               const std::function<bool()>& cancelled) {
+    return EnumerateRecycleBinAtRoot(recycle_root, out,
+        [&](const std::vector<DirEntry>&) { return !cancelled || !cancelled(); });
+}
+
+bool EnumerateRecycleBin(std::vector<DirEntry>& out, RecycleBinInfo* info,
+                         const std::function<bool()>& cancelled) {
+    return EnumerateRecycleBin(out, info,
+        [&](const std::vector<DirEntry>&) { return !cancelled || !cancelled(); });
 }
 
 } // namespace pulse::fs

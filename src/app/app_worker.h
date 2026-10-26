@@ -69,6 +69,8 @@ struct WorkResult {
     double sort_ms = 0.0;
     uint64_t listed_at = 0;  // fs::WatchClock when a folder listing began
     fs::RecycleBinInfo recycle_info;
+    // Progressive rows from a still-running scan: the final result follows.
+    bool partial = false;
 };
 
 using ResultCallback = std::function<void(WorkResult)>;

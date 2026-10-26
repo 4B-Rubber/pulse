@@ -1862,6 +1862,33 @@ void ApplyWorkerResult(AppState& s, app::WorkResult& res) {
                 TraceArmEligibility(window, *tab, "arm-before-shared-data", res.generation, false, 0);
         });
     });
+    // Progressive rows from a still-running scan (a big folder or bin): show what has
+    // been gathered so far in every window that waits for this listing. Selection,
+    // generations, the snapshot store and the banners belong to the final result;
+    // loading stays set so the status bar keeps reporting the growing count and the
+    // final result still lands normally.
+    if (res.partial) {
+        if (!res.snapshot) return;
+        app::ForEachWindowSharingCore(s, [&](AppState& window) {
+            ForEachPane(window, [&](app::Pane& pane) {
+                app::Tab* tab = pane.ActiveTab();
+                if (!tab || tab->current_path != res.path) return;
+                if (tab->pending_generation != res.generation) return;
+                if (tab->applied_generation != 0 && res.generation < tab->applied_generation) return;
+                // A refresh that merges into the shown order keeps its rows where they
+                // are until the final result; progressive batches would shuffle them.
+                if (tab->refresh_keeps_order) return;
+                // SetSnapshot trims the selection (and the focus) to the rows it can
+                // show, so a batch smaller than the row the user has picked would drop
+                // that row for the rest of the scan. Hold the batch back instead.
+                if (tab->snapshot && tab->snapshot->size() > res.snapshot->size() &&
+                    tab->SelectionBeyond(static_cast<int>(res.snapshot->size())))
+                    return;
+                tab->SetSnapshot(res.snapshot);
+            });
+            InvalidateRect(window.hwnd, nullptr, FALSE);
+        });
+    }
     const auto refresh = ApplyWorkerResultData(s.core, res);
     app::ForEachWindowSharingCore(s, [&](AppState& window) {
         ForEachPane(window, [&](app::Pane& pane) {

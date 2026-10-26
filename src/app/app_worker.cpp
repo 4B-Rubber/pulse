@@ -226,6 +226,9 @@ WorkResult WorkerPool::Process(const WorkItem& item) {
     WorkResult res;
     res.path = item.path;
     res.generation = item.generation;
+    // Progressive batches go out through the pool's own consumer, like the final
+    // result; a copy keeps the hook valid if Stop() retires the callback.
+    const ResultCallback emit = callback_;
     const auto cancelled = [&] {
         std::lock_guard lock(mutex_);
         auto it = current_gen_.find(item.request_key);
@@ -237,6 +240,62 @@ WorkResult WorkerPool::Process(const WorkItem& item) {
     auto t0 = std::chrono::steady_clock::now();
     pulse::app::startup_trace::Mark("worker_listing");
     auto entries = std::make_shared<std::vector<fs::DirEntry>>();
+    // A big folder or bin publishes what it has while the scan runs, so the list fills
+    // in instead of staying empty for the whole read. The rows come from the batch the
+    // enumerator just finished (its live vector), not from `entries`: a folder is read on
+    // a provider thread and only lands in `entries` after the whole scan returns. The
+    // first batch is small (the skeleton is replaced quickly); every next one may grow by
+    // half again, which bounds the total copy/sort work on both threads no matter how
+    // many rows there are. At most one batch goes out per kStreamMinIntervalMs. The state
+    // lives in a shared_ptr because a retired provider thread may still call the hook
+    // after Process has returned; it must not touch this frame then.
+    struct StreamState {
+        std::atomic_bool abandoned{false};
+        size_t emitted_items = 0;
+        ULONGLONG last_emit_tick = GetTickCount64();
+    };
+    const auto stream = std::make_shared<StreamState>();
+    struct AbandonOnExit {
+        StreamState* state;
+        ~AbandonOnExit() { state->abandoned.store(true); }
+    } abandon_stream{stream.get()};
+    const auto emit_partial =
+        std::make_shared<std::function<bool(const std::vector<fs::DirEntry>&)>>(
+        [this, item, emit, stream](const std::vector<fs::DirEntry>& gathered_rows) -> bool {
+            if (stream->abandoned.load()) return false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto it = current_gen_.find(item.request_key);
+                if (!running_ || it == current_gen_.end() || it->second != item.generation)
+                    return false; // Navigating away: stop the scan instead of feeding rows.
+            }
+            if (!emit) return true;
+            constexpr size_t kStreamFirstBatch = 2048;
+            constexpr size_t kStreamGrowthNumerator = 3;
+            constexpr size_t kStreamGrowthDenominator = 2;
+            constexpr ULONGLONG kStreamMinIntervalMs = 120;
+            const size_t gathered = gathered_rows.size();
+            if (gathered < stream->emitted_items + kStreamFirstBatch ||
+                gathered * kStreamGrowthDenominator <
+                    stream->emitted_items * kStreamGrowthNumerator)
+                return true;
+            const ULONGLONG now = GetTickCount64();
+            if (now - stream->last_emit_tick < kStreamMinIntervalMs) return true;
+            stream->last_emit_tick = now;
+            stream->emitted_items = gathered;
+            auto snapshot = std::make_shared<std::vector<fs::DirEntry>>(gathered_rows);
+            std::sort(snapshot->begin(), snapshot->end(),
+                [&](const fs::DirEntry& a, const fs::DirEntry& b) {
+                    return EntryLess(a, b, item.sort_column, item.sort_direction);
+                });
+            WorkResult part;
+            part.path = item.path;
+            part.generation = item.generation;
+            part.snapshot = std::move(snapshot);
+            part.partial = true;
+            try { emit(std::move(part)); } catch (...) {}
+            return true;
+        });
     if (item.load_paths) {
         entries->reserve(item.paths.size());
         for (size_t i = 0; i < item.paths.size(); ++i) {
@@ -298,7 +357,14 @@ WorkResult WorkerPool::Process(const WorkItem& item) {
         }
     } else if (fs::IsRecycleViewPath(item.path)) {
         try {
-            fs::EnumerateRecycleBin(*entries, &res.recycle_info);
+            const bool completed = fs::EnumerateRecycleBin(*entries, &res.recycle_info,
+                [emit_partial](const std::vector<fs::DirEntry>& batch) {
+                    return (*emit_partial)(batch);
+                });
+            if (!completed) {
+                res.cancelled = true;
+                return res;
+            }
         } catch (...) {
             res.error = true;
             res.snapshot = nullptr;
@@ -327,9 +393,13 @@ WorkResult WorkerPool::Process(const WorkItem& item) {
             };
             const auto enumerate = [&] {
             return fs::RunBoundedEnumeration<Listing>(item.network_job,
-                [path = item.path](const std::atomic_bool& cancel) {
+                [path = item.path, emit_partial](const std::atomic_bool& cancel) {
                     Listing result;
-                    fs::EnumerateDirectory(path, result.entries, &cancel);
+                    const bool completed = fs::EnumerateDirectory(path, result.entries,
+                        [emit_partial](const std::vector<fs::DirEntry>& batch) {
+                            return (*emit_partial)(batch);
+                        });
+                    if (!completed) throw fs::EnumerationCancelled();
                     if (cancel) throw fs::EnumerationCancelled();
                     if (path.empty()) {
                         for (const auto& drive : result.entries)
