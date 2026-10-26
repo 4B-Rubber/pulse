@@ -70,15 +70,19 @@ void OpsManager::RunAuthorizedDelete(const OpRequest& req, uint64_t task_id) {
     const auto started = GetTickCount64();
     TransferRateEstimator rate;
     rate.SetEtaFloor(0.0);
+    // Item counts arrive in far fewer steps than byte progress: a longer readout
+    // window, and no rate until a handful of items were actually deleted.
+    rate.SetDisplayWindow(2000, 5);
     rate.Reset(started, 0);
     const auto update_rate = [&](OpStatus& status) {
         // Only confirmed source deletions count, including on the elevated path.
         // Skipped sources reduce remaining work without inflating the delete rate.
-        rate.Observe(GetTickCount64(), completed.size(), req.sources.size() - skipped);
-        status.items_per_second = rate.speed();
+        const ULONGLONG now = GetTickCount64();
+        rate.Observe(now, completed.size(), req.sources.size() - skipped);
+        status.items_per_second = rate.speed(now);
         status.peak_items_per_second = (std::max)(status.peak_items_per_second,
                                                 status.items_per_second);
-        status.eta_seconds = rate.eta_seconds();
+        status.eta_seconds = rate.eta_seconds(now);
     };
     for (const auto& source : req.sources) {
         if (transfer_cancel_.load()) break;

@@ -1444,6 +1444,8 @@ target_link_libraries(pulse_enum_cancel_test PRIVATE pulse_localization shell32 
 
 add_executable(pulse_worker_enum_cancel_test src/bench/worker_enum_cancel_test.cpp)
 
+add_executable(pulse_transfer_rate_test src/bench/transfer_rate_test.cpp)
+
 add_executable(pulse_shell_benchmark_test src/bench/shell_benchmark_test.cpp)
 target_link_libraries(pulse_shell_benchmark_test PRIVATE ole32 shell32 uuid comctl32)
 

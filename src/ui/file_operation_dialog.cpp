@@ -701,6 +701,14 @@ void FileOperationWindow::Update(const ops::OpStatus& status) {
     if (new_task) {
         speed_history_.clear();
         speed_sample_tick_ = 0;
+        last_progress_tick_ = now;
+        last_progress_bytes_ = status_.transferred_bytes;
+        last_progress_items_ = status_.completed_items;
+    } else if (status_.transferred_bytes != last_progress_bytes_ ||
+               status_.completed_items != last_progress_items_) {
+        last_progress_tick_ = now;
+        last_progress_bytes_ = status_.transferred_bytes;
+        last_progress_items_ = status_.completed_items;
     }
     if (!hwnd_) return;
     if (status_.authorization != ops::AuthorizationState::None) {
@@ -717,6 +725,20 @@ void FileOperationWindow::Update(const ops::OpStatus& status) {
     // The render timer stops once an operation ends; restart it for the next.
     if (status_.active && !was_active && IsWindowVisible(hwnd_))
         SetTimer(hwnd_, kRenderTimer, 33, nullptr);
+}
+
+bool FileOperationWindow::Stalled(ULONGLONG now) const {
+    // Only a running task that already moved can stall: before the first byte the
+    // readout is "estimating", not zero.
+    if (status_.phase != ops::OpPhase::Running || last_progress_tick_ == 0) return false;
+    if (status_.transferred_bytes == 0 && status_.completed_items == 0) return false;
+    return now - last_progress_tick_ > kStallMs;
+}
+
+double FileOperationWindow::LiveSpeed(ULONGLONG now) const {
+    if (Stalled(now)) return 0.0;
+    return status_.speed_basis == ops::OpSpeedBasis::Items
+        ? status_.items_per_second : status_.bytes_per_second;
 }
 
 void FileOperationWindow::Show(bool activate) {
@@ -988,15 +1010,21 @@ void FileOperationWindow::Render() {
             items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountBytes).c_str()
                 + pulse::format::ByteSize(remain_bytes) + L")";
         else items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountSuffix).c_str();
-        const double live_speed = status_.speed_basis == ops::OpSpeedBasis::Items
-            ? status_.items_per_second : status_.bytes_per_second;
-        const std::wstring speed_text =
-            status_.speed_basis == ops::OpSpeedBasis::None
-                ? l10n::Get(l10n::StringId::OpNoEstimate).c_str()
-            : completed || failed || paused || waiting
-                ? FormatSpeedText(status_.speed_basis, 0.0)
-            : live_speed <= 0.0 ? l10n::Get(l10n::StringId::OpEstimating).c_str()
-            : FormatSpeedText(status_.speed_basis, live_speed);
+        const ULONGLONG now = GetTickCount64();
+        const double live_speed = LiveSpeed(now);
+        std::wstring speed_text;
+        if (status_.speed_basis == ops::OpSpeedBasis::None)
+            speed_text = l10n::Get(l10n::StringId::OpNoEstimate).c_str();
+        else if (completed || failed || paused || waiting)
+            speed_text = FormatSpeedText(status_.speed_basis, 0.0);
+        else if (live_speed > 0.0)
+            speed_text = FormatSpeedText(status_.speed_basis, live_speed);
+        else if (Stalled(now))
+            // Progress stopped but the task still runs: "estimating" would read as
+            // if it were still moving, so say zero instead.
+            speed_text = FormatSpeedText(status_.speed_basis, 0.0);
+        else
+            speed_text = l10n::Get(l10n::StringId::OpEstimating).c_str();
         const D2D1_COLOR_F time_color = failed ? theme.danger : theme.text;
         painter_.DrawText(l10n::Get(l10n::StringId::OpRemainingTime).c_str(), Rect(scale_, 32, 124, 120, 14),
                           compositor_.SmallFormat(), theme.text_secondary);
@@ -1170,10 +1198,7 @@ LRESULT FileOperationWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM l
                 // empty-recycle feed the byte rate, delete and restore the item rate.
                 double sample = 0.0;
                 if (running) {
-                    if (status_.speed_basis == ops::OpSpeedBasis::Bytes)
-                        sample = status_.bytes_per_second;
-                    else if (status_.speed_basis == ops::OpSpeedBasis::Items)
-                        sample = status_.items_per_second;
+                    sample = LiveSpeed(now);
                 }
                 speed_history_.push_back((std::max)(0.0, sample));
                 while (speed_history_.size() > 120) speed_history_.pop_front();
