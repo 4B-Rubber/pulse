@@ -1452,6 +1452,12 @@ void ApplyWorkerResult(AppState& s, app::WorkResult& res) {
                 // A refresh that merges into the shown order keeps its rows where they
                 // are until the final result; progressive batches would shuffle them.
                 if (tab->refresh_keeps_order) return;
+                // SetSnapshot trims the selection (and the focus) to the rows it can
+                // show, so a batch smaller than the row the user has picked would drop
+                // that row for the rest of the scan. Hold the batch back instead.
+                if (tab->snapshot && tab->snapshot->size() > res.snapshot->size() &&
+                    tab->SelectionBeyond(static_cast<int>(res.snapshot->size())))
+                    return;
                 tab->SetSnapshot(res.snapshot);
             });
             InvalidateRect(window.hwnd, nullptr, FALSE);

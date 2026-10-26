@@ -229,6 +229,9 @@ struct Tab {
     bool IsSelected(int index) const;
     int SelectedCount() const;
     std::vector<int> SelectedIndices() const;
+    // True when the focus or a selected row sits at or past `rows`, i.e. a snapshot
+    // with that many rows would trim it (SetSnapshot drops what it cannot show).
+    bool SelectionBeyond(int rows) const;
     // Sum of selected file sizes (folders counted, not sized). Cached per
     // selection revision + snapshot so the status bar stays O(1) per paint.
     // Not for content_results tabs (use ContentSelectionSize).

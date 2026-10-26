@@ -7,11 +7,30 @@ bool IsVirtualPath(const std::wstring& p) { return p.starts_with(L"pulse:"); }
 bool IsUncPath(const std::wstring& p) { return p.starts_with(L"\\\\"); }
 DWORD ReadReparseTag(const std::wstring&) { return 0; }
 void EnumerateDirectory(const std::wstring&, std::vector<DirEntry>&, const std::atomic_bool*) {}
-bool EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>&, const EnumerateProgress&) {
+bool EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out, const EnumerateProgress& progress) {
     if (path.find(L"blocked") != std::wstring::npos) {
         ++block_count;
         SetEvent(blocked);
         WaitForSingleObject(release_io, INFINITE);
+    }
+    if (path.find(L"streaming") != std::wstring::npos) {
+        // Two batches the way fs_enum reports them: the first one is published while
+        // the scan still runs (after the pool's 120 ms throttle), the second is folded
+        // into the final result. 2500 rows clear the 2048-row first batch; the growth
+        // rule then holds the 3000-row batch back.
+        for (int i = 0; i < 2500; ++i) {
+            DirEntry entry;
+            entry.name = L"row" + std::to_wstring(i);
+            out.push_back(std::move(entry));
+        }
+        Sleep(150);
+        if (progress) progress(out);
+        for (int i = 2500; i < 3000; ++i) {
+            DirEntry entry;
+            entry.name = L"row" + std::to_wstring(i);
+            out.push_back(std::move(entry));
+        }
+        if (progress) progress(out);
     }
     return true;
 }
@@ -80,6 +99,45 @@ int main() {
     }
     SetEvent(release_io);
     Check(Drained() && callbacks == 1, "concurrent late results discarded and reclaimed");
+    {
+        // A folder is read on a provider thread and only copied into the worker's own
+        // vector once the scan ends, so the progressive rows have to come from the
+        // batch the enumerator reports. Reading the worker's vector instead published
+        // nothing and left every big folder on its skeleton until the end.
+        app::WorkerPool worker;
+        std::mutex mutex;
+        std::vector<app::WorkResult> results;
+        worker.Start([&](app::WorkResult result) {
+            std::lock_guard<std::mutex> lock(mutex);
+            results.push_back(std::move(result));
+        });
+        worker.Refresh(L"C:\\streaming", ui::SortColumn::Name, ui::SortDirection::Asc);
+        const auto waiting = GetTickCount64();
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (results.size() >= 2) break;
+            }
+            if (GetTickCount64() - waiting >= 3000) break;
+            Sleep(5);
+        }
+        size_t partial_rows = 0, final_rows = 0;
+        bool partial_first = false, final_last = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (results.size() >= 2) {
+                partial_first = results.front().partial;
+                final_last = !results.back().partial;
+                partial_rows = results.front().snapshot ? results.front().snapshot->size() : 0;
+                final_rows = results.back().snapshot ? results.back().snapshot->size() : 0;
+            }
+        }
+        Check(partial_first && final_last,
+            "a long scan publishes gathered rows before the final result");
+        Check(partial_rows == 2500 && final_rows == 3000,
+            "the partial result carries the batch the enumerator reported, not the empty worker vector");
+        worker.Stop();
+    }
     CloseHandle(blocked); CloseHandle(release_io); CloseHandle(delivered);
     return failures ? 1 : 0;
 }

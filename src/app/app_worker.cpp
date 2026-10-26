@@ -160,12 +160,14 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
     auto t0 = std::chrono::steady_clock::now();
     auto entries = std::make_shared<std::vector<fs::DirEntry>>();
     // A big folder or bin publishes what it has while the scan runs, so the list fills
-    // in instead of staying empty for the whole read. The first batch is small (the
-    // skeleton is replaced quickly); every next one may grow by half again, which
-    // bounds the total copy/sort work on both threads no matter how many rows there
-    // are. At most one batch goes out per kStreamMinIntervalMs. The state lives in a
-    // shared_ptr because a retired provider thread may still call the hook after
-    // Process has returned; it must not touch this frame then.
+    // in instead of staying empty for the whole read. The rows come from the batch the
+    // enumerator just finished (its live vector), not from `entries`: a folder is read on
+    // a provider thread and only lands in `entries` after the whole scan returns. The
+    // first batch is small (the skeleton is replaced quickly); every next one may grow by
+    // half again, which bounds the total copy/sort work on both threads no matter how
+    // many rows there are. At most one batch goes out per kStreamMinIntervalMs. The state
+    // lives in a shared_ptr because a retired provider thread may still call the hook
+    // after Process has returned; it must not touch this frame then.
     struct StreamState {
         std::atomic_bool abandoned{false};
         size_t emitted_items = 0;
@@ -176,8 +178,9 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
         StreamState* state;
         ~AbandonOnExit() { state->abandoned.store(true); }
     } abandon_stream{stream.get()};
-    const auto emit_partial = std::make_shared<std::function<bool()>>(
-        [this, item, entries, emit, stream]() -> bool {
+    const auto emit_partial =
+        std::make_shared<std::function<bool(const std::vector<fs::DirEntry>&)>>(
+        [this, item, emit, stream](const std::vector<fs::DirEntry>& gathered_rows) -> bool {
             if (stream->abandoned.load()) return false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -190,7 +193,7 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
             constexpr size_t kStreamGrowthNumerator = 3;
             constexpr size_t kStreamGrowthDenominator = 2;
             constexpr ULONGLONG kStreamMinIntervalMs = 120;
-            const size_t gathered = entries->size();
+            const size_t gathered = gathered_rows.size();
             if (gathered < stream->emitted_items + kStreamFirstBatch ||
                 gathered * kStreamGrowthDenominator <
                     stream->emitted_items * kStreamGrowthNumerator)
@@ -199,7 +202,7 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
             if (now - stream->last_emit_tick < kStreamMinIntervalMs) return true;
             stream->last_emit_tick = now;
             stream->emitted_items = gathered;
-            auto snapshot = std::make_shared<std::vector<fs::DirEntry>>(*entries);
+            auto snapshot = std::make_shared<std::vector<fs::DirEntry>>(gathered_rows);
             std::sort(snapshot->begin(), snapshot->end(),
                 [&](const fs::DirEntry& a, const fs::DirEntry& b) {
                     return EntryLess(a, b, item.sort_column, item.sort_direction);
@@ -259,7 +262,9 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
     } else if (fs::IsRecycleViewPath(item.path)) {
         try {
             const bool completed = fs::EnumerateRecycleBin(*entries, &res.recycle_info,
-                [emit_partial](const std::vector<fs::DirEntry>&) { return (*emit_partial)(); });
+                [emit_partial](const std::vector<fs::DirEntry>& batch) {
+                    return (*emit_partial)(batch);
+                });
             if (!completed) {
                 res.cancelled = true;
                 return res;
@@ -280,8 +285,8 @@ WorkResult WorkerPool::Process(const WorkItem& item, const ResultCallback& emit)
                 [path = item.path, emit_partial](const std::atomic_bool& cancel) {
                     Listing result;
                     const bool completed = fs::EnumerateDirectory(path, result.entries,
-                        [emit_partial](const std::vector<fs::DirEntry>&) {
-                            return (*emit_partial)();
+                        [emit_partial](const std::vector<fs::DirEntry>& batch) {
+                            return (*emit_partial)(batch);
                         });
                     if (!completed) throw fs::EnumerationCancelled();
                     if (cancel) throw fs::EnumerationCancelled();

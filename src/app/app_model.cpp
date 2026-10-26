@@ -437,6 +437,14 @@ int Tab::SelectedCount() const {
     return static_cast<int>(selected.size());
 }
 
+bool Tab::SelectionBeyond(int rows) const {
+    if (selected_index >= rows) return true;
+    if (all_selected) return CountBound() > rows;
+    for (int index : selected)
+        if (index >= rows) return true;
+    return false;
+}
+
 std::vector<int> Tab::SelectedIndices() const {
     const int n = CountBound();
     std::vector<int> out;
