@@ -252,6 +252,9 @@ int main() {
     Check(NormalizeCloudRootPath(L"D:/Baidu/Sync") == L"D:\\Baidu\\Sync", "forward slashes normalized");
     Check(SameCloudRootPath(L"c:\\users\\user\\WPSDrive\\", L"C:\\Users\\User\\wpsdrive"),
           "path comparison is case-insensitive");
+    Check(SameCloudRootPath(L"\\\\?\\D:\\OneDrive", L"D:\\OneDrive") &&
+              SameCloudRootPath(L"\\\\?\\UNC\\server\\share", L"\\\\server\\share"),
+          "the extended-length prefix does not create a second cloud row");
     Check(NormalizeCloudRootPath(L"").empty(), "empty path stays empty");
     Check(SameCloudRootPath(L"\\\\?\\C:\\Users\\User\\OneDrive", L"C:\\Users\\User\\OneDrive\\"),
           "extended account path matches ordinary Shell root");

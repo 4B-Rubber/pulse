@@ -146,6 +146,12 @@ CloudRegistry CloudRegistry::Fixture(const std::wstring& prefix, const std::wstr
 std::wstring NormalizeCloudRootPath(const std::wstring& raw) {
     if (raw.empty()) return {};
     std::wstring path = raw;
+    // Pane paths and the sidebar's own rows carry the extended-length prefix.
+    // GetFullPathNameW leaves it alone, so a "\\?\D:\OneDrive" seed never
+    // matches the plain "D:\OneDrive" a sync root or a namespace target names
+    // and the same folder shows up twice under two labels.
+    if (path.rfind(L"\\\\?\\UNC\\", 0) == 0) path = L"\\\\" + path.substr(8);
+    else if (path.rfind(L"\\\\?\\", 0) == 0) path = path.substr(4);
     if (path.find(L'%') != std::wstring::npos) {
         wchar_t expanded[MAX_PATH * 2]{};
         const DWORD n = ExpandEnvironmentStringsW(path.c_str(), expanded, ARRAYSIZE(expanded));

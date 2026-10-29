@@ -1335,13 +1335,66 @@ std::wstring WindowsAccountDisplayName() {
     return {};
 }
 
+// Explorer names the row "<given name> - <Personal|tenant>" ("Longtao - 个人"),
+// while the Windows account display name is "Longtao Zhang"; the OneDrive
+// client caches the account profile next to its settings, and that is where
+// the shorter name comes from. Falls back to the Windows name when unreadable.
+std::wstring OneDriveProfileName(const std::wstring& account, const std::wstring& cid) {
+    wchar_t local[MAX_PATH * 2]{};
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local))) return {};
+    const std::wstring dir = std::wstring(local) + L"\\Microsoft\\OneDrive\\settings\\" + account;
+    std::wstring path;
+    if (!cid.empty()) path = dir + L"\\" + cid + L"-ProfileServiceResponse.txt";
+    if (path.empty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        WIN32_FIND_DATAW found{};
+        HANDLE find = FindFirstFileW((dir + L"\\*-ProfileServiceResponse.txt").c_str(), &found);
+        if (find == INVALID_HANDLE_VALUE) return {};
+        path = dir + L"\\" + found.cFileName;
+        FindClose(find);
+    }
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {};
+    std::string bytes;
+    char buffer[4096];
+    DWORD read = 0;
+    while (ReadFile(file, buffer, sizeof(buffer), &read, nullptr) && read > 0)
+        bytes.append(buffer, read);
+    CloseHandle(file);
+    if (bytes.empty()) return {};
+    // The client writes this profile as UTF-16 LE ("{\0..."), sometimes with a
+    // BOM; reading it as UTF-8 turns every key into mojibake.
+    std::wstring text;
+    const char* raw = bytes.data();
+    if (bytes.size() >= 2 && static_cast<unsigned char>(raw[0]) == 0xFF &&
+        static_cast<unsigned char>(raw[1]) == 0xFE) {
+        text.assign(reinterpret_cast<const wchar_t*>(raw + 2), (bytes.size() - 2) / sizeof(wchar_t));
+    } else if (bytes.size() >= 2 && raw[1] == '\0') {
+        text.assign(reinterpret_cast<const wchar_t*>(raw), bytes.size() / sizeof(wchar_t));
+    } else {
+        const int chars = MultiByteToWideChar(CP_UTF8, 0, raw,
+            static_cast<int>(bytes.size()), nullptr, 0);
+        if (chars <= 0) return {};
+        text.resize(static_cast<size_t>(chars));
+        MultiByteToWideChar(CP_UTF8, 0, raw, static_cast<int>(bytes.size()),
+            text.data(), chars);
+    }
+    std::wstring name = pulse::json::ExtractString(text, L"givenName");
+    if (name.empty()) name = pulse::json::ExtractString(text, L"displayName");
+    return name;
+}
+
 std::vector<SidebarEntry> BuildOneDriveEntries() {
     std::vector<SidebarEntry> out;
     HKEY root = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kOneDriveAccountsKey, 0, KEY_READ, &root)
             != ERROR_SUCCESS)
         return out;
-    const std::wstring prefix = WindowsAccountDisplayName();
+    const std::wstring windows_name = WindowsAccountDisplayName();
+    // Only the personal account caches a profile response, but Explorer uses
+    // that name for every row of the same signed-in user.
+    const std::wstring personal_name =
+        OneDriveProfileName(L"Personal", RegStringValue(root, L"Personal", L"cid"));
     std::vector<std::wstring> keys{ L"Personal" };
     for (int i = 1; i <= 16; ++i) keys.push_back(L"Business" + std::to_wstring(i));
     for (const auto& key : keys) {
@@ -1359,6 +1412,9 @@ std::vector<SidebarEntry> BuildOneDriveEntries() {
             ? l10n::Get(l10n::StringId::OneDrivePersonal)
             : RegStringValue(root, key, L"DisplayName");
         if (suffix.empty()) suffix = RegStringValue(root, key, L"UserName");
+        const std::wstring profile_name = OneDriveProfileName(key, RegStringValue(root, key, L"cid"));
+        const std::wstring prefix = !profile_name.empty() ? profile_name
+            : !personal_name.empty() ? personal_name : windows_name;
         SidebarEntry entry;
         entry.glyph = L"\xE753";
         entry.fallback = L"1D";
