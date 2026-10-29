@@ -2630,6 +2630,18 @@ int wmain(int argc, wchar_t** argv) {
     parsed_prefs.show_staging_tray = false;
     parsed_prefs.ResetToDefaults();
     passed &= Report("reset shows the staging tray again", parsed_prefs.show_staging_tray);
+    // Upstream owns 38/39 (search master switch, alias mark), 45 (clear
+    // history), 46 (clear network history), 70-79 and now 80/81; ours live at 83-85.
+    const bool progress_window_before = prefs.operation_progress_window;
+    settings_ui.ToggleUi(84);
+    passed &= Report("the progress window switch keeps its own id",
+        prefs.operation_progress_window != progress_window_before);
+    settings_ui.ToggleUi(84);
+    const bool compact_title_bar_before = prefs.compact_title_bar;
+    settings_ui.ToggleUi(85);
+    passed &= Report("the compact title bar switch keeps its own id",
+        prefs.compact_title_bar != compact_title_bar_before);
+    settings_ui.ToggleUi(85);
     {
         const std::wstring exe = L"C:\\Program Files\\Pulse\\pulse.exe";
         passed &= Report("startup Run command quotes the exe and adds --startup",
