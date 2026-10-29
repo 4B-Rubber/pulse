@@ -6301,6 +6301,11 @@ static void RefreshEditFonts(AppState& s) {
 }
 
 void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
+    // Turning the shelf off drops what it recorded while it was on.
+    if (!s.appPrefs.show_staging_tray && !s.tray.batches().empty()) {
+        s.tray.Clear();
+        if (s.hwnd) InvalidateRect(s.hwnd, nullptr, FALSE);
+    }
     // Cheap when unchanged; 文件夹最近变化 (ChangeTracking) also feeds it.
     s.renderer.SetMtimeHint(app::MtimeHintFromPrefs(s.appPrefs));
     s.renderer.SetItemClick(s.appPrefs.single_click_open, s.appPrefs.name_highlight, s.appPrefs.item_checkboxes);

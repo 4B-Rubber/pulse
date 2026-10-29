@@ -896,6 +896,9 @@ bool TrayClipLive(AppState& s) {
 }
 
 size_t StagePaths(AppState& s, const std::vector<std::wstring>& paths, std::optional<bool> move_mode) {
+    // The hidden shelf stops recording too: with the switch off a copy must not
+    // pile up in memory where the user can never see or clear it.
+    if (!s.appPrefs.show_staging_tray) return 0;
     // A path is staged once; staging it again is a no-op.
     std::vector<std::wstring> fresh;
     fresh.reserve(paths.size());
