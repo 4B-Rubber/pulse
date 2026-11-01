@@ -1969,17 +1969,21 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->open_path = launch_path.empty() ? L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}" : launch_path;
             }
             // "Open the default location" drops only the saved tabs; the rest of the
-            // session (sidebar, details pane, window state) still applies.
+            // session (sidebar, details pane, window state) still applies. An
+            // explicit external open (This PC, a folder or a file from the desktop
+            // or Explorer) is a request for that location, not a session restore:
+            // the windows closed before it must not come back with it.
+            const bool explicit_open = !s->shot.active && !s->open_path.empty();
             const bool open_default_location =
                 !s->shot.active && !app::RestoresLastTabs(s->appPrefs, s->restoreUpdateSession);
-            if (open_default_location) {
+            if (open_default_location || explicit_open) {
                 s->session_layout_tabs.clear();
                 s->session_tab_groups.clear();
                 s->session_active_layout_tab = 0;
                 s->session_path.clear();
             }
             // The session's other windows (M4d) come back only with its tabs.
-            if (open_default_location || s->session_layout_tabs.empty() || s->menushot ||
+            if (open_default_location || explicit_open || s->session_layout_tabs.empty() || s->menushot ||
                 s->colorpickshot || s->colorpickdialog)
                 s->core.pending_session_windows.clear();
             if (!s->shot.active && !s->session_layout_tabs.empty()) {
@@ -1990,37 +1994,49 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 else if (app::Tab* t = ActiveTab(*s))
                     RememberPath(*s, t->current_path);
             } else {
-            // Shots accept the This PC arguments too (GUI checks of the drive view).
-            std::wstring startPath = !s->shot.active ? L"C:\\"
-                : app::IsThisPcArgument(s->shot.path) ? std::wstring() : s->shot.path;
-            if (!s->shot.active && !s->session_path.empty()) startPath = s->session_path;
-            else if (!s->shot.active && !s->open_path.empty())
-                startPath = app::IsThisPcArgument(s->open_path) ? std::wstring()
-                                                                : ResolveOpenFolderPath(s->open_path);
-            else if (open_default_location)
-                startPath = app::DefaultLocation(s->appPrefs); // empty = This PC
-            s->pane->NewTab(startPath);
+            // A shell namespace (the taskbar's Explorer button, the desktop's Recycle Bin)
+            // is translated to its Pulse view, or to nothing when Pulse has no view for
+            // it: the window still opens, it just has nothing of its own to show. This PC
+            // is the empty path; an unrecognized namespace keeps the default instead of a
+            // CLSID tab.
+            std::wstring startPath = L"C:\\";
+            bool this_pc_start = false;
             if (s->shot.active) {
-                s->pane->ActiveTab()->view_mode = s->shot.view_mode;
-                s->pane->ActiveTab()->wall = g_shot_wall;
+                // Shots accept the This PC arguments too (GUI checks of the drive view).
+                startPath = app::IsThisPcArgument(s->shot.path) ? std::wstring()
+                    : ResolveOpenFolderPath(s->shot.path);
+                if (startPath.empty() && !app::IsThisPcArgument(s->shot.path)) startPath = L"C:\\";
+            } else if (!s->open_path.empty()) {
+                // The request wins over the session path: open what was asked for.
+                if (app::IsThisPcArgument(s->open_path)) {
+                    this_pc_start = true;
+                } else {
+                    const std::wstring incoming = ResolveOpenFolderPath(s->open_path);
+                    if (!incoming.empty()) startPath = incoming;
+                }
+            } else if (!s->session_path.empty()) {
+                startPath = s->session_path;
+            } else if (open_default_location) {
+                startPath = app::DefaultLocation(s->appPrefs); // empty = This PC
             }
-            StartLoadingPath(*s, *s->pane->ActiveTab(), startPath,
-                !s->shot.active && !s->session_path.empty()
-                    ? PathLoadReason::RestoreSession : PathLoadReason::Navigate);
-            RememberPath(*s, startPath);
-            if (!s->shot.active && s->session_path.empty() && !s->open_path.empty())
-                SelectLaunchedFile(*s, s->open_path);
+            if (this_pc_start) {
+                OpenTabAt(*s, std::wstring());  // NewTab would open C: for ""
+            } else {
+                s->pane->NewTab(startPath);
+                if (s->shot.active) {
+                    s->pane->ActiveTab()->view_mode = s->shot.view_mode;
+                    s->pane->ActiveTab()->wall = g_shot_wall;
+                }
+                StartLoadingPath(*s, *s->pane->ActiveTab(), startPath,
+                    !s->shot.active && !s->session_path.empty()
+                        ? PathLoadReason::RestoreSession : PathLoadReason::Navigate);
+                RememberPath(*s, startPath);
+                if (!s->shot.active && s->session_path.empty() && !s->open_path.empty())
+                    SelectLaunchedFile(*s, s->open_path);
+            }
             }
 
-            if (!s->shot.active && !s->open_path.empty() &&
-                (!s->session_layout_tabs.empty() || !s->session_path.empty())) {
-                const bool this_pc = app::IsThisPcArgument(s->open_path);
-                const std::wstring open_path = this_pc ? std::wstring() : ResolveOpenFolderPath(s->open_path);
-                if (this_pc) OpenTabAt(*s, open_path);  // NewTab would open C: for ""
-                else if (!open_path.empty() && !ActivateExistingFolderTab(*s, open_path))
-                    NewTab(*s, open_path);
-                if (!open_path.empty()) SelectLaunchedFile(*s, s->open_path);
-            }
+
         } else if (s->window_restore && !s->window_restore->layout_tabs.empty()) {
             // A reopened window (M4c) gets its tabs back, as session restore does.
             const app::ClosedWindow restore = std::move(*s->window_restore);
@@ -3711,7 +3727,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // wParam 1: an item inside the previewed folder (Quick Look list).
             const std::wstring inner = wParam == 1 ? (msg == WM_DETAILS_PREVIEW_OPEN ? s->detailsPreview : s->quickPreview).TakeOpenPath() : std::wstring();
             if (!inner.empty()) OpenPath(*s, inner);
-            else OpenSelected(*s);
+            else {
+                // The item opens in its default program; the preview is done.
+                s->quickPreview.Close();
+                OpenSelected(*s);
+            }
         }
         return 0;
 

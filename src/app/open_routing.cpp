@@ -70,6 +70,9 @@ void ForgetOpenToast(AppCore& core) {
 bool ExternalOpenWindowBusy(const AppState& state) { return IsBusy(state); }
 
 ExternalOpenResult OpenExternalFolder(AppState& mru, const std::wstring& raw, bool reveal) {
+    // An external request is for this location (or a new window), not for the
+    // windows closed before it: do not bring them back when the window appears.
+    mru.core.pending_session_windows.clear();
     const bool activate = raw == L"pulse:activate";
     const bool icon = raw.empty();
     const bool win_e = raw == L"pulse:win-e";
