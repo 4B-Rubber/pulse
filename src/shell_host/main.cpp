@@ -290,7 +290,17 @@ public:
         }
         return CheckCancel();
     }
-    IFACEMETHODIMP PostDeleteItem(DWORD, IShellItem*, HRESULT hr, IShellItem*) override {
+    IFACEMETHODIMP PostDeleteItem(DWORD, IShellItem* psi, HRESULT hr, IShellItem* newly_created) override {
+        if (SUCCEEDED(hr) && psi && newly_created) {
+            PWSTR src_path = nullptr;
+            PWSTR dst_path = nullptr;
+            if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &src_path)) && src_path &&
+                SUCCEEDED(newly_created->GetDisplayName(SIGDN_FILESYSPATH, &dst_path)) && dst_path) {
+                recycled_items_.emplace_back(src_path, dst_path);
+            }
+            if (src_path) CoTaskMemFree(src_path);
+            if (dst_path) CoTaskMemFree(dst_path);
+        }
         NoteItemResult(hr);
         ++items_done_;
         MaybeReport(items_done_ == total_items_);
@@ -317,6 +327,7 @@ public:
     const std::wstring& last_failed_item() const { return last_failed_item_; }
     HRESULT item_failure() const { return item_failure_; }
     void NoteSetupFailure(const std::wstring& src) { last_failed_item_ = src; }
+    const std::vector<std::pair<std::wstring, std::wstring>>& recycled_items() const { return recycled_items_; }
     void set_recycle_only(bool value) { recycle_only_ = value; }
     // A transfer reports the whole operation's work (UpdateProgress), which
     // covers the files inside folders too; item counts then grow past the
@@ -374,6 +385,7 @@ private:
     std::wstring last_failed_item_;
     HRESULT item_failure_ = S_OK;
     ULONGLONG last_send_ = 0;
+    std::vector<std::pair<std::wstring, std::wstring>> recycled_items_;
 };
 
 // ---------------------------------------------------------------------------
@@ -490,13 +502,66 @@ using pulse::recycle::FreeSiblingName;
 using pulse::recycle::RestoreSelectedRecyclePayload;
 using pulse::recycle::RestoreOneFromRecycle;
 
+// Deleting and then undoing within one host session: the Shell tells the
+// progress sink where each item actually landed. That matters when the user's
+// folder is a junction and the item goes to another drive's bin, or when
+// several deletions of the same name leave several $R copies.
+std::map<std::wstring, std::vector<std::wstring>> g_recent_recycled;
+
+std::wstring ResolveThroughParentReparse(const std::wstring& path) {
+    const std::wstring parsed = ToParsingPath(path);
+    const size_t slash = parsed.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash == 0) return {};
+    const std::wstring parent = parsed.substr(0, slash);
+    const std::wstring leaf = parsed.substr(slash + 1);
+    HANDLE h = CreateFileW(parent.c_str(), 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    wchar_t buf[4096]{};
+    const DWORD len = GetFinalPathNameByHandleW(h, buf, ARRAYSIZE(buf), FILE_NAME_NORMALIZED);
+    CloseHandle(h);
+    if (len == 0 || len >= ARRAYSIZE(buf)) return {};
+    std::wstring resolved = ToParsingPath(std::wstring(buf, len));
+    if (!resolved.empty() && resolved.back() != L'\\') resolved.push_back(L'\\');
+    resolved += leaf;
+    return resolved;
+}
+
+void RecordRecycledItem(const std::wstring& original_path, const std::wstring& recycled_payload) {
+    const std::wstring key = CanonPath(original_path);
+    if (!key.empty() && !recycled_payload.empty())
+        g_recent_recycled[key].push_back(ToParsingPath(recycled_payload));
+    const std::wstring resolved = CanonPath(ResolveThroughParentReparse(original_path));
+    if (!resolved.empty() && resolved != key && !recycled_payload.empty())
+        g_recent_recycled[resolved].push_back(ToParsingPath(recycled_payload));
+}
+
+std::wstring PopRecycledItem(const std::wstring& wanted_canon) {
+    if (wanted_canon.empty()) return {};
+    auto it = g_recent_recycled.find(wanted_canon);
+    if (it == g_recent_recycled.end()) return {};
+    while (!it->second.empty()) {
+        std::wstring candidate = std::move(it->second.back());
+        it->second.pop_back();
+        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return candidate;
+    }
+    return {};
+}
+
 HRESULT ExecuteRestore(const std::vector<std::wstring>& paths, std::wstring& error) {
     if (paths.empty()) return E_INVALIDARG;
     size_t ok = 0;
     pulse::shell::RecycleRestoreIndex lookup;
     for (const auto& src : paths) {
         std::wstring one_error;
-        if (RestoreOneFromRecycle(src, one_error, lookup)) {
+        // Within this host session the progress sink recorded the payload the
+        // Shell actually created (a junction may send it to another drive's bin,
+        // and one name can be recycled several times): undo restores that one.
+        std::wstring payload = PopRecycledItem(CanonPath(src));
+        if (payload.empty()) payload = src;
+        if (RestoreOneFromRecycle(payload, one_error, lookup)) {
             ++ok;
         } else if (error.empty()) {
             error = one_error;
@@ -807,6 +872,11 @@ void ExecuteRequest(Request* req) {
     if (op) {
         if (sink_cookie) op->Unadvise(sink_cookie);
         op->Release();
+    }
+    if (req->type == REQ_DELETE_RECYCLE) {
+        for (const auto& pair : sink.recycled_items()) {
+            RecordRecycledItem(pair.first, pair.second);
+        }
     }
     // Some shell providers finish the filesystem mutation and then return a
     // failure from final bookkeeping. The filesystem state is authoritative;
