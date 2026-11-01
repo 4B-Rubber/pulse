@@ -39,7 +39,8 @@ constexpr UINT kMsgFocus = WM_APP + 2;        // FocusSearch
 constexpr UINT kMsgIndexStatus = WM_APP + 3;
 constexpr UINT kMsgIndexResult = WM_APP + 4;
 constexpr UINT kMsgStop = WM_APP + 5;
-constexpr UINT_PTR kTimerAddress = 2, kTimerSearch = 3, kTimerProbe = 4, kTimerAnim = 5, kTimerGiveUp = 6, kTimerAuto = 7;
+constexpr UINT_PTR kTimerRestore = 1, kTimerAddress = 2, kTimerSearch = 3, kTimerProbe = 4, kTimerAnim = 5,
+                   kTimerGiveUp = 6, kTimerAuto = 7, kTimerForeground = 8;
 constexpr int kHotkeyId = 0x5054;
 constexpr uint64_t kSession = 0x50554c53444a4d50ull;
 // Geometry in DIPs, after the approved quick jump mockup (scene A).
@@ -74,6 +75,30 @@ bool SetText(HWND hwnd, const std::wstring& text) {
     DWORD_PTR result = 0;
     return SendMessageTimeoutW(hwnd, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(text.c_str()), SMTO_ABORTIFHUNG, 500,
                                &result) != 0;
+}
+// The native address band's edit or breadcrumb. Its nesting differs between
+// Windows versions and dialog kinds, so search by class instead of a fixed ID.
+HWND AddressControl(HWND dialog, bool edit) {
+    if (!dialog || !IsWindow(dialog)) return nullptr;
+    struct Search {
+        HWND result = nullptr;
+        bool edit;
+    } search{nullptr, edit};
+    EnumChildWindows(dialog, [](HWND hwnd, LPARAM param) -> BOOL {
+        auto& state = *reinterpret_cast<Search*>(param);
+        if (ClassOf(hwnd) != L"Address Band Root") return TRUE;
+        EnumChildWindows(hwnd, [](HWND child, LPARAM value) -> BOOL {
+            auto& inner = *reinterpret_cast<Search*>(value);
+            if (IsWindowVisible(child) && ClassOf(child) == (inner.edit ? L"Edit" : L"ToolbarWindow32") &&
+                (inner.edit || GetDlgCtrlID(child) == 1001)) {
+                inner.result = child;
+                return FALSE;
+            }
+            return TRUE;
+        }, param);
+        return state.result ? FALSE : TRUE;
+    }, reinterpret_cast<LPARAM>(&search));
+    return search.result;
 }
 std::wstring Leaf(const std::wstring& path) {
     std::wstring trimmed = path;
@@ -537,6 +562,7 @@ struct DialogJump::Impl {
     bool hotkey = false;
     DialogInfo dlg;
     HWND probe_target = nullptr;
+    HWND observed_foreground = nullptr;
     int probe_tries = 0;
     DialogJumpContext ctx;
     // Frequent places: ctx.folders from `history_from` on came from the jump
@@ -679,6 +705,9 @@ void DialogJump::Impl::Run() {
                                       0, WINEVENT_OUTOFCONTEXT);
     bar_window = bar.hwnd;
     ready = true;
+    // Out-of-context foreground events can be queued behind a later activation;
+    // a slow heartbeat catches the dialog when no event arrives at all.
+    SetTimer(bar.hwnd, kTimerForeground, 300, nullptr);
     Evaluate(GetForegroundWindow());
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -715,7 +744,11 @@ void DialogJump::Impl::Run() {
 
 void CALLBACK DialogJump::Impl::OnForeground(HWINEVENTHOOK, DWORD, HWND hwnd, LONG id_object, LONG id_child, DWORD,
                                              DWORD) {
-    if (t_impl && id_object == OBJID_WINDOW && id_child == CHILDID_SELF) t_impl->Evaluate(hwnd);
+    if (t_impl && id_object == OBJID_WINDOW && id_child == CHILDID_SELF) {
+        // The event may describe a window that has already lost the foreground.
+        const HWND current = GetForegroundWindow();
+        t_impl->Evaluate(current ? current : hwnd);
+    }
 }
 
 void CALLBACK DialogJump::Impl::OnDialogEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG id_object, LONG id_child,
@@ -731,6 +764,7 @@ void CALLBACK DialogJump::Impl::OnDialogEvent(HWINEVENTHOOK, DWORD event, HWND h
 
 void DialogJump::Impl::Evaluate(HWND foreground) {
     if (!foreground) return;
+    observed_foreground = foreground;
     if (foreground == bar.hwnd || foreground == list.hwnd || foreground == tooltip) return;
     if (dlg.dialog && foreground == dlg.dialog) {
         if (!IsWindowVisible(bar.hwnd)) Attach(dlg);
@@ -782,6 +816,9 @@ void DialogJump::Impl::Attach(const DialogInfo& info) {
 }
 
 void DialogJump::Impl::Detach() {
+    if (edit && GetFocus() == edit) SetFocus(nullptr);
+    edit_focused = false;
+    query_width = query_from = query_to = kQueryWidth;
     search_requested = false;
     KillTimer(bar.hwnd, kTimerAddress);
     KillTimer(bar.hwnd, kTimerAuto);
@@ -1315,7 +1352,9 @@ void DialogJump::Impl::BuildPlaceRows() {
 // The empty search box with the focus: where this program's dialogs usually
 // go. False (and nothing shown) when there is no history.
 bool DialogJump::Impl::ShowFrequent() {
-    if (!search_requested || !ctx.remember || !dlg.dialog) return false;
+    // Only while the search box itself has the focus: attaching to a dialog
+    // must not open a popup over its file name or another control.
+    if (!search_requested || !ctx.remember || !dlg.dialog || !edit_focused || GetFocus() != edit) return false;
     std::vector<size_t> visited;
     for (size_t i = 0; i < ctx.folders.size(); ++i)
         if (scores[i] > 0) visited.push_back(i);
@@ -1391,6 +1430,10 @@ void DialogJump::Impl::OnSearchChanged() {
     searching = false;
     // SetWindowText during attachment also sends EN_CHANGE; it is not a user search.
     if (!search_requested) return;
+    if (!edit_focused || GetFocus() != edit) {
+        HideList();
+        return;
+    }
     if (query.empty()) {
         if (!ShowFrequent() && list_mode == ListMode::Search) HideList();
         return;
@@ -1469,8 +1512,11 @@ void DialogJump::Impl::Navigate(const std::wstring& path, bool dir, bool record)
     if (path.empty() || !dlg.dialog || !IsWindow(dlg.dialog)) return;
     auto_pending = false;  // the user went somewhere first
     if (record && ctx.remember && history) history->Record(dir ? path : Parent(path), dlg_app);
+    KillTimer(bar.hwnd, kTimerRestore);
     KillTimer(bar.hwnd, kTimerAddress);
-    if (dir) {
+    // Modern dialogs own the address band; never put a folder into their file
+    // name box and press Save/Open (that does not navigate an IFileSaveDialog).
+    if (dir && (dlg.modern || dlg.folder_picker || !dlg.name_edit)) {
         NavigateAddressBar(path);
         return;
     }
@@ -1488,8 +1534,8 @@ static bool ModifiersDown() {
 }
 
 void DialogJump::Impl::NavigateAddressBar(const std::wstring& path) {
-    // Alt+D puts the dialog's address bar into edit mode (once Ctrl+G's Ctrl
-    // is up); the path goes in once the bar has the focus.
+    // Wait for Ctrl+G's modifiers to be released, then activate the native
+    // address edit without changing the file name or pressing Save/Open.
     if (GetForegroundWindow() != dlg.dialog) SetForegroundWindow(dlg.dialog);
     address_path = path;
     address_ticks = 0;
@@ -1499,6 +1545,17 @@ void DialogJump::Impl::NavigateAddressBar(const std::wstring& path) {
 
 void DialogJump::Impl::SendAddressKeys() {
     address_keys_sent = true;
+    if (AddressControl(dlg.dialog, true)) return;
+    if (const HWND breadcrumb = AddressControl(dlg.dialog, false)) {
+        RECT rc{};
+        GetClientRect(breadcrumb, &rc);
+        const LPARAM point = MAKELPARAM(std::max(0L, rc.right - 2), (rc.bottom - rc.top) / 2);
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(breadcrumb, WM_LBUTTONDOWN, MK_LBUTTON, point, SMTO_ABORTIFHUNG, 300, &ignored);
+        SendMessageTimeoutW(breadcrumb, WM_LBUTTONUP, 0, point, SMTO_ABORTIFHUNG, 300, &ignored);
+        if (AddressControl(dlg.dialog, true)) return;
+    }
+    // Older common dialogs may not expose the breadcrumb control.
     INPUT keys[4]{};
     for (auto& key : keys) key.type = INPUT_KEYBOARD;
     keys[0].ki.wVk = VK_MENU;
@@ -1694,7 +1751,12 @@ LRESULT DialogJump::Impl::HandleBar(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == kHotkeyId && !ctx.current.empty()) Navigate(ctx.current, true);
         return 0;
     case WM_TIMER:
-        if (wp == kTimerAnim) {
+        if (wp == kTimerForeground) {
+            const HWND foreground = GetForegroundWindow();
+            if (foreground && (foreground != observed_foreground ||
+                (foreground == dlg.dialog && !IsWindowVisible(bar.hwnd)) ||
+                (!dlg.dialog && ClassOf(foreground) == L"#32770"))) Evaluate(foreground);
+        } else if (wp == kTimerAnim) {
             const float t = std::min(1.0f, static_cast<float>(GetTickCount64() - anim_start) / 150.0f);
             const float eased = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
             query_width = query_from + (query_to - query_from) * eased;
@@ -1741,17 +1803,16 @@ LRESULT DialogJump::Impl::HandleBar(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             GUITHREADINFO gti{sizeof(gti)};
-            const HWND focus = dlg.dialog && GetGUIThreadInfo(dlg.tid, &gti) ? gti.hwndFocus : nullptr;
-            if (focus != dlg.name_edit && IsAddressEdit(dlg.dialog, focus)) {
+            HWND focus = AddressControl(dlg.dialog, true);
+            if (!focus && !dlg.modern && dlg.dialog && GetGUIThreadInfo(dlg.tid, &gti)) focus = gti.hwndFocus;
+            if (focus && focus != dlg.name_edit && IsChild(dlg.dialog, focus) && ClassOf(focus) == L"Edit") {
                 KillTimer(hwnd, kTimerAddress);
-                if (!SetText(focus, PlainPath(address_path))) return 0;
-                GUITHREADINFO confirmed{sizeof(confirmed)};
-                if (!GetGUIThreadInfo(dlg.tid, &confirmed) || confirmed.hwndFocus != focus || ModifiersDown()) return 0;
-                INPUT keys[2]{};
-                keys[0].type = keys[1].type = INPUT_KEYBOARD;
-                keys[0].ki.wVk = keys[1].ki.wVk = VK_RETURN;
-                keys[1].ki.dwFlags = KEYEVENTF_KEYUP;
-                if (GetForegroundWindow() == dlg.dialog) SendInput(2, keys, sizeof(INPUT));
+                if (SetText(focus, PlainPath(address_path))) {
+                    // Deliver Enter to this address edit, never to a Save button
+                    // or another application's newly focused window.
+                    PostMessageW(focus, WM_KEYDOWN, VK_RETURN, 1);
+                    PostMessageW(focus, WM_KEYUP, VK_RETURN, static_cast<LPARAM>(0xC0000001u));
+                }
             } else if (++address_ticks > 12) {
                 KillTimer(hwnd, kTimerAddress);
             }
