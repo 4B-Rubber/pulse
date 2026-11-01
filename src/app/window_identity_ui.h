@@ -3,7 +3,8 @@
 // and color on screen. With two or more windows the title bar shows a color
 // dot and the name (double-click or right-click edits both), the window title
 // reads "name - Pulse" and the taskbar button carries a dot in the window's
-// color. With one window none of it shows. Rules: window_identity.h.
+// color. With one window none of it shows, and the compact title bar keeps it
+// out of the title bar too (the taskbar still carries it). Rules: window_identity.h.
 #include <windows.h>
 
 #include <string>

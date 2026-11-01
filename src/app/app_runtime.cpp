@@ -2843,7 +2843,9 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     // Open settings shows as the selected settings button, not as a tab.
     if (s.window_tabs.active < vm.tabs.size() && IsSettingsTab(ActiveTab(s)))
         vm.tabs[s.window_tabs.active].hidden = true;
-    if (WindowIdentityShown(s) && app::ValidWindowColor(s.identity.color)) {  // M7c
+    // M7c: the compact title bar gives its room to the tab strip, so the
+    // window then shows only on the taskbar (name and color dot).
+    if (!s.appPrefs.compact_title_bar && WindowIdentityShown(s) && app::ValidWindowColor(s.identity.color)) {
         vm.window_identity = true;
         vm.window_identity_name = WindowDisplayName(s);
         vm.window_identity_rgb = app::kWindowColors[s.identity.color];

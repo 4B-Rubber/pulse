@@ -490,7 +490,8 @@ D2D1_RECT_F MainRenderer::SidebarToggleRect(float w) const {
 // a 10 dip dot, 6 dip gap, the name, 6 dip padding; never under the sidebar
 // toggle. Without room for that (the icon rail, a narrow sidebar) a dot sits
 // on the lower right corner of the mark, or of the toggle where the toggle
-// stands in for the mark.
+// stands in for the mark. The compact title bar shows neither: its room goes
+// to the tab strip, and the taskbar still carries the name and color.
 MainRenderer::WindowIdentityGeometry MainRenderer::WindowIdentityLayout(const WindowViewModel& vm, float w) const {
     const float brand = TitleBrandWidth(vm, w);
     WindowIdentityGeometry g;
@@ -520,10 +521,8 @@ MainRenderer::WindowIdentityGeometry MainRenderer::WindowIdentityLayout(const Wi
     g.dot_radius = 4.0f * scale_;
     if (has_toggle && title_rail && (vertical_tabs_ || embedded_ || user_sidebar_collapsed_)) {
         g.dot = D2D1::Point2F(toggle.right - 3.0f * scale_, toggle.bottom - 3.0f * scale_);
-        if (!compact_title_bar_) {
-            const float reach = g.dot_radius + 3.0f * scale_;
-            g.hit = D2D1::RectF(g.dot.x - reach, g.dot.y - reach, g.dot.x + reach, g.dot.y + reach);
-        }
+        const float reach = g.dot_radius + 3.0f * scale_;
+        g.hit = D2D1::RectF(g.dot.x - reach, g.dot.y - reach, g.dot.x + reach, g.dot.y + reach);
     } else {
         const float mark = 24.0f * scale_;
         const float left = 12.0f * scale_;
@@ -3308,7 +3307,14 @@ MainRenderer::TabStripMetrics MainRenderer::ComputeTabStrip(
     TabStripMetrics m;
 
     const TitleChrome chrome = MakeTitleChrome(window_w, scale_, title_bar_height_);
-    m.x0 = TitleBrandWidth(vm, window_w) + margin_;
+    if (compact_title_bar_) {
+        // Tabs start after the sidebar toggle, which moved to the window edge.
+        // The window identity stays out of this bar (WindowIdentityLayout).
+        const D2D1_RECT_F toggle = SidebarToggleRect(window_w);
+        m.x0 = toggle.right > toggle.left ? toggle.right + margin_ : margin_;
+    } else {
+        m.x0 = TitleBrandWidth(vm, window_w) + margin_;
+    }
     // However many tabs are open, a stretch of title bar right of the "+"
     // button stays empty so the window can still be grabbed there; tabs
     // compact that much earlier instead.

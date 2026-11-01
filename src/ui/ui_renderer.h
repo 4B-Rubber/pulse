@@ -242,7 +242,8 @@ public:
     D2D1_RECT_F SidebarToggleRect(float w) const;
     // The window's dot and name in the title bar (M7c). Without room for the
     // name (the icon rail) only a dot on the corner of the mark or of the
-    // sidebar toggle shows; `hit` is then the mark, or the dot itself.
+    // sidebar toggle shows; `hit` is then the mark, or the dot itself. The
+    // compact title bar shows neither.
     struct WindowIdentityGeometry {
         D2D1_RECT_F hit{};  // empty: not shown
         D2D1_POINT_2F dot{};

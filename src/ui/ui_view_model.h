@@ -1120,7 +1120,8 @@ struct WindowViewModel {
     AiPanelViewModel ai_panel;   // Pulse 助手 (ai_panel_view.h)
     std::wstring window_title;
     // Multi-window M7c: with two or more windows the title bar shows this
-    // window's color dot and name in place of the product name.
+    // window's color dot and name in place of the product name. Off while the
+    // compact title bar is on, which gives the room to the tab strip.
     bool window_identity = false;
     std::wstring window_identity_name;
     uint32_t window_identity_rgb = 0;
