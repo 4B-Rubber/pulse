@@ -884,16 +884,19 @@ int main() {
           "snapshot preserves selection without starting another data subscription");
     frozen_view.Close();
 
-    SendMessageW(view.NodeWindow("next"), BM_CLICK, 0, 0);
-    auto changed_revision = second;
-    changed_revision.revision = "snapshot2";
-    completions.back()(changed_revision);
-    drain();
-    Check(view.StateValue("status") == "error" && view.StateValue("error") == "revision_changed",
-          "append rejects a different listing revision with an explicit reason");
-    size_t before_invalid_cursor = requests.size();
-    SendMessageW(view.NodeWindow("next"), BM_CLICK, 0, 0);
-    Check(requests.size() == before_invalid_cursor, "revision mismatch invalidates pagination cursor until refresh");
+    {
+        SendMessageW(view.NodeWindow("next"), BM_CLICK, 0, 0);
+        auto changed_revision = second;
+        changed_revision.revision = "snapshot2";
+        completions.back()(changed_revision);
+        drain();
+        Check(view.StateValue("status") == "error" && view.StateValue("error") == "revision_changed",
+              "append rejects a different listing revision with an explicit reason");
+        size_t before_invalid_cursor = requests.size();
+        SendMessageW(view.NodeWindow("next"), BM_CLICK, 0, 0);
+        Check(requests.size() == before_invalid_cursor,
+              "revision mismatch invalidates pagination cursor until refresh");
+    }
     auto stale = completions.back();
     view.SetState("filter", "new");
     first.status = "error";

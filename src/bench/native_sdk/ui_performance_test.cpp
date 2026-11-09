@@ -1,3 +1,4 @@
+#include "../../../sdk/native/include/pulse/ui_model.h"
 #include "../../app/extensions/native/dispatch_adapter.h"
 #include "../../app/extensions/native/ui_adapter.h"
 #include "../../common/json_value.h"
