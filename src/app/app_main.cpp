@@ -951,8 +951,19 @@ static app::WindowSessionSnapshot CaptureSessionWindow(AppState& w) {
     snap.layout = CaptureWindowLayout(w);
     RememberLayoutFocus(w);
     snap.active_layout_tab = static_cast<int>(w.window_tabs.active);
-    for (const auto& group : w.window_tabs.tab_groups)
-        snap.tab_groups.push_back({group.id, group.name, group.color_rgb, group.collapsed});
+    for (const auto& group : w.window_tabs.tab_groups) {
+        app::GroupSessionSnapshot group_snap{group.id, group.name, group.color_rgb,
+                                             group.collapsed};
+        if (auto it = w.lastActiveInGroup.find(group.id); it != w.lastActiveInGroup.end()) {
+            for (size_t i = 0; i < w.window_tabs.items.size(); ++i) {
+                if (w.window_tabs.items[i].get() == it->second) {
+                    group_snap.last_active = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        snap.tab_groups.push_back(std::move(group_snap));
+    }
     for (const auto& layout : w.window_tabs.items)
         if (layout) snap.layout_tabs.push_back(app::CaptureLayoutTab(*layout));
     snap.identity = w.identity;
@@ -975,8 +986,23 @@ static app::SessionSnapshot CaptureWindowSession(AppState& requested, HWND reque
     if (tab) snap.active_path = tab->current_path;
     RememberLayoutFocus(s);
     snap.active_layout_tab = static_cast<int>(s.window_tabs.active);
-    for (const auto& group : s.window_tabs.tab_groups)
-        snap.tab_groups.push_back({group.id, group.name, group.color_rgb, group.collapsed});
+    for (const auto& group : s.window_tabs.tab_groups) {
+        app::GroupSessionSnapshot group_snap{group.id, group.name, group.color_rgb,
+                                             group.collapsed};
+        // The live memory is a tab pointer; the session stores the position in
+        // the layout list, so the hover card can still mark "the tab you last
+        // used here" after a restart.
+        if (auto it = s.lastActiveInGroup.find(group.id);
+            it != s.lastActiveInGroup.end()) {
+            for (size_t i = 0; i < s.window_tabs.items.size(); ++i) {
+                if (s.window_tabs.items[i].get() == it->second) {
+                    group_snap.last_active = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        snap.tab_groups.push_back(std::move(group_snap));
+    }
     for (const auto& layout : s.window_tabs.items)
         snap.layout_tabs.push_back(app::CaptureLayoutTab(*layout));
     snap.tray = s.tray;
@@ -1990,6 +2016,18 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!s->shot.active && !s->session_layout_tabs.empty()) {
                 RestoreTabsFromSnapshots(*s, s->session_layout_tabs, s->session_tab_groups,
                                          s->session_active_layout_tab);
+                // Rebuild the group activation memory: the session kept each group's
+                // last-used tab as a position in the restored layout list.
+                s->lastActiveInGroup.clear();
+                for (const auto& group : s->session_tab_groups) {
+                    if (group.last_active < 0 ||
+                        static_cast<size_t>(group.last_active) >= s->window_tabs.items.size())
+                        continue;
+                    const app::LayoutTab* tab =
+                        s->window_tabs.items[static_cast<size_t>(group.last_active)].get();
+                    // A tab that changed groups since the save must not be claimed.
+                    if (tab->tab_group == group.id) s->lastActiveInGroup[group.id] = tab;
+                }
                 if (!s->session_path.empty())
                     RememberPath(*s, s->session_path);
                 else if (app::Tab* t = ActiveTab(*s))

@@ -47,6 +47,30 @@ inline size_t ExtendedRootLength(const std::wstring& path) {
     return share == std::wstring::npos ? path.size() : share + 1;
 }
 
+// A junction on the way to the original folder redirects the restore to the
+// real parent; MoveFileExW does not follow it. Returns empty when nothing on
+// the way is reparse-redirected.
+inline std::wstring ReparseResolvedSibling(const std::wstring& path) {
+    const std::wstring parsed = pulse::path::StripExtendedPathPrefix(path);
+    const size_t slash = parsed.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash == 0) return {};
+    const std::wstring parent = parsed.substr(0, slash);
+    const std::wstring leaf = parsed.substr(slash + 1);
+    HANDLE h = CreateFileW(parent.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    wchar_t buf[4096]{};
+    const DWORD len = GetFinalPathNameByHandleW(h, buf, ARRAYSIZE(buf), FILE_NAME_NORMALIZED);
+    CloseHandle(h);
+    if (len == 0 || len >= ARRAYSIZE(buf)) return {};
+    std::wstring resolved(buf, len);
+    for (auto& c : resolved)
+        if (c == L'/') c = L'\\';
+    if (resolved.empty() || resolved.back() != L'\\') resolved.push_back(L'\\');
+    resolved += leaf;
+    return resolved;
+}
+
 // The Shell's Restore recreates the original folder when it is gone.
 inline bool EnsureParentFolder(const std::wstring& path, size_t root) {
     const size_t slash = path.find_last_of(L'\\');
@@ -108,6 +132,15 @@ inline bool RestoreSelectedRecyclePayload(const std::wstring& payload, std::wstr
             }
             if (dest.empty()) break;
             moved = MoveFileExW(source.c_str(), dest.c_str(), MOVEFILE_COPY_ALLOWED) != FALSE;
+            if (!moved) {
+                // The original folder may be a junction that redirects to another
+                // drive; MoveFileEx needs the real parent there.
+                if (const std::wstring resolved = ReparseResolvedSibling(dest); !resolved.empty()) {
+                    const std::wstring redirected = ExtendedPath(resolved);
+                    if (redirected != dest)
+                        moved = MoveFileExW(source.c_str(), redirected.c_str(), MOVEFILE_COPY_ALLOWED) != FALSE;
+                }
+            }
             if (!moved) {
                 const DWORD move_error = GetLastError();
                 if (exact_destination || (move_error != ERROR_ALREADY_EXISTS && move_error != ERROR_FILE_EXISTS)) break;
