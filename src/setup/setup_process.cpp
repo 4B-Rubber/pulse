@@ -15,6 +15,26 @@ struct ProcessEntry {
     std::wstring path;  // empty when the image could not be queried
 };
 
+// Ending the index service's own process needs SeDebugPrivilege: it runs as
+// LocalSystem, and an elevated setup without the privilege can open it for
+// queries but not for PROCESS_TERMINATE.
+bool EnableDebugPrivilege() {
+    static const bool enabled = [] {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) return false;
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        const bool looked = LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &privileges.Privileges[0].Luid) != FALSE;
+        const bool adjusted = looked &&
+            AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr) != FALSE;
+        const bool granted = adjusted && GetLastError() == ERROR_SUCCESS;
+        CloseHandle(token);
+        return granted;
+    }();
+    return enabled;
+}
+
 std::wstring ProcessPath(DWORD pid) {
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process) return {};
@@ -60,12 +80,22 @@ bool FindProcesses(const wchar_t* image, const std::vector<std::wstring>& dirs, 
 }
 
 bool EndProcess(DWORD pid) {
-    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
-    if (!process) return GetLastError() == ERROR_INVALID_PARAMETER;  // already gone
-    if (WaitForSingleObject(process, 0) != WAIT_OBJECT_0) TerminateProcess(process, 0);
-    const bool gone = WaitForSingleObject(process, 5000) == WAIT_OBJECT_0;
-    CloseHandle(process);
-    return gone;
+    // The service's STOP may still be in flight when this runs, so a refused
+    // open is retried instead of being taken as "cannot".
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
+        if (!process) {
+            const DWORD error = GetLastError();
+            if (error == ERROR_INVALID_PARAMETER) return true;  // already gone
+            Sleep(250);
+            continue;
+        }
+        if (WaitForSingleObject(process, 0) != WAIT_OBJECT_0) TerminateProcess(process, 0);
+        const bool gone = WaitForSingleObject(process, 5000) == WAIT_OBJECT_0;
+        CloseHandle(process);
+        if (gone) return true;
+    }
+    return false;
 }
 
 // Pulse <= 1.0.48 predates the handshake: send what sign-out sends, where
@@ -161,9 +191,11 @@ bool WaitUntilImageGone(const wchar_t* image, const std::vector<std::wstring>& d
 }
 
 void StopPulseHosts(const std::vector<std::wstring>& dirs, bool touch_service) {
+    const bool debug = EnableDebugPrivilege();
     if (touch_service) {
         const auto r = StopService(kServiceName, 15000);
-        Log(L"Stop PulseIndex service: " + std::to_wstring(r));
+        Log(L"Stop PulseIndex service: " + std::to_wstring(r) + L" (debug privilege: " +
+            std::to_wstring(debug) + L")");
     }
     // Scoped to the install directories (the Inno script used taskkill /IM,
     // which also ended hosts of portable copies that do not lock our files).

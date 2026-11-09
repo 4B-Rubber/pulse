@@ -375,7 +375,16 @@ InstallResult RunInstall(Payload& payload, const std::wstring& self_path, const 
             return false;
         }
         StopPulseHosts(dirs, real);
-        WaitUntilImageGone(L"Pulse.Index.exe", dirs, 10000);
+        if (!WaitUntilImageGone(L"Pulse.Index.exe", dirs, 10000)) {
+            // A busy index may still be shutting down; one more stop and a
+            // shorter wait, then report it here instead of failing later in the
+            // cleanup step after the files were already installed.
+            StopPulseHosts(dirs, real);
+            if (!WaitUntilImageGone(L"Pulse.Index.exe", dirs, 5000)) {
+                error = L"The index service is still running and its files are in use.";
+                return false;
+            }
+        }
         return true;
     };
     if (!close_all()) { tx.Abort(); return Fail(kExitPrepareFailed, error); }
@@ -505,6 +514,7 @@ InstallResult RunInstall(Payload& payload, const std::wstring& self_path, const 
     DialogCleanupReport cleanup_report;
     size_t versions_removed = 0;
     if (dialog_version.versioned) {
+        bool ended_old_hosts = false;
         do {
             cleanup_report = CleanupDialogVersionsReport(app);
             versions_removed += cleanup_report.deleted_directories.size();
@@ -512,8 +522,23 @@ InstallResult RunInstall(Payload& payload, const std::wstring& self_path, const 
                 L" protected=" + std::to_wstring(cleanup_report.protected_directories.size()) +
                 L" blocked=" + std::to_wstring(cleanup_report.blocked_directories.size()) +
                 L" retained=" + std::to_wstring(cleanup_report.retained_directories.size()));
-            if (!cleanup_report.Retryable() || !cb.cleanup_locked ||
-                !cb.cleanup_locked(cleanup_report)) break;
+            if (!cleanup_report.Retryable()) break;
+            // A host started by the previous version may still run from the old
+            // bundle's folder (the service's stop can outlive setup's wait). End
+            // only that folder's hosts and retry before asking the user: the new
+            // service runs from a different folder and is left alone.
+            if (!ended_old_hosts) {
+                ended_old_hosts = true;
+                std::vector<std::wstring> old_dirs;
+                for (const auto& entry : cleanup_report.blocked_directories)
+                    old_dirs.push_back(entry.directory);
+                if (!old_dirs.empty()) {
+                    StopPulseHosts(old_dirs, false);
+                    Log(L"Ended hosts left in " + std::to_wstring(old_dirs.size()) + L" old bundle folder(s)");
+                    continue;
+                }
+            }
+            if (!cb.cleanup_locked || !cb.cleanup_locked(cleanup_report)) break;
         } while (true);
         if (!cleanup_report.Complete()) Log(L"Old dialog versions retained; retry cleanup after their owning programs exit.");
     }
