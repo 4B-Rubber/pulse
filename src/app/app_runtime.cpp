@@ -495,7 +495,10 @@ void OpenFolderInNewTab(AppState& s, const std::wstring& raw, bool reveal) {
         RevealWindow(s);
         return;
     }
-    const std::wstring path = ResolveOpenFolderPath(raw, reveal);
+    // Handed over tabs and shell forwards can name a virtual view ("pulse:recent",
+    // a tag, a saved search), a shell namespace (the desktop's Recycle Bin) or a real
+    // folder. A namespace Pulse has no view for opens no tab instead of the CLSID.
+    const std::wstring path = ResolveIncomingPath(raw, reveal);
     // Back from the tray with "open the default location" at startup: an
     // explicit folder starts over on its own, as launching with it would.
     if (!path.empty() && !IsWindowVisible(s.hwnd) && TakeFreshStart(s)) StartFreshAt(s, path);

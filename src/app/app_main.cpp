@@ -2043,14 +2043,14 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (s->shot.active) {
                 // Shots accept the This PC arguments too (GUI checks of the drive view).
                 startPath = app::IsThisPcArgument(s->shot.path) ? std::wstring()
-                    : ResolveOpenFolderPath(s->shot.path);
+                    : ResolveIncomingPath(s->shot.path);
                 if (startPath.empty() && !app::IsThisPcArgument(s->shot.path)) startPath = L"C:\\";
             } else if (!s->open_path.empty()) {
                 // The request wins over the session path: open what was asked for.
                 if (app::IsThisPcArgument(s->open_path)) {
                     this_pc_start = true;
                 } else {
-                    const std::wstring incoming = ResolveOpenFolderPath(s->open_path);
+                    const std::wstring incoming = ResolveIncomingPath(s->open_path);
                     if (!incoming.empty()) startPath = incoming;
                 }
             } else if (!s->session_path.empty()) {
@@ -2204,6 +2204,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->hoverSubIndex = -1;
             s->hoverSince = 0;
             s->tooltipText.clear();
+            HideTabGroupCard(*s);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -2420,6 +2421,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 SyncUiTimerRate(*s, hwnd, false);
             }
             if (wParam != SIZE_MINIMIZED && IsWindowVisible(hwnd)) NoteUiActivity(*s, hwnd, true);
+            // The card is anchored to the chip; a resize invalidates that.
+            HideTabGroupCard(*s);
             if (s->addressEditing) LayoutAddressEditor(*s);
             if (s->filterEditing && !s->filterFocusPending) LayoutFilterEditor(*s);
             if (!s->tagRenameId.empty()) LayoutTagRenameOverlay(*s);
