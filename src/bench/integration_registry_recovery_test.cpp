@@ -44,6 +44,12 @@ void Reset() { enabled = false; events = writes = flushes = crash_at = fail_flus
 #undef RegDeleteValueW
 #undef RegFlushKey
 
+namespace pulse::app_runtime_paths {
+// The release path only matters on an installed copy; the fixtures pass the
+// executable explicitly, so the module lookup never runs here.
+std::wstring StableEntryPath() { return {}; }
+}
+
 namespace {
 using namespace pulse::app;
 const std::wstring old_exe = L"C:\\Private fixture\\pulse.exe", new_exe = L"D:\\Private fixture\\pulse.exe";

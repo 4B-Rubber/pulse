@@ -2095,7 +2095,7 @@ target_link_libraries(pulse_config_capacity_test PRIVATE user32 shell32 ole32 uu
 
 add_executable(pulse_virtual_worker_consumers_test src/bench/virtual_worker_consumers_test.cpp
     src/app/entry_sort.cpp src/app/entry_group.cpp)
-target_link_libraries(pulse_virtual_worker_consumers_test PRIVATE pulse_localization pulse_runtime_log shlwapi)
+target_link_libraries(pulse_virtual_worker_consumers_test PRIVATE pulse_localization shlwapi)
 
 target_sources(pulse_persistence_test PRIVATE src/app/this_pc_argument.cpp)
 target_sources(pulse_single_instance_audit_test PRIVATE src/app/this_pc_argument.cpp)
@@ -2143,9 +2143,8 @@ target_link_libraries(pulse_shell_tag_registry_test PRIVATE advapi32 shell32 shl
 add_executable(pulse_shell_tag_actions_test src/bench/shell_tag_actions_test.cpp
     src/app/places.cpp src/app/tag_ads_sync.cpp src/fs/fs_enum.cpp src/ui/view_layout.cpp)
 target_link_libraries(pulse_shell_tag_actions_test PRIVATE user32 shell32 ole32 uuid advapi32 shlwapi netapi32 pulse_localization pulse_runtime_log)
-add_executable(pulse_integration_registry_recovery_test src/bench/integration_registry_recovery_test.cpp
-    src/common/app_runtime_paths.cpp src/common/dialog_bundle.cpp)
-target_link_libraries(pulse_integration_registry_recovery_test PRIVATE advapi32 shlwapi pulse_runtime_log)
+add_executable(pulse_integration_registry_recovery_test src/bench/integration_registry_recovery_test.cpp)
+target_link_libraries(pulse_integration_registry_recovery_test PRIVATE advapi32 shlwapi)
 add_executable(pulse_bloom_factory_test src/bench/bloom_factory_test.cpp src/ui/bloom_accent_picker.cpp)
 target_link_libraries(pulse_bloom_factory_test PRIVATE d2d1 d3d11 dxgi uuid)
 if(PULSE_WITH_SELFTEST)
