@@ -141,6 +141,9 @@ static_assert(sizeof(DirEntry) <= 96);
 
 // pulse:tag: / pulse:search: / pulse:workspace: — not filesystem paths.
 bool IsVirtualPath(const std::wstring& path);
+// ::{GUID} parsing names and shell: links (the desktop's Recycle Bin, a pinned
+// Explorer button) are shell namespaces, not folders; never normalize them.
+bool IsShellNamespacePath(const std::wstring& path);
 bool IsUncPath(const std::wstring& path);
 
 enum class NetStatus { Unknown = 0, Online, Slow, Offline };
@@ -154,6 +157,12 @@ std::wstring StripLnkSuffix(const std::wstring& name);
 
 // Enumerate a directory into out. Throws std::runtime_error on failure.
 void EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out, const std::atomic_bool* cancelled = nullptr);
+// Progress hook for a long enumeration: called between batches with everything
+// gathered so far (the vector being filled; do not modify it). Returning false stops
+// the scan, and the call then reports false as well. Failures still throw.
+using EnumerateProgress = std::function<bool(const std::vector<DirEntry>&)>;
+// Enumerate with a progress hook. Returns false when the hook asked to stop.
+bool EnumerateDirectory(const std::wstring& path, std::vector<DirEntry>& out, const EnumerateProgress& progress);
 // 显示隐藏共享 (Settings → 网络位置): a server's share list also lists the
 // administrative disk shares whose names end in '$' (C$, ADMIN$). Off by default.
 void SetShowHiddenShares(bool show);
