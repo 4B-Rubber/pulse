@@ -18,6 +18,7 @@
 #include "../ui/settings_page_ids.h"
 
 #include <shellapi.h>
+#include <shlobj.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
