@@ -1856,7 +1856,7 @@ add_executable(pulse_folder_budget_audit_test src/bench/folder_budget_audit_test
 target_link_libraries(pulse_folder_budget_audit_test PRIVATE shlwapi)
 add_executable(pulse_shell_registry_retry_test src/bench/shell_registry_retry_test.cpp
     src/app/shell_window_registry.cpp src/app/shell_window_plan.cpp)
-target_link_libraries(pulse_shell_registry_retry_test PRIVATE ole32 oleaut32 shell32 shlwapi propsys uuid user32)
+target_link_libraries(pulse_shell_registry_retry_test PRIVATE ole32 oleaut32 shell32 shlwapi propsys uuid user32 pulse_runtime_log)
 add_executable(pulse_shell_tag_registry_test src/bench/shell_tag_registry_test.cpp src/app/shell_tag_registry.cpp src/app/shell_tag_protocol.cpp)
 target_link_libraries(pulse_shell_tag_registry_test PRIVATE advapi32 shell32 shlwapi ole32)
 add_executable(pulse_shell_tag_com_test
