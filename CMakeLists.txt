@@ -1074,7 +1074,7 @@ target_link_libraries(pulse_preview_handler_probe PRIVATE
 
 add_executable(pulse_preview_handler_pan_test src/bench/preview_handler_pan_test.cpp)
 add_executable(pulse_directory_test src/bench/directory_regression_test.cpp)
-add_executable(pulse_fs_audit_test src/bench/fs_audit_test.cpp src/app/entry_sort.cpp src/app/drive_verbs.cpp)
+add_executable(pulse_fs_audit_test src/bench/fs_audit_test.cpp)
 target_link_libraries(pulse_fs_audit_test PRIVATE pulse_localization user32 shell32 shlwapi netapi32 advapi32)
 add_executable(pulse_enum_benchmark_test src/bench/enum_benchmark_test.cpp)
 target_link_libraries(pulse_enum_benchmark_test PRIVATE shell32 shlwapi)
@@ -1968,7 +1968,6 @@ add_executable(pulse_enum_cancel_test src/bench/enum_cancel_test.cpp)
 target_link_libraries(pulse_enum_cancel_test PRIVATE pulse_localization shell32 shlwapi netapi32)
 
 add_executable(pulse_worker_enum_cancel_test src/bench/worker_enum_cancel_test.cpp)
-target_link_libraries(pulse_worker_enum_cancel_test PRIVATE pulse_runtime_log)
 
 add_executable(pulse_transfer_rate_test src/bench/transfer_rate_test.cpp)
 

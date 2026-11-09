@@ -59,7 +59,11 @@ std::wstring FindGitRoot(const std::wstring&) { return {}; }
 void ResolveLinksInPlace(const std::wstring&,std::vector<fs::DirEntry>&,const std::function<bool()>&) {}
 ScopedEntryGrouping::ScopedEntryGrouping(int,const std::wstring&) {}
 ScopedEntryGrouping::~ScopedEntryGrouping() = default;
-static bool EntryLess(const fs::DirEntry& a,const fs::DirEntry& b,ui::SortColumn,ui::SortDirection) {return a.name<b.name;}
+FolderSortMode DefaultFolderSortMode() noexcept { return FolderSortMode::FoldersFirst; }
+ScopedFolderSortMode::ScopedFolderSortMode(FolderSortMode) noexcept : previous_(0) {}
+ScopedFolderSortMode::~ScopedFolderSortMode() = default;
+void RefreshDriveEjectable(const std::wstring&, uint8_t) {}
+bool EntryLess(const fs::DirEntry& a,const fs::DirEntry& b,ui::SortColumn,ui::SortDirection) {return a.name<b.name;}
 void SortEntriesBySize(std::vector<fs::DirEntry>&,ui::SortDirection,const FolderSizeLookup&,const std::function<void()>&) {}
 void SortEntries(std::vector<fs::DirEntry>& entries, ui::SortColumn col, ui::SortDirection dir, const std::function<void()>& tick) {
     std::sort(entries.begin(), entries.end(), [&](const fs::DirEntry& a, const fs::DirEntry& b) { if (tick) tick(); return EntryLess(a, b, col, dir); });
