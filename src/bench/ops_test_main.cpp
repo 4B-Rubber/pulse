@@ -2326,7 +2326,7 @@ int wmain(int argc, wchar_t** argv) {
                     done = (std::min)(total, done + bytes_per_tick(at));
                     estimator.Observe(at, done, total);
                 }
-                return std::pair<uint64_t, uint64_t>{ estimator.eta_seconds(), total - done };
+                return std::pair<uint64_t, uint64_t>{ estimator.eta_seconds(until), total - done };
             };
             const auto cold = run_rate([](ULONGLONG at) { return at <= 1500 ? 1000000ull : 10000000ull; }, 3000);
             const double cold_truth = static_cast<double>(cold.second) / 1e8;
@@ -2339,9 +2339,9 @@ int wmain(int argc, wchar_t** argv) {
             held.Reset(0, 0);
             uint64_t held_done = 0;
             for (ULONGLONG at = 100; at <= 3000; at += 100) held.Observe(at, held_done += 10000000ull, total);
-            const double before_pause = held.speed();
+            const double before_pause = held.speed(3000);
             held.Observe(3100, held_done += 10000000ull, total);   // 20 s paused, not on this clock
-            Check(before_pause > 9e7 && held.speed() > 9e7 && held.eta_seconds() > 0,
+            Check(before_pause > 9e7 && held.speed(3100) > 9e7 && held.eta_seconds(3100) > 0,
                   L"speed and time left carry on across a pause");
         }
         {

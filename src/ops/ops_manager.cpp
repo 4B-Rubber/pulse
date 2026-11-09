@@ -4500,10 +4500,9 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
     const uint64_t item_total = entries.size();
     SetStatus([&](OpStatus& st) {
         st.total_bytes = total_bytes;
-        st.total_items = entries.size();
-        st.enumeration_complete = enumeration_complete;
         st.total_items = item_total;
         st.speed_basis = basis;
+        st.enumeration_complete = enumeration_complete;
         if (failure.empty() && !cancelled) {
             st.phase = OpPhase::Running;
             st.percent = 0.0f;
@@ -4523,11 +4522,10 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
     uint64_t active_serial_bytes = 0;
     uint64_t processed_items = 0;
     TransferRateEstimator rate;
-    rate.Reset(rate_now(), 0);
     // Item counts arrive in far fewer steps than byte progress: a longer window,
     // and no readout until a handful of items have moved.
     rate.SetDisplayWindow(item_basis ? 2000 : 1500, item_basis ? 5 : 0);
-    rate.Reset(GetTickCount64(), 0);
+    rate.Reset(rate_now(), 0);
 
     auto publish_progress = [&](const TransferEntry& entry, uint64_t file_done,
                                 uint64_t file_total, uint64_t completed_items) {
@@ -4582,14 +4580,6 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
         });
     };
 
-    auto reset_rate = [&] {
-        rate.Reset(GetTickCount64(), item_basis ? processed_items : published_bytes);
-        SetStatus([&](OpStatus& st) {
-            st.bytes_per_second = 0.0;
-            st.items_per_second = 0.0;
-            st.eta_seconds = 0;
-        });
-    };
 
     auto mark_skipped = [&](const TransferEntry& entry) {
         skipped_sources.push_back(entry.source);
@@ -5252,9 +5242,8 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
             SetStatus([&](OpStatus& st) {
                 st.phase = OpPhase::Running;
                 st.summary = ProgressSummary(req.type, entries.size());
-                const ULONGLONG now = GetTickCount64();
-                st.bytes_per_second = rate.speed(now);
-                st.eta_seconds = rate.eta_seconds(now);
+                st.bytes_per_second = rate.speed(rate_now());
+                st.eta_seconds = rate.eta_seconds(rate_now());
             });
         }
 
@@ -5655,9 +5644,8 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
             SetStatus([&](OpStatus& st) {
                 st.phase = OpPhase::Running;
                 st.summary = ProgressSummary(req.type, entries.size());
-                const ULONGLONG now = GetTickCount64();
-                st.bytes_per_second = rate.speed(now);
-                st.eta_seconds = rate.eta_seconds(now);
+                st.bytes_per_second = rate.speed(rate_now());
+                st.eta_seconds = rate.eta_seconds(rate_now());
             });
         }
         const bool item_skipped = item_control_.Finish(current_item);
@@ -6181,11 +6169,11 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
                 st.percent = st.total_bytes ? 100.0f * static_cast<float>(st.transferred_bytes) / static_cast<float>(st.total_bytes)
                     : p.total_items ? 100.0f * static_cast<float>(p.removed_items) / static_cast<float>(p.total_items) : -1.0f;
                 st.current_item = p.current.empty() ? OpVerb(OpType::EmptyRecycle) : p.current;
-                const ULONGLONG now_tick = GetTickCount64();
-                recycle_rate.Observe(now_tick, st.transferred_bytes, st.total_bytes);
-                st.bytes_per_second = recycle_rate.speed(now_tick);
+                const ULONGLONG now = GetTickCount64();
+                recycle_rate.Observe(now, st.transferred_bytes, st.total_bytes);
+                st.bytes_per_second = recycle_rate.speed(now);
                 st.peak_bytes_per_second = (std::max)(st.peak_bytes_per_second, st.bytes_per_second);
-                st.eta_seconds = recycle_rate.eta_seconds(now_tick);
+                st.eta_seconds = recycle_rate.eta_seconds(now);
             });
         };
         const auto bin_folders = recycle_empty::CurrentUserBinFolders();
