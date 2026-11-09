@@ -1531,7 +1531,7 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
             s.hwnd, *pending_conflict, s.darkMode, s.accentColor);
         s.ops.ResolveConflict(pending_conflict->token, result.choice, result.apply_to_all);
         // Time spent on the prompt is not time the transfer ran: the resumed
-        // transfer gets its own wait before the window may open, so answering
+        // transfer gets its own 400 ms before the window may open, so answering
         // a prompt for a file that copies at once shows no window at all.
         s.operationStartedAt = std::chrono::steady_clock::now();
     }
@@ -1573,21 +1573,26 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
     }
 
     if (status.active) {
-        // The window is the setting's job: off keeps progress in the status-bar
-        // pill only. When on, a task still running after the delay opens the
-        // details window once (without taking focus), unless it is nearly done.
-        // Closing that window keeps it closed for this task
-        // (operationDismissedTaskId above). Emptying the Recycle Bin starts from
-        // a menu with no row to watch, so its window opens sooner.
+        // Progress starts in the status-bar pill; a task still running after
+        // kOperationAutoShowDelay opens the details window once (without
+        // taking focus), unless it is nearly done. Closing that window keeps
+        // it closed for this task (operationDismissedTaskId above).
+        // Emptying the Recycle Bin starts from a menu with no row to watch, so
+        // its window opens sooner. The preference below asks for a window in
+        // every case and skips the conflict wait, so a quick copy does not
+        // flash a dialog while the user has not answered yet.
         constexpr auto kOperationAutoShowDelay = std::chrono::milliseconds(2000);
         const bool quick_type = status.type == ops::OpType::Rename ||
                                 status.type == ops::OpType::CreateFolder ||
                                 status.type == ops::OpType::CreateTextFile;
         const bool emptying = status.type == ops::OpType::EmptyRecycle;
-        const auto delay = emptying ? std::chrono::milliseconds(400) : kOperationAutoShowDelay;
+        const bool preferred = s.appPrefs.operation_progress_window && !awaiting_conflict;
+        const auto delay = preferred        ? std::chrono::milliseconds(400)
+                           : emptying      ? std::chrono::milliseconds(400)
+                                           : kOperationAutoShowDelay;
         const bool nearly_done = !emptying && status.percent >= 90.0f;
-        if (s.appPrefs.operation_progress_window && !quick_type && !s.operationAutoShown &&
-            !nearly_done && !awaiting_conflict &&
+        if ((preferred || (!quick_type && !s.operationAutoShown && !nearly_done)) &&
+            status.phase != ops::OpPhase::WaitingForConflict &&
             now - s.operationStartedAt >= delay) {
             s.operationAutoShown = true;
             if (!OperationWindowVisible(s)) ShowOperationWindow(s, status, false);
