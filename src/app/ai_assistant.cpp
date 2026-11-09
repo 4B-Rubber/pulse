@@ -2185,10 +2185,10 @@ bool AiAssistantSetCursor(AppState& s, int x, int y) {
     // so it is tested before the containment check.
     using Edge = ui::AiPanelView::ResizeEdge;
     switch (view.EdgeAt(static_cast<float>(x), static_cast<float>(y))) {
-    case Edge::DockLeft:
+    case Edge::DockRight:
     case Edge::FloatRight: SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return true;
-    case Edge::FloatBottom: SetCursor(LoadCursorW(nullptr, IDC_SIZENS)); return true;
-    case Edge::FloatCorner: SetCursor(LoadCursorW(nullptr, IDC_SIZENWSE)); return true;
+    case Edge::FloatTop: SetCursor(LoadCursorW(nullptr, IDC_SIZENS)); return true;
+    case Edge::FloatCorner: SetCursor(LoadCursorW(nullptr, IDC_SIZENESW)); return true;
     default: break;
     }
     if (!view.Contains(static_cast<float>(x), static_cast<float>(y))) return false;

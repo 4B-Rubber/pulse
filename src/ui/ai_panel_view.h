@@ -765,9 +765,11 @@ public:
     float FloatingWidthDip() const noexcept { return float_width_dip_; }
     float FloatingHeightDip() const noexcept { return float_height_dip_; }
 
-    // Which edge a press would resize by: the docked column's left edge, the
-    // floating card's right / bottom edge, or its corner.
-    enum class ResizeEdge : uint8_t { None = 0, DockLeft, FloatRight, FloatBottom, FloatCorner };
+    // Which edge a press would resize by. The docked column sits against the
+    // sidebar, so its right edge is the one between it and the panes; the
+    // floating card sits in the lower left, so its right edge widens it and its
+    // top edge makes it taller.
+    enum class ResizeEdge : uint8_t { None = 0, DockRight, FloatRight, FloatTop, FloatCorner };
     ResizeEdge EdgeAt(float x, float y) const;
     void BeginResize(ResizeEdge edge) noexcept { resize_edge_ = edge; }
     void DragResize(float x, float y);

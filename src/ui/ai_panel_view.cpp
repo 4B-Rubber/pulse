@@ -143,23 +143,24 @@ float AiPanelView::DockWidth(float window_width, float rail_width, float scale) 
 }
 
 AiPanelView::ResizeEdge AiPanelView::EdgeAt(float x, float y) const {
-    // A few pixels along the edge the panel grows from: the docked column's left
-    // edge, or the floating card's right / bottom edge and its corner.
+    // A few pixels along the edge the panel grows from: the docked column's
+    // right edge (it starts at the sidebar), or the floating card's right / top
+    // edge and its corner (it sits in the lower left of the window).
     constexpr float kGrip = 6.0f;
     if (mode_ == AiPanelMode::Docked) {
         if (dock_value_ < 0.999f || !open_) return ResizeEdge::None;
-        if (x >= panel_rect_.left - kGrip && x <= panel_rect_.left + 2.0f &&
+        if (x >= panel_rect_.right - 2.0f && x <= panel_rect_.right + kGrip &&
             y >= panel_rect_.top + 8.0f && y <= panel_rect_.bottom - 8.0f)
-            return ResizeEdge::DockLeft;
+            return ResizeEdge::DockRight;
         return ResizeEdge::None;
     }
     if (float_value_ < 0.999f || !open_) return ResizeEdge::None;
     if (panel_rect_.right <= panel_rect_.left) return ResizeEdge::None;
     const bool right = x >= panel_rect_.right - kGrip && x <= panel_rect_.right + kGrip;
-    const bool bottom = y >= panel_rect_.bottom - kGrip && y <= panel_rect_.bottom + kGrip;
-    if (right && bottom) return ResizeEdge::FloatCorner;
+    const bool top = y >= panel_rect_.top - kGrip && y <= panel_rect_.top + kGrip;
+    if (right && top) return ResizeEdge::FloatCorner;
     if (right) return ResizeEdge::FloatRight;
-    if (bottom) return ResizeEdge::FloatBottom;
+    if (top) return ResizeEdge::FloatTop;
     return ResizeEdge::None;
 }
 
@@ -167,17 +168,15 @@ void AiPanelView::DragResize(float x, float y) {
     const float s = resize_scale_ > 0.0f ? resize_scale_ : 1.0f;
     constexpr float kMinDip = 300.0f, kMaxDip = 900.0f;
     constexpr float kMinHeightDip = 240.0f, kMaxHeightDip = 960.0f;
-    if (resize_edge_ == ResizeEdge::DockLeft) {
-        if (panel_rect_.right <= panel_rect_.left) return;
-        dock_width_dip_ = std::clamp((panel_rect_.right - x) / s, kMinDip, kMaxDip);
-        return;
-    }
     if (panel_rect_.right <= panel_rect_.left) return;
-    if (resize_edge_ == ResizeEdge::FloatRight || resize_edge_ == ResizeEdge::FloatCorner) {
-        float_width_dip_ = std::clamp((x - panel_rect_.left) / s, kMinDip, kMaxDip);
-        panel_rect_.right = panel_rect_.left + float_width_dip_ * s;
+    if (resize_edge_ == ResizeEdge::DockRight || resize_edge_ == ResizeEdge::FloatRight ||
+        resize_edge_ == ResizeEdge::FloatCorner) {
+        const float width = std::clamp((x - panel_rect_.left) / s, kMinDip, kMaxDip);
+        if (resize_edge_ == ResizeEdge::DockRight) dock_width_dip_ = width;
+        else float_width_dip_ = width;
+        panel_rect_.right = panel_rect_.left + width * s;
     }
-    if (resize_edge_ == ResizeEdge::FloatBottom || resize_edge_ == ResizeEdge::FloatCorner) {
+    if (resize_edge_ == ResizeEdge::FloatTop || resize_edge_ == ResizeEdge::FloatCorner) {
         float_height_dip_ = std::clamp((panel_rect_.bottom - y) / s, kMinHeightDip, kMaxHeightDip);
         panel_rect_.top = panel_rect_.bottom - float_height_dip_ * s;
     }
