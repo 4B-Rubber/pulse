@@ -31,6 +31,7 @@ int EffortFromThinking(int level, const std::string& service) {
 
 
 constexpr size_t kMaxClients = 64, kMaxRules = 256, kMaxName = 128;
+constexpr size_t kMaxModels = 64, kMaxCapabilities = 8;
 constexpr size_t kMaxServices = 32;
 
 // An address ai.json may carry: http(s), at most 512 bytes.
@@ -88,6 +89,30 @@ bool SameText(std::wstring_view a, std::wstring_view b) {
            CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
 }
 
+// assistant.models ["<id>"]: what the connection's model card may say about
+// one model. Every field is optional; what is missing stays unstated rather
+// than being guessed.
+ModelPrefs ParseModelPrefs(const json::Value& e) {
+    ModelPrefs p;
+    const std::wstring name = json::Wide(e.get_string("name"));
+    if (!name.empty() && name.size() <= kMaxName) p.name = name;
+    const std::wstring detail = json::Wide(e.get_string("detail"));
+    if (!detail.empty() && detail.size() <= 256) p.detail = detail;
+    if (const auto* caps = e.find("capabilities"); caps && caps->is_array()) {
+        for (const auto& c : caps->items()) {
+            if (!c.is_string() || p.capabilities.size() >= kMaxCapabilities) continue;
+            const std::wstring text = json::Wide(c.as_string());
+            if (!text.empty() && text.size() <= 64) p.capabilities.push_back(text);
+        }
+    }
+    if (const auto* context = e.find("context")) {
+        int64_t n = 0;
+        if (context->get_int(n, 1, 100000000)) p.context = static_cast<uint64_t>(n);
+    }
+    if (const auto* cost = e.find("cost"); cost && cost->is_number()) p.cost = cost->as_number(0.0);
+    return p;
+}
+
 } // namespace
 
 std::wstring AiDirectory() {
@@ -103,6 +128,12 @@ std::wstring SettingsPath() {
 std::wstring ActivityDirectory() {
     const std::wstring dir = AiDirectory();
     return dir.empty() ? std::wstring{} : dir + L"\\activity";
+}
+
+const ModelPrefs* AssistantPrefs::FindModel(std::string_view id) const {
+    for (const ModelRecord& r : models)
+        if (r.id == id) return &r.prefs;
+    return nullptr;
 }
 
 Settings ParseSettings(std::string_view utf8, bool* malformed) {
@@ -193,6 +224,14 @@ Settings ParseSettings(std::string_view utf8, bool* malformed) {
             const std::string mic = v->get_string("mic");
             if (mic.size() <= 512) voice.mic = mic;
         }
+        if (const auto* models = a->find("models"); models && models->is_object()) {
+            for (const std::string& id : models->keys()) {
+                if (s.assistant.models.size() >= kMaxModels) break;
+                const json::Value* e = models->find(id);
+                if (!id.empty() && id.size() <= kMaxName && e && e->is_object())
+                    s.assistant.models.push_back({id, ParseModelPrefs(*e)});
+            }
+        }
     }
     return s;
 }
@@ -281,6 +320,23 @@ std::string SerializeSettings(const Settings& s) {
         voice.set("pause", vp.pause);
         if (!vp.mic.empty()) voice.set("mic", vp.mic);
         assistant.set("voice", std::move(voice));
+    }
+    if (!s.assistant.models.empty()) {
+        json::Value models = json::Value::Object();
+        for (const ModelRecord& r : s.assistant.models) {
+            json::Value e = json::Value::Object();
+            if (!r.prefs.name.empty()) e.set("name", json::Utf8(r.prefs.name));
+            if (!r.prefs.detail.empty()) e.set("detail", json::Utf8(r.prefs.detail));
+            if (!r.prefs.capabilities.empty()) {
+                json::Value caps = json::Value::Array();
+                for (const std::wstring& c : r.prefs.capabilities) caps.push(json::Utf8(c));
+                e.set("capabilities", std::move(caps));
+            }
+            if (r.prefs.context) e.set("context", static_cast<uint64_t>(r.prefs.context));
+            if (r.prefs.cost > 0.0) e.set("cost", r.prefs.cost);
+            models.set(r.id, std::move(e));
+        }
+        assistant.set("models", std::move(models));
     }
     if (!s.assistant.history) assistant.set("history", false);
     if (s.assistant.history_days > 0) assistant.set("history_days", s.assistant.history_days);

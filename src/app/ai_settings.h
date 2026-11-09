@@ -1,8 +1,9 @@
 // ai_settings.h - %LOCALAPPDATA%\Pulse\ai\ai.json: whether AI clients may
 // connect over MCP, how each known client was approved, the folders where a
-// client may create files without asking, and how long the activity log is
-// kept. Read with the strict json_value parser; a file that does not parse
-// is ignored (defaults: everything off) and never overwritten silently.
+// client may create files without asking, how long the activity log is kept,
+// and the assistant's own prefs including what each model states about itself.
+// Read with the strict json_value parser; a file that does not parse is
+// ignored (defaults: everything off) and never overwritten silently.
 #pragma once
 #include <cstdint>
 #include <string>
@@ -50,6 +51,22 @@ struct VoicePrefs {
     bool IsDefault() const { return service.empty() && base_url.empty() && model.empty() && pause == 1 && mic.empty(); }
 };
 
+// One model's own facts, as the connection's 可用功能 and 上下文 lines show
+// them. A service's /models only lists ids, so a custom endpoint states these
+// in ai.json assistant.models { "<id>": {...} }; an id without an entry shows
+// the id alone and claims nothing.
+struct ModelPrefs {
+    std::wstring name;                   // "name"; empty: the id
+    std::wstring detail;                 // "detail": one line under the name
+    std::vector<std::wstring> capabilities;   // "capabilities": ["图片理解", ...]
+    uint64_t context = 0;                // "context": tokens; 0 = not stated
+    double cost = 0.0;                   // "cost": relative consumption; 0 = not stated
+};
+struct ModelRecord {
+    std::string id;                      // the id the service lists
+    ModelPrefs prefs;
+};
+
 // What Pulse 助手 remembers of a model service that is not the one in use
 // (设置 › AI 助手 › 其他已保存的服务), so switching back keeps its model and
 // address. Its key stays in its own key file (ai_model_key.h).
@@ -72,6 +89,9 @@ struct AssistantPrefs {
     std::string base_url;                     // empty: the service's own address
     std::vector<std::pair<std::string, ServicePrefs>> services;   // "services": {id: {...}}, the others
     VoicePrefs voice;                         // "voice": {...}
+    std::vector<ModelRecord> models;          // "models": {...}
+    // The entry for `id`, or nullptr.
+    const ModelPrefs* FindModel(std::string_view id) const;
     // 55 P3 历史对话: "history": false stops saving conversations;
     // "history_days" removes those not updated for that many days (pinned
     // ones stay). Written only when not the default, so older files stay.

@@ -163,6 +163,26 @@ int main(int argc, char** argv) {
         const Settings broken = LoadSettings(&malformed);
         Check(malformed && !broken.mcp_enabled, "a malformed ai.json reads as defaults (MCP off)");
         Check(ParseSettings("{\"log_days\":9999}").log_days == 30, "log_days out of range keeps the default");
+        // assistant.models: what a custom endpoint states about its models.
+        {
+            Settings with_models;
+            ModelPrefs stated;
+            stated.name = L"DeepSeek V4.1 Flash";
+            stated.detail = L"快，适合日常整理";
+            stated.capabilities = {L"图片理解", L"推理"};
+            stated.context = 1000000;
+            stated.cost = 0.06;
+            with_models.assistant.models = {{"deepseek-v4.1-flash", stated}};
+            const Settings back_models = ParseSettings(SerializeSettings(with_models));
+            Check(back_models.assistant.models.size() == 1 &&
+                  back_models.assistant.models[0].id == "deepseek-v4.1-flash",
+                  "assistant.models round-trips its id");
+            const ModelPrefs* got = back_models.assistant.FindModel("deepseek-v4.1-flash");
+            Check(got && got->name == L"DeepSeek V4.1 Flash" && got->capabilities.size() == 2 &&
+                  got->context == 1000000 && got->cost > 0.05 && got->cost < 0.07,
+                  "a model's stated name, capabilities, context and cost survive ai.json");
+            Check(!back_models.assistant.FindModel("not-there"), "an unstated model has no entry");
+        }
         // Legacy effort is migrated to thinking without adding service preferences.
         const std::string older =
             "{\"mcp_enabled\":false,\"log_days\":30,\"clients\":[],\"allow\":[],"

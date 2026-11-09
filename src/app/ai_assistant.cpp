@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
+#include <map>
 #include <vector>
 
 namespace pulse {
@@ -53,6 +54,9 @@ constexpr KnownModel kKnownModels[] = {
     {"deepseek-v4-pro", I::AiAsstModelProShort, I::AiAsstModelProDetail},
 };
 std::string g_model = "deepseek-flash";   // the chosen id (ai.json assistant.model)
+// ai.json assistant.models: what each model states about itself. Loaded with
+// the other prefs; an id without an entry claims nothing.
+std::map<std::string, ai::ModelPrefs, std::less<>> g_model_prefs;
 
 const std::vector<std::string>& Listed() { return ai::ListedModels(AiAgentBaseUrl()); }
 
@@ -91,6 +95,29 @@ std::wstring Fill(std::wstring text, std::wstring_view key, const std::wstring& 
     return text;
 }
 
+// 上下文 1M · 消耗 0.06×, from what the model states; an unstated fact leaves
+// its part out rather than showing a made-up number.
+std::wstring ModelMetaLine(const ai::ModelPrefs& m) {
+    std::wstring meta;
+    if (m.context) {
+        wchar_t size[32];
+        if (m.context >= 1000000 && m.context % 100000 == 0)
+            swprintf_s(size, L"%.1fM", static_cast<double>(m.context) / 1000000.0);
+        else if (m.context >= 1000 && m.context % 1000 == 0)
+            swprintf_s(size, L"%lluK", static_cast<unsigned long long>(m.context) / 1000);
+        else
+            swprintf_s(size, L"%llu", static_cast<unsigned long long>(m.context));
+        meta = Fill(Text(I::AiAsstModelContext), L"{n}", size);
+    }
+    if (m.cost > 0.0) {
+        wchar_t cost[32];
+        swprintf_s(cost, L"%g", m.cost);
+        const std::wstring part = Fill(Text(I::AiAsstModelCost), L"{x}", cost);
+        meta = meta.empty() ? part : meta + L" \u00B7 " + part;
+    }
+    return meta;
+}
+
 COLORREF ToColorRef(D2D1_COLOR_F c) {
     auto b = [](float v) { return static_cast<BYTE>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
     return RGB(b(c.r), b(c.g), b(c.b));
@@ -98,6 +125,15 @@ COLORREF ToColorRef(D2D1_COLOR_F c) {
 
 void Redraw(AppState& s) {
     if (s.hwnd) InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
+// ai.json may be edited by hand while Pulse runs: the menu re-reads what each
+// model states about itself each time it opens. Only these lines change; the
+// chosen id, the address and effort stay as the panel has them.
+void ReloadModelPrefs() {
+    const ai::Settings settings = ai::LoadSettings();
+    g_model_prefs.clear();
+    for (const ai::ModelRecord& r : settings.assistant.models) g_model_prefs[r.id] = r.prefs;
 }
 
 void LoadPrefs(AiAssistantState& a) {
@@ -109,6 +145,7 @@ void LoadPrefs(AiAssistantState& a) {
     a.think = std::clamp(settings.assistant.thinking, 0, 6);
     a.model = 0;
     if (!settings.assistant.model.empty()) g_model = settings.assistant.model;
+    ReloadModelPrefs();
 }
 
 void SavePrefs(const AiAssistantState& a) {
@@ -807,6 +844,8 @@ bool HasTip(ui::AiPanelPart part) {
 void PickModel(AppState& s, const D2D1_RECT_F& box) {
     AiAssistantState& a = s.aiAssistant;
     if (box.right <= box.left || !EnsureMenu(s)) return;
+    // ai.json may be edited by hand while Pulse runs: the rows follow it.
+    ReloadModelPrefs();
     const std::vector<std::string>& listed = Listed();
     // Before the service listed anything: the chosen one alone.
     const std::vector<std::string> alone{CurrentModel()};
@@ -825,11 +864,28 @@ void PickModel(AppState& s, const D2D1_RECT_F& box) {
         item.command = static_cast<int>(i) + 1;
         item.text = json::Wide(rows[i]);
         item.checked = rows[i] == current;
-        for (const KnownModel& k : kKnownModels)
-            if (rows[i] == k.id) {
-                item.shortcut = Text(k.caption);
-                item.tooltip = Text(k.detail);
+        // What the model states about itself (ai.json assistant.models) wins:
+        // its name for the row, its detail and 可用功能 in the tip, and 上下文 /
+        // 消耗 as the right-hand caption. An unstated fact is left out.
+        if (const auto stated = g_model_prefs.find(rows[i]); stated != g_model_prefs.end()) {
+            const ai::ModelPrefs& m = stated->second;
+            if (!m.name.empty()) item.text = m.name;
+            std::wstring tip = m.detail;
+            for (const std::wstring& cap : m.capabilities)
+                tip += (tip.empty() ? L"" : L"\n") + cap;
+            const std::wstring meta = ModelMetaLine(m);
+            if (!meta.empty()) {
+                item.shortcut = meta;
+                tip += (tip.empty() ? L"" : L"\n") + meta;
             }
+            if (!tip.empty()) item.tooltip = tip;
+        } else {
+            for (const KnownModel& k : kKnownModels)
+                if (rows[i] == k.id) {
+                    item.shortcut = Text(k.caption);
+                    item.tooltip = Text(k.detail);
+                }
+        }
         if (ai::IsChatOnlyModel(AiAgentBaseUrl(), rows[i])) item.badge_text = Text(I::AsstChatOnly);
         items.push_back(std::move(item));
     }
@@ -1619,7 +1675,10 @@ void FillAiAssistantVm(AppState& s, ui::WindowViewModel& vm) {
     p.placeholder = Text(I::AiAsstPlaceholder);
     p.quote = a.quote;
     p.add_files = Text(I::AiAsstAddFiles);
+    // The button shows the model's own name when it states one, else the id.
     p.model_label = json::Wide(CurrentModel());
+    if (const auto it = g_model_prefs.find(CurrentModel()); it != g_model_prefs.end() && !it->second.name.empty())
+        p.model_label = it->second.name;
     const ai::ThinkSpec think = CurrentThinking();
     const ai::ThinkLevel level = ai::SnapThinking(think, Preferred(a));
     p.effort_mode = think.kind == ai::ThinkKind::Fixed    ? ui::AiEffortMode::Fixed
