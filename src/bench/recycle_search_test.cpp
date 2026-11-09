@@ -4,11 +4,12 @@
 namespace pulse::fs {
 int recycle_enumerations = 0;
 bool recycle_cancel_forwarded = false;
-void EnumerateRecycleBin(std::vector<DirEntry>& out, RecycleBinInfo* info, const std::function<bool()>& cancelled) {
+bool EnumerateRecycleBin(std::vector<DirEntry>& out, RecycleBinInfo* info, const std::function<bool()>& cancelled) {
     ++recycle_enumerations;
     recycle_cancel_forwarded = static_cast<bool>(cancelled);
     out.clear();
     if (info) info->valid = true;
+    return true;
 }
 }
 
