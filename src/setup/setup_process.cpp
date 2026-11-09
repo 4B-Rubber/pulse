@@ -224,7 +224,8 @@ void StopPulseHosts(const std::vector<std::wstring>& dirs, bool touch_service) {
     // which also ended hosts of portable copies that do not lock our files).
     std::vector<ProcessEntry> list;
     for (const wchar_t* image : {L"Pulse.Index.exe", L"Pulse.Preview.exe", L"pulse_shell.exe", L"Pulse.AI.exe",
-                                  L"Pulse.Content.exe", L"Pulse.Document.exe"}) {
+                                  L"Pulse.Content.exe", L"Pulse.Document.exe", L"pulse_hotkey_broker.exe",
+                                  L"pulse_elevated.exe", L"pulse_integration.exe"}) {
         if (!FindProcesses(image, dirs, list, false)) continue;
         for (const auto& p : list) {
             const bool ok = EndProcess(p.pid);

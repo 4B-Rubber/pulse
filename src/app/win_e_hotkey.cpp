@@ -156,10 +156,11 @@ DWORD WINAPI WinEHotkey::Thread(void* value) {
         {"error", self.hook_ ? ERROR_SUCCESS : GetLastError()}});
     std::unique_ptr<WinEBrokerClient> broker;
     if (self.hook_) {
-        if (self.elevated_support_ && !elevated::IsElevated(GetCurrentProcess())) {
-            try { broker = std::make_unique<WinEBrokerClient>(self.host_); self.broker_ = broker.get(); }
-            catch (...) { diagnostics::runtime::Event("win_e_broker_start", {{"success", 0}, {"error", ERROR_NOT_ENOUGH_MEMORY}}); }
-        }
+        // A Win+E pressed over an elevated window needs a hook running at that
+        // level, which only a separate administrator process can install — and
+        // launching that with "runas" raises a UAC prompt on *every* start, far
+        // more intrusive than the one shortcut it recovers. Nothing starts it
+        // automatically; plain windows' Win+E is handled by the hook above.
         self.hook_generation_ = 1;
         self.last_foreground_ = GetForegroundWindow();
         self.foreground_hook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
