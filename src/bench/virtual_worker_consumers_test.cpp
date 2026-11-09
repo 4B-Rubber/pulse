@@ -57,6 +57,7 @@ void ResolveLinksInPlace(const std::wstring&, std::vector<fs::DirEntry>&, const 
 }
 namespace pulse::diagnostics::runtime {
 void Event(const char*, std::initializer_list<Field>, Level) noexcept {}
+bool Enabled() noexcept { return false; }
 }
 namespace {
 using namespace pulse;

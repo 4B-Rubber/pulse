@@ -2278,6 +2278,7 @@ add_executable(pulse_advanced_search_query_test src/bench/advanced_search_query_
     src/bench/dialog_gallery.rc
     src/ui/dialog_lifecycle.cpp
     src/ui/advanced_search_dialog.cpp src/ui/edit_host.cpp src/ui/fluent_components.cpp
+    src/ui/ai_panel_icons.cpp
     src/ui/tab_shape.cpp src/ui/typography.cpp src/ui/ui_compositor.cpp src/ui/window_helpers.cpp
     src/app/search_query.cpp src/app/search_query_rewrite.cpp
     src/index/index_query.cpp src/index/search_kinds.cpp src/index/filename_pinyin.cpp)
