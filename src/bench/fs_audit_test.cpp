@@ -62,6 +62,8 @@ ScopedEntryGrouping::~ScopedEntryGrouping() = default;
 FolderSortMode DefaultFolderSortMode() noexcept { return FolderSortMode::FoldersFirst; }
 ScopedFolderSortMode::ScopedFolderSortMode(FolderSortMode) noexcept : previous_(0) {}
 ScopedFolderSortMode::~ScopedFolderSortMode() = default;
+ScopedMediaSortFolder::ScopedMediaSortFolder(const std::wstring&) noexcept : previous_(nullptr) {}
+ScopedMediaSortFolder::~ScopedMediaSortFolder() = default;
 void RefreshDriveEjectable(const std::wstring&, uint8_t) {}
 bool EntryLess(const fs::DirEntry& a,const fs::DirEntry& b,ui::SortColumn,ui::SortDirection) {return a.name<b.name;}
 void SortEntriesBySize(std::vector<fs::DirEntry>&,ui::SortDirection,const FolderSizeLookup&,const std::function<void()>&) {}

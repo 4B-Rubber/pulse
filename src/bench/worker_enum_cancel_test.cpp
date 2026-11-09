@@ -72,6 +72,7 @@ void Mark(const char*) noexcept {}
 }
 namespace pulse::diagnostics::runtime {
 void Event(const char*, std::initializer_list<Field>, Level) noexcept {}
+bool Enabled() noexcept { return false; }
 }
 static int failures = 0;
 static void Check(bool ok, const char* label) { printf("[%s] %s\n", ok ? "PASS" : "FAIL", label); failures += !ok; }
