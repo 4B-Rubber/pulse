@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cwchar>
 #include <functional>
+#include <memory>
 #include <utility>
 
 namespace pulse {
@@ -482,11 +483,17 @@ bool AiHistoryActivate(AppState& s, ui::AiPanelPart part, int row) {
         if (!ai::DeleteChat(dir, id)) return false;
         h.all.erase(std::remove_if(h.all.begin(), h.all.end(), [&](const ai::ChatEntry& x) { return x.id == id; }),
                     h.all.end());
-        // The panel's conversation stays; saved again it becomes a new file.
         if (s.aiAssistant.chat && s.aiAssistant.chat->history_id == id) {
-            s.aiAssistant.chat->history_id.clear();
-            s.aiAssistant.chat->saved_sig = 0;
-            s.aiAssistant.chat->pinned = false;
+            // 用户删掉的正是正在进行的这条对话: 面板里的它也一起清空。先断开
+            // 保存目标再换新的对话，免得下一次保存把删掉的内容又写回磁盘。
+            AiChatStop(s);
+            s.aiAssistant.chat = std::make_shared<AiChat>();
+            s.renderer.AiPanel().ScrollToEnd();
+            s.renderer.AiPanel().ClearSelection();
+            if (s.aiAssistant.edit) SetWindowTextW(s.aiAssistant.edit, L"");
+            s.aiAssistant.quote.clear();
+            s.aiAssistant.context_removed_for.clear();
+            s.aiAssistant.focus_pending = true;
         }
         Refilter(h);
         Redraw(s);

@@ -1443,7 +1443,7 @@ void MainRenderer::Render(const WindowViewModel& vm, const D2D1_RECT_F& rect,
             const float dock = AiDockWidth(rect.right);
             ai_panel_.Draw(compositor_, vm.ai_panel, theme,
                            D2D1::RectF(rect.left, title_bar_height_, rect.left + dock, rect.bottom - status_height_),
-                           AiPanelView::DockTargetWidth(rect.right, kSidebarRailWidthDip * scale_, scale_),
+                           ai_panel_.DockTargetWidth(rect.right, kSidebarRailWidthDip * scale_, scale_),
                            AiFloatingArea(rect.right, rect.bottom), scale_, motion_now_);
         }
         DrawStatusBar(vm, rect, theme);
@@ -1468,7 +1468,7 @@ void MainRenderer::Render(const WindowViewModel& vm, const D2D1_RECT_F& rect,
         else details_preview_bounds_ = {};
         if (ai_panel_.Visible()) {
             ai_panel_.Draw(compositor_, vm.ai_panel, theme, AiColumnRect(rect.right, rect.bottom),
-                           AiPanelView::DockTargetWidth(rect.right, kSidebarRailWidthDip * scale_, scale_),
+                           ai_panel_.DockTargetWidth(rect.right, kSidebarRailWidthDip * scale_, scale_),
                            AiFloatingArea(rect.right, rect.bottom), scale_, motion_now_);
         }
         if (peek) DrawSidebarPeek(vm, rect, theme);

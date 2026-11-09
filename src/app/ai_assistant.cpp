@@ -23,7 +23,9 @@
 
 #include <commctrl.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <uxtheme.h>
+#include <wrl/client.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -37,6 +39,11 @@ namespace {
 
 namespace ai = app::ai;
 using I = l10n::StringId;
+using Microsoft::WRL::ComPtr;
+
+// 添加文件: the file picker feeds the composer (defined after the click
+// dispatcher that uses it).
+void PickFilesIntoComposer(AppState& s);
 
 constexpr UINT_PTR kComposerSubclass = 0x4149;   // 'AI'
 constexpr UINT_PTR kTurnEditSubclass = 0x4145;   // 'AE': a message edited in place
@@ -1457,6 +1464,12 @@ void Activate(AppState& s, const ui::AiPanelHit& hit) {
         break;
     }
     case P::AddFiles:
+        // 添加文件: the picked paths land in the composer as @-mentions, so the
+        // next message carries them and the user can still edit the words.
+        CloseMenu(s);
+        PickFilesIntoComposer(s);
+        a.focus_pending = true;
+        break;
     case P::ContextChip:
     case P::Input:
     case P::Panel:
@@ -1468,6 +1481,34 @@ void Activate(AppState& s, const ui::AiPanelHit& hit) {
         break;
     }
     Redraw(s);
+}
+
+void PickFilesIntoComposer(AppState& s) {
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return;
+    DWORD options = 0;
+    if (FAILED(dialog->GetOptions(&options))) return;
+    dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+    dialog->SetTitle(Text(I::AiAsstAddFiles).c_str());
+    if (FAILED(dialog->Show(s.hwnd))) return;   // cancelled
+    ComPtr<IShellItemArray> items;
+    if (FAILED(dialog->GetResults(&items))) return;
+    DWORD count = 0;
+    if (FAILED(items->GetCount(&count)) || count == 0) return;
+    std::wstring text;
+    for (DWORD i = 0; i < count; ++i) {
+        ComPtr<IShellItem> item;
+        if (FAILED(items->GetItemAt(i, &item))) continue;
+        PWSTR raw = nullptr;
+        if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &raw)) || !raw) continue;
+        const std::wstring path = raw;
+        CoTaskMemFree(raw);
+        if (path.empty()) continue;
+        if (!text.empty()) text += L'\n';
+        text += L"@\"" + path + L"\"";
+    }
+    if (text.empty()) return;
+    AiAssistantAppendComposer(s, text);
 }
 
 } // namespace
@@ -1865,6 +1906,17 @@ void AiAssistantLayout(AppState& s) {
 bool AiAssistantMouseMove(AppState& s, int x, int y) {
     AiAssistantState& a = s.aiAssistant;
     ui::AiPanelView& view = s.renderer.AiPanel();
+    if (a.resizing) {
+        if (GetCapture() != s.hwnd) {   // the release went elsewhere
+            view.EndResize();
+            a.resizing = false;
+            a.captured = false;
+        } else {
+            view.DragResize(static_cast<float>(x), static_cast<float>(y));
+            Redraw(s);
+        }
+        return true;
+    }
     if (view.ScrollDragging() != 0) {
         if ((GetKeyState(VK_LBUTTON) & 0x8000) == 0) {   // the release went elsewhere
             view.EndScrollDrag();
@@ -1934,6 +1986,20 @@ bool AiAssistantMouseDown(AppState& s, int x, int y) {
     AiAssistantState& a = s.aiAssistant;
     if (!Reachable(s)) return false;
     ui::AiPanelView& view = s.renderer.AiPanel();
+    if (a.open) {
+        const auto edge = view.EdgeAt(static_cast<float>(x), static_cast<float>(y));
+        if (edge != ui::AiPanelView::ResizeEdge::None) {
+            if (a.menu_open || AiVoiceMenuOpen(s)) CloseMenu(s);
+            view.BeginResize(edge);
+            a.resizing = true;
+            a.pressed = {};
+            a.selecting = false;
+            SetCapture(s.hwnd);
+            a.captured = true;
+            Redraw(s);
+            return true;
+        }
+    }
     if (a.open && !view.HistoryCovers(static_cast<float>(x), static_cast<float>(y)) &&
         view.BeginScrollDrag(static_cast<float>(x), static_cast<float>(y))) {
         // The conversation's bar is outside the menus: they fold like for any click there.
@@ -2002,6 +2068,15 @@ bool AiAssistantMouseDown(AppState& s, int x, int y) {
 bool AiAssistantMouseUp(AppState& s, int x, int y) {
     AiAssistantState& a = s.aiAssistant;
     ui::AiPanelView& view = s.renderer.AiPanel();
+    if (a.resizing) {
+        view.EndResize();
+        a.resizing = false;
+        a.captured = false;
+        if (GetCapture() == s.hwnd) ReleaseCapture();
+        a.hover = HitAt(s, x, y);
+        Redraw(s);
+        return true;
+    }
     if (view.ScrollDragging() != 0) {
         view.EndScrollDrag();
         a.captured = false;
@@ -2104,8 +2179,19 @@ void AiAssistantMouseLeave(AppState& s) {
 
 bool AiAssistantSetCursor(AppState& s, int x, int y) {
     const AiAssistantState& a = s.aiAssistant;
-    if (!a.open || !s.renderer.AiPanel().Contains(static_cast<float>(x), static_cast<float>(y))) return false;
+    if (!a.open) return false;
     const ui::AiPanelView& view = s.renderer.AiPanel();
+    // The edge a press would resize by sits just outside the panel's own rect,
+    // so it is tested before the containment check.
+    using Edge = ui::AiPanelView::ResizeEdge;
+    switch (view.EdgeAt(static_cast<float>(x), static_cast<float>(y))) {
+    case Edge::DockLeft:
+    case Edge::FloatRight: SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return true;
+    case Edge::FloatBottom: SetCursor(LoadCursorW(nullptr, IDC_SIZENS)); return true;
+    case Edge::FloatCorner: SetCursor(LoadCursorW(nullptr, IDC_SIZENWSE)); return true;
+    default: break;
+    }
+    if (!view.Contains(static_cast<float>(x), static_cast<float>(y))) return false;
     const ui::AiPanelHit hit = view.HitTest(static_cast<float>(x), static_cast<float>(y));
     using P = ui::AiPanelPart;
     LPCWSTR cursor = IDC_ARROW;

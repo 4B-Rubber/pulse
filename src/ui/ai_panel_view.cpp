@@ -123,15 +123,64 @@ bool AiPanelView::Tick(uint64_t now_ms) {
     return dock_anim_ || float_anim_;
 }
 
-float AiPanelView::DockTargetWidth(float window_width, float rail_width, float scale) {
-    // Leave the panes at least 480 DIP; never narrower than 300 DIP.
+float AiPanelView::DockTargetWidth(float window_width, float rail_width, float scale) const {
+    // Automatic: leave the panes at least 480 DIP; never narrower than 300 DIP.
+    // Dragged: the user may widen it past the design's 408 DIP, but the panes
+    // keep at least 320 DIP and the column stops at 720 DIP.
+    const float narrowest = 300.0f * scale;
+    if (dock_width_dip_ > 0.0f) {
+        const float widest = (std::max)(narrowest,
+            (std::min)(window_width - rail_width - 320.0f * scale, 720.0f * scale));
+        return std::round(std::clamp(dock_width_dip_ * scale, narrowest, widest));
+    }
     const float room = window_width - rail_width - 480.0f * scale;
-    return std::round(std::clamp(room, 300.0f * scale, kDockWidthDip * scale));
+    return std::round(std::clamp(room, narrowest, kDockWidthDip * scale));
 }
 
 float AiPanelView::DockWidth(float window_width, float rail_width, float scale) const {
     if (dock_value_ <= 0.0f) return 0.0f;
     return std::round(DockTargetWidth(window_width, rail_width, scale) * dock_value_);
+}
+
+AiPanelView::ResizeEdge AiPanelView::EdgeAt(float x, float y) const {
+    // A few pixels along the edge the panel grows from: the docked column's left
+    // edge, or the floating card's right / bottom edge and its corner.
+    constexpr float kGrip = 6.0f;
+    if (mode_ == AiPanelMode::Docked) {
+        if (dock_value_ < 0.999f || !open_) return ResizeEdge::None;
+        if (x >= panel_rect_.left - kGrip && x <= panel_rect_.left + 2.0f &&
+            y >= panel_rect_.top + 8.0f && y <= panel_rect_.bottom - 8.0f)
+            return ResizeEdge::DockLeft;
+        return ResizeEdge::None;
+    }
+    if (float_value_ < 0.999f || !open_) return ResizeEdge::None;
+    if (panel_rect_.right <= panel_rect_.left) return ResizeEdge::None;
+    const bool right = x >= panel_rect_.right - kGrip && x <= panel_rect_.right + kGrip;
+    const bool bottom = y >= panel_rect_.bottom - kGrip && y <= panel_rect_.bottom + kGrip;
+    if (right && bottom) return ResizeEdge::FloatCorner;
+    if (right) return ResizeEdge::FloatRight;
+    if (bottom) return ResizeEdge::FloatBottom;
+    return ResizeEdge::None;
+}
+
+void AiPanelView::DragResize(float x, float y) {
+    const float s = resize_scale_ > 0.0f ? resize_scale_ : 1.0f;
+    constexpr float kMinDip = 300.0f, kMaxDip = 900.0f;
+    constexpr float kMinHeightDip = 240.0f, kMaxHeightDip = 960.0f;
+    if (resize_edge_ == ResizeEdge::DockLeft) {
+        if (panel_rect_.right <= panel_rect_.left) return;
+        dock_width_dip_ = std::clamp((panel_rect_.right - x) / s, kMinDip, kMaxDip);
+        return;
+    }
+    if (panel_rect_.right <= panel_rect_.left) return;
+    if (resize_edge_ == ResizeEdge::FloatRight || resize_edge_ == ResizeEdge::FloatCorner) {
+        float_width_dip_ = std::clamp((x - panel_rect_.left) / s, kMinDip, kMaxDip);
+        panel_rect_.right = panel_rect_.left + float_width_dip_ * s;
+    }
+    if (resize_edge_ == ResizeEdge::FloatBottom || resize_edge_ == ResizeEdge::FloatCorner) {
+        float_height_dip_ = std::clamp((panel_rect_.bottom - y) / s, kMinHeightDip, kMaxHeightDip);
+        panel_rect_.top = panel_rect_.bottom - float_height_dip_ * s;
+    }
 }
 
 void AiPanelView::EnsureFormats(Compositor* compositor, float scale) {
@@ -266,6 +315,7 @@ void AiPanelView::Draw(Compositor* compositor, const AiPanelViewModel& vm, const
     bars_[0].drawn = false;
     conv_anim_ = false;
     conv_decor_ = false;
+    resize_scale_ = scale;
     ID2D1DeviceContext* dc = compositor ? compositor->Dc() : nullptr;
     if (!dc || !Visible()) return;
     EnsureFormats(compositor, scale);
@@ -334,8 +384,14 @@ void AiPanelView::Draw(Compositor* compositor, const AiPanelViewModel& vm, const
         drawn_ = true;
     }
     if (float_value_ > 0.0f) {
-        const float w = (std::min)(kFloatingWidthDip * s, floating_area.right - floating_area.left - 20.0f * s);
-        const float h = (std::min)(kFloatingHeightDip * s, floating_area.bottom - floating_area.top - 16.0f * s);
+        // A dragged size wins over the design's; either way the card stays inside
+        // the area the renderer gave it.
+        const float wanted_w = (float_width_dip_ > 0.0f ? float_width_dip_ : kFloatingWidthDip) * s;
+        const float wanted_h = (float_height_dip_ > 0.0f ? float_height_dip_ : kFloatingHeightDip) * s;
+        const float w = (std::max)(300.0f * s,
+            (std::min)(wanted_w, floating_area.right - floating_area.left - 20.0f * s));
+        const float h = (std::max)(220.0f * s,
+            (std::min)(wanted_h, floating_area.bottom - floating_area.top - 16.0f * s));
         const float left = std::round(floating_area.left + 10.0f * s);
         const float bottom = std::round(floating_area.bottom - 6.0f * s);
         const D2D1_RECT_F card = D2D1::RectF(left, bottom - h, left + w, bottom);

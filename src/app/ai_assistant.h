@@ -36,6 +36,9 @@ struct AiAssistantState {
     POINT hover_point{};
     uint64_t hover_since = 0;
     bool captured = false;
+    // Dragging an edge of the panel: the docked column's left edge, or the
+    // floating card's right / bottom edge.
+    bool resizing = false;
     // Text selection in the conversation: clicks are counted (2 a word, 3 a
     // paragraph) and a drag past its edge scrolls.
     bool selecting = false;

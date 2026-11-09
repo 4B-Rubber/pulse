@@ -750,8 +750,30 @@ public:
 
     // Width of the docked column this frame, in px (0 when floating or closed).
     float DockWidth(float window_width, float rail_width, float scale) const;
-    // The full docked width the column grows to, in px.
-    static float DockTargetWidth(float window_width, float rail_width, float scale);
+    // The full docked width the column grows to, in px. A width the user
+    // dragged (SetDockWidthDip) replaces the automatic one.
+    float DockTargetWidth(float window_width, float rail_width, float scale) const;
+
+    // Dragged sizes, in DIP. 0 keeps the automatic size (a share of the
+    // window when docked, kFloatingWidth/Height when floating).
+    void SetDockWidthDip(float dip) noexcept { dock_width_dip_ = dip; }
+    float DockWidthDip() const noexcept { return dock_width_dip_; }
+    void SetFloatingSizeDip(float width, float height) noexcept {
+        float_width_dip_ = width;
+        float_height_dip_ = height;
+    }
+    float FloatingWidthDip() const noexcept { return float_width_dip_; }
+    float FloatingHeightDip() const noexcept { return float_height_dip_; }
+
+    // Which edge a press would resize by: the docked column's left edge, the
+    // floating card's right / bottom edge, or its corner.
+    enum class ResizeEdge : uint8_t { None = 0, DockLeft, FloatRight, FloatBottom, FloatCorner };
+    ResizeEdge EdgeAt(float x, float y) const;
+    void BeginResize(ResizeEdge edge) noexcept { resize_edge_ = edge; }
+    void DragResize(float x, float y);
+    void EndResize() noexcept { resize_edge_ = ResizeEdge::None; }
+    bool Resizing() const noexcept { return resize_edge_ != ResizeEdge::None; }
+    ResizeEdge ResizingEdge() const noexcept { return resize_edge_; }
 
     // `column`: docked column this frame (may be narrower than the content
     // while it opens). `floating_area`: the area a floating card sits in
@@ -950,6 +972,11 @@ private:
     // Docked width and floating fade, 0..1, each with its own spring.
     float dock_value_ = 0.0f, dock_from_ = 0.0f;
     float float_value_ = 0.0f, float_from_ = 0.0f;
+    // Dragged sizes (DIP; 0 = automatic) and the edge being dragged.
+    float dock_width_dip_ = 0.0f;
+    float float_width_dip_ = 0.0f, float_height_dip_ = 0.0f;
+    ResizeEdge resize_edge_ = ResizeEdge::None;
+    float resize_scale_ = 1.0f;   // the scale of the last draw
     bool dock_anim_ = false, float_anim_ = false;
     uint64_t dock_start_ = 0, float_start_ = 0;
     uint64_t opened_at_ = 0;
