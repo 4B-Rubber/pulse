@@ -85,7 +85,7 @@ ExternalOpenResult OpenExternalFolder(AppState& mru, const std::wstring& raw, bo
         ? (mru.appPrefs.new_window_shows == 0 ? mru.appPrefs.home_folder :
            mru.appPrefs.new_window_shows == 1 ? std::wstring() :
            current ? current->current_path : std::wstring())
-        : this_pc ? std::wstring() : ResolveOpenFolderPath(raw, reveal);
+        : this_pc ? std::wstring() : ResolveIncomingPath(raw, reveal);
     // Screenshot runs stay one window (plan §8.7); nothing to open stays as before.
     if (mru.shot.active || (!this_pc && path.empty())) {
         OpenFolderInNewTab(mru, raw, reveal);

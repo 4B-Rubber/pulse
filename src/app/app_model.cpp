@@ -1679,7 +1679,10 @@ static std::wstring StatusText(const Tab& tab) {
         swprintf_s(count,l10n::Get(l10n::StringId::ContentStatusMatches).c_str(),tab.search_total);
         return count;
     }
-    if (tab.loading || !tab.snapshot) return L"";
+    // Rows that have arrived while a long scan still runs already report the growing
+    // count, so a big folder shows progress instead of a blank status bar.
+    if (!tab.snapshot) return L"";
+    if (tab.loading && tab.directory_count + tab.file_count == 0) return L"";
     if (tab.current_path == L"pulse:networks" && !tab.virtual_status.empty()) return tab.virtual_status;
     if (tab.current_path.empty()) {
         // This PC: what is there (2 个磁盘 · 1 个网络盘 · 1 个设备), not

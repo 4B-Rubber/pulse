@@ -544,7 +544,7 @@ void FillWindowTabStrip(ui::WindowViewModel& vm, const WindowTabs& tabs);
 // viewed is marked `active`; the group's last-used tab while another is active
 // is marked `was_active`), then "New tab in group" and "Edit group".
 std::vector<ui::TabGroupCardRow> TabGroupCardRows(const WindowTabs& tabs, int group_id,
-                                                  const LayoutTab* group_last_active);
+                                                  const LayoutTab* group_last_active = nullptr);
 
 // Pull every group's members into one contiguous run (group order by first
 // appearance; member order preserved). Chromium keeps groups always

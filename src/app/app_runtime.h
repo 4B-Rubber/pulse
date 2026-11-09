@@ -80,6 +80,9 @@ std::vector<std::wstring> VisibleFolderPaths(const AppState& s);
 void SyncVisibleWatches(AppState& s);
 void BindCurrentLayout(AppState& s);
 std::wstring ResolveOpenFolderPath(std::wstring path, bool reveal = false);
+// A launch path, a shell namespace or a pulse: view. An unrecognised namespace
+// becomes an empty path (open nothing) instead of a tab showing a CLSID.
+std::wstring ResolveIncomingPath(const std::wstring& raw, bool reveal = false);
 // When `raw` (a launch or forwarded path) names an existing file, selects it
 // in the active tab, which ResolveOpenFolderPath opened on its folder.
 void SelectLaunchedFile(AppState& s, const std::wstring& raw, bool reveal = false);
