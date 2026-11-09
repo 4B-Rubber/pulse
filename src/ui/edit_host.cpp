@@ -363,14 +363,14 @@ bool HandleChildEditMessage(Compositor& compositor, IDWriteTextFormat* format,
     D2D1_COLOR_F foreground, D2D1_COLOR_F background, HBRUSH background_brush,
     HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT& result) {
     (void)background_brush;
+    // A click or a navigation key is the user taking the caret back: it ends the input method
+    // burst before anything on this layer can be mistaken for one (see kImeCaretBurst).
+    if (EndsImeCaretBurst(msg, wParam)) EndImeCaretBurst(hwnd);
     if (GetPropW(hwnd, L"Pulse.EditOffscreenPrint") &&
         (msg == WM_PRINTCLIENT || msg == WM_ERASEBKGND)) {
         result = DefSubclassProc(hwnd, msg, wParam, lParam);
         return true;
     }
-    // A click or a navigation key is the user taking the caret back: it ends the input method
-    // burst before anything on this layer can be mistaken for one (see kImeCaretBurst).
-    if (EndsImeCaretBurst(msg, wParam)) EndImeCaretBurst(hwnd);
     if (msg == WM_NCDESTROY) {
         compositor.SynchronizeEditSelection(hwnd, msg, wParam, lParam);
         RemovePropW(hwnd, kNativeEdit);
