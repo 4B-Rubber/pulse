@@ -192,10 +192,33 @@ bool WaitUntilImageGone(const wchar_t* image, const std::vector<std::wstring>& d
 
 void StopPulseHosts(const std::vector<std::wstring>& dirs, bool touch_service) {
     const bool debug = EnableDebugPrivilege();
+    DWORD service_pid = 0;
     if (touch_service) {
         const auto r = StopService(kServiceName, 15000);
         Log(L"Stop PulseIndex service: " + std::to_wstring(r) + L" (debug privilege: " +
             std::to_wstring(debug) + L")");
+        // The service runs as LocalSystem: its image path may not be readable by
+        // the process walk below, so take its pid from the SCM when the stop did
+        // not finish (a busy index keeps it in STOP_PENDING).
+        SERVICE_STATUS_PROCESS status{};
+        if (ReadServiceStatus(kServiceName, status) == ERROR_SUCCESS &&
+            status.dwCurrentState != SERVICE_STOPPED)
+            service_pid = status.dwProcessId;
+    } else {
+        // Cleaning an old bundle folder: the service may still run that binary.
+        SERVICE_STATUS_PROCESS status{};
+        if (ReadServiceStatus(kServiceName, status) == ERROR_SUCCESS &&
+            status.dwCurrentState != SERVICE_STOPPED) {
+            auto binary = ServiceBinaryPath(kServiceName);
+            if (!binary.empty() && binary.front() == L'"') {
+                const auto close = binary.find(L'"', 1);
+                if (close != std::wstring::npos) binary = binary.substr(1, close - 1);
+            } else {
+                const auto space = binary.find(L' ');
+                if (space != std::wstring::npos) binary = binary.substr(0, space);
+            }
+            if (!binary.empty() && PathInDirectories(binary, dirs)) service_pid = status.dwProcessId;
+        }
     }
     // Scoped to the install directories (the Inno script used taskkill /IM,
     // which also ended hosts of portable copies that do not lock our files).
@@ -207,6 +230,10 @@ void StopPulseHosts(const std::vector<std::wstring>& dirs, bool touch_service) {
             const bool ok = EndProcess(p.pid);
             Log(std::wstring(L"Ended ") + image + L" pid " + std::to_wstring(p.pid) + L": " + std::to_wstring(ok));
         }
+    }
+    if (service_pid != 0) {
+        const bool ok = EndProcess(service_pid);
+        Log(L"Ended PulseIndex service process " + std::to_wstring(service_pid) + L": " + std::to_wstring(ok));
     }
 }
 
