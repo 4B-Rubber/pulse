@@ -1056,7 +1056,7 @@ target_link_libraries(pulse_open_handoff_test PRIVATE user32 ole32 advapi32)
 
 add_executable(pulse_integration_registry_test src/bench/integration_registry_test.cpp
     src/app/shell_integration_registry.cpp)
-target_link_libraries(pulse_integration_registry_test PRIVATE advapi32 shlwapi)
+target_link_libraries(pulse_integration_registry_test PRIVATE advapi32 shlwapi pulse_app_runtime_paths)
 target_compile_definitions(pulse_integration_registry_test PRIVATE PULSE_INTEGRATION_TEST=1)
 
 add_executable(pulse_preview_handler_probe
@@ -2713,6 +2713,9 @@ if(TARGET pulse)
     target_link_libraries(pulse PRIVATE pulse_app_identity)
 endif()
 target_link_libraries(pulse_app_runtime_paths PUBLIC pulse_dialog_bundle)
+# The registry's stale-folder release resolves the same entry path the
+# registration writes, so the small integration host needs it too.
+target_link_libraries(pulse_integration PRIVATE pulse_app_runtime_paths)
 add_executable(pulse_launcher WIN32 src/app_launcher/main.cpp src/app_launcher/launcher.rc)
 target_link_libraries(pulse_launcher PRIVATE pulse_dialog_bundle shell32 ole32 pulse_runtime_log pulse_app_identity)
 target_link_options(pulse_launcher PRIVATE /MANIFEST:NO)
