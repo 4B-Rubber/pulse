@@ -3470,22 +3470,8 @@ D2D1_RECT_F ChangePopoverRect(const ChangePopover& popup, const D2D1_RECT_F& bou
     const float y = std::clamp(popup.y + 10 * scale, bounds.top + 8 * scale, std::max(bounds.top + 8 * scale, bounds.bottom - h - 8 * scale));
     return D2D1::RectF(x, y, x + w, y + h);
 }
-struct ScrollbarMetrics {
-    float thumbY, thumbH;
-    bool valid;
-};
-
-ScrollbarMetrics ComputeScrollbar(float viewH, float totalH, float scrollY, float rowH) {
-    ScrollbarMetrics m{};
-    if (totalH <= viewH || viewH <= 0) return m;
-    m.valid = true;
-    m.thumbH = std::min(viewH, std::max(rowH, viewH * (viewH / totalH)));
-    m.thumbY = std::clamp(scrollY / (totalH - viewH), 0.0f, 1.0f) * (viewH - m.thumbH);
-    return m;
-}
-
-// Edge-style group hover card (tab strip): row pitch, padding and the margins
-// that keep it inside the window.
+// Group hover card: fixed row/pad metrics shared by the draw and hit-test
+// paths so a click always lands on the row it appears to.
 constexpr float kTabGroupCardRowDip = 32.0f;
 constexpr float kTabGroupCardPadDip = 4.0f;
 constexpr float kTabGroupCardMinWidthDip = 200.0f;
@@ -3552,13 +3538,32 @@ inline D2D1_RECT_F TabGroupCardRect(const TabGroupCardView& card, const D2D1_REC
             static_cast<int>(std::floor((avail - 2 * pad) / row_h)));
     }
     visible = std::max(0, visible);
+    if (visible < total) {
+        // Member rows are the ones that give way: a card that cannot show its
+        // actions is a card that cannot be used.
+        visible = std::max(visible, std::min(total, 2));
+    }
+    const float w = std::min(kTabGroupCardMinWidthDip * scale,
+                             std::max(0.0f, bounds.right - bounds.left - 16 * scale));
+    const float h = 2 * pad + row_h * static_cast<float>(visible);
+    const float x = std::clamp(chip_rc.left, bounds.left + 8 * scale,
+        std::max(bounds.left + 8 * scale, bounds.right - w - 8 * scale));
     if (visible_rows) *visible_rows = visible;
-    const float width = std::max(kTabGroupCardMinWidthDip * scale,
-                                 chip_rc.right - chip_rc.left);
-    const float left = std::clamp(chip_rc.left, bounds.left + gap,
-                                  std::max(bounds.left + gap, bounds.right - gap - width));
-    const float height = 2 * pad + static_cast<float>(visible) * row_h;
-    return D2D1::RectF(left, chip_rc.bottom, left + width, chip_rc.bottom + height);
+    return D2D1::RectF(x, chip_rc.bottom, x + w, chip_rc.bottom + h);
+}
+
+struct ScrollbarMetrics {
+    float thumbY, thumbH;
+    bool valid;
+};
+
+ScrollbarMetrics ComputeScrollbar(float viewH, float totalH, float scrollY, float rowH) {
+    ScrollbarMetrics m{};
+    if (totalH <= viewH || viewH <= 0) return m;
+    m.valid = true;
+    m.thumbH = std::min(viewH, std::max(rowH, viewH * (viewH / totalH)));
+    m.thumbY = std::clamp(scrollY / (totalH - viewH), 0.0f, 1.0f) * (viewH - m.thumbH);
+    return m;
 }
 } // namespace
 

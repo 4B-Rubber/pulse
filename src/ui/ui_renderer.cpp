@@ -495,8 +495,6 @@ D2D1_RECT_F MainRenderer::SidebarToggleRect(float w) const {
 MainRenderer::WindowIdentityGeometry MainRenderer::WindowIdentityLayout(const WindowViewModel& vm, float w) const {
     const float brand = TitleBrandWidth(vm, w);
     WindowIdentityGeometry g;
-    // The compact title bar shows neither: its room goes to the tab strip, and
-    // the taskbar still carries the name and the color.
     if (compact_title_bar_ || !vm.window_identity || vm.window_identity_name.empty() || !compositor_) return g;
     const D2D1_RECT_F toggle = SidebarToggleRect(w);
     const bool has_toggle = toggle.right > toggle.left;
@@ -520,6 +518,7 @@ MainRenderer::WindowIdentityGeometry MainRenderer::WindowIdentityLayout(const Wi
     g.compact = true;
     g.dot_radius = 4.0f * scale_;
     if (has_toggle && title_rail && (vertical_tabs_ || embedded_ || user_sidebar_collapsed_)) {
+        // The icon rail: the toggle stands in for the mark and carries the dot.
         g.dot = D2D1::Point2F(toggle.right - 3.0f * scale_, toggle.bottom - 3.0f * scale_);
         const float reach = g.dot_radius + 3.0f * scale_;
         g.hit = D2D1::RectF(g.dot.x - reach, g.dot.y - reach, g.dot.x + reach, g.dot.y + reach);
@@ -2358,14 +2357,19 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
     };
     const int dragI = (strip.item_rects.empty() || vm.tab_layout == 0) ? vm.tab_drag_index : -1;
     // Group chips sit at run starts: Edge-style solid blocks, not pill badges.
-    auto brighten = [&](const D2D1_COLOR_F& c) {
-        // Toward white (dark theme) or black (light) for readable chip text.
+    // Shifts a color toward white (dark theme) or black (light theme); alpha is
+    // preserved so the result can still be layered over the strip.
+    auto toward = [&](const D2D1_COLOR_F& c, float t) {
         D2D1_COLOR_F out = c;
-        const float t = 0.35f;
         const float target = vm.dark ? 1.0f : 0.0f;
         out.r += (target - out.r) * t;
         out.g += (target - out.g) * t;
         out.b += (target - out.b) * t;
+        return out;
+    };
+    auto brighten = [&](const D2D1_COLOR_F& c) {
+        // Opaque variant: keeps chip text readable over the tinted body.
+        D2D1_COLOR_F out = toward(c, 0.35f);
         out.a = 1.0f;
         return out;
     };
@@ -2412,15 +2416,32 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
                                            chipLeft + chip.width,
                                            chip.top + 4.0f * scale_ + ch);
         const bool chip_hovered = IsHovered(vm, HitTestResult::TabGroup, chip.group);
-        const bool named = !gv.name.empty() && chip.width >= 32.0f*scale_;
+        const bool named = !gv.name.empty() && chip.width >= 32.0f * scale_;
+        // A folded chip hides its members, so when its group owns the tab the
+        // user is viewing it takes the selected-tab surface instead of a badge.
+        // The top strip keeps the group's own color so the group stays
+        // identifiable, and the geometry is untouched.
+        const bool selected = gv.collapsed && gv.has_active;
+        const float chip_radius = 5.0f * scale_;
         D2D1_COLOR_F fill = gc;
-        fill.a *= named ? (chip_hovered ? 0.42f : 0.32f)
-                        : (chip_hovered ? 1.0f : 0.85f);
+        if (selected) {
+            fill = theme.header_bg;
+            if (vm.backdrop_enabled) fill.a = vm.dark ? 0.78f : 0.84f;
+            if (chip_hovered) fill = toward(fill, 0.06f);
+        } else {
+            fill.a *= named ? (chip_hovered ? 0.42f : 0.32f)
+                            : (chip_hovered ? 1.0f : 0.85f);
+        }
         MakeBrush(dc, fill, brFillHover_);
         FillRoundedRect(dc, brFillHover_.get(), rc.left, rc.top, chip.width, ch,
-                        5.0f * scale_);
+                        chip_radius);
+        if (selected) {
+            MakeBrush(dc, gc, brAccent_);
+            FillRoundedAccent(dc, brAccent_.get(), rc, chip_radius, 2.0f * scale_,
+                              AccentEdge::Top);
+        }
         if (named) {
-            MakeBrush(dc, brighten(gc), brText_);
+            MakeBrush(dc, selected ? theme.text : brighten(gc), brText_);
             DrawTextRect(dc, compositor_->SmallFormat(), brText_.get(), gv.name,
                 rc.left + 8.0f * scale_, rc.top, chip.width - 16.0f * scale_, ch);
         }
