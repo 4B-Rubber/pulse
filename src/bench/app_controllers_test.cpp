@@ -264,8 +264,8 @@ bool TestDefaultFileManager() {
         passed &= Report("default file manager: turning on takes over folders, Win+E and This PC",
             starts_off && applied && DefaultFileManagerState(reread) == DefaultManagerState::Full &&
             Read(L"Software\\Classes\\Directory\\shell", nullptr) == L"open" &&
-            Read(kWinECommand, nullptr) == L"\"" + exe + L"\"" &&
-            Read(kThisPcCommand, nullptr) == L"\"" + exe + L"\" \"" + kThisPcParsingName + L"\"" &&
+            Read(kWinECommand, nullptr) == L"\"" + exe + L"\" --shell-open pulse:win-e" &&
+            Read(kThisPcCommand, nullptr) == L"\"" + exe + L"\" --shell-open \"" + kThisPcParsingName + L"\"" &&
             Read(kThisPcShell, nullptr) == L"open");
         passed &= Report("default file manager: the other manager's commands are kept as backups",
             SnapshotExists(L"WinE") && SnapshotExists(L"ThisPc"));
@@ -543,8 +543,8 @@ bool TestExplorerShortcuts() {
     passed &= Report("explorer keys: Ctrl+Shift+N new folder, Ctrl+E / F3 search",
         is(L'N', true, true, false, A::NewFolder) && is(L'E', true, false, false, A::Search) &&
         is(VK_F3, false, false, false, A::Search));
-    passed &= Report("explorer keys: Ctrl+N is unassigned, Ctrl+Shift+W closes the window",
-        is(L'N', true, false, false, A::None) && is(L'W', true, true, false, A::CloseWindow) &&
+    passed &= Report("explorer keys: Ctrl+N opens a window, Ctrl+Shift+W closes it",
+        is(L'N', true, false, false, A::NewWindow) && is(L'W', true, true, false, A::CloseWindow) &&
         is(L'N', true, false, true, A::None) && is(L'N', false, false, false, A::None));
     passed &= Report("explorer keys: Ctrl+Shift+M moves the tab to a new window, Ctrl+M and Ctrl+Alt+Shift+M do not (M4e)",
         is(L'M', true, true, false, A::MoveTabToNewWindow) && is(L'M', true, false, false, A::None) &&
@@ -909,8 +909,11 @@ bool TestToolbarApps() {
                     narrow_drag.pins[2].left, narrow_drag.pins[2].right);
     ok &= Report("toolbar apps: a narrow window folds them, a file drag shows them behind the label",
         idle_folded && drag_shown);
-    const auto no_room = MakeToolbarLayout(740, 1, 46, 8, 40, 224, 0, 0, 0, 34, 34, 3, 0,
-                                           ToolbarPinOptions{0, true, 400});
+    ToolbarPinOptions tight;
+    tight.app_from = 0;
+    tight.drop_mode = true;
+    tight.label_width = 400;
+    const auto no_room = MakeToolbarLayout(740, 1, 46, 8, 40, 224, 0, 0, 0, 34, 34, 3, 0, tight);
     ok &= Report("toolbar apps: the drop label gives way before an app does",
         no_room.pin_label.right <= no_room.pin_label.left && no_room.pins[0].right > no_room.pins[0].left);
     // 收藏栏: labels up to 168 DIP wide, the rest folds into » (toolbar redesign §8).
@@ -2618,10 +2621,10 @@ int wmain(int argc, wchar_t** argv) {
         !pulse::l10n::Get(pulse::l10n::StringId::SettingsShowStagingTray).empty() &&
         !pulse::l10n::Get(pulse::l10n::StringId::SettingsShowStagingTrayDesc).empty());
     passed &= Report("the staging tray is shown by default", prefs.show_staging_tray);
-    settings_ui.ToggleUi(37);
+    settings_ui.ToggleUi(83);
     passed &= Report("hiding the staging tray persists",
         !prefs.show_staging_tray && parsed_prefs.FromJson(prefs.ToJson()) && !parsed_prefs.show_staging_tray);
-    settings_ui.ToggleUi(37);
+    settings_ui.ToggleUi(83);
     passed &= Report("showing it again persists",
         prefs.show_staging_tray && parsed_prefs.FromJson(prefs.ToJson()) && parsed_prefs.show_staging_tray);
     parsed_prefs.show_staging_tray = false;
