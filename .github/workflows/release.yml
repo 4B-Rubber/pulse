@@ -36,6 +36,20 @@ jobs:
         channel: [windows, win81]
     steps:
       - uses: actions/checkout@v4
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Point sccache at the cached directory
+        shell: pwsh
+        run: |
+          "SCCACHE_DIR=${{ github.workspace }}/sccache" >> $env:GITHUB_ENV
+      # Per channel: the win81 toolset compiles different commands than windows.
+      - name: Restore the compiler cache
+        uses: actions/cache@v4
+        with:
+          path: sccache
+          key: sccache-${{ matrix.channel }}-${{ github.sha }}
+          restore-keys: |
+            sccache-${{ matrix.channel }}-
       - name: Validate release tag
         shell: pwsh
         env:

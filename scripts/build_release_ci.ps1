@@ -7,6 +7,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+# Per-stage wall time in the log; the release bottleneck lives in this script.
+$stage = [System.Diagnostics.Stopwatch]::StartNew()
+function Write-StageTime([string]$Name) {
+    Write-Output ("[timing] {0}: {1:mm\:ss}" -f $Name, $script:stage.Elapsed)
+    $script:stage = [System.Diagnostics.Stopwatch]::StartNew()
+}
 $build = [IO.Path]::GetFullPath((Join-Path $repo $BuildDir))
 if (-not $build.StartsWith($repo + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'BuildDir must be inside the repository'
@@ -31,6 +37,17 @@ set "LIB=$toolset\lib\x64;%WindowsSdkDir%Lib\%WindowsSDKVersion%ucrt\x64;%Window
 $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
 # The release tag pins the complete SDK; CI verifies it before configuring CMake.
 $sdkRoot = & (Join-Path $PSScriptRoot 'verify_lumatext_sdk.ps1')
+Write-StageTime 'toolchain and SDK verification'
+# Compiler cache: the workflow installs sccache and warms actions/cache between
+# releases. Version labels ride in generated headers, so most commands repeat.
+$sccacheLaunch = ''
+if (Get-Command sccache -ErrorAction SilentlyContinue) {
+    sccache --start-server 2>$null
+    $sccacheLaunch = ' -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache'
+    Write-Output '[timing] sccache launcher enabled'
+} else {
+    Write-Output '[timing] sccache not found: cold compilation'
+}
 $candidate = if ($Channel -eq 'win81') { 'ON' } else { 'OFF' }
 $manifest = if ($Channel -eq 'win81') { 'update-manifest-win81.json' } else { 'update-manifest.json' }
 $publicKey = (Get-Content (Join-Path $repo 'cmake/update-public-key.txt') -Raw).Trim()
@@ -66,13 +83,15 @@ if errorlevel 1 exit /b 1
 chcp 65001 >nul
 set "VSLANG=1033"
 $toolsetEnvironment
-cmake -S "$repo" -B "$build" -G Ninja $compilerArguments -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DPULSE_WIN81_CANDIDATE=$candidate $testConfiguration -DPULSE_WITH_LUMATEXT=ON -DLUMATEXT_SOURCE_DIR= -DCMAKE_PREFIX_PATH="$sdkRoot" -DPULSE_UPDATE_MANIFEST_URL="https://github.com/4B-Rubber/pulse/releases/latest/download/$manifest" -DPULSE_UPDATE_PUBLIC_KEY_HEX=$publicKey -DPULSE_VERSION_LABEL=$version-dev
+cmake -S "$repo" -B "$build" -G Ninja $compilerArguments$sccacheLaunch -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DPULSE_WIN81_CANDIDATE=$candidate $testConfiguration -DPULSE_WITH_LUMATEXT=ON -DLUMATEXT_SOURCE_DIR= -DCMAKE_PREFIX_PATH="$sdkRoot" -DPULSE_UPDATE_MANIFEST_URL="https://github.com/4B-Rubber/pulse/releases/latest/download/$manifest" -DPULSE_UPDATE_PUBLIC_KEY_HEX=$publicKey -DPULSE_VERSION_LABEL=$version-dev
 if errorlevel 1 exit /b 1
+echo [timing] configure finished at %TIME%
 cmake --build "$build" --parallel 4 --target $testTargets
 exit /b %errorlevel%
 "@ | Set-Content -LiteralPath $batch -Encoding ascii
 & $batch
 if ($LASTEXITCODE -ne 0) { throw 'Release compilation failed' }
+Write-StageTime 'configure and verification build'
 if (-not $SkipTests) {
     foreach ($testName in $testNames) {
         & (Join-Path $build "$testName.exe")
@@ -155,11 +174,13 @@ if (-not $SkipTests) {
         throw 'Live content selection regression failed'
     }
     Remove-Item Env:PULSE_LUMATEXT
+    Write-StageTime 'unit, mode and selftest regressions'
     # Strip the embedded test suite and GUI probes from the shipped executable after verification.
     (Get-Content -LiteralPath $batch -Raw).Replace('-DPULSE_WITH_SELFTEST=ON', '-DPULSE_WITH_SELFTEST=OFF -DPULSE_WITH_TEST_HOOKS=OFF').Replace("--target $testTargets", '--target pulse') |
         Set-Content -LiteralPath $batch -Encoding ascii
     & $batch
     if ($LASTEXITCODE -ne 0) { throw 'Production compilation failed' }
+    Write-StageTime 'production rebuild'
 }
 & (Join-Path $repo 'scripts/check_release_payload.ps1') -BuildDir $build
 # Content enhancement pack assets of this channel, matching the catalog in pulse.exe.
@@ -184,3 +205,5 @@ Copy-Item -Path (Join-Path $sdkRoot 'share/LumaText/licenses/*') -Destination $l
 # Pulse setup: bootstrapper + xz payload (scripts/pack_setup.bat).
 & (Join-Path $repo 'scripts/pack_setup.bat') $build $Channel
 if ($LASTEXITCODE -ne 0) { throw 'Installer packaging failed' }
+if (Get-Command sccache -ErrorAction SilentlyContinue) { sccache --show-stats }
+Write-StageTime 'payload, packs and installer'
