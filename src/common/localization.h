@@ -5112,6 +5112,19 @@ enum class StringId : UINT {
     SettingsCompactTitleBarDesc = IDS_SETTINGS_COMPACT_TITLE_BAR_DESC,
     AiAsstModelContext = IDS_AI_ASST_MODEL_CONTEXT,
     AiAsstModelCost = IDS_AI_ASST_MODEL_COST,
+    SettingsZipFormat = IDS_SETTINGS_ZIP_FORMAT,
+    SettingsZipFormatZip = IDS_SETTINGS_ZIP_FORMAT_ZIP,
+    SettingsZipFormat7z = IDS_SETTINGS_ZIP_FORMAT_7Z,
+    SettingsZipFormatTarGz = IDS_SETTINGS_ZIP_FORMAT_TAR_GZ,
+    SettingsZipFormatDesc = IDS_SETTINGS_ZIP_FORMAT_DESC,
+    SettingsZipLevel = IDS_SETTINGS_ZIP_LEVEL,
+    SettingsZipLevelStore = IDS_SETTINGS_ZIP_LEVEL_STORE,
+    SettingsZipLevelFast = IDS_SETTINGS_ZIP_LEVEL_FAST,
+    SettingsZipLevelNormal = IDS_SETTINGS_ZIP_LEVEL_NORMAL,
+    SettingsZipLevelMax = IDS_SETTINGS_ZIP_LEVEL_MAX,
+    SettingsZipLevelDesc = IDS_SETTINGS_ZIP_LEVEL_DESC,
+    SettingsSecArchive = IDS_SETTINGS_SEC_ARCHIVE,
+    OpFiles = IDS_OP_FILES,
 };
 
 bool IsLanguageId(std::wstring_view id) noexcept;

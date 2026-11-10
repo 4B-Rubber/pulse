@@ -3486,6 +3486,8 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
                    hit.region == ui::HitTestResult::SettingsBlankClick ||
                    hit.region == ui::HitTestResult::SettingsHomeFolder ||
                    hit.region == ui::HitTestResult::SettingsLanCache ||
+                   hit.region == ui::HitTestResult::SettingsZipFormat ||
+                   hit.region == ui::HitTestResult::SettingsZipLevel ||
                    hit.region == ui::HitTestResult::SettingsThumbCache) {
             // One branch on purpose: this else-if chain sits at MSVC's block
             // nesting limit (C1061), so new settings must not lengthen it.
@@ -3495,6 +3497,8 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             case ui::HitTestResult::SettingsBlankClick: s->settings.BlankClick(hit.index); break;
             case ui::HitTestResult::SettingsHomeFolder: s->settings.HomeFolder(hit.index); break;
             case ui::HitTestResult::SettingsLanCache: SetLanCacheMode(*s, hit.index); break;
+            case ui::HitTestResult::SettingsZipFormat: s->settings.ZipFormat(hit.index); break;
+            case ui::HitTestResult::SettingsZipLevel: s->settings.ZipLevel(hit.index); break;
             case ui::HitTestResult::SettingsThumbCache: s->settings.ClearThumbCache(); break;
             case ui::HitTestResult::SettingsMtimeStyle: s->settings.MtimeStyle(hit.index); break;
             case ui::HitTestResult::SettingsMtimeRange: s->settings.MtimeRange(hit.index); break;

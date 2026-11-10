@@ -658,6 +658,9 @@ struct AppState : AppCoreOwner {
         uint64_t id = 0;
         std::wstring zip_path;
         std::shared_ptr<std::atomic<bool>> cancel;
+        // The operation window's task (ops::OpsManager external task), 0 when
+        // the caller draws its own progress (the staging shelf).
+        uint64_t task_id = 0;
     };
     std::vector<ZipJob> zipJobs;
     std::unique_ptr<ui::FileOperationWindow> operationWindow;

@@ -884,6 +884,14 @@ void MainRenderer::DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F
             dim_end(dim);
         }
         // 网络位置.
+        {
+            const I formats[]={I::SettingsZipFormatZip,I::SettingsZipFormat7z,I::SettingsZipFormatTarGz};const int format_values[]={0,1,2};
+            segmented(lay.zip_format_card,lay.zip_format_row,formats,format_values,vm.settings_zip_format,H::SettingsZipFormat,I::SettingsZipFormat,I::SettingsZipFormatDesc,3,L"\xF012");
+        }
+        {
+            const I levels[]={I::SettingsZipLevelStore,I::SettingsZipLevelFast,I::SettingsZipLevelNormal,I::SettingsZipLevelMax};const int level_values[]={0,1,2,3};
+            segmented(lay.zip_level_card,lay.zip_level_row,levels,level_values,vm.settings_zip_level,H::SettingsZipLevel,I::SettingsZipLevel,I::SettingsZipLevelDesc,4,L"\xF012");
+        }
         toggle(lay.lan_discovery_row,I::SettingsLanDiscovery,I::SettingsLanDiscoveryDesc,L"\xE701",vm.settings_lan_discovery,40);
         {
             const I modes[]={I::LanCache10Min,I::LanCache1Hour,I::LanCacheSession};const int mode_values[]={0,1,2};

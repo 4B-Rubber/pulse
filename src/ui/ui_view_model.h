@@ -1416,6 +1416,8 @@ struct WindowViewModel {
     bool settings_network_recent = true;
     bool settings_hidden_shares = false;
     int settings_lan_cache_mode = 0;  // 0 10 min, 1 1 h, 2 this session
+    int settings_zip_format = 0;      // 0 ZIP, 1 7Z, 2 TAR.GZ
+    int settings_zip_level = 2;       // 0 store, 1 fast, 2 normal, 3 max
     bool settings_show_hints = true;
     bool settings_tips_seen = false;   // any teaching bubble already shown
     int settings_folder_sort = 0; // 0 folders first, 1 folders last, 2 mixed
@@ -1702,6 +1704,8 @@ struct HitTestResult {
         SettingsBlankClick,
         SettingsHomeFolder,
         SettingsLanCache,  // 发现结果保留: 0 10 min, 1 1 h, 2 this session
+        SettingsZipFormat, // 压缩格式: 0 ZIP, 1 7Z, 2 TAR.GZ
+        SettingsZipLevel,  // 压缩级别: 0 store, 1 fast, 2 normal, 3 max
         SettingsThumbCache,
         SettingsTextRender,
         SettingsUiFontSize,

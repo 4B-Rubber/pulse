@@ -5120,5 +5120,18 @@
 #define IDS_SETTINGS_COMPACT_TITLE_BAR_DESC                                              6398
 #define IDS_AI_ASST_MODEL_CONTEXT                                                        6399
 #define IDS_AI_ASST_MODEL_COST                                                           6400
+#define IDS_SETTINGS_ZIP_FORMAT                                                          6401
+#define IDS_SETTINGS_ZIP_FORMAT_ZIP                                                      6402
+#define IDS_SETTINGS_ZIP_FORMAT_7Z                                                       6403
+#define IDS_SETTINGS_ZIP_FORMAT_TAR_GZ                                                   6404
+#define IDS_SETTINGS_ZIP_FORMAT_DESC                                                     6405
+#define IDS_SETTINGS_ZIP_LEVEL                                                           6406
+#define IDS_SETTINGS_ZIP_LEVEL_STORE                                                     6407
+#define IDS_SETTINGS_ZIP_LEVEL_FAST                                                      6408
+#define IDS_SETTINGS_ZIP_LEVEL_NORMAL                                                    6409
+#define IDS_SETTINGS_ZIP_LEVEL_MAX                                                       6410
+#define IDS_SETTINGS_ZIP_LEVEL_DESC                                                      6411
+#define IDS_SETTINGS_SEC_ARCHIVE                                                         6412
+#define IDS_OP_FILES                                                                     6413
 
 #endif  // PULSE_STRING_IDS_H

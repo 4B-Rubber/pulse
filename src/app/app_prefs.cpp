@@ -103,6 +103,8 @@ void AppPrefs::ResetToDefaults() {
     network_recent_enabled = true;
     show_hidden_shares = false;
     lan_cache_mode = 0;
+    zip_format = 0;
+    zip_level = 2;
     show_staging_tray = true;
     home_folder.clear();
     text_render = 0;
@@ -305,6 +307,10 @@ std::wstring AppPrefs::ToJson() const {
     out += show_hidden_shares ? L"true" : L"false";
     out += L",\n  \"lan_cache_mode\":";
     out += std::to_wstring(lan_cache_mode);
+    out += L",\n  \"zip_format\":";
+    out += std::to_wstring(zip_format);
+    out += L",\n  \"zip_level\":";
+    out += std::to_wstring(zip_level);
     out += L",\n  \"home_folder\":\"";
     out += escaped_home;
     out += L"\"";
@@ -617,6 +623,8 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     network_recent_enabled = pulse::json::ExtractBool(json, L"network_recent_enabled", true);
     show_hidden_shares = pulse::json::ExtractBool(json, L"show_hidden_shares", false);
     lan_cache_mode = std::clamp(pulse::json::ExtractInt(json, L"lan_cache_mode", 0), 0, 2);
+    zip_format = std::clamp(pulse::json::ExtractInt(json, L"zip_format", 0), 0, 2);
+    zip_level = std::clamp(pulse::json::ExtractInt(json, L"zip_level", 2), 0, 3);
     home_folder = pulse::json::ExtractString(json, L"home_folder");
     text_render = pulse::json::ExtractInt(json, L"text_render", 0);
     if (text_render < 0 || text_render > 2) text_render = 0;

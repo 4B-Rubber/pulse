@@ -10,6 +10,7 @@
 #include "../common/text_format.h"
 #include "../ops/ops_manager.h"
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -19,13 +20,25 @@ namespace {
 
 // Arrival tasks of 压缩 stay clear of the ops queue's ids.
 constexpr uint64_t kZipTaskBase = 1ull << 62;
-// A quick archive just shows its result; a slower one shows it is working.
-constexpr ULONGLONG kBusySnackMs = 400;
+
 
 struct ZipDone {
     uint64_t id = 0;
+    uint64_t task_id = 0;   // the operation window's task; 0 when the caller draws its own ring
     std::wstring zip_path;
     app::ZipCompressResult result;
+};
+
+// Posted while an archive runs so the operation window can show a live bar
+// without the worker touching AppState.
+struct ZipProgress {
+    uint64_t task_id = 0;
+    uint64_t done = 0;
+    uint64_t total = 0;
+    uint64_t items_done = 0;
+    uint64_t items_total = 0;
+    double bytes_per_second = 0.0;
+    double peak_bytes_per_second = 0.0;
 };
 
 uint64_t NextZipId() {
@@ -96,10 +109,15 @@ namespace {
 // Shared by the toolbar tool and the staging shelf. With `progress` the
 // caller shows its own indicator (the shelf's ring) instead of the busy snack.
 uint64_t StartZip(AppState& s, std::vector<std::wstring> paths, const std::wstring& dir,
-                  const std::wstring& zip_path, std::shared_ptr<std::atomic<float>> progress) {
+                  const std::wstring& zip_path, app::ArchiveOptions options,
+                  std::shared_ptr<std::atomic<float>> progress) {
     const uint64_t id = NextZipId();
     auto cancel = std::make_shared<std::atomic<bool>>(false);
-    s.zipJobs.push_back({id, zip_path, cancel});
+    // The toolbar and the context menu have no progress surface of their own, so
+    // a long archive shows up in the operation window like a copy does. The
+    // staging shelf draws its own ring and stays out of that window.
+    const uint64_t task_id = progress ? 0 : s.ops.CreateExternalTask(Leaf(zip_path), l10n::Get(l10n::StringId::ToolbarToolZip));
+    s.zipJobs.push_back({id, zip_path, cancel, task_id});
     // Select the archive once it is listed, the way a paste selects its items.
     if (app::Tab* tab = ActiveTab(s);
         tab && _wcsicmp(fs::NormalizePath(tab->current_path).c_str(), fs::NormalizePath(dir).c_str()) == 0) {
@@ -107,20 +125,48 @@ uint64_t StartZip(AppState& s, std::vector<std::wstring> paths, const std::wstri
         ExpectArrival(s, zip_path);
     }
     const HWND hwnd = s.hwnd;
-    std::thread([hwnd, id, paths = std::move(paths), zip_path, cancel, progress] {
+    std::thread([hwnd, id, task_id, paths = std::move(paths), zip_path, options, cancel, progress] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        const ULONGLONG started = GetTickCount64();
-        bool told = progress != nullptr;
+        const auto started = std::chrono::steady_clock::now();
+        uint64_t last_bytes = 0;
+        double peak = 0.0;
+        auto last_at = started;
+        auto last_post = started;
         auto done = std::make_unique<ZipDone>();
         done->id = id;
+        done->task_id = task_id;
         done->zip_path = zip_path;
-        done->result = app::CompressToZip(paths, zip_path, cancel.get(), [&](uint64_t now, uint64_t total) {
-            if (progress && total > 0)
-                progress->store(static_cast<float>(static_cast<double>(now) / static_cast<double>(total)));
-            if (!told && GetTickCount64() - started >= kBusySnackMs) {
-                told = true;
-                PostMessageW(hwnd, WM_ZIP_COMPRESS, 0, static_cast<LPARAM>(id & 0x7FFFFFFF));
+        done->result = app::CompressToArchive(paths, zip_path, options, cancel.get(),
+                                               [&](uint64_t now, uint64_t total, uint64_t items,
+                                                   uint64_t total_items) {
+            if (progress) {
+                if (total > 0)
+                    progress->store(static_cast<float>(static_cast<double>(now) / static_cast<double>(total)));
+                return;
             }
+            if (task_id == 0 || cancel->load()) return;
+            const auto clock = std::chrono::steady_clock::now();
+            // Four updates a second keep the bar and the speed readable without
+            // flooding the window with messages on a fast disk. The final update
+            // (everything processed) always goes out.
+            const bool finished = now == total && items == total_items;
+            if (!finished && clock - last_post < std::chrono::milliseconds(150)) return;
+            auto update = std::make_unique<ZipProgress>();
+            update->task_id = task_id;
+            update->done = now;
+            update->total = total;
+            update->items_done = items;
+            update->items_total = total_items;
+            const double seconds = std::chrono::duration<double>(clock - last_at).count();
+            if (seconds > 0.05 && now > last_bytes)
+                update->bytes_per_second = static_cast<double>(now - last_bytes) / seconds;
+            peak = (std::max)(peak, update->bytes_per_second);
+            update->peak_bytes_per_second = peak;
+            last_bytes = now;
+            last_at = clock;
+            last_post = clock;
+            if (PostMessageW(hwnd, WM_ZIP_PROGRESS, 0, reinterpret_cast<LPARAM>(update.get())))
+                update.release();
         });
         if (progress) progress->store(1.0f);
         if (PostMessageW(hwnd, WM_ZIP_COMPRESS, 1, reinterpret_cast<LPARAM>(done.get()))) done.release();
@@ -129,23 +175,38 @@ uint64_t StartZip(AppState& s, std::vector<std::wstring> paths, const std::wstri
 }
 } // namespace
 
+namespace {
+// The user's format/effort, with the format falling back to ZIP when this build's
+// system library cannot write it.
+app::ArchiveOptions CurrentArchiveOptions(AppState& s) {
+    app::ArchiveOptions options;
+    options.format = static_cast<app::ArchiveFormat>(std::clamp(s.appPrefs.zip_format, 0, 2));
+    if (!app::ArchiveFormatAvailable(options.format)) options.format = app::ArchiveFormat::Zip;
+    options.level = std::clamp(s.appPrefs.zip_level, 0, 3);
+    return options;
+}
+} // namespace
+
 void CompressSelection(AppState& s) {
     std::vector<std::wstring> paths;
     std::wstring dir;
     if (!CompressTarget(s, &paths, &dir)) return;
-    const std::wstring zip_path = app::ZipPathFor(paths, dir);
-    StartZip(s, std::move(paths), dir, zip_path, nullptr);
+    const app::ArchiveOptions options = CurrentArchiveOptions(s);
+    const std::wstring archive_path = app::ArchivePathFor(paths, dir, options.format);
+    StartZip(s, std::move(paths), dir, archive_path, options, nullptr);
 }
 
 uint64_t CompressPathsTo(AppState& s, std::vector<std::wstring> paths, const std::wstring& dir,
                          const std::wstring& base_name, std::shared_ptr<std::atomic<float>> progress) {
     if (paths.empty() || dir.empty() || fs::IsVirtualPath(dir) || !app::ZipCompressAvailable()) return 0;
+    const app::ArchiveOptions options = CurrentArchiveOptions(s);
+    const std::wstring extension = app::ArchiveExtension(options.format);
     std::wstring folder = dir;
     if (folder.back() != L'\\') folder += L'\\';
-    std::wstring zip_path = folder + base_name + L".zip";
-    for (int n = 2; GetFileAttributesW(zip_path.c_str()) != INVALID_FILE_ATTRIBUTES && n < 1000; ++n)
-        zip_path = folder + base_name + L" (" + std::to_wstring(n) + L").zip";
-    return StartZip(s, std::move(paths), dir, zip_path, std::move(progress));
+    std::wstring archive_path = folder + base_name + extension;
+    for (int n = 2; GetFileAttributesW(archive_path.c_str()) != INVALID_FILE_ATTRIBUTES && n < 1000; ++n)
+        archive_path = folder + base_name + L" (" + std::to_wstring(n) + L")" + extension;
+    return StartZip(s, std::move(paths), dir, archive_path, options, std::move(progress));
 }
 
 void HandleZipMessage(AppState& s, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -153,18 +214,44 @@ void HandleZipMessage(AppState& s, UINT message, WPARAM wparam, LPARAM lparam) {
         for (auto& job : s.zipJobs) job.cancel->store(true);
         return;
     }
-    if (wparam == 0) {
-        // Still working: the snack offers 取消 until the result replaces it.
-        const uint64_t low = static_cast<uint64_t>(lparam);
-        const auto job = std::find_if(s.zipJobs.begin(), s.zipJobs.end(),
-                                      [&](const AppState::ZipJob& j) { return (j.id & 0x7FFFFFFF) == low; });
-        if (job == s.zipJobs.end() || job->cancel->load()) return;
-        s.notification_toast.ShowSnack(s.hwnd, ui::SnackIcon::Merge, l10n::Get(l10n::StringId::ZipCompressing),
-            Leaf(job->zip_path), {ui::SnackAction{l10n::Get(l10n::StringId::Cancel), WM_ZIP_CANCEL}}, {}, 10 * 60 * 1000);
+    if (message == WM_ZIP_PROGRESS) {
+        std::unique_ptr<ZipProgress> progress(reinterpret_cast<ZipProgress*>(lparam));
+        if (!progress || progress->task_id == 0) return;
+        ops::OpStatus status;
+        status.active = true;
+        status.total_bytes = progress->total;
+        status.transferred_bytes = progress->done;
+        status.percent = progress->total > 0
+            ? static_cast<float>(100.0 * static_cast<double>(progress->done) /
+                                 static_cast<double>(progress->total))
+            : -1.0f;
+        status.total_items = progress->items_total;
+        status.completed_items = progress->items_done;
+        status.bytes_per_second = progress->bytes_per_second;
+        status.peak_bytes_per_second = progress->peak_bytes_per_second;
+        status.speed_basis = ops::OpSpeedBasis::Bytes;
+        if (progress->bytes_per_second > 1.0 && progress->total > progress->done) {
+            status.eta_seconds = static_cast<uint64_t>(
+                static_cast<double>(progress->total - progress->done) / progress->bytes_per_second);
+        }
+        s.ops.UpdateExternalTask(progress->task_id, status);
         return;
     }
+    if (wparam != 1) return;   // 0 was the old "still working" snack
     std::unique_ptr<ZipDone> done(reinterpret_cast<ZipDone*>(lparam));
     if (!done) return;
+    if (done->task_id != 0) {
+        ops::OpStatus final;
+        final.active = false;
+        final.total_bytes = done->result.bytes;
+        final.transferred_bytes = done->result.bytes;
+        final.percent = done->result.ok ? 100.0f : -1.0f;
+        final.last_error = done->result.error;
+        const ops::ExternalOutcome outcome = done->result.ok ? ops::ExternalOutcome::Completed
+            : done->result.cancelled ? ops::ExternalOutcome::Cancelled
+                                     : ops::ExternalOutcome::Failed;
+        s.ops.FinishExternalTask(done->task_id, outcome, final);
+    }
     s.zipJobs.erase(std::remove_if(s.zipJobs.begin(), s.zipJobs.end(),
                                    [&](const AppState::ZipJob& j) { return j.id == done->id; }),
                     s.zipJobs.end());
@@ -178,7 +265,10 @@ void HandleZipMessage(AppState& s, UINT message, WPARAM wparam, LPARAM lparam) {
         s.store.MarkDirty(parent);
         RefreshPath(s, parent, RefreshReason::OperationCompleted);
     }
-    ShowResult(s, *done);
+    // A long run already reported its outcome in the operation window; a snack
+    // on top of it would be the same news twice. Short runs never open that
+    // window and still get the snack.
+    if (!(s.operationWindow && s.operationWindow->IsVisible())) ShowResult(s, *done);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 

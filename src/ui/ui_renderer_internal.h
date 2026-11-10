@@ -2819,6 +2819,8 @@ struct SettingsLayout {
     D2D1_RECT_F tray_hide_row{};
     D2D1_RECT_F lan_discovery_row{}, network_recent_row{}, hidden_shares_row{};
     D2D1_RECT_F lan_cache_card{}, lan_cache_row[3]{};
+    D2D1_RECT_F zip_format_card{}, zip_format_row[3]{};
+    D2D1_RECT_F zip_level_card{}, zip_level_row[4]{};
     D2D1_RECT_F network_clear_row{}, network_clear_button{};
     D2D1_RECT_F hints_row{};
     D2D1_RECT_F hints_reset_row{};

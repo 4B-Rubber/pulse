@@ -357,6 +357,34 @@ int wmain() {
                   Fails(RunZip(plan, stop), "cancelled") && CountEntries(src) == before &&
                   !std::filesystem::exists(src + L"\\cancelled.zip"),
               "zip: a cancelled call leaves nothing behind");
+        // 压缩格式: the other containers really come out of the system writer.
+        {
+            auto head = [](const std::wstring& path, size_t count) {
+                std::vector<unsigned char> bytes(count);
+                std::FILE* file = _wfopen(path.c_str(), L"rb");
+                if (!file) return std::vector<unsigned char>{};
+                const size_t read = std::fread(bytes.data(), 1, count, file);
+                std::fclose(file);
+                bytes.resize(read);
+                return bytes;
+            };
+            app::ArchiveOptions seven;
+            seven.format = app::ArchiveFormat::SevenZip;
+            const auto r7 = app::CompressToArchive({src + L"\\a.txt"}, src + L"\\format-test.7z", seven,
+                                                   nullptr, {});
+            const auto h7 = head(src + L"\\format-test.7z", 6);
+            Check(r7.ok && h7.size() == 6 && h7[0] == 0x37 && h7[1] == 0x7A && h7[5] == 0x1C,
+                  "archive: the 7z writer produces a 7z container");
+            app::ArchiveOptions targz;
+            targz.format = app::ArchiveFormat::TarGz;
+            const auto rgz = app::CompressToArchive({src + L"\\a.txt"}, src + L"\\format-test.tar.gz", targz,
+                                                    nullptr, {});
+            const auto hgz = head(src + L"\\format-test.tar.gz", 2);
+            Check(rgz.ok && hgz.size() == 2 && hgz[0] == 0x1F && hgz[1] == 0x8B,
+                  "archive: TAR.GZ adds the gzip filter");
+            std::filesystem::remove(src + L"\\format-test.7z", ec);
+            std::filesystem::remove(src + L"\\format-test.tar.gz", ec);
+        }
     }
 
     std::filesystem::remove_all(L"\\\\?\\" + root, ec);

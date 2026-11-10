@@ -11,8 +11,10 @@ namespace pulse {
 struct AppState;
 // Real files and folders of one folder are selected.
 bool CanCompressSelection(AppState& s);
-// Starts the archive on a thread; a snack with 取消 shows once it takes a
-// moment, and the result replaces it. The archive gets selected (arrival_select.h).
+// Starts the archive on a thread. A run longer than the operation window's
+// delay shows up there with a live bar, speed and 取消, like a copy; a quick
+// one only reports its result as a snack. The archive gets selected
+// (arrival_select.h).
 void CompressSelection(AppState& s);
 // Staging shelf: paths into dir\<base_name>.zip (" (2)" when taken). The
 // caller draws `progress` (0..1); the result snack is the same. Returns the

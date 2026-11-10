@@ -3628,8 +3628,12 @@ void FileOperationWindow::Render() {
         const float top = kContentH + fail_block - TaskLayoutReduction(status_);
         painter_.FillRoundedRect(Rect(s, kPadX, top, content_w, kDetailsBlockH - 12.0f), ScaleDip(s, 6.0f),
                                  WithAlpha(theme.text, dark_ ? 0.08f : 0.04f));
+        // 压缩 reports members, not transfers: "已处理" means files here and the
+        // byte row reads "已处理" too, so neither row borrows copy/move wording.
+        const bool member_basis = status_.external && status_.total_items > 0;
         const std::wstring detail_labels[6] = {
-            l10n::Get(l10n::StringId::OpProcessedItems), l10n::Get(l10n::StringId::OpTransferredBytes),
+            l10n::Get(member_basis ? l10n::StringId::OpFiles : l10n::StringId::OpProcessedItems),
+            l10n::Get(member_basis ? l10n::StringId::OpProcessedItems : l10n::StringId::OpTransferredBytes),
             l10n::Get(l10n::StringId::OpAverageSpeed), l10n::Get(l10n::StringId::OpPeakSpeed),
             l10n::Get(l10n::StringId::OpElapsed), l10n::Get(l10n::StringId::OpRemainingTime) };
         const std::wstring detail_values[6] = {

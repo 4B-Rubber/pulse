@@ -2926,6 +2926,8 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.settings_network_recent = s.appPrefs.network_recent_enabled;
     vm.settings_hidden_shares = s.appPrefs.show_hidden_shares;
     vm.settings_lan_cache_mode = s.appPrefs.lan_cache_mode;
+    vm.settings_zip_format = s.appPrefs.zip_format;
+    vm.settings_zip_level = s.appPrefs.zip_level;
     vm.settings_show_hints = s.appPrefs.show_hints;
     vm.settings_tips_seen = s.appPrefs.tips_seen != 0;
     vm.settings_folder_sort = s.appPrefs.folder_sort_mode;

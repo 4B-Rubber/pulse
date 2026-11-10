@@ -66,6 +66,7 @@ constexpr UINT WM_DETAILS_TREE_UNDO = WM_APP + 91;  // the "expanded N folders" 
 constexpr UINT WM_UNDO_DELETE = WM_APP + 92;  // the "deleted N items" snack: undo the delete
 constexpr UINT WM_ZIP_COMPRESS = WM_APP + 93;  // 压缩: wParam 0 still running (lParam job id), 1 done (ZipDone*)
 constexpr UINT WM_ZIP_CANCEL = WM_APP + 94;  // the 压缩 snack: cancel
+constexpr UINT WM_ZIP_PROGRESS = WM_APP + 145;  // 压缩: lParam owns a ZipProgress* (bytes done/total, speed)
 constexpr UINT WM_DEFERRED_STARTUP = WM_APP + 95;  // posted by the first WM_CREATE: build what the first frame does not need
 constexpr UINT WM_REGISTER_DROP_TARGET = WM_APP + 96;  // posted by every WM_CREATE: RegisterDragDrop once the first frame is up
 constexpr UINT WM_FAVORITE_UNDO = WM_APP + 97;  // the 已移出收藏夹 snack (收藏栏 drag-out): put it back

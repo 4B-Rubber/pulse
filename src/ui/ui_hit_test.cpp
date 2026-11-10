@@ -662,6 +662,12 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 if (ContainsPt(lay.operation_progress_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 84; return r;
                 }
+                for (int i = 0; i < 3; ++i) if (ContainsPt(lay.zip_format_row[i], x, y)) {
+                    r.region = HitTestResult::SettingsZipFormat; r.index = i; return r;
+                }
+                for (int i = 0; i < 4; ++i) if (ContainsPt(lay.zip_level_row[i], x, y)) {
+                    r.region = HitTestResult::SettingsZipLevel; r.index = i; return r;
+                }
                 // 文件操作 → 网络位置 (zero rects on the other pages).
                 if (ContainsPt(lay.lan_discovery_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 40; return r;

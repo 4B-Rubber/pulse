@@ -286,6 +286,8 @@ public:
     void HomeFolder(int action);
     void TextRendering(int index);
     void UiFontSize(int index);   // 0 small 90%, 1 default 100%, 2 large 112%, 3 larger 125%
+    void ZipFormat(int index);    // 压缩格式: 0 ZIP, 1 7Z, 2 TAR.GZ
+    void ZipLevel(int index);     // 压缩级别: 0 store, 1 fast, 2 normal, 3 max
     void TrayIconSize(int index);
     void DoubleCtrlGap(int index);   // 连按间隔: 200 / 300 / 400 ms
     // Settings sliders: 0 interface transparency (0..90), 1 wallpaper blur (0..40),

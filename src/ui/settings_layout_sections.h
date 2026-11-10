@@ -478,6 +478,10 @@ float LayoutSettingsGeneral(SettingsLayout& l, const WindowViewModel& vm, float 
         l.confirm_delete_row=row(64);
         l.operation_progress_row=row(64);
 
+        section(I::SettingsSecArchive);
+        l.zip_format_card=row(seg_h,true); fitted_segments(l.zip_format_card,l.zip_format_row,{I::SettingsZipFormatZip,I::SettingsZipFormat7z,I::SettingsZipFormatTarGz});
+        l.zip_level_card=row(seg_h,true); fitted_segments(l.zip_level_card,l.zip_level_row,{I::SettingsZipLevelStore,I::SettingsZipLevelFast,I::SettingsZipLevelNormal,I::SettingsZipLevelMax});
+
         section(I::SettingsSecStaging);
         l.tray_icon_card=row(seg_h); fitted_segments(l.tray_icon_card,l.tray_icon_row,{I::SettingsTraySmall,I::SettingsTrayStandard,I::SettingsTrayLarge});
         l.tray_hide_row=row(64);

@@ -15,6 +15,12 @@ void CopyProgress(OpStatus& to, const OpStatus& from) {
     to.completed_items = from.completed_items;
     to.failed_items = from.failed_items;
     to.enumeration_complete = from.enumeration_complete;
+    // The window's speed readout and ETA come from these; an external task
+    // (压缩, pack installs) measures them itself.
+    to.bytes_per_second = from.bytes_per_second;
+    to.peak_bytes_per_second = from.peak_bytes_per_second;
+    to.eta_seconds = from.eta_seconds;
+    to.speed_basis = from.speed_basis;
     to.summary = from.summary.empty() ? to.external_title : from.summary.substr(0, 512);
 }
 }

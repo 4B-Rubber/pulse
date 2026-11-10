@@ -22,6 +22,10 @@ struct WriterApi {
     HMODULE module = nullptr;
     archive* (*write_new)() = nullptr;
     int (*set_format_zip)(archive*) = nullptr;
+    // Optional: the system library ships them, but a ZIP-only fallback is fine.
+    int (*set_format_7zip)(archive*) = nullptr;
+    int (*set_format_pax)(archive*) = nullptr;
+    int (*add_filter_gzip)(archive*) = nullptr;
     int (*set_options)(archive*, const char*) = nullptr;
     int (*open_filename_w)(archive*, const wchar_t*) = nullptr;
     int (*write_header)(archive*, archive_entry*) = nullptr;
@@ -63,6 +67,9 @@ struct WriterApi {
             load(set_filetype, "archive_entry_set_filetype") &&
             load(set_perm, "archive_entry_set_perm") &&
             load(set_mtime, "archive_entry_set_mtime");
+        load(set_format_7zip, "archive_write_set_format_7zip");
+        load(set_format_pax, "archive_write_set_format_pax");
+        load(add_filter_gzip, "archive_write_add_filter_gzip");
     }
 };
 
@@ -152,7 +159,26 @@ bool ZipCompressAvailable() {
     return Api().ready;
 }
 
-std::wstring ZipPathFor(const std::vector<std::wstring>& sources, const std::wstring& dir) {
+bool ArchiveFormatAvailable(ArchiveFormat format) {
+    const WriterApi& api = Api();
+    if (!api.ready) return false;
+    switch (format) {
+    case ArchiveFormat::SevenZip: return api.set_format_7zip != nullptr;
+    case ArchiveFormat::TarGz: return api.set_format_pax != nullptr && api.add_filter_gzip != nullptr;
+    default: return api.set_format_zip != nullptr;
+    }
+}
+
+const wchar_t* ArchiveExtension(ArchiveFormat format) {
+    switch (format) {
+    case ArchiveFormat::SevenZip: return L".7z";
+    case ArchiveFormat::TarGz: return L".tar.gz";
+    default: return L".zip";
+    }
+}
+
+std::wstring ArchivePathFor(const std::vector<std::wstring>& sources, const std::wstring& dir,
+                            ArchiveFormat format) {
     std::wstring stem;
     if (sources.size() == 1) {
         stem = Leaf(sources.front());
@@ -166,21 +192,31 @@ std::wstring ZipPathFor(const std::vector<std::wstring>& sources, const std::wst
         if (stem.empty() || stem.back() == L':' || stem.back() == L'\\') stem = L"Archive";
     }
     if (stem.empty()) stem = L"Archive";
+    const std::wstring extension = ArchiveExtension(format);
     std::wstring base = dir;
     if (!base.empty() && base.back() != L'\\') base += L'\\';
-    std::wstring path = base + stem + L".zip";
-    for (int n = 2; Exists(path) && n < 10000; ++n) path = base + stem + L" (" + std::to_wstring(n) + L").zip";
+    std::wstring path = base + stem + extension;
+    for (int n = 2; Exists(path) && n < 10000; ++n)
+        path = base + stem + L" (" + std::to_wstring(n) + L")" + extension;
     return path;
 }
 
-ZipCompressResult CompressToZip(const std::vector<std::wstring>& sources, const std::wstring& zip_path,
-                                const std::atomic<bool>* cancel,
-                                const std::function<void(uint64_t, uint64_t)>& progress,
-                                const std::vector<std::wstring>* names) {
+std::wstring ZipPathFor(const std::vector<std::wstring>& sources, const std::wstring& dir) {
+    return ArchivePathFor(sources, dir, ArchiveFormat::Zip);
+}
+
+ZipCompressResult CompressToArchive(const std::vector<std::wstring>& sources, const std::wstring& archive_path,
+                                    const ArchiveOptions& options, const std::atomic<bool>* cancel,
+                                    const CompressProgress& progress,
+                                    const std::vector<std::wstring>* names) {
     ZipCompressResult result;
     const WriterApi& api = Api();
     if (!api.ready) {
         result.error = L"archiveint.dll";
+        return result;
+    }
+    if (!ArchiveFormatAvailable(options.format)) {
+        result.error = L"archiveint.dll: writer";
         return result;
     }
     std::vector<Item> items;
@@ -202,9 +238,9 @@ ZipCompressResult CompressToZip(const std::vector<std::wstring>& sources, const 
         return result;
     }
 
-    const size_t slash = zip_path.find_last_of(L"\\/");
-    const std::wstring temp = slash == std::wstring::npos ? zip_path + L".pulse-tmp"
-        : zip_path.substr(0, slash + 1) + L"." + zip_path.substr(slash + 1) + L".pulse-tmp";
+    const size_t slash = archive_path.find_last_of(L"\\/");
+    const std::wstring temp = slash == std::wstring::npos ? archive_path + L".pulse-tmp"
+        : archive_path.substr(0, slash + 1) + L"." + archive_path.substr(slash + 1) + L".pulse-tmp";
     archive* a = api.write_new();
     if (!a) {
         result.error = L"archive_write_new";
@@ -217,7 +253,28 @@ ZipCompressResult CompressToZip(const std::vector<std::wstring>& sources, const 
         DeleteFileW(LongPath(temp).c_str());
         return result;
     };
-    api.set_format_zip(a);
+    // Level 0 stores; 1..3 map to each format's own effort scale.
+    const int level = std::clamp(options.level, 0, 3);
+    switch (options.format) {
+    case ArchiveFormat::SevenZip:
+        api.set_format_7zip(a);
+        api.set_options(a, level <= 0 ? "7zip:compression=copy" : "7zip:compression=lzma2");
+        if (level > 0) api.set_options(a, ("7zip:compression-level=" + std::to_string(
+            level == 1 ? 1 : level == 2 ? 5 : 9)).c_str());
+        break;
+    case ArchiveFormat::TarGz:
+        api.set_format_pax(a);
+        api.add_filter_gzip(a);
+        api.set_options(a, ("gzip:compression-level=" + std::to_string(
+            level == 0 ? 1 : level == 1 ? 1 : level == 2 ? 6 : 9)).c_str());
+        break;
+    default:
+        api.set_format_zip(a);
+        api.set_options(a, level <= 0 ? "zip:compression=store"
+                                      : ("zip:compression-level=" + std::to_string(
+                                            level == 1 ? 1 : level == 2 ? 5 : 9)).c_str());
+        break;
+    }
     // UTF-8 names, flagged as such: Explorer, 7-Zip and macOS all read them.
     api.set_options(a, "hdrcharset=UTF-8");
     if (api.open_filename_w(a, LongPath(temp).c_str()) != kArchiveOk)
@@ -225,9 +282,10 @@ ZipCompressResult CompressToZip(const std::vector<std::wstring>& sources, const 
     SetFileAttributesW(LongPath(temp).c_str(), FILE_ATTRIBUTE_HIDDEN);
 
     std::unique_ptr<char[]> buffer(new char[256 * 1024]);
-    uint64_t done = 0;
-    if (progress) progress(0, total);
-    for (const Item& item : items) {
+    uint64_t done = 0, done_items = 0;
+    if (progress) progress(0, total, 0, items.size());
+    for (size_t index = 0; index < items.size(); ++index) {
+        const Item& item = items[index];
         if (cancel && cancel->load()) {
             result.cancelled = true;
             return fail({});
@@ -270,7 +328,7 @@ ZipCompressResult CompressToZip(const std::vector<std::wstring>& sources, const 
                 }
                 left -= take;
                 done += take;
-                if (progress) progress(done, total);
+                if (progress) progress(done, total, done_items, items.size());
                 if (cancel && cancel->load()) break;
             }
             CloseHandle(file);
@@ -282,12 +340,14 @@ ZipCompressResult CompressToZip(const std::vector<std::wstring>& sources, const 
             ++result.files;
         }
         api.finish_entry(a);
+        ++done_items;
+        if (progress) progress(done, total, done_items, items.size());
     }
     if (api.write_close(a) != kArchiveOk) return fail(Widen(api.error_string(a)));
     api.write_free(a);
     a = nullptr;
     SetFileAttributesW(LongPath(temp).c_str(), FILE_ATTRIBUTE_NORMAL);
-    if (!MoveFileExW(LongPath(temp).c_str(), LongPath(zip_path).c_str(), MOVEFILE_COPY_ALLOWED)) {
+    if (!MoveFileExW(LongPath(temp).c_str(), LongPath(archive_path).c_str(), MOVEFILE_COPY_ALLOWED)) {
         const DWORD error = GetLastError();
         DeleteFileW(LongPath(temp).c_str());
         result.error = SystemMessage(error);
@@ -296,6 +356,16 @@ ZipCompressResult CompressToZip(const std::vector<std::wstring>& sources, const 
     result.ok = true;
     result.bytes = done;
     return result;
+}
+
+ZipCompressResult CompressToZip(const std::vector<std::wstring>& sources, const std::wstring& zip_path,
+                                const std::atomic<bool>* cancel,
+                                const std::function<void(uint64_t, uint64_t)>& progress,
+                                const std::vector<std::wstring>* names) {
+    CompressProgress adapted;
+    if (progress)
+        adapted = [&](uint64_t bytes, uint64_t total, uint64_t, uint64_t) { progress(bytes, total); };
+    return CompressToArchive(sources, zip_path, ArchiveOptions{}, cancel, adapted, names);
 }
 
 } // namespace pulse::app

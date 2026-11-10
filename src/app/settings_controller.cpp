@@ -1058,6 +1058,16 @@ void SettingsController::TrayIconSize(int index) {
         SaveAndApply(SettingsEffect::TrayDeckIcon);
 }
 
+void SettingsController::ZipFormat(int index) {
+    static constexpr int values[] = {0, 1, 2};
+    if (prefs_ && SelectValue(index, values, prefs_->zip_format)) SaveAndApply(SettingsEffect::None);
+}
+
+void SettingsController::ZipLevel(int index) {
+    static constexpr int values[] = {0, 1, 2, 3};
+    if (prefs_ && SelectValue(index, values, prefs_->zip_level)) SaveAndApply(SettingsEffect::None);
+}
+
 void SettingsController::DoubleCtrlGap(int index) {
     static constexpr int values[] = {200, 300, 400};
     if (prefs_ && SelectValue(index, values, prefs_->global_search_double_ctrl_ms))

@@ -1002,7 +1002,13 @@ bool EnsureOperationWindow(AppState& s) {
     if (!hwnd || !IsWindow(hwnd)) return false;
     ui::FileOperationCallbacks operation_callbacks;
     operation_callbacks.cancel_task = [hwnd](uint64_t task) {
-        if (AppState* state = GetAppState(hwnd)) state->ops.CancelTask(task);
+        if (AppState* state = GetAppState(hwnd)) {
+            // 压缩 runs its own thread: the window's 取消 reaches it through the
+            // job's flag, then the task is cancelled like any other.
+            for (auto& job : state->zipJobs)
+                if (job.task_id == task) job.cancel->store(true);
+            state->ops.CancelTask(task);
+        }
     };
     operation_callbacks.cancel = [hwnd] {
         if (AppState* state = GetAppState(hwnd)) state->ops.CancelCurrent();

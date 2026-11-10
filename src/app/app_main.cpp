@@ -2568,6 +2568,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_ZIP_COMPRESS:
     case WM_ZIP_CANCEL:
+    case WM_ZIP_PROGRESS:
         if (s) HandleZipMessage(*s, msg, wParam, lParam);
         return 0;
 

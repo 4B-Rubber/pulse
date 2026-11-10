@@ -5127,3 +5127,16 @@ SettingsCompactTitleBar	IDS_SETTINGS_COMPACT_TITLE_BAR	6397	紧凑标题栏	Comp
 SettingsCompactTitleBarDesc	IDS_SETTINGS_COMPACT_TITLE_BAR_DESC	6398	隐藏标题栏左侧的 Pulse 品牌标识，把空间留给标签页；侧边栏折叠按钮会移到最左边	Hide the Pulse brand on the left so tabs get the room; the sidebar toggle moves to the window edge.	隱藏標題列左側的 Pulse 品牌標識，把空間留給分頁；側邊欄摺疊按鈕會移到最左邊
 AiAsstModelContext	IDS_AI_ASST_MODEL_CONTEXT	6399	上下文 {n}	Context {n}	上下文 {n}
 AiAsstModelCost	IDS_AI_ASST_MODEL_COST	6400	消耗 {x}×	Uses {x}×	消耗 {x}×
+SettingsZipFormat	IDS_SETTINGS_ZIP_FORMAT	6401	压缩格式	Archive format	
+SettingsZipFormatZip	IDS_SETTINGS_ZIP_FORMAT_ZIP	6402	ZIP	ZIP	
+SettingsZipFormat7z	IDS_SETTINGS_ZIP_FORMAT_7Z	6403	7Z	7Z	
+SettingsZipFormatTarGz	IDS_SETTINGS_ZIP_FORMAT_TAR_GZ	6404	TAR.GZ	TAR.GZ	
+SettingsZipFormatDesc	IDS_SETTINGS_ZIP_FORMAT_DESC	6405	新建压缩包时使用的格式。	Format used for new archives.	
+SettingsZipLevel	IDS_SETTINGS_ZIP_LEVEL	6406	压缩级别	Compression level	
+SettingsZipLevelStore	IDS_SETTINGS_ZIP_LEVEL_STORE	6407	仅打包	Store	
+SettingsZipLevelFast	IDS_SETTINGS_ZIP_LEVEL_FAST	6408	快速	Fast	
+SettingsZipLevelNormal	IDS_SETTINGS_ZIP_LEVEL_NORMAL	6409	标准	Normal	
+SettingsZipLevelMax	IDS_SETTINGS_ZIP_LEVEL_MAX	6410	最大	Maximum	
+SettingsZipLevelDesc	IDS_SETTINGS_ZIP_LEVEL_DESC	6411	级别越高越省空间，但压缩更慢。	Higher levels save space but take longer.	
+SettingsSecArchive	IDS_SETTINGS_SEC_ARCHIVE	6412	压缩	Compression	
+OpFiles	IDS_OP_FILES	6413	文件	Files	

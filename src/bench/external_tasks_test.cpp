@@ -31,6 +31,13 @@ int main() {
     auto snapshot = manager.QueryTask(first);
     check(snapshot && snapshot->external && snapshot->active && !snapshot->can_pause && snapshot->type == OpType::External && snapshot->percent == 25,
         "worker progress preserves host identity and controls");
+    OpStatus speed; speed.percent = 40; speed.total_bytes = 1000; speed.transferred_bytes = 400;
+    speed.bytes_per_second = 1234.5; speed.eta_seconds = 3; speed.speed_basis = OpSpeedBasis::Bytes;
+    check(manager.UpdateExternalTask(first, speed), "worker speed update accepted");
+    snapshot = manager.QueryTask(first);
+    check(snapshot && snapshot->bytes_per_second == 1234.5 && snapshot->eta_seconds == 3 &&
+          snapshot->speed_basis == OpSpeedBasis::Bytes,
+        "external task keeps the speed and remaining time the worker measured");
     OpsManagerAuditAccess::Builtin(manager, true);
     check(manager.Status().task_id == 9999, "builtin active operation retains status priority");
     check(manager.CancelTask(second) && manager.ExternalTaskCancelled(second) && !manager.ExternalTaskCancelled(first), "cancel targets exact external ID");

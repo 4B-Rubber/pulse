@@ -5102,6 +5102,19 @@ BEGIN
     IDS_SETTINGS_COMPACT_TITLE_BAR_DESC "隐藏标题栏左侧的 Pulse 品牌标识，把空间留给标签页；侧边栏折叠按钮会移到最左边"
     IDS_AI_ASST_MODEL_CONTEXT "上下文 {n}"
     IDS_AI_ASST_MODEL_COST "消耗 {x}×"
+    IDS_SETTINGS_ZIP_FORMAT "压缩格式"
+    IDS_SETTINGS_ZIP_FORMAT_ZIP "ZIP"
+    IDS_SETTINGS_ZIP_FORMAT_7Z "7Z"
+    IDS_SETTINGS_ZIP_FORMAT_TAR_GZ "TAR.GZ"
+    IDS_SETTINGS_ZIP_FORMAT_DESC "新建压缩包时使用的格式。"
+    IDS_SETTINGS_ZIP_LEVEL "压缩级别"
+    IDS_SETTINGS_ZIP_LEVEL_STORE "仅打包"
+    IDS_SETTINGS_ZIP_LEVEL_FAST "快速"
+    IDS_SETTINGS_ZIP_LEVEL_NORMAL "标准"
+    IDS_SETTINGS_ZIP_LEVEL_MAX "最大"
+    IDS_SETTINGS_ZIP_LEVEL_DESC "级别越高越省空间，但压缩更慢。"
+    IDS_SETTINGS_SEC_ARCHIVE "压缩"
+    IDS_OP_FILES "文件"
 END
 
 LANGUAGE 0x09, 0x01
@@ -10203,6 +10216,19 @@ BEGIN
     IDS_SETTINGS_COMPACT_TITLE_BAR_DESC "Hide the Pulse brand on the left so tabs get the room; the sidebar toggle moves to the window edge."
     IDS_AI_ASST_MODEL_CONTEXT "Context {n}"
     IDS_AI_ASST_MODEL_COST "Uses {x}×"
+    IDS_SETTINGS_ZIP_FORMAT "Archive format"
+    IDS_SETTINGS_ZIP_FORMAT_ZIP "ZIP"
+    IDS_SETTINGS_ZIP_FORMAT_7Z "7Z"
+    IDS_SETTINGS_ZIP_FORMAT_TAR_GZ "TAR.GZ"
+    IDS_SETTINGS_ZIP_FORMAT_DESC "Format used for new archives."
+    IDS_SETTINGS_ZIP_LEVEL "Compression level"
+    IDS_SETTINGS_ZIP_LEVEL_STORE "Store"
+    IDS_SETTINGS_ZIP_LEVEL_FAST "Fast"
+    IDS_SETTINGS_ZIP_LEVEL_NORMAL "Normal"
+    IDS_SETTINGS_ZIP_LEVEL_MAX "Maximum"
+    IDS_SETTINGS_ZIP_LEVEL_DESC "Higher levels save space but take longer."
+    IDS_SETTINGS_SEC_ARCHIVE "Compression"
+    IDS_OP_FILES "Files"
 END
 
 // Traditional Chinese (Taiwan), generated from the Simplified entries above.

@@ -95,6 +95,9 @@ struct AppPrefs {
     bool network_recent_enabled = true;  // remember and list 最近访问
     bool show_hidden_shares = false;     // list C$ / ADMIN$ in a server's shares
     int lan_cache_mode = 0;              // keep found devices: 0 10 min, 1 1 h, 2 this session
+    // 压缩: format 0 ZIP, 1 7Z, 2 TAR.GZ; effort 0 store, 1 fast, 2 normal, 3 max.
+    int zip_format = 0;
+    int zip_level = 2;
     bool sidebar_collapsed = false;   // sidebar folded to its icon rail (Ctrl+B)
     bool favorites_bar = false;       // 收藏栏 under the command row (Ctrl+Shift+B)
     bool favorites_bar_icon_only = false;
