@@ -29,13 +29,27 @@ bool AppendJournal(HANDLE journal, bool had_old, const std::wstring& rel) {
 // Undo of one journaled step; safe whether or not the step completed.
 bool UndoStep(const std::wstring& app, const std::wstring& backup, bool had_old, const std::wstring& rel) {
     const std::wstring dst = app + L"\\" + rel, old = backup + L"\\" + rel;
-    if (had_old) {
-        if (Exists(old) && !MoveFileExW(old.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING))
-            return false;
-    } else if (Exists(dst) && !DeleteFileW(dst.c_str())) {
-        return false;
+    if (!had_old) return !Exists(dst) || DeleteFileW(dst.c_str()) != FALSE;
+    if (!Exists(old)) return true;   // nothing was moved yet
+    if (MoveFileExW(old.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING)) return true;
+    const DWORD first = GetLastError();
+    // A mapped image (the dialog DLL a host loaded, or a running exe) cannot be
+    // replaced, but it can be renamed aside. Move it out of the way, restore the
+    // backup, and let the renamed file go at the next boot; that keeps a
+    // half-finished update recoverable instead of failing setup with error 5.
+    if (Exists(dst)) {
+        const std::wstring aside = dst + L".pulse-recovered";
+        DeleteFileW(aside.c_str());
+        if (MoveFileExW(dst.c_str(), aside.c_str(), 0)) {
+            if (MoveFileExW(old.c_str(), dst.c_str(), 0)) {
+                MoveFileExW(aside.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+                return true;
+            }
+            MoveFileExW(aside.c_str(), dst.c_str(), 0);   // put it back; the tree stays whole
+        }
     }
-    return true;
+    SetLastError(first);
+    return false;
 }
 
 }  // namespace

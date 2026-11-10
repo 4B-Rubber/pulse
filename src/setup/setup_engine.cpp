@@ -538,6 +538,24 @@ InstallResult RunInstall(Payload& payload, const std::wstring& self_path, const 
                     continue;
                 }
             }
+            // Only third-party hosts (QQ, Word, 微信) are left: they mapped the
+            // old dialog DLL and keep it mapped until they exit, and nobody
+            // closes a chat app for an installer. Schedule the folder for the
+            // next boot instead of asking; new hosts load the install-root copy,
+            // so this is the last version folder that can be held this way.
+            bool external_only = !cleanup_report.locks.programs.empty();
+            for (const auto& program : cleanup_report.locks.programs) {
+                if (!external_only) break;
+                if (!ProcessOutsideDirectories(program.pid, std::vector<std::wstring>{app})) external_only = false;
+            }
+            if (external_only && !cleanup_report.blocked_directories.empty()) {
+                for (const auto& entry : cleanup_report.blocked_directories) {
+                    RemoveTree(entry.directory);
+                    Log(L"Scheduled a version held only by external hosts for deletion at boot: " +
+                        entry.directory);
+                }
+                break;
+            }
             if (!cb.cleanup_locked || !cb.cleanup_locked(cleanup_report)) break;
         } while (true);
         if (!cleanup_report.Complete()) Log(L"Old dialog versions retained; retry cleanup after their owning programs exit.");

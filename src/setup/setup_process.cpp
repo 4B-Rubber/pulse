@@ -238,4 +238,10 @@ void StopPulseHosts(const std::vector<std::wstring>& dirs, bool touch_service) {
     }
 }
 
+bool ProcessOutsideDirectories(DWORD pid, const std::vector<std::wstring>& dirs) {
+    const auto path = ProcessPath(pid);
+    if (path.empty()) return false;   // gone or unreadable: not evidence of a host
+    return !PathInDirectories(path, dirs);
+}
+
 }  // namespace pulse::setup

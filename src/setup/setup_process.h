@@ -2,6 +2,8 @@
 // Closing running Pulse before files are replaced. Port of the
 // "closing running Pulse" section of installer/PulseSetup.iss.
 
+#include <windows.h>
+
 #include <string>
 #include <vector>
 
@@ -19,5 +21,10 @@ CloseState ClosePulseForUpdate(const std::vector<std::wstring>& dirs, bool unatt
 // Index, preview, Shell, AI and content/document hosts from `dirs`.
 void StopPulseHosts(const std::vector<std::wstring>& dirs, bool touch_service);
 bool WaitUntilImageGone(const wchar_t* image, const std::vector<std::wstring>& dirs, unsigned timeout_ms);
+
+// True when `pid` still runs an image outside `dirs` (a third-party host such
+// as QQ that mapped the dialog DLL). False for an exited or unreadable process:
+// those keep the conservative "ask the user" path.
+bool ProcessOutsideDirectories(DWORD pid, const std::vector<std::wstring>& dirs);
 
 }  // namespace pulse::setup
