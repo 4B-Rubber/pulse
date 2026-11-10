@@ -22,6 +22,7 @@
 #include "../common/localization.h"
 #include "../common/path_utils.h"
 #include "../ui/panel_metrics.h"
+#include "../ui/window_effect_support.h"
 #include "../ui/FluentTokens.h"
 #include "../index/index_client.h"
 #include "../index/network_agent_client.h"
@@ -2366,10 +2367,16 @@ int wmain(int argc, wchar_t** argv) {
     };
     settings_ui.BindUi(prefs, context, index_client, network_client,
                        std::move(ui_callbacks));
+    // Materials need Windows 11 22H2: the release runner is Server 2022, so the
+    // unsupported branch is the real behavior there rather than a skip.
+    const bool material_supported = pulse::ui::WindowEffectSupported(pulse::ui::WindowEffect::Mica);
+    const std::wstring default_material = prefs.window_effect;
     settings_ui.WindowEffect(L"mica");
-    passed &= Report("settings window effect returns material invalidation",
-        prefs.window_effect == L"mica" &&
-        HasEffect(last_effect, SettingsEffect::WindowMaterial));
+    passed &= Report("settings window effect applies Mica only where the host supports it",
+        material_supported
+            ? prefs.window_effect == L"mica" && HasEffect(last_effect, SettingsEffect::WindowMaterial)
+            : prefs.window_effect == default_material &&
+                !HasEffect(last_effect, SettingsEffect::WindowMaterial));
     settings_ui.AccentChoice(false, 0x12AB34);
     passed &= Report("settings accent is normalized and reports its side effect",
         prefs.accent_rgb == L"12AB34" && HasEffect(last_effect, SettingsEffect::Accent));
@@ -2393,8 +2400,9 @@ int wmain(int argc, wchar_t** argv) {
     settings_ui.RowHeight(0);
     settings_ui.AccentChoice(false, 0x2468AC);
     passed &= Report("settings UI controller routes preference commands",
-        prefs.window_effect == L"mica-alt" && prefs.row_height == 28 &&
-        prefs.accent_rgb == L"2468AC" && applied_effects == 10);
+        prefs.window_effect == (material_supported ? L"mica-alt" : default_material) &&
+        prefs.row_height == 28 && prefs.accent_rgb == L"2468AC" &&
+        applied_effects == (material_supported ? 10 : 8));
     settings_ui.NotifyIcon(2);
     passed &= Report("settings tray icon choice requests tray synchronization",
         prefs.notify_icon_mode == 2 && HasEffect(last_effect, SettingsEffect::TrayVisibility));

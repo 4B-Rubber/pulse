@@ -603,7 +603,7 @@ int main(int argc, char** argv) {
             steps.push(std::move(odd));
             c.Send(Request(18, "tools/call", CallParams("run_actions", steps_args(std::move(steps)))));
         }
-        Check(c.Response(18, r) && ToolErrorIs(r, "invalid_args") && ToolText(r).find("unknown member \"path\"") != std::string::npos,
+        Check(c.Response(18, r) && ToolErrorIs(r, "invalid_args") && ToolText(r).find("unknown member path") != std::string::npos,
               "run_actions: a stray member in a step is refused, naming it");
         {
             json::Value steps = json::Value::Array();
