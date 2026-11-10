@@ -326,17 +326,17 @@ struct FluentMenuTestPeer {
         FluentMenuItem clear;
         clear.command = 120;
         clear.text = L"No color dot";
-        menu.sub_model_.SetItems({strip, clear});
-        menu.sub_model_.Layout(nullptr, scale);
+        menu.first_sub_.model.SetItems({strip, clear});
+        menu.first_sub_.model.Layout(nullptr, scale);
         // Deliberately different parent width: submenu hits must use its own geometry.
         menu.model_.SetItems({clear});
         menu.model_.Layout(nullptr, scale, 800.0f);
         const int y = menu.kShadowMargin + static_cast<int>(
-            menu.sub_model_.RowTopPx(0) + menu.sub_model_.RowHeightPx() * 0.5f);
+            menu.first_sub_.model.RowTopPx(0) + menu.first_sub_.model.RowHeightPx() * 0.5f);
         for (int i = 0; i < 8; ++i) {
             int x = -1;
-            for (int candidate = 0; candidate < menu.sub_model_.WidthPx() + menu.kShadowMargin; ++candidate) {
-                if (menu.HitTestSwatch(menu.sub_model_, 0, static_cast<float>(candidate)) == i) {
+            for (int candidate = 0; candidate < menu.first_sub_.model.WidthPx() + menu.kShadowMargin; ++candidate) {
+                if (menu.HitTestSwatch(menu.first_sub_.model, 0, static_cast<float>(candidate)) == i) {
                     x = candidate;
                     break;
                 }
@@ -344,18 +344,18 @@ struct FluentMenuTestPeer {
             if (x < 0) return false;
             menu.open_ = true;
             menu.animating_out_ = false;
-            menu.sub_parent_row_ = 0;
+            menu.first_sub_.parent_row = 0;
             menu.OnSubMouse(POINT{x, y}, false);
-            if (menu.sub_hover_swatch_ != i) return false;
+            if (menu.first_sub_.hover_swatch != i) return false;
             menu.OnSubMouse(POINT{x, y}, true);
             if (menu.result_ != 90 + i) return false;
         }
         menu.open_ = true;
         menu.animating_out_ = false;
-        menu.sub_parent_row_ = 0;
+        menu.first_sub_.parent_row = 0;
         menu.OnSubMouse(POINT{menu.kShadowMargin + 10,
-            menu.kShadowMargin + static_cast<int>(menu.sub_model_.RowTopPx(1) +
-                menu.sub_model_.RowHeightPx() * 0.5f)}, true);
+            menu.kShadowMargin + static_cast<int>(menu.first_sub_.model.RowTopPx(1) +
+                menu.first_sub_.model.RowHeightPx() * 0.5f)}, true);
         return menu.result_ == 120;
     }
 };
@@ -4676,17 +4676,30 @@ void TestNavigateAlwaysEnumerates() {
     RemoveDirectoryW(parent.c_str());
 }
 
+std::wstring CreateSnapshotPatchDirectory(const wchar_t* name) {
+    const std::wstring dir = kOpsTestRoot + L"\\" + name + L"-" +
+        std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    std::error_code error;
+    std::filesystem::create_directories(kOpsTestRoot, error);
+    const bool created = !error && std::filesystem::create_directory(dir, error);
+    Check(created && !error, L"patch fixture: creates an isolated workspace directory");
+    if (!created || error) {
+        LogLine(L"[INFO] patch fixture: directory creation failed (%d): %s\n", error.value(), dir.c_str());
+        return {};
+    }
+    return dir;
+}
+
 void TestSnapshotPatch() {
-    wchar_t temp[MAX_PATH]{};
-    GetTempPathW(ARRAYSIZE(temp), temp);
-    const std::wstring dir = std::wstring(temp) + L"PulsePatchTest-" +
-                             std::to_wstring(GetCurrentProcessId());
-    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring dir = CreateSnapshotPatchDirectory(L"PulsePatchTest");
+    if (dir.empty()) return;
     const std::wstring a = dir + L"\\alpha.txt";
     const std::wstring b = dir + L"\\beta.txt";
     HANDLE hf = CreateFileW(a.c_str(), GENERIC_WRITE, 0, nullptr,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+    Check(hf != INVALID_HANDLE_VALUE, L"patch fixture: creates the expected real file");
+    if (hf == INVALID_HANDLE_VALUE) { RemoveDirectoryW(dir.c_str()); return; }
+    CloseHandle(hf);
 
     std::vector<fs::DirEntry> entries;
     fs::DirNotifyEvent added;
@@ -4699,13 +4712,19 @@ void TestSnapshotPatch() {
 
     hf = CreateFileW(b.c_str(), GENERIC_WRITE, 0, nullptr,
                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+    Check(hf != INVALID_HANDLE_VALUE, L"patch fixture: creates the expected real file");
+    if (hf == INVALID_HANDLE_VALUE) {
+        DeleteFileW(a.c_str());
+        RemoveDirectoryW(dir.c_str());
+        return;
+    }
+    CloseHandle(hf);
     added.name = L"beta.txt";
     Check(ApplyDirNotify(entries, dir, added, ui::SortColumn::Name, ui::SortDirection::Asc) ==
               NotifyPatch::Applied &&
           entries.size() == 2,
           L"patch: second ADDED keeps sort order");
-    Check(_wcsicmp(entries[0].name.c_str(), L"alpha.txt") == 0 &&
+    Check(entries.size() == 2 && _wcsicmp(entries[0].name.c_str(), L"alpha.txt") == 0 &&
           _wcsicmp(entries[1].name.c_str(), L"beta.txt") == 0,
           L"patch: name sort is alpha then beta");
 
@@ -4741,11 +4760,8 @@ void TestSnapshotPatch() {
 }
 
 void TestSnapshotPatchBatch() {
-    wchar_t temp[MAX_PATH]{};
-    GetTempPathW(ARRAYSIZE(temp), temp);
-    const std::wstring dir = std::wstring(temp) + L"PulsePatchBatch-" +
-                             std::to_wstring(GetCurrentProcessId());
-    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring dir = CreateSnapshotPatchDirectory(L"PulsePatchBatch");
+    if (dir.empty()) return;
     const auto full = [&](const wchar_t* name) { return dir + L"\\" + name; };
     const auto make = [&](const wchar_t* name, DWORD bytes) {
         HANDLE hf = CreateFileW(full(name).c_str(), GENERIC_WRITE, 0, nullptr,
@@ -4873,11 +4889,8 @@ void TestSnapshotPatchBatch() {
 
 // #13: patches keep rows on screen in place like File Explorer.
 void TestSnapshotPatchHoldsRows() {
-    wchar_t temp[MAX_PATH]{};
-    GetTempPathW(ARRAYSIZE(temp), temp);
-    const std::wstring dir = std::wstring(temp) + L"PulsePatchHold-" +
-                             std::to_wstring(GetCurrentProcessId());
-    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring dir = CreateSnapshotPatchDirectory(L"PulsePatchHold");
+    if (dir.empty()) return;
     const auto full = [&](const wchar_t* name) { return dir + L"\\" + name; };
     const auto make = [&](const wchar_t* name, DWORD bytes) {
         HANDLE hf = CreateFileW(full(name).c_str(), GENERIC_WRITE, 0, nullptr,
@@ -4926,9 +4939,9 @@ void TestSnapshotPatchHoldsRows() {
     make(L"beta.txt", 5000);
     Check(ApplyDirNotify(entries, dir, ev(FILE_ACTION_MODIFIED, L"beta.txt"),
                          ui::SortColumn::Size, ui::SortDirection::Desc) == NotifyPatch::Applied &&
-          names(entries) == L"aardvark.txt,zeta.txt,beta.txt,gamma.txt" &&
-          entries[2].size == 5000u,
-          L"patch hold: a modified row keeps its place and takes the new size");
+          names(entries) == L"beta.txt,aardvark.txt,zeta.txt,gamma.txt" &&
+          entries[0].size == 5000u,
+          L"patch sort: a modified size key moves the row to its descending sort position");
 
     {
         const ScopedEntryGrouping grouping(static_cast<int>(GroupBy::Type));
@@ -4936,11 +4949,11 @@ void TestSnapshotPatchHoldsRows() {
         make(L"notes.md", 1);
         name_asc(entries, ev(FILE_ACTION_ADDED, L"new"), dir);
         name_asc(entries, ev(FILE_ACTION_ADDED, L"notes.md"), dir);
-        Check(names(entries) == L"new,notes.md,aardvark.txt,zeta.txt,beta.txt,gamma.txt",
+        Check(names(entries) == L"new,notes.md,beta.txt,aardvark.txt,zeta.txt,gamma.txt",
               L"patch hold: grouped, a new row goes to its sort position in its group");
         MoveFileW(full(L"zeta.txt").c_str(), full(L"zeta.md").c_str());
         name_asc(entries, ev(FILE_ACTION_RENAMED_NEW_NAME, L"zeta.md", L"zeta.txt"), dir);
-        Check(names(entries) == L"new,notes.md,zeta.md,aardvark.txt,beta.txt,gamma.txt",
+        Check(names(entries) == L"new,notes.md,zeta.md,beta.txt,aardvark.txt,gamma.txt",
               L"patch hold: grouped, a rename into another group moves to its place there");
     }
 

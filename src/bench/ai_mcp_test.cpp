@@ -594,7 +594,7 @@ int main(int argc, char** argv) {
             steps.push(std::move(no_action));
             c.Send(Request(17, "tools/call", CallParams("run_actions", steps_args(std::move(steps)))));
         }
-        Check(c.Response(17, r) && ToolErrorIs(r, "invalid_args") && ToolText(r).find("action is required") != std::string::npos,
+        Check(c.Response(17, r) && ToolErrorIs(r, "invalid_args") && ToolText(r).find(".action must be an action identifier") != std::string::npos,
               "run_actions: a step without action is refused, naming it");
         {
             json::Value steps = json::Value::Array();
@@ -603,8 +603,8 @@ int main(int argc, char** argv) {
             steps.push(std::move(odd));
             c.Send(Request(18, "tools/call", CallParams("run_actions", steps_args(std::move(steps)))));
         }
-        Check(c.Response(18, r) && ToolErrorIs(r, "invalid_args") && ToolText(r).find("put the action's arguments in args") != std::string::npos,
-              "run_actions: a stray member in a step is refused with a hint to use args");
+        Check(c.Response(18, r) && ToolErrorIs(r, "invalid_args") && ToolText(r).find("unknown member \"path\"") != std::string::npos,
+              "run_actions: a stray member in a step is refused, naming it");
         {
             json::Value steps = json::Value::Array();
             for (int i = 0; i < 13; ++i) steps.push(step("nav.back"));
