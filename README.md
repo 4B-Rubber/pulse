@@ -6,9 +6,9 @@
 
 为 Windows 打造的文件管理器：多窗格与可恢复工作区、索引与拼音搜索、丰富预览、照片墙、标签与别名、可预览的批量重命名，以及先给方案、由你确认的 Pulse 助手。
 
-[下载最新版](https://github.com/jimmgreen/pulse/releases/latest) · [1.0.59 更新说明](docs/releases/1.0.59.md) · [历史版本](https://github.com/jimmgreen/pulse/releases) · [反馈问题](https://github.com/jimmgreen/pulse/issues) · [English](README.en.md)
+[下载最新版](https://github.com/jimmgreen/pulse/releases/latest) · [1.0.60 更新说明](docs/releases/1.0.60.md) · [历史版本](https://github.com/jimmgreen/pulse/releases) · [反馈问题](https://github.com/jimmgreen/pulse/issues) · [English](README.en.md)
 
-> 当前源码版本为 **1.0.59**，可下载版本以 Releases 为准。支持 Windows 10/11 x64，另提供 Windows 8.1 x64 兼容版。界面支持简体中文、繁體中文和 English。
+> 当前源码版本为 **1.0.60**，可下载版本以 Releases 为准。支持 Windows 10/11 x64，另提供 Windows 8.1 x64 兼容版。界面支持简体中文、繁體中文和 English。
 
 ![Pulse 深色主题与照片墙](docs/images/1.0.59/hero.png)
 
@@ -175,7 +175,7 @@ pwsh ./scripts/build_release_ci.ps1 -Channel win81 -BuildDir build-ci-win81
 
 ## 文档与反馈
 
-[更新说明](docs/releases/1.0.59.md) · [Windows 兼容性](docs/windows-compatibility.md) · [索引存储与迁移](docs/index-migration.md) · [AI 与 MCP](docs/ai-pack.md) · [原生扩展文档](docs/extensions-index.md) · [问题反馈](https://github.com/jimmgreen/pulse/issues)
+[更新说明](docs/releases/1.0.60.md) · [Windows 兼容性](docs/windows-compatibility.md) · [索引存储与迁移](docs/index-migration.md) · [AI 与 MCP](docs/ai-pack.md) · [原生扩展文档](docs/extensions-index.md) · [问题反馈](https://github.com/jimmgreen/pulse/issues)
 
 反馈请附上 Pulse / Windows 版本、复现步骤及必要截图或诊断信息；分享前移除密钥和私人文件内容。
 

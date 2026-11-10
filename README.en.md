@@ -6,9 +6,9 @@
 
 A file manager for Windows with multiple panes and saved workspaces, indexed and pinyin search, rich previews, a photo wall, tags and aliases, batch renaming with previews, and a Pulse assistant that proposes a plan for you to approve.
 
-[Download the latest release](https://github.com/jimmgreen/pulse/releases/latest) · [1.0.59 release notes](docs/releases/1.0.59.en.md) · [Release history](https://github.com/jimmgreen/pulse/releases) · [Report an issue](https://github.com/jimmgreen/pulse/issues) · [简体中文](README.md)
+[Download the latest release](https://github.com/jimmgreen/pulse/releases/latest) · [1.0.60 release notes](docs/releases/1.0.60.en.md) · [Release history](https://github.com/jimmgreen/pulse/releases) · [Report an issue](https://github.com/jimmgreen/pulse/issues) · [简体中文](README.md)
 
-> The current source version is **1.0.59**; see Releases for available downloads. Supports Windows 10/11 x64, with a separate Windows 8.1 x64-compatible edition. The interface supports Simplified Chinese, Traditional Chinese and English.
+> The current source version is **1.0.60**; see Releases for available downloads. Supports Windows 10/11 x64, with a separate Windows 8.1 x64-compatible edition. The interface supports Simplified Chinese, Traditional Chinese and English.
 
 ![Pulse in dark theme with the photo wall](docs/images/1.0.59/hero.png)
 
@@ -175,7 +175,7 @@ Built with C++20, Win32, Direct2D and DirectComposition. File-system, indexing, 
 
 ## Documentation and feedback
 
-[Release notes](docs/releases/1.0.59.en.md) · [Windows compatibility](docs/windows-compatibility.md) · [Index storage and migration](docs/index-migration.md) · [AI and MCP](docs/ai-pack.md) · [Native extension documentation](docs/extensions-index.md) · [Report an issue](https://github.com/jimmgreen/pulse/issues)
+[Release notes](docs/releases/1.0.60.en.md) · [Windows compatibility](docs/windows-compatibility.md) · [Index storage and migration](docs/index-migration.md) · [AI and MCP](docs/ai-pack.md) · [Native extension documentation](docs/extensions-index.md) · [Report an issue](https://github.com/jimmgreen/pulse/issues)
 
 When reporting an issue, include your Pulse and Windows versions, reproduction steps, and relevant screenshots or diagnostics. Remove credentials and private file contents before sharing.
 
