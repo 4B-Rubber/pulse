@@ -4175,7 +4175,22 @@ bool MainRenderer::DrawTruncatedName(const std::wstring& name, float x, float y,
         DrawNameHighlightBackground(compositor_, highlighted.get(), {x, y_snap}, rc, visible_matches, theme, scale_);
         compositor_->DrawTextLayout({x, y_snap}, highlighted.get(), brText_.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
     } else if (!drawn) {
-        dc->DrawText(shown.c_str(), (UINT32)shown.size(), fmt, &rc, brText_.get(),
+        // Snap the baseline to a whole pixel row like LumaText and the layout
+        // path above; otherwise fractional scales shift the row by a pixel.
+        float plain_top = y;
+        ComPtr<IDWriteTextLayout> metrics;
+        if (SUCCEEDED(factory->CreateTextLayout(shown.c_str(), static_cast<UINT32>(shown.size()), fmt, w, h, &metrics))) {
+            DWRITE_TEXT_METRICS text_metrics{};
+            DWRITE_LINE_METRICS line_metrics{};
+            UINT32 line_count = 0;
+            if (SUCCEEDED(metrics->GetMetrics(&text_metrics)) &&
+                SUCCEEDED(metrics->GetLineMetrics(&line_metrics, 1, &line_count)) && line_count > 0) {
+                const float baseline = y + text_metrics.top + line_metrics.baseline;
+                plain_top += std::round(baseline) - baseline;
+            }
+        }
+        const D2D1_RECT_F plain_rc = D2D1::RectF(x, plain_top, x + w, plain_top + h);
+        dc->DrawText(shown.c_str(), (UINT32)shown.size(), fmt, &plain_rc, brText_.get(),
                      D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
     }
 
