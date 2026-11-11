@@ -7,6 +7,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+# The pack catalogs must still describe the assets this release will host.
+& python (Join-Path $repo 'scripts/test_release_packs.py')
+if ($LASTEXITCODE -ne 0) { throw 'Release pack catalog validation failed before compilation' }
 # Per-stage wall time in the log; the release bottleneck lives in this script.
 $stage = [System.Diagnostics.Stopwatch]::StartNew()
 function Write-StageTime([string]$Name) {

@@ -2367,16 +2367,14 @@ int wmain(int argc, wchar_t** argv) {
     };
     settings_ui.BindUi(prefs, context, index_client, network_client,
                        std::move(ui_callbacks));
-    // Materials need Windows 11 22H2: the release runner is Server 2022, so the
-    // unsupported branch is the real behavior there rather than a skip.
-    const bool material_supported = pulse::ui::WindowEffectSupported(pulse::ui::WindowEffect::Mica);
-    const std::wstring default_material = prefs.window_effect;
+    const bool mica_supported = pulse::ui::WindowEffectSupported(pulse::ui::WindowEffect::Mica);
+    const std::wstring before_mica = prefs.window_effect;
     settings_ui.WindowEffect(L"mica");
-    passed &= Report("settings window effect applies Mica only where the host supports it",
-        material_supported
-            ? prefs.window_effect == L"mica" && HasEffect(last_effect, SettingsEffect::WindowMaterial)
-            : prefs.window_effect == default_material &&
-                !HasEffect(last_effect, SettingsEffect::WindowMaterial));
+    const bool mica_changed = mica_supported && before_mica != L"mica";
+    passed &= Report("settings window effect respects platform support and material invalidation",
+        prefs.window_effect == (mica_supported ? L"mica" : before_mica) &&
+        applied_effects == (mica_changed ? 1 : 0) &&
+        (mica_changed ? HasEffect(last_effect, SettingsEffect::WindowMaterial) : last_effect == SettingsEffect::None));
     settings_ui.AccentChoice(false, 0x12AB34);
     passed &= Report("settings accent is normalized and reports its side effect",
         prefs.accent_rgb == L"12AB34" && HasEffect(last_effect, SettingsEffect::Accent));
@@ -2396,13 +2394,26 @@ int wmain(int argc, wchar_t** argv) {
     passed &= Report("settings status performance toggle persists",
         prefs.show_status_performance &&
         HasEffect(last_effect, SettingsEffect::StatusBarPerformance));
+    const bool mica_alt_supported = pulse::ui::WindowEffectSupported(pulse::ui::WindowEffect::MicaAlt);
+    const std::wstring before_mica_alt = prefs.window_effect;
+    const int effects_before_mica_alt = applied_effects;
+    last_effect = SettingsEffect::None;
     settings_ui.WindowEffect(L"mica-alt");
+    const bool mica_alt_changed = mica_alt_supported && before_mica_alt != L"mica-alt";
+    passed &= Report("settings MicaAlt mutates and invalidates only when supported",
+        prefs.window_effect == (mica_alt_supported ? L"mica-alt" : before_mica_alt) &&
+        applied_effects == effects_before_mica_alt + (mica_alt_changed ? 1 : 0) &&
+        (mica_alt_changed ? HasEffect(last_effect, SettingsEffect::WindowMaterial) : last_effect == SettingsEffect::None));
     settings_ui.RowHeight(0);
     settings_ui.AccentChoice(false, 0x2468AC);
     passed &= Report("settings UI controller routes preference commands",
-        prefs.window_effect == (material_supported ? L"mica-alt" : default_material) &&
-        prefs.row_height == 28 && prefs.accent_rgb == L"2468AC" &&
-        applied_effects == (material_supported ? 10 : 8));
+        prefs.window_effect == (mica_alt_supported ? L"mica-alt" : before_mica_alt) && prefs.row_height == 28 &&
+        prefs.accent_rgb == L"2468AC" && applied_effects == 8 + (mica_changed ? 1 : 0) + (mica_alt_changed ? 1 : 0));
+    const int effects_before_none = applied_effects;
+    settings_ui.WindowEffect(L"none");
+    passed &= Report("settings no-material choice remains available on unsupported systems",
+        prefs.window_effect == L"none" && applied_effects == effects_before_none + 1 &&
+        HasEffect(last_effect, SettingsEffect::WindowMaterial));
     settings_ui.NotifyIcon(2);
     passed &= Report("settings tray icon choice requests tray synchronization",
         prefs.notify_icon_mode == 2 && HasEffect(last_effect, SettingsEffect::TrayVisibility));

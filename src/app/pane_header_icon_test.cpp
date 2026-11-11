@@ -39,43 +39,35 @@ struct PaneHeaderIconTest {
             vm.pane.path=L"C:\\Users\\Desktop";vm.pane.header_text=L"Desktop";
             vm.pane.selected_count=1;
             vm.pane_slots.resize(2);
+            vm.layout_controls.pane_names = {L"Left", L"Right"};
             const auto window=D2D1::RectF(0,0,width*scale,700*scale);
             const float left=renderer.EffectiveSidebarWidth(window.right);
             for (bool expanded:{false,true}) {
                 vm.address_searching=width==320 && expanded;
                 vm.pane.filter_expand=expanded ? 1.0f : 0.0f;
                 vm.pane.filter_text=expanded ? L"report" : L"";
-                const auto layout=MakeToolbarLayout(window.right,scale,renderer.TitleBarHeight(),renderer.Margin(),
-                    renderer.NewButtonWidthPx(window.right-left < 600*scale),left,vm.pane.filter_expand);
+                renderer.SetNavigationForward(vm.can_go_forward);
+                renderer.SetSearchBarMinWidth(vm.address_searching ? 500.0f : 0.0f);
+                const auto layout=renderer.ToolbarLayoutAt(window.right,
+                    renderer.NewButtonWidthPx(window.right-left < 600*scale),vm.pane.filter_expand);
                 check(layout.filter.right<=window.right-renderer.Margin(),"toolbar filter stays inside window");
                 const auto hit=[&](D2D1_RECT_F rc) { return renderer.HitTest(vm,window,(rc.left+rc.right)*0.5f,(rc.top+rc.bottom)*0.5f).region; };
                 if (vm.address_searching) {
-                    // The app widens the field to 520 DIP while the search is active
-                    // (app::SyncSearchBarWidth); the overlay is laid out from it.
-                    renderer.SetSearchBarMinWidth(520.0f);
                     const auto search=LayoutAddressSearch(renderer.SearchBarRect(window.right),scale);
                     check(search.input.right-search.input.left>=64*scale,"compact search expands to usable input");
                     check(hit(search.input)==HitTestResult::AddressSearchInput && hit(search.close)==HitTestResult::AddressSearchClose,
                         "compact search overlay routes input and close before navigation");
-                    renderer.SetSearchBarMinWidth(0.0f);
                 } else {
-                    // Full tier: refresh sits between address and search. Narrower
-                    // tiers keep it in the address bar's right end instead of taking
-                    // its own 32 DIP, so the field keeps more text.
-                    check(layout.navigation[3].right <= layout.search.left,
-                        "refresh never overlaps the search entry");
-                    if (layout.refresh_inside) {
-                        check(layout.navigation[3].left >= layout.address.left &&
-                            layout.navigation[3].right <= layout.address.right &&
-                            layout.address_text.right <= layout.navigation[3].left,
-                            "compact refresh stays inside the address bar and clear of its text");
-                    } else {
-                        check(layout.address.right <= layout.navigation[3].left,
-                            "refresh sits between address and search without overlap");
-                        check(layout.address.right+2*scale<=layout.search.left,"address and search do not overlap");
-                    }
+                    const auto refresh = layout.navigation[3];
+                    check((layout.refresh_inside ? layout.address_text.right <= refresh.left &&
+                        refresh.right <= layout.address.right : layout.address.right <= refresh.left) &&
+                        refresh.right <= layout.search.left,
+                        "refresh is bounded after address text and before search without overlap");
                     check(hit(layout.navigation[3]) == HitTestResult::NavRefresh,
                         "relocated refresh routes to refresh action");
+                    check((layout.merged_search ? layout.address_text.right <= layout.search.left &&
+                        layout.search.right <= layout.address.right : layout.address.right+2*scale<=layout.search.left),
+                        "address text and search target do not overlap in separate or merged chrome");
                     check(hit(layout.search)==HitTestResult::AddressSearch,"search entry remains accessible");
                 }
                 check(hit(layout.sort)==HitTestResult::ToolbarSort,"toolbar sort hit target");
@@ -201,6 +193,7 @@ struct PaneHeaderIconTest {
                         WindowViewModel vm;
                         vm.dark = dark;
                         vm.pane_slots.resize(2);
+                        vm.layout_controls.pane_names = {L"Left", L"Right"};
                         PaneViewModel pane;
                         pane.path = L"C:\\Pictures";
                         pane.header_text = L"Pictures";
@@ -231,47 +224,32 @@ struct PaneHeaderIconTest {
                         slot.pane = pane;
                         slot.pane.filter_expand = 0;
                         slot.pane.filter_text.clear();
-                        const D2D1_RECT_F buttons[] = {
-                            renderer.PaneDetailsRect(paneRect,0), renderer.PaneMediumIconsRect(paneRect,0),
-                            renderer.PaneViewButtonRect(paneRect,0)};
                         const HitTestResult::Region actions[] = {HitTestResult::PaneDetails,
                             HitTestResult::PaneMediumIcons,HitTestResult::PaneViewButton};
-                        // Two panes keep every header action clickable whatever the
-                        // focus or the fade state: either pane can be driven without
-                        // being focused first. A lone pane still reveals them on focus.
-                        for (bool focused : {false,true}) for (float opacity : {0.0f,0.45f,1.0f}) {
-                            slot.focused = focused;
-                            slot.pane.header_controls_opacity = opacity;
-                            for (size_t i=0;i<std::size(buttons);++i) {
-                                const auto& button=buttons[i];
-                                const auto hit=renderer.HitTest(vm,window,(button.left+button.right)*0.5f,
-                                    (button.top+button.bottom)*0.5f);
-                                check(hit.region == actions[i],
-                                    "two panes keep header actions reachable regardless of focus and fade");
-                            }
-                        }
-                        {
-                            vm.pane_slots.pop_back();
-                            slot.focused = false;
-                            slot.pane.header_controls_opacity = 0.0f;
-                            // The rects follow the pane count the last hit test saw, so
-                            // probe inside the pane once before measuring them.
-                            renderer.HitTest(vm,window,paneRect.left+4.0f,paneRect.top+4.0f);
-                            const D2D1_RECT_F single[] = {
-                                renderer.PaneDetailsRect(paneRect,0), renderer.PaneMediumIconsRect(paneRect,0),
-                                renderer.PaneViewButtonRect(paneRect,0)};
+                        for (bool split : {false,true}) {
+                            // Actual view models have one name per slot; split headers stay visible.
+                            vm.pane_slots.resize(split ? 2 : 1);
+                            vm.layout_controls.pane_names = split ? std::vector<std::wstring>{L"Left", L"Right"}
+                                : std::vector<std::wstring>{L"Only pane"};
+                            auto& active_slot = vm.pane_slots[0];
+                            dc->BeginDraw();
+                            renderer.DrawSinglePane(vm,active_slot.pane,paneRect,0,true,false,theme);
+                            check(SUCCEEDED(dc->EndDraw()), "single and split header geometry renders");
+                            const D2D1_RECT_F buttons[] = {
+                                renderer.PaneDetailsRect(paneRect,1.0f,active_slot.pane.size_control),
+                                renderer.PaneMediumIconsRect(paneRect,1.0f,active_slot.pane.size_control),
+                                renderer.PaneViewButtonRect(paneRect)};
                             for (bool focused : {false,true}) for (float opacity : {0.0f,0.45f,1.0f}) {
-                                slot.focused = focused;
-                                slot.pane.header_controls_opacity = opacity;
-                                for (size_t i=0;i<std::size(single);++i) {
-                                    const auto& button=single[i];
+                                active_slot.focused = focused;
+                                active_slot.pane.header_controls_opacity = opacity;
+                                for (size_t i=0;i<std::size(buttons);++i) {
+                                    const auto& button=buttons[i];
                                     const auto hit=renderer.HitTest(vm,window,(button.left+button.right)*0.5f,
                                         (button.top+button.bottom)*0.5f);
-                                    check(hit.region == (focused && opacity > 0.05f ? actions[i] : HitTestResult::PaneHeader),
-                                        "only visible focused header actions accept clicks");
+                                    check(hit.region == (split || (focused && opacity > 0.05f) ? actions[i] : HitTestResult::PaneHeader),
+                                        "split headers stay clickable; single headers require visible focused actions");
                                 }
                             }
-                            vm.pane_slots.resize(2);
                         }
                     }
                 }
