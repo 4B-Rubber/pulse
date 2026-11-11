@@ -160,6 +160,11 @@ set(PULSE_CONTENT_PACK_CHANNEL windows)
 if(PULSE_WIN81_CANDIDATE)
     set(PULSE_CONTENT_PACK_CHANNEL win81)
 endif()
+# The dev fork publishes the enhancement packs on its own release, so the
+# catalogs compiled into pulse.exe must name that repository (upstream's point
+# at jimmgreen/pulse). Override with -DPULSE_PACK_REPOSITORY=owner/repo.
+set(PULSE_PACK_REPOSITORY "4B-Rubber/pulse" CACHE STRING
+    "Repository whose releases host the content and AI pack assets")
 set(PULSE_PDFIUM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pdfium" CACHE PATH
     "PDFium distribution matching the target architecture")
 file(SHA256 "${PULSE_PDFIUM_ROOT}/bin/pdfium.dll" PULSE_PDFIUM_SHA256)
@@ -1398,7 +1403,7 @@ set(PULSE_CONTENT_PACK_CATALOG "${CMAKE_BINARY_DIR}/generated/content_pack_catal
 add_custom_command(OUTPUT "${PULSE_CONTENT_PACK_CATALOG}"
     COMMAND pulse_pack_catalog --key content --symbol Content --version "${PULSE_VERSION}"
         --channel "${PULSE_CONTENT_PACK_CHANNEL}"
-        --base-url "https://github.com/jimmgreen/pulse/releases/download/v${PULSE_VERSION}/"
+        --base-url "https://github.com/${PULSE_PACK_REPOSITORY}/releases/download/v${PULSE_VERSION}/"
         --out-dir "${PULSE_CONTENT_PACK_DIR}" --header "${PULSE_CONTENT_PACK_CATALOG}"
         "$<TARGET_FILE:pulse_content>" "$<TARGET_FILE:pulse_document>"
     DEPENDS pulse_pack_catalog pulse_content pulse_document
@@ -1427,7 +1432,7 @@ set(PULSE_AI_PACK_CATALOG "${CMAKE_BINARY_DIR}/generated/ai_pack_catalog.h")
 add_custom_command(OUTPUT "${PULSE_AI_PACK_CATALOG}"
     COMMAND pulse_pack_catalog --key ai --symbol Ai --version "${PULSE_VERSION}"
         --channel "${PULSE_CONTENT_PACK_CHANNEL}"
-        --base-url "https://github.com/jimmgreen/pulse/releases/download/v${PULSE_VERSION}/"
+        --base-url "https://github.com/${PULSE_PACK_REPOSITORY}/releases/download/v${PULSE_VERSION}/"
         --out-dir "${PULSE_AI_PACK_DIR}" --header "${PULSE_AI_PACK_CATALOG}"
         "$<TARGET_FILE:pulse_ai>"
     DEPENDS pulse_pack_catalog pulse_ai "$<TARGET_FILE:pulse_ai>"

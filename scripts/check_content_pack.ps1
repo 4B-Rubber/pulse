@@ -9,7 +9,10 @@ param(
     [string]$PackDir,
     [string]$BuildDir,
     [ValidateSet('content', 'ai')]
-    [string]$Key = 'content'
+    [string]$Key = 'content',
+    # The repository the compiled catalog downloads the pack from (CMake's
+    # PULSE_PACK_REPOSITORY, which defaults to this dev fork).
+    [string]$Repository = '4B-Rubber/pulse'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,7 +26,7 @@ if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Missing $label manifes
 $pack = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 if ($pack.key -ne $Key) { throw "Unexpected $label key: $($pack.key)" }
 if ($pack.version -ne $version) { throw "$label is version $($pack.version), expected $version" }
-if ($pack.base_url -ne "https://github.com/jimmgreen/pulse/releases/download/v$version/") {
+if ($pack.base_url -ne "https://github.com/$Repository/releases/download/v$version/") {
     throw "$label points at another release: $($pack.base_url)"
 }
 $names = @($pack.files | ForEach-Object { $_.name } | Sort-Object)

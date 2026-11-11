@@ -71,7 +71,7 @@ $packAssets = @()
 foreach ($key in @('content', 'ai')) {
     foreach ($channel in @('windows', 'win81')) {
         $packDir = "dist/$key-pack-$channel"
-        & "$PSScriptRoot/check_content_pack.ps1" -Key $key -PackDir $packDir
+        & "$PSScriptRoot/check_content_pack.ps1" -Key $key -PackDir $packDir -Repository $repository
         $pack = Get-Content -LiteralPath "$packDir/$key-pack-assets.json" -Raw | ConvertFrom-Json
         if ($pack.channel -ne $channel -or $pack.base_url -ne "$base/") { throw "The $key pack for $channel targets another release" }
         $packAssets += @($pack.files | ForEach-Object { Join-Path $packDir $_.asset })
