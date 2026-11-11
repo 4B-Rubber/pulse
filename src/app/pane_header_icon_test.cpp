@@ -50,17 +50,32 @@ struct PaneHeaderIconTest {
                 check(layout.filter.right<=window.right-renderer.Margin(),"toolbar filter stays inside window");
                 const auto hit=[&](D2D1_RECT_F rc) { return renderer.HitTest(vm,window,(rc.left+rc.right)*0.5f,(rc.top+rc.bottom)*0.5f).region; };
                 if (vm.address_searching) {
+                    // The app widens the field to 520 DIP while the search is active
+                    // (app::SyncSearchBarWidth); the overlay is laid out from it.
+                    renderer.SetSearchBarMinWidth(520.0f);
                     const auto search=LayoutAddressSearch(renderer.SearchBarRect(window.right),scale);
                     check(search.input.right-search.input.left>=64*scale,"compact search expands to usable input");
                     check(hit(search.input)==HitTestResult::AddressSearchInput && hit(search.close)==HitTestResult::AddressSearchClose,
                         "compact search overlay routes input and close before navigation");
+                    renderer.SetSearchBarMinWidth(0.0f);
                 } else {
-                    check(layout.address.right <= layout.navigation[3].left &&
-                        layout.navigation[3].right <= layout.search.left,
-                        "refresh sits between address and search without overlap");
+                    // Full tier: refresh sits between address and search. Narrower
+                    // tiers keep it in the address bar's right end instead of taking
+                    // its own 32 DIP, so the field keeps more text.
+                    check(layout.navigation[3].right <= layout.search.left,
+                        "refresh never overlaps the search entry");
+                    if (layout.refresh_inside) {
+                        check(layout.navigation[3].left >= layout.address.left &&
+                            layout.navigation[3].right <= layout.address.right &&
+                            layout.address_text.right <= layout.navigation[3].left,
+                            "compact refresh stays inside the address bar and clear of its text");
+                    } else {
+                        check(layout.address.right <= layout.navigation[3].left,
+                            "refresh sits between address and search without overlap");
+                        check(layout.address.right+2*scale<=layout.search.left,"address and search do not overlap");
+                    }
                     check(hit(layout.navigation[3]) == HitTestResult::NavRefresh,
                         "relocated refresh routes to refresh action");
-                    check(layout.address.right+2*scale<=layout.search.left,"address and search do not overlap");
                     check(hit(layout.search)==HitTestResult::AddressSearch,"search entry remains accessible");
                 }
                 check(hit(layout.sort)==HitTestResult::ToolbarSort,"toolbar sort hit target");
@@ -221,6 +236,9 @@ struct PaneHeaderIconTest {
                             renderer.PaneViewButtonRect(paneRect,0)};
                         const HitTestResult::Region actions[] = {HitTestResult::PaneDetails,
                             HitTestResult::PaneMediumIcons,HitTestResult::PaneViewButton};
+                        // Two panes keep every header action clickable whatever the
+                        // focus or the fade state: either pane can be driven without
+                        // being focused first. A lone pane still reveals them on focus.
                         for (bool focused : {false,true}) for (float opacity : {0.0f,0.45f,1.0f}) {
                             slot.focused = focused;
                             slot.pane.header_controls_opacity = opacity;
@@ -228,9 +246,32 @@ struct PaneHeaderIconTest {
                                 const auto& button=buttons[i];
                                 const auto hit=renderer.HitTest(vm,window,(button.left+button.right)*0.5f,
                                     (button.top+button.bottom)*0.5f);
-                                check(hit.region == (focused && opacity > 0.05f ? actions[i] : HitTestResult::PaneHeader),
-                                    "only visible focused header actions accept clicks");
+                                check(hit.region == actions[i],
+                                    "two panes keep header actions reachable regardless of focus and fade");
                             }
+                        }
+                        {
+                            vm.pane_slots.pop_back();
+                            slot.focused = false;
+                            slot.pane.header_controls_opacity = 0.0f;
+                            // The rects follow the pane count the last hit test saw, so
+                            // probe inside the pane once before measuring them.
+                            renderer.HitTest(vm,window,paneRect.left+4.0f,paneRect.top+4.0f);
+                            const D2D1_RECT_F single[] = {
+                                renderer.PaneDetailsRect(paneRect,0), renderer.PaneMediumIconsRect(paneRect,0),
+                                renderer.PaneViewButtonRect(paneRect,0)};
+                            for (bool focused : {false,true}) for (float opacity : {0.0f,0.45f,1.0f}) {
+                                slot.focused = focused;
+                                slot.pane.header_controls_opacity = opacity;
+                                for (size_t i=0;i<std::size(single);++i) {
+                                    const auto& button=single[i];
+                                    const auto hit=renderer.HitTest(vm,window,(button.left+button.right)*0.5f,
+                                        (button.top+button.bottom)*0.5f);
+                                    check(hit.region == (focused && opacity > 0.05f ? actions[i] : HitTestResult::PaneHeader),
+                                        "only visible focused header actions accept clicks");
+                                }
+                            }
+                            vm.pane_slots.resize(2);
                         }
                     }
                 }

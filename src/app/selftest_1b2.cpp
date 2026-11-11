@@ -4064,10 +4064,11 @@ void TestFolderSorts() {
           prefs.folder_sorts.Find(L"C:/B/") == newest,
           L"folder sorts: case, separators, trailing slash and extended prefix agree");
     Check(!prefs.folder_sorts.Set(L"pulse:search:x", newest) &&
-          !prefs.folder_sorts.Set(L"", newest) &&
           !prefs.folder_sorts.Set(L"relative", newest) &&
-          !prefs.folder_sorts.Set(L"C:\\Bad", { static_cast<SortColumn>(9), SortDirection::Asc }),
+          !prefs.folder_sorts.Set(L"C:\\Bad", { static_cast<SortColumn>(64), SortDirection::Asc }),
           L"folder sorts: virtual, nonabsolute and invalid values are rejected");
+    Check(prefs.folder_sorts.Set(L"", newest) && prefs.folder_sorts.Find(L"") == newest,
+          L"folder sorts: This PC keeps its own order under the empty path");
     const std::wstring unc = L"\\\\server\\share\\照片";
     prefs.folder_sorts.Set(unc, biggest);
     AppPrefs reloaded;

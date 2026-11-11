@@ -2089,9 +2089,12 @@ int wmain(int argc, wchar_t** argv) {
         std::vector<unsigned char> junk(4096, 0x01);
         Check(WriteBytes(path(L"broken.7z"), junk), L"create damaged 7z fixture");
         Result junkResult;
+        // .7z/.rar previews come from the extension plugin; without it the host
+        // asks for the plugin instead of dumping the bytes as hex.
         Check(host.Request(path(L"broken.7z"), junkResult) &&
-              junkResult.response.kind == ipc::PreviewContentKind::Hex,
-              L"a file that is not an archive keeps the hex fallback");
+              junkResult.response.kind != ipc::PreviewContentKind::Hex &&
+              junkResult.error == L"archive-plugin-required",
+              L"a 7z without its extension plugin asks for it instead of dumping hex");
     }
 
     Check(WriteEmfFixture(path(L"shapes.emf")), L"create EMF fixture");
